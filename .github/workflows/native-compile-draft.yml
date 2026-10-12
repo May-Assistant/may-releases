@@ -1,0 +1,77 @@
+name: May protected native compile (inactive draft)
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Native platform to compile without signing or upload
+        required: true
+        type: choice
+        options: [ios, android]
+      source_sha:
+        description: Reviewed 40-character May app commit already on main
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: may-native-compile
+  cancel-in-progress: false
+jobs:
+  admission:
+    # This workflow is intentionally inert until a later reviewed change removes
+    # this guard after the protected environment and scoped keys exist.
+    if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
+  native:
+    needs: admission
+    if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Recheck protection after reviewer approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
+      - name: Select JDK 21 for Android
+        if: inputs.platform == 'android'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch exact private app and pinned design system quietly
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 tools/may_release/prepare.py --source-sha "$MAY_SOURCE_SHA"
+      - name: Compile without signing or store access
+        env:
+          MAY_PLATFORM: ${{ inputs.platform }}
+        run: python3 tools/may_release/compile.py --platform "$MAY_PLATFORM"
+      - name: Remove private source, logs and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"
