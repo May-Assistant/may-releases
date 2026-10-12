@@ -14,21 +14,24 @@ CONTROL_REPO = "May-Assistant/may-releases"
 OWNER_ID = 58840187
 ENVIRONMENTS = {
     "compile": "may-native-compile",
-    "ios": "may-ios-internal",
-    "android": "may-android-internal",
+    ("ios", "production"): "may-ios-internal",
+    ("ios", "playground"): "may-ios-playground-internal",
+    ("android", "production"): "may-android-internal",
+    ("android", "playground"): "may-android-playground-internal",
 }
 
 
-def validate_run(repo, ref, event, sha, action, build_number=None):
+def validate_run(repo, ref, event, sha, action, build_number=None, target="production"):
     if (repo, ref, event) != (CONTROL_REPO, "refs/heads/main", "workflow_dispatch"):
         raise ValueError("May control must run by manual dispatch from its main branch")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("Private source must be an exact lowercase commit SHA")
-    if action not in ENVIRONMENTS:
+    key = "compile" if action == "compile" else (action, target)
+    if key not in ENVIRONMENTS:
         raise ValueError("Unknown May control action")
     if action != "compile" and not re.fullmatch(r"[1-9][0-9]{0,8}", build_number or ""):
         raise ValueError("Store build number must be a positive decimal integer")
-    return ENVIRONMENTS[action]
+    return ENVIRONMENTS[key]
 
 
 def validate_environment(data, policies):
@@ -64,13 +67,14 @@ def get_json(path, token):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=sorted(ENVIRONMENTS), required=True)
+    parser.add_argument("--action", choices=("compile", "ios", "android"), required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--build-number")
+    parser.add_argument("--target", choices=("production", "playground"), default="production")
     args = parser.parse_args()
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
-                       args.build_number)
+                       args.build_number, args.target)
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise ValueError("GitHub metadata token unavailable")

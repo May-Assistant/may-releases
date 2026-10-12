@@ -5,6 +5,7 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[2]
 check = (root / ".github/workflows/control-check.yml").read_text()
 compile_workflow = (root / ".github/workflows/native-compile-draft.yml").read_text()
+store_workflow = (root / ".github/workflows/store-release-draft.yml").read_text()
 assert "pull_request:" in check and "permissions:\n  contents: read" in check
 assert "secrets." not in check and "pull_request_target" not in check
 assert compile_workflow.count("if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}") == 2
@@ -15,4 +16,11 @@ assert "secrets.MAY_APP_READ_KEY" in compile_workflow and "secrets.MAY_DS_READ_K
 assert "upload-artifact" not in compile_workflow and "pull_request_target" not in compile_workflow
 assert "--source-sha '${{ inputs.source_sha }}'" not in compile_workflow
 assert "--platform '${{ inputs.platform }}'" not in compile_workflow
+assert store_workflow.count("github.event_name == 'may-store-disabled-pending-review'") == 3
+assert "environment: ${{ needs.admission.outputs.environment }}" in store_workflow
+assert store_workflow.count("Recheck protected destination after Samuel's review") == 2
+assert "secrets.MAY_APP_READ_KEY" in store_workflow and "secrets.MAY_DS_READ_KEY" in store_workflow
+assert "secrets.MAY_ASC_KEY_BASE64" in store_workflow and "secrets.MAY_PLAY_JSON" in store_workflow
+assert "pull_request_target" not in store_workflow and "upload-artifact" not in store_workflow
+assert "track: production" not in store_workflow and "--track production" not in store_workflow
 print("May public draft is inert and its no-secret controls are structurally present")
