@@ -26,6 +26,18 @@ def run(argv, log, cwd=None, env=None):
         raise CompileError("Native compile failed; diagnostics remain on protected runner")
 
 
+def extract_generator(archive, generator):
+    generator.mkdir(mode=0o700)
+    with zipfile.ZipFile(archive) as package:
+        package.extractall(generator)
+    binary = generator / "xcodegen/bin/xcodegen"
+    if not binary.is_file():
+        raise CompileError("Pinned XcodeGen binary is unavailable")
+    # zipfile.extractall discards Unix executable bits even when the archive has 0755.
+    binary.chmod(0o755)
+    return binary
+
+
 def compile_native(platform):
     root = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
     source, private = root / "may-source", root / "may-private"
@@ -49,13 +61,7 @@ def compile_native(platform):
         run(["curl", "-fsSL", "--retry", "2", "-o", str(archive), XCODEGEN_URL], log)
         if hashlib.sha256(archive.read_bytes()).hexdigest() != XCODEGEN_SHA256:
             raise CompileError("Pinned XcodeGen download hash differs")
-        generator = private / "xcodegen"
-        generator.mkdir(mode=0o700)
-        with zipfile.ZipFile(archive) as package:
-            package.extractall(generator)
-        binary = generator / "xcodegen/bin/xcodegen"
-        if not binary.is_file():
-            raise CompileError("Pinned XcodeGen binary is unavailable")
+        binary = extract_generator(archive, private / "xcodegen")
         env["PATH"] = str(binary.parent) + os.pathsep + env.get("PATH", "")
         run([str(binary), "generate"], log, cwd=source / "ios", env=env)
         for scheme in ("May", "MayPlayground"):
