@@ -10,7 +10,14 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sys
 import subprocess
+
+# Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
+# after the standard library. A file planted here cannot shadow a stdlib import.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from store import SOURCE_READ_SECRETS, StoreError, child_env, require_step_secrets
 
 APP = "git@github.com:May-Assistant/may-app.git"
 DS = "git@github.com:May-Assistant/may-design-system.git"
@@ -65,20 +72,21 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
     if dest.exists() or not key_text.strip():
         raise PrepareError("Private checkout path or scoped read key is unavailable")
     key, known, log = private / (label + ".key"), private / "known_hosts", private / (label + ".log")
-    descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as secret_file:
-        secret_file.write(key_text.strip() + "\n")
-    known.write_text(GITHUB_HOST_KEY + "\n")
-    known.chmod(0o600)
     ssh = " ".join(shlex.quote(p) for p in (
         "ssh", "-F", "/dev/null", "-i", str(key), "-o", "IdentitiesOnly=yes",
         "-o", "IdentityAgent=none", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
         "-o", "HostKeyAlgorithms=ssh-ed25519", "-o", "UserKnownHostsFile=" + str(known)))
-    env = {k: v for k, v in os.environ.items() if k not in ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
-           and not k.startswith("GIT_")}
-    env.update(GIT_SSH_COMMAND=ssh, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
-               GIT_CONFIG_GLOBAL=os.devnull, GIT_LFS_SKIP_SMUDGE="1")
+    # git and ssh get an allowlisted environment: never the read keys or any GIT_* override.
+    env = child_env(GIT_SSH_COMMAND=ssh, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
+                    GIT_CONFIG_GLOBAL=os.devnull, GIT_LFS_SKIP_SMUDGE="1")
     try:
+        # The key is written inside the try so that a failed write (for example
+        # a full disk part-way through) still removes the partial key file.
+        descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as secret_file:
+            secret_file.write(key_text.strip() + "\n")
+        known.write_text(GITHUB_HOST_KEY + "\n")
+        known.chmod(0o600)
         quiet(["git", "init", "-q", str(dest)], log, env=env)
         quiet(["git", "-C", str(dest), "remote", "add", "origin", remote], log, env=env)
         ref = "+refs/heads/main:refs/remotes/origin/main" if main_history else sha
@@ -99,6 +107,7 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
 
 
 def prepare(source_sha):
+    require_step_secrets(SOURCE_READ_SECRETS)
     root = private_runner_root()
     private = root / "may-private"
     private.mkdir(mode=0o700)
@@ -127,5 +136,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         prepare(args.source_sha)
-    except (PrepareError, OSError, subprocess.SubprocessError):
+    except (PrepareError, StoreError, OSError, subprocess.SubprocessError):
         raise SystemExit("Private May source preparation failed; no source or credential was printed") from None

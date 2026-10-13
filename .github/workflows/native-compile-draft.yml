@@ -25,7 +25,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      deployments: read
     outputs:
       environment: ${{ steps.gate.outputs.environment }}
     steps:
@@ -40,13 +39,13 @@ jobs:
   native:
     needs: admission
     if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}
-    runs-on: macos-15
+    # Android needs nothing from macOS, and the pinned JDK is linux x64 only.
+    runs-on: ${{ inputs.platform == 'android' && 'ubuntu-24.04' || 'macos-15' }}
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 90
     permissions:
       contents: read
       actions: read
-      deployments: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -56,12 +55,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
         run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
-      - name: Select JDK 21 for Android
+      - name: Install pinned, checksum-verified JDK 21 for Android
         if: inputs.platform == 'android'
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: '21'
+        run: python3 tools/may_release/toolchain.py jdk --export
       - name: Fetch exact private app and pinned design system quietly
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}

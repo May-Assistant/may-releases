@@ -12,5 +12,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # Pinned, checksum-verified JDK and age for the real jarsigner and age
+      # round trips in the tests (no secret involved).
+      - run: |
+          python3 tools/may_release/toolchain.py jdk --export
+          python3 tools/may_release/toolchain.py age --export
       - run: python3 -m unittest discover -s tools/may_release -p 'test_*.py' -v
       - run: python3 tools/may_release/static_check.py
