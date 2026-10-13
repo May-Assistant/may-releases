@@ -38,7 +38,7 @@ def upload(target, source_sha, build_number):
     try:
         write_private(keys / ("AuthKey_" + APPLE_KEY_ID + ".p8"), key)
         env = child_env(DEVELOPER_DIR=XCODE_DEVELOPER_DIR, API_PRIVATE_KEYS_DIR=str(keys))
-        run_private(["xcrun", "altool", "--upload-app", "--file", str(ipa), "--type", "ios",
+        run_private(["/usr/bin/xcrun", "altool", "--upload-app", "--file", str(ipa), "--type", "ios",
                      "--apiKey", APPLE_KEY_ID, "--apiIssuer", issuer],
                     private, private / "ios-upload.log", env)
     finally:

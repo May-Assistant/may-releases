@@ -1,13 +1,22 @@
+import base64
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.error
+from urllib.parse import parse_qs
 
-from play_upload import PlayRefusal, upload
+import play_upload
+from play_upload import PlayRefusal, PlaySession, access_token, upload
 from store import StoreError
+
+HAS_OPENSSL = os.path.exists(play_upload.OPENSSL)
 
 ACCOUNT = "may-play-upload@may-assistant-app.iam.gserviceaccount.com"
 CREDENTIAL = json.dumps({"type": "service_account", "project_id": "may-assistant-app",
@@ -157,6 +166,88 @@ class PlayUploadTests(unittest.TestCase):
             with self.assertRaises(StoreError):
                 upload("playground", "a" * 40, "9", session)
         self.assertEqual(session.calls, [])
+
+
+class Reply:
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class Opener:
+    def __init__(self, replies):
+        self.replies, self.requests = list(replies), []
+
+    def open(self, request, timeout):
+        self.requests.append(request)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+class StdlibClientTests(unittest.TestCase):
+    """The release job's Play client: stdlib urllib plus the system openssl, no retries."""
+
+    def test_session_sends_bearer_only_to_the_play_api_and_never_retries(self):
+        opener = Opener([Reply(200, b'{"id": "edit-1"}'),
+                         urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b"secret body"))])
+        session = PlaySession("token-1", opener)
+        self.assertEqual(session.post(play_upload.API + "/x/edits", json={}).json(), {"id": "edit-1"})
+        unauthorized = session.put(play_upload.API + "/x/edits/1/tracks/internal", json={})
+        self.assertEqual((unauthorized.status_code, unauthorized.body), (401, b""))
+        self.assertEqual(len(opener.requests), 2)
+        self.assertEqual(opener.requests[0].get_header("Authorization"), "Bearer token-1")
+        for url in ("https://example.com/androidpublisher/v3", "http://androidpublisher.googleapis.com/androidpublisher/"):
+            with self.assertRaises(StoreError):
+                session.get(url)
+        self.assertEqual(len(opener.requests), 2)
+
+    def test_redirects_are_not_followed(self):
+        handler = play_upload.NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://elsewhere.example/"))
+
+    def test_token_endpoint_must_be_googles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(StoreError):
+                access_token({"token_uri": "https://evil.example/token", "client_email": "x",
+                              "private_key": "x"}, Path(directory), Opener([]))
+
+    @unittest.skipUnless(HAS_OPENSSL or os.environ.get("CI"), "system openssl is required")
+    def test_service_account_assertion_is_a_valid_rs256_jwt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            subprocess.run([play_upload.OPENSSL, "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+                            "-out", str(work / "k.pem")], check=True, capture_output=True)
+            subprocess.run([play_upload.OPENSSL, "pkey", "-in", str(work / "k.pem"), "-pubout",
+                            "-out", str(work / "pub.pem")], check=True, capture_output=True)
+            credential = {"type": "service_account", "client_email": ACCOUNT, "private_key_id": "kid-1",
+                          "private_key": (work / "k.pem").read_text(), "token_uri": play_upload.TOKEN_URI}
+            opener = Opener([Reply(200, b'{"access_token": "issued", "expires_in": 3599}')])
+            self.assertEqual(access_token(credential, work, opener, now=1_700_000_000), "issued")
+            request = opener.requests[0]
+            self.assertEqual(request.full_url, play_upload.TOKEN_URI)
+            assertion = parse_qs(request.data.decode())["assertion"][0]
+            header, claims, signature = assertion.split(".")
+            pad = lambda part: base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+            self.assertEqual(json.loads(pad(header)), {"alg": "RS256", "typ": "JWT", "kid": "kid-1"})
+            self.assertEqual(json.loads(pad(claims)), {"iss": ACCOUNT, "scope": play_upload.SCOPE,
+                                                       "aud": play_upload.TOKEN_URI,
+                                                       "iat": 1_700_000_000, "exp": 1_700_000_600})
+            (work / "sig").write_bytes(pad(signature))
+            verified = subprocess.run([play_upload.OPENSSL, "dgst", "-sha256", "-verify", str(work / "pub.pem"),
+                                       "-signature", str(work / "sig")], input=(header + "." + claims).encode(),
+                                      capture_output=True)
+            self.assertEqual(verified.returncode, 0)
+            self.assertEqual(sorted(p.name for p in work.iterdir()), ["k.pem", "pub.pem", "sig"])
 
 
 if __name__ == "__main__":

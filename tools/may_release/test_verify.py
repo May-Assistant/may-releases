@@ -51,12 +51,20 @@ class AabVerificationTests(unittest.TestCase):
     def test_unsigned_extra_or_duplicate_entries_are_refused(self):
         for name, extra in (("added", [("base/dex/classes.dex", b"unsigned code")]),
                             ("duplicate", [("BundleConfig.pb", b"shadowing entry")]),
-                            ("second-signer", [("META-INF/OTHER.RSA", b"x"), ("META-INF/OTHER.SF", b"x")])):
+                            ("second-signer", [("META-INF/OTHER.RSA", b"x"), ("META-INF/OTHER.SF", b"x")]),
+                            ("sig-entry", [("META-INF/SIG-EXTRA", b"x")])):
             with self.subTest(name=name):
                 path = self.root / (name + ".aab")
                 rewrite_zip(fx.SIGNED_AAB, path, extra=extra)
                 with self.assertRaises(VerifyError):
                     verify.aab_signer_sha256(path)
+
+    def test_pre_sign_check_sees_every_signature_entry(self):
+        path = self.root / "presigned.aab"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("BundleConfig.pb", b"x")
+            archive.writestr("META-INF/SIG-ANDROID", b"x")
+        self.assertEqual(verify.signature_entries(path), ["META-INF/SIG-ANDROID"])
 
     def test_unsigned_bundle_is_refused(self):
         path = self.root / "unsigned.aab"

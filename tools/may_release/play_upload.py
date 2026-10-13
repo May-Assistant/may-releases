@@ -16,27 +16,139 @@ one. Otherwise, inside one edit, it:
 Any failure deletes the edit. A failed or uncertain commit is never retried
 automatically; inspect Play before retry. The caller must already hold
 Samuel's protected-environment approval.
+
+No third-party code: this runs in the release job, where only this repository's
+Python, the system openssl and pinned tools run. The OAuth service-account
+grant is built here (RS256 JWT signed by /usr/bin/openssl, exchanged once at
+Google's fixed token endpoint), and requests use urllib. Nothing is retried:
+there is no refresh-and-resend on 401 for the upload or the commit, and
+redirects are refused so the bearer token is only ever sent to Google's API
+host. A 401 fails the run and deletes the edit.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import re
-from urllib.parse import quote
+import subprocess
+import time
+import urllib.error
+from urllib.parse import quote, urlencode
+import urllib.request
 
-from store import (PLAY_UPLOAD_SECRETS, StoreError, identity, play_identity, require_step_secrets,
-                   runner_root)
+from store import (PLAY_UPLOAD_SECRETS, StoreError, child_env, identity, play_identity,
+                   require_step_secrets, runner_root, write_private)
 
 SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 API = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications"
 UPLOAD_API = "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+OPENSSL = "/usr/bin/openssl"
 ROLLED_OUT = ("completed", "inProgress", "halted")
 MAX_VERSION_JUMP = 1000
 
 
 class PlayRefusal(StoreError):
     """A deliberate refusal before any change. Its message is a fixed literal."""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # A redirect becomes an HTTP error; the token never leaves Google's hosts.
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+class Response:
+    def __init__(self, status_code, body):
+        self.status_code, self.body = status_code, body
+
+    def json(self):
+        return json.loads(self.body)
+
+
+def send(opener, request, timeout):
+    try:
+        with opener.open(request, timeout=timeout) as reply:
+            return Response(reply.status, reply.read())
+    except urllib.error.HTTPError as error:
+        error.close()
+        return Response(error.code, b"")  # Provider error bodies are discarded unread.
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise StoreError("Google Play request was rejected or uncertain") from None
+
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+
+def rs256(message, private_key_pem, work):
+    """Sign with the service-account key via the system openssl; the key file is 0600 and removed."""
+    key = work / "play-sa.pem"
+    try:
+        write_private(key, private_key_pem.encode())
+        result = subprocess.run([OPENSSL, "dgst", "-sha256", "-sign", str(key)], input=message,
+                                capture_output=True, env=child_env())
+    finally:
+        key.unlink(missing_ok=True)
+    if result.returncode or not result.stdout:
+        raise StoreError("Play service-account assertion could not be signed")
+    return result.stdout
+
+
+def access_token(credential, work, opener=OPENER, now=None):
+    if credential.get("token_uri", TOKEN_URI) != TOKEN_URI:
+        raise StoreError("Play credential token endpoint is not Google's")
+    issued = int(now if now is not None else time.time())
+    header = {"alg": "RS256", "typ": "JWT"}
+    if isinstance(credential.get("private_key_id"), str):
+        header["kid"] = credential["private_key_id"]
+    claims = {"iss": credential["client_email"], "scope": SCOPE, "aud": TOKEN_URI,
+              "iat": issued, "exp": issued + 600}
+    signing_input = b64url(json.dumps(header).encode()) + b"." + b64url(json.dumps(claims).encode())
+    assertion = signing_input + b"." + b64url(rs256(signing_input, credential["private_key"], work))
+    body = urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                      "assertion": assertion.decode()}).encode()
+    reply = send(opener, urllib.request.Request(
+        TOKEN_URI, data=body, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"}), 30)
+    token = checked_json(reply).get("access_token")
+    if not isinstance(token, str) or not token:
+        raise StoreError("Google did not issue a Play access token")
+    return token
+
+
+class PlaySession:
+    """The small requests-like surface upload() uses, over urllib with a fixed bearer token."""
+
+    def __init__(self, token, opener=OPENER):
+        self.token, self.opener = token, opener
+
+    def _request(self, method, url, json_body=None, data=None, headers=None, timeout=30):
+        if not url.startswith(("https://androidpublisher.googleapis.com/androidpublisher/",
+                               "https://androidpublisher.googleapis.com/upload/androidpublisher/")):
+            raise StoreError("Refusing a request outside the Play Developer API")
+        all_headers = {"Authorization": "Bearer " + self.token, **(headers or {})}
+        if json_body is not None:
+            data = json.dumps(json_body).encode()
+            all_headers["Content-Type"] = "application/json"
+        return send(self.opener, urllib.request.Request(url, data=data, method=method, headers=all_headers),
+                    timeout)
+
+    def post(self, url, json=None, data=None, headers=None, timeout=30):
+        return self._request("POST", url, json, data, headers, timeout)
+
+    def get(self, url, timeout=30):
+        return self._request("GET", url, timeout=timeout)
+
+    def put(self, url, json=None, timeout=30):
+        return self._request("PUT", url, json, timeout=timeout)
+
+    def delete(self, url, timeout=30):
+        return self._request("DELETE", url, timeout=timeout)
 
 
 def checked_json(response):
@@ -110,10 +222,9 @@ def upload(target, source_sha, build_number, session=None):
         raise StoreError("Signed Android App Bundle is unavailable")
     local_sha256 = file_sha256(bundle)
     if session is None:
-        from google.auth.transport.requests import AuthorizedSession
-        from google.oauth2.service_account import Credentials
-        credentials = Credentials.from_service_account_info(json.loads(raw), scopes=[SCOPE])
-        session = AuthorizedSession(credentials)
+        work = runner_root() / "may-private"
+        work.mkdir(mode=0o700, exist_ok=True)
+        session = PlaySession(access_token(json.loads(raw), work))
     path = quote(package, safe="")
     base = f"{API}/{path}/edits"
     edit = checked_json(session.post(base, json={}, timeout=30)).get("id")
@@ -125,7 +236,8 @@ def upload(target, source_sha, build_number, session=None):
         with bundle.open("rb") as stream:
             uploaded = checked_json(session.post(
                 f"{UPLOAD_API}/{path}/edits/{edit}/bundles?uploadType=media",
-                data=stream, headers={"Content-Type": "application/octet-stream"}, timeout=300))
+                data=stream, headers={"Content-Type": "application/octet-stream",
+                                      "Content-Length": str(bundle.stat().st_size)}, timeout=300))
         if str(uploaded.get("versionCode")) != build_number:
             raise StoreError("Google Play returned a different version code")
         if str(uploaded.get("sha256", "")).lower() != local_sha256:

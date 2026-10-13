@@ -1,6 +1,7 @@
 import copy
 import io
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -39,7 +40,7 @@ class GateTests(unittest.TestCase):
 
     def test_build_number_ceiling(self):
         self.assertEqual(validate_run(REPO, MAIN, DISPATCH, self.sha, "android", "2000000000"),
-                         "android-production")
+                         "may-android-internal")
         for build in ("2000000001", "2100000000", "99999999999"):
             with self.subTest(build=build), self.assertRaises(GateDenial):
                 validate_run(REPO, MAIN, DISPATCH, self.sha, "android", build)
@@ -48,8 +49,8 @@ class GateTests(unittest.TestCase):
         expected = {
             ("ios", "production"): "may-ios-internal",
             ("ios", "playground"): "may-ios-playground-internal",
-            ("android", "production"): "android-production",
-            ("android", "playground"): "android-playground",
+            ("android", "production"): "may-android-internal",
+            ("android", "playground"): "may-android-playground-internal",
         }
         for (platform, target), environment in expected.items():
             with self.subTest(platform=platform, target=target):
@@ -73,14 +74,14 @@ class GateTests(unittest.TestCase):
             validate_environment(self.environment, {"branch_policies": [{"name": "*"}]})
 
     def test_exact_environment_names_confirmed_by_setup_lane(self):
-        # Confirmed by Samuel and the setup lane on 2026-10-13. Any rename must
-        # be made in the repository settings and here together.
+        # Confirmed from the repository's Actions secrets page on 2026-10-13. Any
+        # rename must be made in the repository settings and here together.
         self.assertEqual(gate.ENVIRONMENTS, {
             "compile": "may-native-compile",
             ("ios", "production"): "may-ios-internal",
             ("ios", "playground"): "may-ios-playground-internal",
-            ("android", "production"): "android-production",
-            ("android", "playground"): "android-playground",
+            ("android", "production"): "may-android-internal",
+            ("android", "playground"): "may-android-playground-internal",
         })
 
     def test_prevented_self_review_by_sole_reviewer_is_denied(self):
@@ -92,8 +93,8 @@ class GateTests(unittest.TestCase):
                 validate_environment(prevented, self.policies, actor_id, login)
         # Another dispatcher can be approved by Samuel.
         validate_environment(prevented, self.policies, "12345", "another-maintainer")
-        # Self-review allowed (the confirmed setting for both Android
-        # environments): Samuel may dispatch and then approve.
+        # Self-review allowed (Samuel's current policy for internal-only
+        # releases): Samuel may dispatch and then approve.
         validate_environment(self.environment, self.policies, "58840187", "samuelalake")
 
     def test_unreadable_self_review_setting_is_denied(self):
@@ -117,11 +118,56 @@ class GateTests(unittest.TestCase):
             argv = ["gate.py", "--action", "android", "--target", "playground",
                     "--source-sha", self.sha, "--build-number", "9"]
             with patch.dict(os.environ, env), patch("sys.argv", argv), \
+                    patch("gate.artifact_recipient", return_value="age1" + "q" * 58), \
                     patch("urllib.request.urlopen", side_effect=not_found):
                 with self.assertRaises(GateDenial) as denied:
                     gate.main()
             self.assertIn("does not exist", denied.exception.args[0])
             self.assertFalse(os.path.exists(output))
+
+    def test_placeholder_artifact_key_denies_before_any_request(self):
+        for environment in ("may-ios-internal", "may-ios-playground-internal", "may-android-internal",
+                            "may-android-playground-internal"):
+            self.assertIsNone(gate.artifact_recipient(environment))  # committed placeholders
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH,
+                   "GH_TOKEN": "fixture-token", "GITHUB_OUTPUT": os.path.join(directory, "output")}
+            argv = ["gate.py", "--action", "ios", "--target", "production", "--source-sha", self.sha,
+                    "--build-number", "9"]
+            with patch.dict(os.environ, env), patch("sys.argv", argv), \
+                    patch("urllib.request.urlopen") as request:
+                with self.assertRaises(GateDenial) as denied:
+                    gate.main()
+                request.assert_not_called()
+            self.assertIn("placeholder", denied.exception.args[0])
+
+    def test_real_public_key_is_accepted_and_both_environments_are_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            keys = Path(directory)
+            (keys / "may-android-playground-internal.age.pub").write_text("age1" + "q" * 58 + "\n")
+            output = os.path.join(directory, "output")
+            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH,
+                   "GH_TOKEN": "fixture-token", "GITHUB_OUTPUT": output}
+            argv = ["gate.py", "--action", "android", "--target", "playground", "--source-sha", self.sha,
+                    "--build-number", "9"]
+            checked = []
+
+            def fake_json(path, token):
+                checked.append(path.split("/")[1])
+                return self.policies if path.endswith("per_page=100") else self.environment
+
+            with patch.dict(os.environ, env), patch("sys.argv", argv), patch("gate.ARTIFACT_KEYS", keys), \
+                    patch("gate.get_json", side_effect=fake_json):
+                gate.main()
+            self.assertEqual(sorted(set(checked)), ["may-android-playground-internal", "may-native-compile"])
+            with open(output) as stream:
+                self.assertEqual(stream.read(), "environment=may-android-playground-internal\n"
+                                                "build_environment=may-native-compile\n")
+        for bad in ("age1short", "AGE-SECRET-KEY-1" + "Q" * 58, "age1" + "b" * 58):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / "x.age.pub").write_text(bad)
+                with patch("gate.ARTIFACT_KEYS", Path(directory)):
+                    self.assertIsNone(gate.artifact_recipient("x"))
 
 
 if __name__ == "__main__":

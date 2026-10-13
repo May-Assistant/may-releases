@@ -1,11 +1,17 @@
 name: May protected store release (inactive draft)
-# Protected environments, chosen by gate.py and never auto-created (a missing
-# one is a 404 and the admission job denies):
-#   android/production -> android-production   (May, Play 4974275831988601568)
-#   android/playground -> android-playground   (May Playground, Play 4972137188420176977)
-#   ios/production     -> may-ios-internal             (May, ASC 6821782401)
-#   ios/playground     -> may-ios-playground-internal  (May Playground, ASC 6822072535)
-# Each step that needs a secret gets only its own; build steps get none.
+# Each run is two jobs on separate fresh VMs:
+#   *-build    environment may-native-compile (read-only source keys only). Runs
+#              the private build (Gradle / Xcode / SwiftPM: third-party code) and
+#              encrypts the unsigned product to the target's committed age key.
+#   *-release  the target's store environment. Runs no build toolchain: only this
+#              repository's Python, checksum-verified Temurin jarsigner and age,
+#              and Apple's tools. Decrypts, signs, verifies and uploads.
+# Store environments, chosen by gate.py and never auto-created (a missing one is
+# a 404 and admission denies):
+#   android/production -> may-android-internal             (May, Play 4974275831988601568)
+#   android/playground -> may-android-playground-internal  (May Playground, Play 4972137188420176977)
+#   ios/production     -> may-ios-internal                 (May, ASC 6821782401)
+#   ios/playground     -> may-ios-playground-internal      (May Playground, ASC 6822072535)
 on:
   workflow_dispatch:
     inputs:
@@ -34,8 +40,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   admission:
-    # A later reviewed change must enable this job after all four environments,
-    # private keys, signing credentials and store identities have been verified.
+    # A later reviewed change must enable this job after all environments,
+    # artifact keys, signing credentials and store identities have been verified.
     if: ${{ github.event_name == 'may-store-disabled-pending-review' }}
     runs-on: ubuntu-24.04
     permissions:
@@ -43,6 +49,7 @@ jobs:
       actions: read
     outputs:
       environment: ${{ steps.gate.outputs.environment }}
+      build_environment: ${{ steps.gate.outputs.build_environment }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -55,18 +62,17 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_BUILD_NUMBER: ${{ inputs.build_number }}
         run: python3 tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
-  ios:
+  android-build:
     needs: admission
-    if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
-    runs-on: macos-15
-    environment: ${{ needs.admission.outputs.environment }}
-    timeout-minutes: 120
+    if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'android' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.build_environment }}
+    timeout-minutes: 90
     permissions:
       contents: read
       actions: read
     env:
       PYTHONDONTWRITEBYTECODE: '1'
-      MAY_PLATFORM: ${{ inputs.platform }}
       MAY_TARGET: ${{ inputs.target }}
       MAY_SOURCE_SHA: ${{ inputs.source_sha }}
       MAY_BUILD_NUMBER: ${{ inputs.build_number }}
@@ -74,47 +80,47 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Recheck protected destination after Samuel's review
+      - name: Recheck build environment after Samuel's review
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 tools/may_release/gate.py --action ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+        run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
+      - name: Install pinned JDK and age
+        run: |
+          python3 tools/may_release/toolchain.py jdk --export
+          python3 tools/may_release/toolchain.py age
       - name: Fetch exact private source and pinned design system
         env:
           MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 tools/may_release/prepare.py --source-sha "$MAY_SOURCE_SHA"
-      - name: Build unsigned iOS archive without secrets
-        run: python3 tools/may_release/store.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
-      - name: Sign and verify internal-TestFlight IPA
-        env:
-          MAY_IOS_CERT_BASE64: ${{ secrets.MAY_IOS_CERT_BASE64 }}
-          MAY_IOS_CERT_PASSWORD: ${{ secrets.MAY_IOS_CERT_PASSWORD }}
-          MAY_IOS_PROFILE_BASE64: ${{ secrets.MAY_IOS_PROFILE_BASE64 }}
-        run: python3 tools/may_release/sign.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
-      - name: Upload verified IPA for internal TestFlight
-        env:
-          MAY_ASC_KEY_BASE64: ${{ secrets.MAY_ASC_KEY_BASE64 }}
-          MAY_ASC_KEY_ID: ${{ vars.MAY_ASC_KEY_ID }}
-          MAY_ASC_ISSUER_ID: ${{ secrets.MAY_ASC_ISSUER_ID }}
-        run: python3 tools/may_release/ios_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
-      - name: Remove task-owned private source and signing material
+      - name: Build unsigned Android App Bundle without secrets
+        run: python3 tools/may_release/store.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Encrypt unsigned bundle to the target's public key
+        run: python3 tools/may_release/handoff.py seal --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-handoff-android
+          path: ${{ runner.temp }}/may-handoff/handoff.age
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Remove task-owned private source and build output
         if: always()
         run: |
           if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-play-venv" "$RUNNER_TEMP/may-android."* "$RUNNER_TEMP/may-ios."*
+            rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff"
           fi
-  android:
-    needs: admission
+  android-release:
+    needs: [admission, android-build]
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'android' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
-    timeout-minutes: 120
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
     env:
       PYTHONDONTWRITEBYTECODE: '1'
-      MAY_PLATFORM: ${{ inputs.platform }}
       MAY_TARGET: ${{ inputs.target }}
       MAY_SOURCE_SHA: ${{ inputs.source_sha }}
       MAY_BUILD_NUMBER: ${{ inputs.build_number }}
@@ -126,21 +132,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/may_release/gate.py --action android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
-      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - name: Install hash-locked Play client without secrets
+      - name: Install pinned JDK and age
         run: |
-          python3 -m venv "$RUNNER_TEMP/may-play-venv"
-          "$RUNNER_TEMP/may-play-venv/bin/python" -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: -r tools/may_release/requirements-play.txt > "$RUNNER_TEMP/may-play-venv/pip.log" 2>&1 || { echo 'Hash-locked Play client setup failed'; exit 1; }
-      - name: Fetch exact private source and pinned design system
+          python3 tools/may_release/toolchain.py jdk
+          python3 tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: may-handoff-android
+          path: ${{ runner.temp }}/may-handoff-download
+      - name: Decrypt and check the build handoff
         env:
-          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
-          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
-        run: python3 tools/may_release/prepare.py --source-sha "$MAY_SOURCE_SHA"
-      - name: Build unsigned Android App Bundle without secrets
-        run: python3 tools/may_release/store.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+          MAY_ARTIFACT_DECRYPT_KEY: ${{ secrets.MAY_ARTIFACT_DECRYPT_KEY }}
+        run: python3 tools/may_release/handoff.py open --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Sign and verify Android App Bundle
         env:
           MAY_ANDROID_KEYSTORE_BASE64: ${{ secrets.MAY_ANDROID_KEYSTORE_BASE64 }}
@@ -153,11 +156,106 @@ jobs:
         env:
           MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}
           MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}
-        run: |
-          "$RUNNER_TEMP/may-play-venv/bin/python" tools/may_release/play_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
-      - name: Remove task-owned private source, bundle, keys and logs
+        run: python3 tools/may_release/play_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Remove task-owned bundle, keys and logs
         if: always()
         run: |
           if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-play-venv" "$RUNNER_TEMP/may-android."* "$RUNNER_TEMP/may-ios."*
+            rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff-download"
+          fi
+  ios-build:
+    needs: admission
+    if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.build_environment }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAY_TARGET: ${{ inputs.target }}
+      MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+      MAY_BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Recheck build environment after Samuel's review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
+      - name: Install pinned age
+        run: python3 tools/may_release/toolchain.py age
+      - name: Fetch exact private source and pinned design system
+        env:
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 tools/may_release/prepare.py --source-sha "$MAY_SOURCE_SHA"
+      - name: Build unsigned iOS archive without secrets
+        run: python3 tools/may_release/store.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Encrypt unsigned archive to the target's public key
+        run: python3 tools/may_release/handoff.py seal --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-handoff-ios
+          path: ${{ runner.temp }}/may-handoff/handoff.age
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Remove task-owned private source and build output
+        if: always()
+        run: |
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
+            rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff"
+          fi
+  ios-release:
+    needs: [admission, ios-build]
+    if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAY_TARGET: ${{ inputs.target }}
+      MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+      MAY_BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Recheck protected destination after Samuel's review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/may_release/gate.py --action ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Install pinned age
+        run: python3 tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: may-handoff-ios
+          path: ${{ runner.temp }}/may-handoff-download
+      - name: Decrypt and check the build handoff
+        env:
+          MAY_ARTIFACT_DECRYPT_KEY: ${{ secrets.MAY_ARTIFACT_DECRYPT_KEY }}
+        run: python3 tools/may_release/handoff.py open --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Sign and verify internal-TestFlight IPA
+        env:
+          MAY_IOS_CERT_BASE64: ${{ secrets.MAY_IOS_CERT_BASE64 }}
+          MAY_IOS_CERT_PASSWORD: ${{ secrets.MAY_IOS_CERT_PASSWORD }}
+          MAY_IOS_PROFILE_BASE64: ${{ secrets.MAY_IOS_PROFILE_BASE64 }}
+        run: python3 tools/may_release/sign.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Upload verified IPA for internal TestFlight
+        env:
+          MAY_ASC_KEY_BASE64: ${{ secrets.MAY_ASC_KEY_BASE64 }}
+          MAY_ASC_KEY_ID: ${{ vars.MAY_ASC_KEY_ID }}
+          MAY_ASC_ISSUER_ID: ${{ secrets.MAY_ASC_ISSUER_ID }}
+        run: python3 tools/may_release/ios_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Remove task-owned archive, keys and logs
+        if: always()
+        run: |
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
+            rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff-download"
           fi

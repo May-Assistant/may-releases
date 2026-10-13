@@ -7,29 +7,55 @@ CLI prints it.
 A protected job's `environment:` would silently auto-create a missing environment
 with no protection. This gate runs first and denies on a 404, so that never
 happens: the environments must be created, by hand, before any dispatch.
+
+Every store run builds in `may-native-compile` (read-only source keys only) and
+signs and uploads in the target's store environment, so admission checks both.
+It also denies while the target's committed artifact public key is still a
+placeholder.
+
+Self-review: the gate denies only when self-review is prevented and the sole
+reviewer dispatched (the run could never be approved). With it off, Samuel may
+dispatch and approve his own run. That is acceptable only because every path in
+this repository targets internal testing alone (the Play `internal` track and
+internal-only TestFlight); there is no track input to choose anything else.
+Before any production or public-beta release, Prevent self-review must be on and
+a second reviewer added (README, "Before any non-internal release").
 """
 
 import argparse
 import json
 import os
+from pathlib import Path
 import re
 import urllib.error
 import urllib.request
 
 CONTROL_REPO = "May-Assistant/may-releases"
 OWNER_ID = 58840187
+# Exact names confirmed from the repository's Actions secrets page, 2026-10-13.
 ENVIRONMENTS = {
     "compile": "may-native-compile",
-    ("ios", "production"): "may-ios-internal",  # confirmed by the setup lane, 2026-10-13
-    ("ios", "playground"): "may-ios-playground-internal",  # confirmed by the setup lane, 2026-10-13
-    ("android", "production"): "android-production",  # created by the setup lane (May)
-    ("android", "playground"): "android-playground",  # created by the setup lane (May Playground)
+    ("ios", "production"): "may-ios-internal",
+    ("ios", "playground"): "may-ios-playground-internal",
+    ("android", "production"): "may-android-internal",
+    ("android", "playground"): "may-android-playground-internal",
 }
 MAX_BUILD_NUMBER = 2_000_000_000
+ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
+AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
 
 class GateDenial(ValueError):
     pass
+
+
+def artifact_recipient(environment):
+    """The committed age public key for a store environment, or None if a placeholder."""
+    try:
+        text = (ARTIFACT_KEYS / (environment + ".age.pub")).read_text().strip()
+    except OSError:
+        return None
+    return text if AGE_RECIPIENT.fullmatch(text) else None
 
 
 def validate_run(repo, ref, event, sha, action, build_number=None, target="production"):
@@ -104,17 +130,22 @@ def main():
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
+    build_env = ENVIRONMENTS["compile"]
+    if args.action != "compile" and artifact_recipient(env) is None:
+        raise GateDenial("Artifact encryption public key for this target is still a placeholder; "
+                         "the setup lane must commit it first")
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise GateDenial("GitHub metadata token unavailable")
-    base = f"environments/{env}"
-    validate_environment(get_json(base, token),
-                         get_json(base + "/deployment-branch-policies?per_page=100", token),
-                         os.environ.get("GITHUB_ACTOR_ID"), os.environ.get("GITHUB_TRIGGERING_ACTOR"))
+    for name in sorted({env, build_env}):
+        base = f"environments/{name}"
+        validate_environment(get_json(base, token),
+                             get_json(base + "/deployment-branch-policies?per_page=100", token),
+                             os.environ.get("GITHUB_ACTOR_ID"), os.environ.get("GITHUB_TRIGGERING_ACTOR"))
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as stream:
-            stream.write(f"environment={env}\n")
+            stream.write(f"environment={env}\nbuild_environment={build_env}\n")
     print(f"May {args.action} admission passed for {args.source_sha}")
 
 

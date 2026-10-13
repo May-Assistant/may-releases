@@ -54,12 +54,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
         run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
-      - name: Select JDK 21 for Android
+      - name: Install pinned, checksum-verified JDK 21 for Android
         if: inputs.platform == 'android'
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: '21'
+        run: python3 tools/may_release/toolchain.py jdk --export
       - name: Fetch exact private app and pinned design system quietly
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}

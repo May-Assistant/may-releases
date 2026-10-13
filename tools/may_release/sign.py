@@ -1,7 +1,10 @@
 """Sign and verify the unsigned May product with this public repository's code.
 
-The workflow step that runs this receives only its platform's signing secrets:
-no source read key and no store upload key. Secret material is written to
+This runs in the `release` job, on a fresh VM where no build toolchain or other
+third-party build code has run: only this repository's Python, the pinned and
+checksum-verified Temurin jarsigner, and Apple's own tools. The step that runs
+it receives only its platform's signing secrets: no source read key, artifact
+key or store upload key. Secret material is written to
 0600 files under RUNNER_TEMP/may-private and removed before this exits.
 Signing tools get a minimal environment that holds only the password variables
 they read by name. Tool output stays in private runner logs.
@@ -27,12 +30,20 @@ import subprocess
 from store import (ANDROID_SIGNING_SECRETS, APPLE_CERT_SHA1, APPLE_TEAM, IOS_SIGNING_SECRETS,
                    XCODE_DEVELOPER_DIR, StoreError, child_env, identity, require_step_secrets,
                    run_private, runner_root, secret_bytes, write_private)
+import toolchain
 import verify
+
+# Apple's tools by absolute path; xcodebuild honours DEVELOPER_DIR.
+SECURITY, XCODEBUILD = "/usr/bin/security", "/usr/bin/xcodebuild"
+
+
+def jarsigner():
+    return toolchain.tool_path("jdk", "bin/jarsigner")
 
 
 def verify_signed_aab(signed, expected_sha256, log):
     expected = verify.normalize_fingerprint(expected_sha256)
-    result = subprocess.run(["jarsigner", "-verify", "-verbose", "-certs", str(signed)],
+    result = subprocess.run([jarsigner(), "-verify", "-verbose", "-certs", str(signed)],
                             capture_output=True, stdin=subprocess.DEVNULL, env=child_env())
     with log.open("ab") as output:
         output.write(result.stdout + result.stderr)
@@ -46,7 +57,7 @@ def sign_android(target, source_sha, build_number):
     identity("android", target, source_sha, build_number)
     require_step_secrets(ANDROID_SIGNING_SECRETS)
     alias = os.environ.get("MAY_ANDROID_KEY_ALIAS", "")
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", alias):
         raise StoreError("Android key alias metadata is invalid")
     expected = verify.normalize_fingerprint(os.environ.get("MAY_ANDROID_CERT_SHA256", ""))
     root = runner_root()
@@ -62,7 +73,7 @@ def sign_android(target, source_sha, build_number):
         write_private(keystore, secret_bytes("MAY_ANDROID_KEYSTORE_BASE64"))
         env = child_env(MAY_ANDROID_STORE_PASSWORD=os.environ.get("MAY_ANDROID_STORE_PASSWORD", ""),
                         MAY_ANDROID_KEY_PASSWORD=os.environ.get("MAY_ANDROID_KEY_PASSWORD", ""))
-        run_private(["jarsigner", "-keystore", str(keystore),
+        run_private([jarsigner(), "-keystore", str(keystore),
                      "-storepass:env", "MAY_ANDROID_STORE_PASSWORD",
                      "-keypass:env", "MAY_ANDROID_KEY_PASSWORD",
                      "-signedjar", str(signed), str(unsigned), alias], private, log, env)
@@ -104,27 +115,27 @@ def sign_ios(target, source_sha, build_number):
             path.parent.mkdir(parents=True, exist_ok=True)
             write_private(path, profile_bytes)  # O_EXCL: never replaces an existing profile
             written.append(path)
-        run_private(["security", "create-keychain", "-p", password, str(keychain)], work, log, env)
+        run_private([SECURITY, "create-keychain", "-p", password, str(keychain)], work, log, env)
         created = True
-        run_private(["security", "set-keychain-settings", "-lut", "3600", str(keychain)], work, log, env)
-        run_private(["security", "unlock-keychain", "-p", password, str(keychain)], work, log, env)
+        run_private([SECURITY, "set-keychain-settings", "-lut", "3600", str(keychain)], work, log, env)
+        run_private([SECURITY, "unlock-keychain", "-p", password, str(keychain)], work, log, env)
         # security(1) takes the PKCS#12 password only as an argument. It is
         # visible to same-user processes for this call, which could equally read
         # the 0600 .p12 itself; no step or tool environment exposes it.
-        run_private(["security", "import", str(p12), "-k", str(keychain), "-f", "pkcs12",
+        run_private([SECURITY, "import", str(p12), "-k", str(keychain), "-f", "pkcs12",
                      "-P", os.environ.get("MAY_IOS_CERT_PASSWORD", ""), "-T", "/usr/bin/codesign"],
                     work, log, env)
         p12.unlink()
-        run_private(["security", "set-key-partition-list", "-S", "apple-tool:,apple:", "-s",
+        run_private([SECURITY, "set-key-partition-list", "-S", "apple-tool:,apple:", "-s",
                      "-k", password, str(keychain)], work, log, env)
-        listed = subprocess.run(["security", "list-keychains", "-d", "user"], capture_output=True,
+        listed = subprocess.run([SECURITY, "list-keychains", "-d", "user"], capture_output=True,
                                 stdin=subprocess.DEVNULL, env=env)
         if listed.returncode:
             raise StoreError("Keychain search list is unavailable")
         existing = [line.strip().strip('"') for line in listed.stdout.decode().splitlines() if line.strip()]
-        run_private(["security", "list-keychains", "-d", "user", "-s", str(keychain), *existing],
+        run_private([SECURITY, "list-keychains", "-d", "user", "-s", str(keychain), *existing],
                     work, log, env)
-        identities = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning", str(keychain)],
+        identities = subprocess.run([SECURITY, "find-identity", "-v", "-p", "codesigning", str(keychain)],
                                     capture_output=True, stdin=subprocess.DEVNULL, env=env)
         if identities.returncode or APPLE_CERT_SHA1.encode() not in identities.stdout.upper():
             raise StoreError("Approved Apple distribution identity is not in the signing keychain")
@@ -135,7 +146,7 @@ def sign_ios(target, source_sha, build_number):
             "provisioningProfiles": {app_id: uuid}, "testFlightInternalTestingOnly": True,
             "manageAppVersionAndBuildNumber": False, "uploadSymbols": True}))
         exported = work / "export"
-        run_private(["xcodebuild", "-exportArchive", "-archivePath", str(archive),
+        run_private([XCODEBUILD, "-exportArchive", "-archivePath", str(archive),
                      "-exportPath", str(exported), "-exportOptionsPlist", str(options)], work, log, env)
         ipas = list(exported.glob("*.ipa"))
         if len(ipas) != 1 or ipas[0].is_symlink():
@@ -143,7 +154,7 @@ def sign_ios(target, source_sha, build_number):
         shutil.move(str(ipas[0]), str(ipa))
     finally:
         if created:
-            subprocess.run(["security", "delete-keychain", str(keychain)], stdout=subprocess.DEVNULL,
+            subprocess.run([SECURITY, "delete-keychain", str(keychain)], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env)
         for path in written:
             path.unlink(missing_ok=True)

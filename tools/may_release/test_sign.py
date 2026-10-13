@@ -79,7 +79,7 @@ class AndroidSigningTests(unittest.TestCase):
         self.work.directory.cleanup()
 
     def test_signs_verifies_and_removes_keystore(self):
-        with patch.dict(os.environ, self.env, clear=True):
+        with patch.dict(os.environ, self.env, clear=True), patch("sign.jarsigner", return_value=shutil.which("jarsigner")):
             sign.sign_android("playground", "a" * 40, "9")
         signed = self.work.root / "may-release/signed.aab"
         self.assertEqual(verify.aab_signer_sha256(signed), self.fingerprint)
@@ -88,7 +88,7 @@ class AndroidSigningTests(unittest.TestCase):
 
     def test_wrong_expected_certificate_is_refused_and_bundle_removed(self):
         self.env["MAY_ANDROID_CERT_SHA256"] = "ab" * 32
-        with patch.dict(os.environ, self.env, clear=True):
+        with patch.dict(os.environ, self.env, clear=True), patch("sign.jarsigner", return_value=shutil.which("jarsigner")):
             with self.assertRaises(StoreError):
                 sign.sign_android("playground", "a" * 40, "9")
         self.assertFalse((self.work.root / "may-release/signed.aab").exists())
@@ -97,6 +97,9 @@ class AndroidSigningTests(unittest.TestCase):
 
 class AndroidSigningIsolationTests(unittest.TestCase):
     def setUp(self):
+        self.pinned = patch("sign.jarsigner", return_value="/pinned/jdk/bin/jarsigner")
+        self.pinned.start()
+        self.addCleanup(self.pinned.stop)
         self.work = Workspace()
         unsigned_aab(self.work.root / "may-release/unsigned.aab")
         self.env = {"RUNNER_TEMP": str(self.work.root), "PATH": "/usr/bin",
@@ -118,6 +121,7 @@ class AndroidSigningIsolationTests(unittest.TestCase):
                 patch("sign.run_private", side_effect=fake_jarsigner), \
                 patch("sign.verify_signed_aab"):
             sign.sign_android("playground", "a" * 40, "9")
+        self.assertEqual(captured["argv"][0], "/pinned/jdk/bin/jarsigner")
         self.assertNotIn("MAY_ANDROID_KEYSTORE_BASE64", captured["env"])
         self.assertEqual(captured["env"]["MAY_ANDROID_STORE_PASSWORD"], "store-secret")
         self.assertNotIn("store-secret", captured["argv"])
@@ -131,6 +135,22 @@ class AndroidSigningIsolationTests(unittest.TestCase):
                 with self.assertRaises(StoreError):
                     sign.sign_android("playground", "a" * 40, "9")
                 runner.assert_not_called()
+
+    def test_key_alias_cannot_be_an_option(self):
+        for alias in ("-J-Dx=y", "-storepass", "", "a" * 65, "up load"):
+            with self.subTest(alias=alias), patch.dict(os.environ, dict(self.env, MAY_ANDROID_KEY_ALIAS=alias),
+                                                       clear=True), patch("sign.run_private") as runner:
+                with self.assertRaises(StoreError):
+                    sign.sign_android("playground", "a" * 40, "9")
+                runner.assert_not_called()
+
+    def test_pinned_jarsigner_is_required(self):
+        self.pinned.stop()
+        with patch.dict(os.environ, self.env, clear=True), patch("sign.run_private") as runner:
+            with self.assertRaises(StoreError):
+                sign.sign_android("playground", "a" * 40, "9")
+            runner.assert_not_called()
+        self.pinned.start()
 
     def test_already_signed_input_is_refused(self):
         (self.work.root / "may-release/unsigned.aab").write_bytes(fx.SIGNED_AAB)
@@ -160,7 +180,7 @@ class IosSigningTests(unittest.TestCase):
 
         def fake_tool(argv, cwd, log, env):
             calls.append((argv, env))
-            if argv[:2] == ["xcodebuild", "-exportArchive"]:
+            if argv[:2] == [sign.XCODEBUILD, "-exportArchive"]:
                 exported = Path(argv[argv.index("-exportPath") + 1])
                 exported.mkdir()
                 fixture_ipa(exported / "May.ipa", build)
@@ -184,7 +204,7 @@ class IosSigningTests(unittest.TestCase):
         self.assertEqual(options["provisioningProfiles"], {PLAYGROUND: fx.PROFILE_UUID})
         self.assertIs(options["testFlightInternalTestingOnly"], True)
         self.assertEqual(options["method"], "app-store-connect")
-        self.assertIn(["security", "delete-keychain"], [c[0][:2] for c in calls if c[0] != "options"])
+        self.assertIn([sign.SECURITY, "delete-keychain"], [c[0][:2] for c in calls if c[0] != "options"])
         for argv, env in calls:
             if argv != "options":
                 self.assertFalse(set(env or {}) & set(SECRET_NAMES))

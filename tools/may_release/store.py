@@ -1,11 +1,12 @@
 """Protected, quiet unsigned build of the reviewed May app, plus shared helpers.
 
-This step runs with no signing or upload secret in its environment. It runs
-only after gate.py, a human environment review, and prepare.py's exact private
-main-history checkout. It asks the private app's release script for an
-unsigned product; this public repository signs it in sign.py and uploads it in
-play_upload.py or ios_upload.py, each in its own workflow step that receives
-only the secrets it needs.
+This runs in the `build` job, which holds only the read-only source keys (in an
+earlier step) and never a signing or upload secret. It runs after gate.py, a
+human review of `may-native-compile`, and prepare.py's exact private
+main-history checkout. It asks the private app's release script for an unsigned
+product; handoff.py then encrypts it to the target's committed public key for
+the separate `release` job, which runs on a fresh VM and signs (sign.py) and
+uploads (play_upload.py or ios_upload.py).
 
 Provider output and private build diagnostics stay under RUNNER_TEMP. Every
 StoreError message is a fixed literal (static_check.py enforces this), so the
@@ -43,7 +44,10 @@ SECRET_NAMES = (
     "MAY_PLAY_JSON",
     "MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD", "MAY_IOS_PROFILE_BASE64",
     "MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID",
+    "MAY_ARTIFACT_DECRYPT_KEY",
 )
+SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
+HANDOFF_SECRETS = ("MAY_ARTIFACT_DECRYPT_KEY",)
 ANDROID_SIGNING_SECRETS = ("MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PASSWORD",
                            "MAY_ANDROID_KEY_PASSWORD")
 IOS_SIGNING_SECRETS = ("MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD", "MAY_IOS_PROFILE_BASE64")
@@ -178,7 +182,7 @@ def build(platform, target, source_sha, build_number):
         raise StoreError("Unsigned build must leave exactly its one expected product")
     if not (made.is_dir() if platform == "ios" else made.is_file()):
         raise StoreError("Unsigned build must leave exactly its one expected product")
-    print("Protected unsigned May build prepared; signing and upload are separate steps")
+    print("Protected unsigned May build prepared; signing and upload run in a separate job")
 
 
 if __name__ == "__main__":

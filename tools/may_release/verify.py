@@ -16,6 +16,7 @@ import zipfile
 SIGNED_DATA_OID = bytes.fromhex("06092a864886f70d010702")
 SIGNATURE_BLOCK = re.compile(r"META-INF/[^/]+\.(RSA|DSA|EC)", re.IGNORECASE)
 SIGNATURE_FILE = re.compile(r"META-INF/[^/]+\.SF", re.IGNORECASE)
+SIGNATURE_EXTRA = re.compile(r"META-INF/SIG-[^/]+", re.IGNORECASE)
 SIGNATURE_RELATED = re.compile(r"META-INF/(MANIFEST\.MF|[^/]+\.(SF|RSA|DSA|EC)|SIG-[^/]+)", re.IGNORECASE)
 
 
@@ -175,7 +176,8 @@ def manifest_names(raw):
 
 def signature_entries(path):
     with zipfile.ZipFile(path) as archive:
-        return [n for n in archive.namelist() if SIGNATURE_BLOCK.fullmatch(n) or SIGNATURE_FILE.fullmatch(n)]
+        return [n for n in archive.namelist() if SIGNATURE_BLOCK.fullmatch(n) or SIGNATURE_FILE.fullmatch(n)
+                or SIGNATURE_EXTRA.fullmatch(n)]
 
 
 def aab_signer_sha256(path):
@@ -191,7 +193,7 @@ def aab_signer_sha256(path):
                 raise VerifyError("Bundle has duplicate entries")
             blocks = [n for n in names if SIGNATURE_BLOCK.fullmatch(n)]
             files = [n for n in names if SIGNATURE_FILE.fullmatch(n)]
-            if len(blocks) != 1 or len(files) != 1:
+            if len(blocks) != 1 or len(files) != 1 or any(SIGNATURE_EXTRA.fullmatch(n) for n in names):
                 raise VerifyError("Bundle must carry exactly one signature")
             signed = manifest_names(archive.read("META-INF/MANIFEST.MF"))
             for name in names:

@@ -11,34 +11,44 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|docker://\S+@sha256:[0-9a-f]{64})")
-# Messages these exceptions carry may be printed by a CLI, so each must be one
-# string literal: never formatted, never derived from provider or file data.
+# Messages these exceptions (and any subclass) carry may be printed by a CLI, so
+# each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError"}
-STEP_SECRETS = {
-    "android": {
-        "Fetch exact private source and pinned design system": {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"},
-        "Sign and verify Android App Bundle": {"MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PASSWORD",
-                                               "MAY_ANDROID_KEY_PASSWORD"},
-        "Upload update to the internal track only": {"MAY_PLAY_JSON"},
-    },
-    "ios": {
-        "Fetch exact private source and pinned design system": {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"},
-        "Sign and verify internal-TestFlight IPA": {"MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD",
-                                                    "MAY_IOS_PROFILE_BASE64"},
-        "Upload verified IPA for internal TestFlight": {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"},
-    },
+CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+UPLOAD_ARTIFACT = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+DOWNLOAD_ARTIFACT = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+FETCH = "Fetch exact private source and pinned design system"
+DECRYPT = "Decrypt and check the build handoff"
+READ_KEYS = {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"}
+# Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
+STORE_JOBS = {
+    "android-build": (
+        ["Install pinned JDK and age", FETCH, "Build unsigned Android App Bundle without secrets",
+         "Encrypt unsigned bundle to the target's public key"],
+        {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
+    "android-release": (
+        ["Install pinned JDK and age", DECRYPT, "Sign and verify Android App Bundle",
+         "Upload update to the internal track only"],
+        {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
+         "Sign and verify Android App Bundle": {"MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PASSWORD",
+                                                "MAY_ANDROID_KEY_PASSWORD"},
+         "Upload update to the internal track only": {"MAY_PLAY_JSON"}},
+        {CHECKOUT, DOWNLOAD_ARTIFACT}),
+    "ios-build": (
+        ["Install pinned age", FETCH, "Build unsigned iOS archive without secrets",
+         "Encrypt unsigned archive to the target's public key"],
+        {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
+    "ios-release": (
+        ["Install pinned age", DECRYPT, "Sign and verify internal-TestFlight IPA",
+         "Upload verified IPA for internal TestFlight"],
+        {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
+         "Sign and verify internal-TestFlight IPA": {"MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD",
+                                                     "MAY_IOS_PROFILE_BASE64"},
+         "Upload verified IPA for internal TestFlight": {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"}},
+        {CHECKOUT, DOWNLOAD_ARTIFACT}),
 }
-STEP_ORDER = {
-    "android": ["Install hash-locked Play client without secrets",
-                "Fetch exact private source and pinned design system",
-                "Build unsigned Android App Bundle without secrets",
-                "Sign and verify Android App Bundle",
-                "Upload update to the internal track only"],
-    "ios": ["Fetch exact private source and pinned design system",
-            "Build unsigned iOS archive without secrets",
-            "Sign and verify internal-TestFlight IPA",
-            "Upload verified IPA for internal TestFlight"],
-}
+# In a release job every command is this repository's own Python, or cleanup.
+RELEASE_COMMAND = re.compile(r"python3 tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload)\.py( .*)?")
 
 
 def job_text(workflow, job):
@@ -62,6 +72,32 @@ def secrets_in(text):
     return set(re.findall(r"secrets\.([A-Z0-9_]+)", text))
 
 
+def uses_in(text):
+    return re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*['\"]?([^\s'\"#]+)", text)
+
+
+def run_commands(step):
+    """Command lines of a step's run: (single line or block)."""
+    match = re.search(r"(?ms)^        run: (\|\n(.*)|(.*?)$)", step)
+    if not match:
+        return []
+    if match.group(3) is not None:
+        return [match.group(3).strip()]
+    return [line.strip() for line in match.group(2).splitlines() if line.strip()]
+
+
+def bare_secret_references(text):
+    """Any use of the secrets context other than secrets.NAME (e.g. secrets[...],
+    toJSON(secrets), `secrets: inherit`). Comments and name/description values are prose."""
+    found = 0
+    for line in text.splitlines():
+        code = re.sub(r"(^|\s)#.*$", "", line)
+        if re.match(r"\s*(-\s+)?(name|description):", code):
+            continue
+        found += len(re.findall(r"\bsecrets\b(?!\.[A-Za-z_][A-Za-z0-9_]*)", code))
+    return found
+
+
 def workflow_problems(root):
     found = []
     workflows = sorted((root / ".github/workflows").glob("*.y*ml"))
@@ -69,17 +105,73 @@ def workflow_problems(root):
         found.append("No workflows found")
     for path in workflows:
         text = path.read_text()
-        for ref in re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*['\"]?([^\s'\"#]+)", text):
+        for ref in uses_in(text):
             if not PINNED_USES.fullmatch(ref):
                 found.append(f"{path.name}: action reference is not pinned to a 40-hex commit SHA")
+            if ref.startswith("actions/setup-java@"):
+                found.append(f"{path.name}: setup-java does not verify its JDK; use toolchain.py")
+        if bare_secret_references(text):
+            found.append(f"{path.name}: secrets are referenced other than as secrets.NAME")
         if re.search(r"(?m)^\s*deployments:", text):
             found.append(f"{path.name}: requests deployments permission")
         if "pull_request_target" in text:
             found.append(f"{path.name}: uses pull_request_target")
+        if re.search(r"pip3? install|python3? -m pip", text):
+            found.append(f"{path.name}: installs Python packages")
+        for step in re.split(r"(?m)^      - ", text)[1:]:
+            if re.search(r"uses: actions/checkout@", step) and "persist-credentials: false" not in step:
+                found.append(f"{path.name}: a checkout persists its credentials")
+        if re.search(r"plugin_marketplaces:.*https?://", text):
+            found.append(f"{path.name}: plugin marketplace is a moving URL, not a pinned checkout")
         for job in re.findall(r"(?m)^  ([\w-]+):\n", text.partition("\njobs:\n")[2]):
             header = job_text(text, job).partition("    steps:\n")[0]
-            if re.search(r"(?m)^    environment:", header) and not re.search(r"(?m)^    needs: admission$", header):
+            if re.search(r"(?m)^    environment:", header) and not re.search(r"(?m)^    needs: (admission|\[admission, [\w-]+\])$", header):
                 found.append(f"{path.name}: protected job {job} does not wait for admission")
+    return found
+
+
+def store_problems(store):
+    found = []
+    if store.count("github.event_name == 'may-store-disabled-pending-review'") != 5:
+        found.append("store-release-draft.yml is not inert")
+    if store.count("Recheck protected destination after Samuel's review") != 2 or \
+            store.count("Recheck build environment after Samuel's review") != 2:
+        found.append("store-release-draft.yml does not recheck after review")
+    if "track: production" in store or "--track production" in store:
+        found.append("store-release-draft.yml names the production track")
+    if secrets_in(job_text(store, "admission")):
+        found.append("store admission: holds a secret")
+    for job, (order, expected, actions) in STORE_JOBS.items():
+        header, steps = job_steps(store, job)
+        release = job.endswith("-release")
+        build = job.replace("-release", "-build")
+        environment = "needs.admission.outputs.environment" if release else "needs.admission.outputs.build_environment"
+        if not header:
+            found.append(f"store {job}: job is missing")
+            continue
+        if "    environment: ${{ " + environment + " }}" not in header:
+            found.append(f"store {job}: environment is not the one admission checked")
+        if release and f"    needs: [admission, {build}]" not in header:
+            found.append(f"store {job}: does not run after its own build job")
+        if secrets_in(header):
+            found.append(f"store {job}: job-level environment holds a secret")
+        if any("${{" in text.partition("run:")[2] for _, text in steps):
+            found.append(f"store {job}: a run script interpolates an expression into shell")
+        names = [name for name, _ in steps]
+        if [n for n in names if n in order] != order:
+            found.append(f"store {job}: its steps are missing or out of order")
+        if {name: secrets_in(text) for name, text in steps if secrets_in(text)} != expected:
+            found.append(f"store {job}: a step holds secrets it does not need")
+        if set(uses_in(job_text(store, job))) - actions:
+            found.append(f"store {job}: uses an action it does not need")
+        for _, text in steps:
+            if UPLOAD_ARTIFACT in text and "path: ${{ runner.temp }}/may-handoff/handoff.age\n" not in text:
+                found.append(f"store {job}: uploads something other than the encrypted handoff")
+        if release:
+            for name, text in steps:
+                for command in run_commands(text):
+                    if not (RELEASE_COMMAND.fullmatch(command) or command.startswith(("if [", "rm -rf --", "fi"))):
+                        found.append(f"store {job}: runs a command that is not this repository's Python")
     return found
 
 
@@ -93,69 +185,60 @@ def control_problems(root):
         found.append("control-check.yml is not a read-only, no-secret PR check")
     if compile_workflow.count("if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}") != 2:
         found.append("native-compile-draft.yml is not inert")
-    if store.count("github.event_name == 'may-store-disabled-pending-review'") != 3:
-        found.append("store-release-draft.yml is not inert")
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
-        if "environment: ${{ needs.admission.outputs.environment }}" not in text:
+        if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")
-        if "upload-artifact" in text:
-            found.append(f"{name}: publishes an artifact")
+    if "upload-artifact" in compile_workflow:
+        found.append("native-compile-draft.yml: publishes an artifact")
     if "Recheck protection after reviewer approval" not in compile_workflow:
         found.append("native-compile-draft.yml does not recheck after review")
     if "--source-sha '${{ inputs.source_sha }}'" in compile_workflow or "--platform '${{ inputs.platform }}'" in compile_workflow:
         found.append("native-compile-draft.yml interpolates inputs into shell")
-    if store.count("Recheck protected destination after Samuel's review") != 2:
-        found.append("store-release-draft.yml does not recheck after review")
-    if "track: production" in store or "--track production" in store:
-        found.append("store-release-draft.yml names the production track")
-    for line in store.splitlines():
-        if "pip" in line and "install" in line and not all(
-                flag in line for flag in ("--require-hashes", "--only-binary=:all:",
-                                          "-r tools/may_release/requirements-play.txt")):
-            found.append("store-release-draft.yml installs packages without hash-locked wheels")
-    for job, expected in STEP_SECRETS.items():
-        header, steps = job_steps(store, job)
-        if any("${{" in text.partition("run:")[2] for _, text in steps):
-            found.append(f"store {job}: a run script interpolates an expression into shell")
-        if secrets_in(header):
-            found.append(f"store {job}: job-level environment holds a secret")
-        names = [name for name, _ in steps]
-        if [n for n in names if n in STEP_ORDER[job]] != STEP_ORDER[job]:
-            found.append(f"store {job}: build, sign and upload steps are missing or out of order")
-        actual = {name: secrets_in(text) for name, text in steps if secrets_in(text)}
-        if actual != expected:
-            found.append(f"store {job}: a step holds secrets it does not need")
-    return found
+    return found + store_problems(store)
 
 
-def requirements_problems(root):
-    found = []
-    text = (root / "tools/may_release/requirements-play.txt").read_text()
-    entries = re.findall(r"(?m)^([A-Za-z0-9._-]+)==(\S+) \\\n((?:\s+--hash=sha256:[0-9a-f]{64}(?: \\)?\n)+)", text)
-    requirement_lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith(("#", "--hash"))]
-    if len(entries) != len(requirement_lines) or not entries:
-        found.append("requirements-play.txt has a requirement without a pinned version and hash")
-    if ("google-auth", "2.40.3") not in {(name, version) for name, version, _ in entries}:
-        found.append("requirements-play.txt does not pin google-auth 2.40.3")
-    return found
+def printed_error_classes(trees):
+    """PRINTED_ERRORS plus every class, in any module, that derives from one."""
+    names, changed = set(PRINTED_ERRORS), True
+    while changed:
+        changed = False
+        for tree in trees.values():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name not in names and any(
+                        (isinstance(b, ast.Name) and b.id in names) or
+                        (isinstance(b, ast.Attribute) and b.attr in names) for b in node.bases):
+                    names.add(node.name)
+                    changed = True
+    return names
+
+
+def called_name(func):
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
 
 
 def message_problems(root):
     found = []
-    for path in sorted((root / "tools/may_release").glob("*.py")):
-        if path.name.startswith("test_"):
-            continue
-        for node in ast.walk(ast.parse(path.read_text(), str(path))):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in PRINTED_ERRORS:
+    trees = {path: ast.parse(path.read_text(), str(path))
+             for path in sorted((root / "tools/may_release").glob("*.py")) if not path.name.startswith("test_")}
+    printed = printed_error_classes(trees)
+    for path, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and called_name(node.func) in printed:
                 if node.keywords or len(node.args) != 1 or not (
                         isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
                     found.append(f"{path.name}:{node.lineno}: printed error message is not one string literal")
+            if isinstance(node, ast.Raise) and node.exc is not None and not isinstance(node.exc, ast.Call) \
+                    and called_name(node.exc) in printed:
+                found.append(f"{path.name}:{node.lineno}: printed error raised without a message")
     return found
 
 
 def problems(root=ROOT):
-    return (workflow_problems(root) + control_problems(root) + requirements_problems(root) +
-            message_problems(root))
+    return workflow_problems(root) + control_problems(root) + message_problems(root)
 
 
 if __name__ == "__main__":
