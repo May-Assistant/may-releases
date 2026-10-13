@@ -32,6 +32,22 @@ class GateTests(unittest.TestCase):
         self.assertEqual(validate_run("May-Assistant/may-releases", "refs/heads/main",
                                       "workflow_dispatch", self.sha, "compile"), "may-native-compile")
 
+    def test_each_store_target_has_distinct_protected_environment(self):
+        expected = {
+            ("ios", "production"): "may-ios-internal",
+            ("ios", "playground"): "may-ios-playground-internal",
+            ("android", "production"): "may-android-internal",
+            ("android", "playground"): "may-android-playground-internal",
+        }
+        for (platform, target), environment in expected.items():
+            with self.subTest(platform=platform, target=target):
+                self.assertEqual(validate_run("May-Assistant/may-releases", "refs/heads/main",
+                                              "workflow_dispatch", self.sha, platform, "9", target), environment)
+        for target in ("rem", "", "production/../playground"):
+            with self.assertRaises(ValueError):
+                validate_run("May-Assistant/may-releases", "refs/heads/main",
+                             "workflow_dispatch", self.sha, "ios", "9", target)
+
     def test_protected_owner_gate(self):
         validate_environment(self.environment, self.policies)
         for field, value in (("can_admins_bypass", True),
