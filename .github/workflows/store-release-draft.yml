@@ -3,8 +3,8 @@ name: May protected store release (inactive draft)
 # one is a 404 and the admission job denies):
 #   android/production -> android-production   (May, Play 4974275831988601568)
 #   android/playground -> android-playground   (May Playground, Play 4972137188420176977)
-#   ios/production     -> may-ios-internal             CONFIRM with setup lane
-#   ios/playground     -> may-ios-playground-internal  CONFIRM with setup lane
+#   ios/production     -> may-ios-internal             (May, ASC 6821782401)
+#   ios/playground     -> may-ios-playground-internal  (May Playground, ASC 6822072535)
 # Each step that needs a secret gets only its own; build steps get none.
 on:
   workflow_dispatch:

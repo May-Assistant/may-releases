@@ -12,14 +12,14 @@ Google Play accepts only `status: draft` releases through the API until an app's
 
 The draft [native compile workflow](.github/workflows/native-compile-draft.yml) and [store-release workflow](.github/workflows/store-release-draft.yml) are **inert**: their jobs require event names the workflows do not register (`may-compile-disabled-pending-review`, `may-store-disabled-pending-review`). A separate reviewed change must remove those guards. The pull-request check runs only dependency-free control tests and static checks with a read-only token.
 
-According to the setup lane, the Android store environments **`android-production`** (May) and **`android-playground`** (May Playground) now exist, their credentials have been transferred, and the May Android upload keystore has been chosen. The iOS store environment names have not been confirmed; `gate.py` still uses `may-ios-internal` and `may-ios-playground-internal`, each marked `CONFIRM with setup lane`. Secret presence is not visible to this repository: the setup lane is the record of what was entered, and admission checks protection settings, not values.
+According to the setup lane, the Android store environments **`android-production`** (May) and **`android-playground`** (May Playground) now exist, their credentials have been transferred, and the May Android upload keystore has been chosen. The iOS store environments are exactly `may-ios-internal` and `may-ios-playground-internal` (confirmed by Samuel and the setup lane on 2026-10-13). Both Android environments require @samuelalake as reviewer with *Prevent self-review* off. No repository- or organization-level secret shares a release secret name: the only repository secret is `CLAUDE_CODE_OAUTH_TOKEN`, and no organization secrets are available to this repository. Secret presence is not visible to this repository: the setup lane is the record of what was entered, and admission checks protection settings, not values.
 
 ## Protected environments
 
 | Target | Environment | Store app |
 | --- | --- | --- |
-| May iOS | `may-ios-internal` (confirm with setup lane) | ASC `6821782401` |
-| May Playground iOS | `may-ios-playground-internal` (confirm with setup lane) | ASC `6822072535` |
+| May iOS | `may-ios-internal` | ASC `6821782401` |
+| May Playground iOS | `may-ios-playground-internal` | ASC `6822072535` |
 | May Android | `android-production` | Play `4974275831988601568` |
 | May Playground Android | `android-playground` | Play `4972137188420176977` |
 
@@ -33,9 +33,9 @@ A no-secret admission job checks the chosen environment before any secret become
 
 **Environments are never auto-created.** A job's `environment:` key would create a missing environment with no protection, so the admission job runs first and denies on the API's 404. Create each environment by hand before any dispatch.
 
-**Self-review.** If an environment has *Prevent self-review* turned on, Samuel cannot approve a run he dispatched himself, and the run would wait until it times out. The gate denies that case up front with a fixed message. Either another maintainer dispatches, or the setting stays off so that Samuel's approval is a deliberate second confirmation of his own dispatch.
+**Self-review.** If an environment has *Prevent self-review* turned on, Samuel cannot approve a run he dispatched himself, and the run would wait until it times out. The gate denies that case up front with a fixed message. Either another maintainer dispatches, or the setting stays off so that Samuel's approval is a deliberate second confirmation of his own dispatch. As of 2026-10-13 it is off in `android-production` and `android-playground`, so the gate admits a run Samuel starts.
 
-**No repository- or organization-level secrets with the same names.** GitHub falls back from an environment secret to a repository or organization secret of the same name. If one of the names below also exists at repository or organization level, a step could receive it without the environment's protection. The gate cannot see this, so whoever manages secrets must check it. None of these names may exist outside the protected environments.
+**No repository- or organization-level secrets with the same names.** GitHub falls back from an environment secret to a repository or organization secret of the same name. If one of the names below also exists at repository or organization level, a step could receive it without the environment's protection. The gate cannot see this, so whoever manages secrets must check it. None of these names may exist outside the protected environments. As of 2026-10-13 none does: the only repository secret is `CLAUDE_CODE_OAUTH_TOKEN`, and no organization secrets are available.
 
 ## Secrets and variables per environment
 

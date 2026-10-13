@@ -20,8 +20,8 @@ CONTROL_REPO = "May-Assistant/may-releases"
 OWNER_ID = 58840187
 ENVIRONMENTS = {
     "compile": "may-native-compile",
-    ("ios", "production"): "may-ios-internal",  # CONFIRM with setup lane
-    ("ios", "playground"): "may-ios-playground-internal",  # CONFIRM with setup lane
+    ("ios", "production"): "may-ios-internal",  # confirmed by the setup lane, 2026-10-13
+    ("ios", "playground"): "may-ios-playground-internal",  # confirmed by the setup lane, 2026-10-13
     ("android", "production"): "android-production",  # created by the setup lane (May)
     ("android", "playground"): "android-playground",  # created by the setup lane (May Playground)
 }

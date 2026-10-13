@@ -72,6 +72,17 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_environment(self.environment, {"branch_policies": [{"name": "*"}]})
 
+    def test_exact_environment_names_confirmed_by_setup_lane(self):
+        # Confirmed by Samuel and the setup lane on 2026-10-13. Any rename must
+        # be made in the repository settings and here together.
+        self.assertEqual(gate.ENVIRONMENTS, {
+            "compile": "may-native-compile",
+            ("ios", "production"): "may-ios-internal",
+            ("ios", "playground"): "may-ios-playground-internal",
+            ("android", "production"): "android-production",
+            ("android", "playground"): "android-playground",
+        })
+
     def test_prevented_self_review_by_sole_reviewer_is_denied(self):
         prevented = copy.deepcopy(self.environment)
         prevented["protection_rules"][0]["prevent_self_review"] = True
@@ -81,7 +92,8 @@ class GateTests(unittest.TestCase):
                 validate_environment(prevented, self.policies, actor_id, login)
         # Another dispatcher can be approved by Samuel.
         validate_environment(prevented, self.policies, "12345", "another-maintainer")
-        # Self-review allowed: Samuel may dispatch and then approve.
+        # Self-review allowed (the confirmed setting for both Android
+        # environments): Samuel may dispatch and then approve.
         validate_environment(self.environment, self.policies, "58840187", "samuelalake")
 
     def test_unreadable_self_review_setting_is_denied(self):
