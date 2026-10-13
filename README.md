@@ -1,2 +1,16 @@
-# may-releases
-Public release-control workflows for private May applications; no app source or build artifacts
+# May release control
+
+This **public** repository holds release-control workflows only. May app and design-system source remain private. No private source, assets, signing material, provider response, native build output, or credential belongs in a commit, public log, or artifact here.
+
+The draft [native compile workflow](.github/workflows/native-compile-draft.yml) is **inert**: both jobs require an event name the workflow does not register. Even after this branch is merged, a separate reviewed change must remove those guards. There is no enabled store-release workflow, no environment, and no secret in this repository yet. The pull-request check runs only dependency-free control tests and static checks with a read-only token.
+
+## Proposed cloud path
+
+1. Samuel separately approves creation of `may-native-compile` as a protected environment: `main` only, Samuel (GitHub user ID `58840187`) as the sole required reviewer, and administrator bypass disabled. A no-secret admission job reads those exact settings before any private key is available; the protected job checks again after review.
+2. Samuel separately installs two **read-only deploy keys**, one for `May-Assistant/may-app` and one for `May-Assistant/may-design-system`, then enters the private keys directly as environment secrets `MAY_APP_READ_KEY` and `MAY_DS_READ_KEY`. The control code uses pinned GitHub SSH host identity and never prints private checkout output. Do not put these keys in repository-wide secrets or chat.
+3. A later reviewed change enables only the protected, no-signing compile workflow. It fetches a full app SHA from app `main`, checks that the iOS and Android design-system pins agree, fetches that exact design-system SHA, and compiles both platforms on a cloud macOS runner. It writes logs and products only under `$RUNNER_TEMP`, emits a fixed result line, then removes private material. It neither signs nor uploads.
+4. A **separate reviewed release PR** will add iOS internal-TestFlight and Android Play-internal upload jobs. Those jobs need distinct `may-ios-internal` and `may-android-internal` environments with the same main-only/Samuel-review/no-bypass policy, plus May-specific signing and provider credentials entered directly by the owner. Preserve exact app/DS SHA checks, internal-only destination, store build-number checks and public-log suppression. No paid GitHub plan or visibility change to existing private repositories is proposed.
+
+The active Rem public release orchestrator provides a precedent, not shared May credentials or approval. The May app [draft release scripts](https://github.com/May-Assistant/may-app/pull/42) and the real May Apple App ID/listing are preparatory evidence; Play registration and May-specific signing/upload credentials still need owner verification. No May backend deployment should be inferred from a mobile compile: model-spend limits and default-off voice activation are separate staging admission gates.
+
+Public GitHub Actions logs are visible to everyone. Any failure path must print only fixed, nonsensitive messages. The draft does not publish artifacts or raw private build logs. See [GitHub's environment availability rules](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) for why the control repository is public while the app repositories remain private.
