@@ -50,7 +50,7 @@ STORE_JOBS = {
 # In a release job every command is this repository's own Python, with arguments
 # from a safe character set: no ; | & ` ( ) < > { } or newline, so no $( or chaining.
 RELEASE_COMMAND = re.compile(
-    r"python3 tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|cleanup)\.py"
+    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|cleanup|integrity)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
 VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
@@ -140,6 +140,8 @@ def workflow_problems(root):
                 found.append(f"{path.name}: setup-java does not verify its JDK; use toolchain.py")
         if bare_secret_references(text):
             found.append(f"{path.name}: secrets are referenced other than as secrets.NAME")
+        if re.search(r"(?m)^\s*(-\s+)?env:[ \t]*[^\s#]", text):
+            found.append(f"{path.name}: uses a flow-style env mapping")
         if re.search(r"(?m)^\s*deployments:", text):
             found.append(f"{path.name}: requests deployments permission")
         if "pull_request_target" in text:
@@ -216,6 +218,9 @@ def store_problems(store):
                 for command in run_commands(text):
                     if not RELEASE_COMMAND.fullmatch(command):
                         found.append(f"store {job}: runs a command that is not this repository's Python")
+            for previous, current in zip(steps, steps[1:]):
+                if secrets_in(current[1]) and run_commands(previous[1]) != ["python3 -I -S -B tools/may_release/integrity.py"]:
+                    found.append(f"store {job}: a secret step is not preceded by the checkout integrity check")
     return found
 
 

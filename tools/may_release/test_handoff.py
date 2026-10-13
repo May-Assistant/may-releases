@@ -182,6 +182,84 @@ class TarRulesTests(unittest.TestCase):
             with self.assertRaises(StoreError):
                 handoff.checked_members(archive, root, False)
 
+    def test_names_that_alias_on_a_case_insensitive_filesystem_are_refused(self):
+        root = "product/May.xcarchive"
+        app = root + "/Products/Applications/May.app"
+        parents = [entry(root, "dir"), entry(root + "/Products", "dir"),
+                   entry(root + "/Products/Applications", "dir"), entry(app, "dir")]
+        cases = {
+            "case-link-vs-dir": [entry(app + "/Real", "dir"), entry(app + "/link", "sym", link="Real"),
+                                 entry(app + "/LINK", "dir")],
+            "case-write-under-link": [entry(app + "/Real", "dir"), entry(app + "/link", "sym", link="Real"),
+                                      entry(app + "/LINK/x", data=b"x")],
+            "nfc-vs-nfd": [entry(app + "/caf\u00e9", data=b"a"), entry(app + "/cafe\u0301", data=b"b")],
+            "case-files": [entry(app + "/Info.plist"), entry(app + "/info.plist")],
+            "link-target-aliases-member": [entry(app + "/Real", "dir"), entry(app + "/Real/f"),
+                                           entry(app + "/l", "sym", link="REAL/f")],
+        }
+        for name, members in cases.items():
+            with self.subTest(name=name), tarfile.open(self.tar(expected(platform="ios"), parents + members)) as archive:
+                with self.assertRaises(StoreError) as refused:
+                    handoff.checked_members(archive, root, True)
+                self.assertIn("alias", refused.exception.args[0])
+
+    def test_missing_handoff_says_to_rerun_all_jobs(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, dict(RUN, RUNNER_TEMP=directory, MAY_ARTIFACT_DECRYPT_KEY="AGE-SECRET-KEY-1" + "Q" * 58)), \
+                patch("handoff.artifact_recipient", return_value="age1" + "q" * 58):
+            with self.assertRaises(StoreError) as refused:
+                handoff.open_handoff("android", "playground", SHA, "9")
+        self.assertEqual(refused.exception.args[0],
+                         "Re-run all jobs: this release only accepts a build from the same run attempt")
+
+    def test_parent_chain_is_resolved_before_every_write(self):
+        """Validation bypassed: extract alone must not write through a link in any component."""
+        root = "product/May.xcarchive"
+        cases = {
+            "file-under-escaping-link": [entry(root, "dir"), entry(root + "/a", "dir"),
+                                         entry(root + "/a/l", "sym", link="../../.."),
+                                         entry(root + "/a/l/planted.py", data=b"evil")],
+            "dir-under-escaping-link": [entry(root, "dir"), entry(root + "/a", "dir"),
+                                        entry(root + "/a/l", "sym", link="../../.."),
+                                        entry(root + "/a/l/planted", "dir")],
+        }
+        for name, members in cases.items():
+            with self.subTest(name=name), tarfile.open(self.tar(expected(platform="ios"), members)) as archive:
+                out = self.destination()
+                with self.assertRaises(StoreError):
+                    handoff.extract(archive, archive.getmembers()[1:], root, out)
+                self.assertFalse((self.root / "planted.py").exists())
+                self.assertFalse((self.root / "planted").exists())
+
+    def test_case_insensitive_resolution_through_an_aliased_link_is_refused(self):
+        """Model APFS on Linux: a resolver that matches names case- and normalization-insensitively."""
+        def folding_resolve(path):
+            current, pending, hops = Path("/"), list(Path(path).parts[1:]), 0
+            while pending:
+                part = pending.pop(0)
+                names = {handoff.fold(n): n for n in os.listdir(current)} if current.is_dir() else {}
+                actual = part if (current / part).exists() or (current / part).is_symlink() else names.get(handoff.fold(part))
+                if actual is None:
+                    raise FileNotFoundError(part)
+                candidate = current / actual
+                if candidate.is_symlink():
+                    hops += 1
+                    if hops > 40:
+                        raise RuntimeError("loop")
+                    pending = list(Path(os.readlink(candidate)).parts) + pending
+                    continue
+                current = Path(os.path.normpath(candidate))
+            return current
+
+        root = "product/May.xcarchive"
+        for name, last in (("file", entry(root + "/a/LINK/x", data=b"x")), ("mkdir", entry(root + "/a/LINK/sub", "dir"))):
+            members = [entry(root, "dir"), entry(root + "/a", "dir"), entry(root + "/a/link", "sym", link="../../.."),
+                       last]
+            with self.subTest(name=name), tarfile.open(self.tar(expected(platform="ios"), members)) as archive:
+                with self.assertRaises(StoreError) as refused:
+                    handoff.extract(archive, archive.getmembers()[1:], root, self.destination(), folding_resolve)
+                self.assertIn("outside its own folder", refused.exception.args[0])
+
     def test_symlink_is_rechecked_where_it_finally_lives(self):
         # If validation were bypassed, the post-extraction realpath check still refuses.
         ios = expected(platform="ios")

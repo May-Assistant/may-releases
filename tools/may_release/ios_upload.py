@@ -10,6 +10,11 @@ import argparse
 import os
 import re
 import shutil
+import sys
+
+# Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
+# after the standard library. A file planted here cannot shadow a stdlib import.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from store import (APPLE_KEY_ID, APPLE_TEAM, IOS_UPLOAD_SECRETS, XCODE_DEVELOPER_DIR, StoreError,
                    child_env, identity, require_step_secrets, run_private, runner_root, secret_bytes,

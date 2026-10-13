@@ -62,8 +62,8 @@ class StaticCheckTests(unittest.TestCase):
                     "      - run: |\n          python3 tools/may_release/toolchain.py jdk --export\n")
         self.assertFlagged("setup-java does not verify its JDK")
         self.fresh()
-        self.mutate(STORE, "          python3 tools/may_release/toolchain.py age\n",
-                    "          python3 tools/may_release/toolchain.py age\n          python3 -m pip install requests\n")
+        self.mutate(STORE, "          python3 -I -S -B tools/may_release/toolchain.py age\n",
+                    "          python3 -I -S -B tools/may_release/toolchain.py age\n          python3 -m pip install requests\n")
         self.assertFlagged("installs Python packages")
 
     def test_secrets_context_only_by_name(self):
@@ -93,18 +93,18 @@ class StaticCheckTests(unittest.TestCase):
 
     def test_secrets_stay_in_their_own_job_and_step(self):
         moves = (
-            ("android-build", "        run: python3 tools/may_release/store.py --platform android",
+            ("android-build", "        run: python3 -I -S -B tools/may_release/store.py --platform android",
              "        env:\n          MAY_ANDROID_KEY_PASSWORD: ${{ secrets.MAY_ANDROID_KEY_PASSWORD }}\n"
-             "        run: python3 tools/may_release/store.py --platform android"),
+             "        run: python3 -I -S -B tools/may_release/store.py --platform android"),
             ("android-release", "          MAY_ANDROID_CERT_SHA256: ${{ vars.MAY_ANDROID_CERT_SHA256 }}\n",
              "          MAY_ANDROID_CERT_SHA256: ${{ vars.MAY_ANDROID_CERT_SHA256 }}\n"
              "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"),
             ("android-release", "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n",
              "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
              "          MAY_ARTIFACT_DECRYPT_KEY: ${{ secrets.MAY_ARTIFACT_DECRYPT_KEY }}\n"),
-            ("ios-build", "        run: python3 tools/may_release/store.py --platform ios",
+            ("ios-build", "        run: python3 -I -S -B tools/may_release/store.py --platform ios",
              "        env:\n          MAY_IOS_CERT_PASSWORD: ${{ secrets.MAY_IOS_CERT_PASSWORD }}\n"
-             "        run: python3 tools/may_release/store.py --platform ios"),
+             "        run: python3 -I -S -B tools/may_release/store.py --platform ios"),
             ("ios-release", "    timeout-minutes: 60\n",
              "    timeout-minutes: 60\n    env:\n      MAY_ASC_KEY_BASE64: ${{ secrets.MAY_ASC_KEY_BASE64 }}\n"),
         )
@@ -120,7 +120,7 @@ class StaticCheckTests(unittest.TestCase):
         self.mutate(STORE, "      - name: Encrypt unsigned bundle to the target's public key\n",
                     "      - name: Sign and verify Android App Bundle\n        env:\n"
                     "          MAY_ANDROID_KEY_PASSWORD: ${{ secrets.MAY_ANDROID_KEY_PASSWORD }}\n"
-                    "        run: python3 tools/may_release/sign.py --platform android\n"
+                    "        run: python3 -I -S -B tools/may_release/sign.py --platform android\n"
                     "      - name: Encrypt unsigned bundle to the target's public key\n")
         self.assertFlagged("store android-build: a step holds secrets it does not need")
         self.fresh()
@@ -132,26 +132,24 @@ class StaticCheckTests(unittest.TestCase):
         self.assertFlagged("environment is not the one admission checked")
 
     def test_release_job_runs_only_this_repositorys_python(self):
-        self.mutate(STORE, "        run: python3 tools/may_release/sign.py --platform android",
-                    "        run: ./gradlew signingReport && python3 tools/may_release/sign.py --platform android")
+        self.mutate(STORE, "        run: python3 -I -S -B tools/may_release/sign.py --platform android",
+                    "        run: ./gradlew signingReport && python3 -I -S -B tools/may_release/sign.py --platform android")
         self.assertFlagged("store android-release: runs a command that is not this repository's Python")
         self.fresh()
-        self.mutate(STORE, "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\n"
-                           "        with:\n          name: may-handoff-ios-${{ github.run_attempt }}\n",
+        self.mutate(STORE, "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\n",
                     "      - uses: some/action@" + "a" * 40 + "\n"
-                    "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\n"
-                    "        with:\n          name: may-handoff-ios-${{ github.run_attempt }}\n")
-        self.assertFlagged("store ios-release: uses an action it does not need")
+                    "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\n")
+        self.assertFlagged("store android-release: uses an action it does not need")
 
     def test_release_commands_cannot_chain_or_substitute(self):
-        base = 'run: python3 tools/may_release/sign.py --platform android --target "$MAY_TARGET"'
+        base = 'run: python3 -I -S -B tools/may_release/sign.py --platform android --target "$MAY_TARGET"'
         for injected in ('; curl https://x.example', ' | sh', ' && id', ' `id`', ' $(id)', ' > /tmp/x'):
             with self.subTest(injected=injected):
                 self.fresh()
                 self.mutate(STORE, base, base + injected)
                 self.assertFlagged("store android-release: runs a command that is not this repository's Python")
         self.fresh()
-        self.mutate(STORE, "        run: python3 tools/may_release/cleanup.py release\n",
+        self.mutate(STORE, "        run: python3 -I -S -B tools/may_release/cleanup.py release\n",
                     "        run: rm -rf -- \"$RUNNER_TEMP/may-private\"\n", 1)
         self.assertFlagged("store android-release: runs a command that is not this repository's Python")
 
@@ -159,8 +157,8 @@ class StaticCheckTests(unittest.TestCase):
         cases = (
             ("    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: bash\n",
              "store android-release: overrides the shell"),
-            ("      MAY_BUILD_NUMBER: ${{ inputs.build_number }}\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n      - name: Recheck protected destination after Samuel's review\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: python3 tools/may_release/gate.py --action android",
-             "      MAY_BUILD_NUMBER: ${{ inputs.build_number }}\n      LD_PRELOAD: /tmp/x.so\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n      - name: Recheck protected destination after Samuel's review\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: python3 tools/may_release/gate.py --action android",
+            ("      MAY_BUILD_NUMBER: ${{ inputs.build_number }}\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n      - name: Recheck protected destination after Samuel's review\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: python3 -I -S -B tools/may_release/gate.py --action android",
+             "      MAY_BUILD_NUMBER: ${{ inputs.build_number }}\n      LD_PRELOAD: /tmp/x.so\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n      - name: Recheck protected destination after Samuel's review\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: python3 -I -S -B tools/may_release/gate.py --action android",
              "store android-release: sets an environment variable it does not declare"),
             ("          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n",
              "          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n          PYTHONPATH: /tmp\n",
@@ -168,8 +166,8 @@ class StaticCheckTests(unittest.TestCase):
             ("          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n",
              "          MAY_PLAY_ACCOUNT: ${{ secrets.MAY_PLAY_JSON }}\n",
              "store android-release: sets an environment variable it does not declare"),
-            ("        run: python3 tools/may_release/sign.py --platform ios",
-             "        shell: bash\n        run: python3 tools/may_release/sign.py --platform ios",
+            ("        run: python3 -I -S -B tools/may_release/sign.py --platform ios",
+             "        shell: bash\n        run: python3 -I -S -B tools/may_release/sign.py --platform ios",
              "store ios-release: overrides the shell"),
             ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: read\nenv:\n  BASH_ENV: /tmp/x\nconcurrency:",
              "sets workflow-level env or defaults"),
@@ -179,6 +177,21 @@ class StaticCheckTests(unittest.TestCase):
                 self.fresh()
                 self.mutate(STORE, old, new)
                 self.assertFlagged(expected)
+
+    def test_release_scripts_run_isolated_after_an_integrity_check(self):
+        self.mutate(STORE, "        run: python3 -I -S -B tools/may_release/sign.py --platform android",
+                    "        run: python3 tools/may_release/sign.py --platform android")
+        self.assertFlagged("store android-release: runs a command that is not this repository's Python")
+        self.fresh()
+        self.mutate(STORE, "      - name: Check the checkout is exactly its commit before uploading\n"
+                           "        run: python3 -I -S -B tools/may_release/integrity.py\n", "", 1)
+        self.assertFlagged("store android-release: a secret step is not preceded by the checkout integrity check")
+
+    def test_flow_style_env_is_refused(self):
+        self.mutate(STORE, "        env:\n          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
+                           "          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n",
+                    "        env: { MAY_PLAY_JSON: '${{ secrets.MAY_PLAY_JSON }}', LD_PRELOAD: /tmp/x.so }\n")
+        self.assertFlagged("store-release-draft.yml: uses a flow-style env mapping")
 
     def test_handoff_artifact_is_bound_to_the_run_attempt(self):
         self.mutate(STORE, "          name: may-handoff-ios-${{ github.run_attempt }}\n", "          name: may-handoff-ios\n")
@@ -204,7 +217,7 @@ class StaticCheckTests(unittest.TestCase):
              'raise verify.VerifyError(str(ipa))'),
             ("tools/may_release/handoff.py", 'raise StoreError("Build handoff contents are unexpected")',
              'raise HandoffError(str(names))'),
-            ("tools/may_release/handoff.py", 'raise StoreError("Encrypted build handoff is unavailable")',
+            ("tools/may_release/handoff.py", 'raise StoreError("Re-run all jobs: this release only accepts a build from the same run attempt")',
              'raise StoreError'),
         )
         for path, old, new in cases:

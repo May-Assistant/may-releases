@@ -72,14 +72,17 @@ Each store run is **two jobs on separate fresh VMs**:
    - encrypts the product with [age](https://age-encryption.org) to the target's public key committed in `tools/may_release/artifact_keys/` (`handoff.py seal`);
    - uploads only the encrypted file, as a one-day artifact.
 2. **`*-release`** (the store environment; `needs: [admission, *-build]`):
-   - on a fresh VM, runs no build toolchain. Its only actions are SHA-pinned `actions/checkout` and `actions/download-artifact`, used before any secret is present. Every command is this repository's Python, which calls the pinned, checksum-verified Temurin `jarsigner`, the pinned `age`, the system `openssl`, and Apple's `/usr/bin` tools.
+   - on a fresh VM, runs no build toolchain. Its only actions are SHA-pinned `actions/checkout` and `actions/download-artifact`, used before any secret is present. Every command is this repository's Python, run as `python3 -I -S -B` (isolated: neither the script folder nor site-packages comes before the standard library, so a planted file cannot shadow a stdlib import), which calls the pinned, checksum-verified Temurin `jarsigner`, the pinned `age`, the system `openssl`, and Apple's `/usr/bin` tools.
    - `handoff.py open` decrypts with `MAY_ARTIFACT_DECRYPT_KEY` and checks that key against the committed public key. It refuses the payload unless its manifest names exactly this repository, run ID, **run attempt**, platform, target, source SHA and build number. The artifact name also carries the attempt.
    - It then validates every tar member before writing anything, and extracts them one by one. It does not use `tarfile`'s extraction filters.
      - Only regular files and directories are allowed, plus, for iOS, relative symlinks.
      - Each symlink, followed through any chain of other links, must land on an existing entry inside its own bundle (`.app`, `.framework`, …) of the final product.
      - Refused: absolute, escaping and dangling links, hard links, devices, fifos, `..`, absolute or non-normal paths, and anything written through a link.
+     - The macOS runner's APFS ignores case and Unicode normalization, so names are also compared the way it sees them (`NFC` + `casefold`). Two members, or a link-target component and a member, that fold to the same name but are not byte-identical are refused.
+     - Before every file write or `mkdir` (one level at a time), the parent must resolve on the real filesystem to exactly the folder the member names, so a symlink anywhere in the chain, under any case or normalization alias, is refused.
      - Every link is re-resolved in its final location before any signing secret is on the VM.
-   - Because the attempt is bound, re-running a store run means **re-running all jobs**. Re-running only the release job refuses the earlier attempt's handoff.
+   - `integrity.py` runs before each secret step (decrypt, sign, upload). It refuses unless `git status --ignored` is empty and every file under `tools/may_release/` matches the checked-out commit's blob, mode and file list.
+   - Because the attempt is bound, re-running a store run means **re-running all jobs**. Re-running only the release job finds no artifact for the new attempt and stops with "Re-run all jobs: this release only accepts a build from the same run attempt".
    - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads.
 
 Within a job, each step receives only its own secrets, and each script refuses to run if it finds another step's secret. Tools get an allowlisted environment. `static_check.py` enforces:

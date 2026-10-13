@@ -10,7 +10,12 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sys
 import subprocess
+
+# Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
+# after the standard library. A file planted here cannot shadow a stdlib import.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from store import SOURCE_READ_SECRETS, StoreError, child_env, require_step_secrets
 

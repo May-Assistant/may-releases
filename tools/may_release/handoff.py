@@ -23,8 +23,14 @@ from pathlib import Path
 import posixpath
 import re
 import shutil
+import sys
 import subprocess
 import tarfile
+import unicodedata
+
+# Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
+# after the standard library. A file planted here cannot shadow a stdlib import.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from gate import ENVIRONMENTS, artifact_recipient
 from store import (HANDOFF_SECRETS, StoreError, child_env, identity, require_step_secrets, runner_root,
@@ -76,8 +82,26 @@ def inside(path, root):
     return path == root or path.startswith(root + "/")
 
 
-def resolve(path, links, product_root, limit=40):
-    """Resolve an archive path through the archive's own symlinks, never leaving product_root."""
+def fold(name):
+    """How a case- and normalization-insensitive filesystem (APFS on the macOS runner) sees a name."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def claim(path, by_fold):
+    """Register path and each of its prefixes; refuse a name that aliases a different one."""
+    parts = path.split("/")
+    for depth in range(1, len(parts) + 1):
+        exact = "/".join(parts[:depth])
+        if by_fold.setdefault(fold(exact), exact) != exact:
+            raise StoreError("Build handoff names alias each other on a case-insensitive filesystem")
+
+
+def resolve(path, links, product_root, by_fold, limit=40):
+    """Resolve an archive path through the archive's own symlinks, never leaving product_root.
+
+    Every component is compared as APFS would see it: one that folds to an
+    existing member's name but is not byte-identical is refused.
+    """
     pending, resolved, hops = path.split("/"), [], 0
     while pending:
         part = pending.pop(0)
@@ -91,6 +115,8 @@ def resolve(path, links, product_root, limit=40):
                 raise StoreError("Build handoff contains an unsafe symlink")
             continue
         candidate = "/".join(resolved + [part])
+        if by_fold.get(fold(candidate), candidate) != candidate:
+            raise StoreError("Build handoff names alias each other on a case-insensitive filesystem")
         if candidate in links:
             hops += 1
             if hops > limit:
@@ -113,7 +139,7 @@ def checked_members(archive, product_root, allow_symlinks):
     Paths must already be normal, relative and under product_root. This does not
     rely on tarfile's extraction filters.
     """
-    members, seen, links = archive.getmembers()[1:], set(), {}
+    members, seen, links, by_fold = archive.getmembers()[1:], set(), {}, {}
     if not members or members[0].name != product_root:
         raise StoreError("Build handoff contents are unexpected")
     for member in members:
@@ -122,6 +148,7 @@ def checked_members(archive, product_root, allow_symlinks):
                 or posixpath.normpath(name) != name or ".." in name.split("/")
                 or not inside(name, product_root)):
             raise StoreError("Build handoff contains an unsafe path")
+        claim(name, by_fold)
         if any(inside(name, link) for link in links):
             raise StoreError("Build handoff writes through a symlink")
         if member.issym():
@@ -134,22 +161,42 @@ def checked_members(archive, product_root, allow_symlinks):
         seen.add(name)
     entries = seen - set(links)
     for name, joined in links.items():
-        final = resolve(joined, links, product_root)
+        final = resolve(joined, links, product_root, by_fold)
         if final not in entries or not inside(final, bundle_root(name, product_root)):
             raise StoreError("Build handoff contains an unsafe symlink")
     return members
 
 
-def extract(archive, members, product_root, destination):
-    """Write the validated members under destination, one by one, never following links."""
+def strict_resolve(path):
+    return path.resolve(strict=True)
+
+
+def extract(archive, members, product_root, destination, resolver=strict_resolve):
+    """Write the validated members under destination, one by one, never following links.
+
+    Before every write, the parent must resolve (through the real filesystem, so
+    with APFS case and normalization folding) to exactly the folder the member
+    names: no symlink anywhere in the chain. Directories are created one level at
+    a time and checked the same way. `resolver` is injectable so tests can model
+    a case-insensitive filesystem on Linux.
+    """
     base = len(product_root) - len(product_root.split("/")[-1])
+    real_root = resolver(destination)
     created = []
     for member in members:
-        path = destination / member.name[base:]
-        if path.parent != destination and (not path.parent.is_dir() or path.parent.is_symlink()):
-            raise StoreError("Build handoff entry has no extracted parent directory")
+        relative = member.name[base:].split("/")
+        path = destination.joinpath(*relative)
+        expected_parent = real_root.joinpath(*relative[:-1])
+        try:
+            actual_parent = resolver(path.parent)
+        except (OSError, RuntimeError):
+            raise StoreError("Build handoff entry has no extracted parent directory") from None
+        if actual_parent != expected_parent:
+            raise StoreError("Build handoff would write outside its own folder")
         if member.isdir():
             path.mkdir(mode=0o700)
+            if resolver(path) != expected_parent / relative[-1]:
+                raise StoreError("Build handoff would write outside its own folder")
         elif member.issym():
             os.symlink(member.linkname, path)
             created.append((path, member))
@@ -227,7 +274,7 @@ def open_handoff(platform, target, source_sha, build_number):
     root = runner_root()
     sealed = root / "may-handoff-download/handoff.age"
     if not sealed.is_file() or sealed.is_symlink():
-        raise StoreError("Encrypted build handoff is unavailable")
+        raise StoreError("Re-run all jobs: this release only accepts a build from the same run attempt")
     private, out = root / "may-private", root / "may-release"
     private.mkdir(mode=0o700, exist_ok=True)
     out.mkdir(mode=0o700)
