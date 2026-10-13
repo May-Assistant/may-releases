@@ -65,11 +65,6 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
     if dest.exists() or not key_text.strip():
         raise PrepareError("Private checkout path or scoped read key is unavailable")
     key, known, log = private / (label + ".key"), private / "known_hosts", private / (label + ".log")
-    descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as secret_file:
-        secret_file.write(key_text.strip() + "\n")
-    known.write_text(GITHUB_HOST_KEY + "\n")
-    known.chmod(0o600)
     ssh = " ".join(shlex.quote(p) for p in (
         "ssh", "-F", "/dev/null", "-i", str(key), "-o", "IdentitiesOnly=yes",
         "-o", "IdentityAgent=none", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
@@ -79,6 +74,13 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
     env.update(GIT_SSH_COMMAND=ssh, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
                GIT_CONFIG_GLOBAL=os.devnull, GIT_LFS_SKIP_SMUDGE="1")
     try:
+        # The key is written inside the try so that a failed write (for example
+        # a full disk part-way through) still removes the partial key file.
+        descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as secret_file:
+            secret_file.write(key_text.strip() + "\n")
+        known.write_text(GITHUB_HOST_KEY + "\n")
+        known.chmod(0o600)
         quiet(["git", "init", "-q", str(dest)], log, env=env)
         quiet(["git", "-C", str(dest), "remote", "add", "origin", remote], log, env=env)
         ref = "+refs/heads/main:refs/remotes/origin/main" if main_history else sha

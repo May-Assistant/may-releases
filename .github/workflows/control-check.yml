@@ -12,5 +12,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # JDK for the real jarsigner round trip in test_sign.py (no secret involved)
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
       - run: python3 -m unittest discover -s tools/may_release -p 'test_*.py' -v
       - run: python3 tools/may_release/static_check.py

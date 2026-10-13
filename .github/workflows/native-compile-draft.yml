@@ -25,7 +25,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      deployments: read
     outputs:
       environment: ${{ steps.gate.outputs.environment }}
     steps:
@@ -46,7 +45,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      deployments: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
