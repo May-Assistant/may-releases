@@ -99,17 +99,14 @@ jobs:
         run: python3 tools/may_release/handoff.py seal --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: may-handoff-android
+          name: may-handoff-android-${{ github.run_attempt }}
           path: ${{ runner.temp }}/may-handoff/handoff.age
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
       - name: Remove task-owned private source and build output
         if: always()
-        run: |
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff"
-          fi
+        run: python3 tools/may_release/cleanup.py build
   android-release:
     needs: [admission, android-build]
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'android' }}
@@ -138,7 +135,7 @@ jobs:
           python3 tools/may_release/toolchain.py age
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: may-handoff-android
+          name: may-handoff-android-${{ github.run_attempt }}
           path: ${{ runner.temp }}/may-handoff-download
       - name: Decrypt and check the build handoff
         env:
@@ -159,10 +156,7 @@ jobs:
         run: python3 tools/may_release/play_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Remove task-owned bundle, keys and logs
         if: always()
-        run: |
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff-download"
-          fi
+        run: python3 tools/may_release/cleanup.py release
   ios-build:
     needs: admission
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
@@ -198,17 +192,14 @@ jobs:
         run: python3 tools/may_release/handoff.py seal --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: may-handoff-ios
+          name: may-handoff-ios-${{ github.run_attempt }}
           path: ${{ runner.temp }}/may-handoff/handoff.age
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
       - name: Remove task-owned private source and build output
         if: always()
-        run: |
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff"
-          fi
+        run: python3 tools/may_release/cleanup.py build
   ios-release:
     needs: [admission, ios-build]
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
@@ -235,7 +226,7 @@ jobs:
         run: python3 tools/may_release/toolchain.py age
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: may-handoff-ios
+          name: may-handoff-ios-${{ github.run_attempt }}
           path: ${{ runner.temp }}/may-handoff-download
       - name: Decrypt and check the build handoff
         env:
@@ -255,7 +246,4 @@ jobs:
         run: python3 tools/may_release/ios_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Remove task-owned archive, keys and logs
         if: always()
-        run: |
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-handoff-download"
-          fi
+        run: python3 tools/may_release/cleanup.py release

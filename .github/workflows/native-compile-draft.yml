@@ -39,7 +39,8 @@ jobs:
   native:
     needs: admission
     if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}
-    runs-on: macos-15
+    # Android needs nothing from macOS, and the pinned JDK is linux x64 only.
+    runs-on: ${{ inputs.platform == 'android' && 'ubuntu-24.04' || 'macos-15' }}
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 90
     permissions:

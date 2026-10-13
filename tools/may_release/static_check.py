@@ -47,8 +47,13 @@ STORE_JOBS = {
          "Upload verified IPA for internal TestFlight": {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"}},
         {CHECKOUT, DOWNLOAD_ARTIFACT}),
 }
-# In a release job every command is this repository's own Python, or cleanup.
-RELEASE_COMMAND = re.compile(r"python3 tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload)\.py( .*)?")
+# In a release job every command is this repository's own Python, with arguments
+# from a safe character set: no ; | & ` ( ) < > { } or newline, so no $( or chaining.
+RELEASE_COMMAND = re.compile(
+    r"python3 tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|cleanup)\.py"
+    r"( [A-Za-z0-9_./\"$=-]+)*")
+VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
+INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
 
 
 def job_text(workflow, job):
@@ -84,6 +89,29 @@ def run_commands(step):
     if match.group(3) is not None:
         return [match.group(3).strip()]
     return [line.strip() for line in match.group(2).splitlines() if line.strip()]
+
+
+def env_entries(text):
+    """(name, value) for every entry of every env: block in text."""
+    found, env_indent = [], None
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip(" "))
+        if env_indent is not None and line.strip() and indent > env_indent:
+            name, _, value = line.strip().partition(":")
+            found.append((name, value.strip()))
+            continue
+        env_indent = indent if re.fullmatch(r"\s*(-\s+)?env:", line) else None
+    return found
+
+
+def release_env_allowed(name, value, secrets):
+    if name in secrets:
+        return value == "${{ secrets." + name + " }}"
+    if name in VARS:
+        return value == "${{ vars." + name + " }}"
+    if name in INPUTS:
+        return value == "${{ inputs." + INPUTS[name] + " }}"
+    return (name, value) in {("PYTHONDONTWRITEBYTECODE", "'1'"), ("GH_TOKEN", "${{ github.token }}")}
 
 
 def bare_secret_references(text):
@@ -125,6 +153,10 @@ def workflow_problems(root):
             found.append(f"{path.name}: plugin marketplace is a moving URL, not a pinned checkout")
         for job in re.findall(r"(?m)^  ([\w-]+):\n", text.partition("\njobs:\n")[2]):
             header = job_text(text, job).partition("    steps:\n")[0]
+            runs_on = re.search(r"(?m)^    runs-on: (.+)$", header)
+            if "toolchain.py jdk" in job_text(text, job) and runs_on and "macos" in runs_on.group(1) and \
+                    "inputs.platform == 'android' && 'ubuntu-24.04'" not in runs_on.group(1):
+                found.append(f"{path.name}: job {job} installs the linux-only pinned JDK on macOS")
             if re.search(r"(?m)^    environment:", header) and not re.search(r"(?m)^    needs: (admission|\[admission, [\w-]+\])$", header):
                 found.append(f"{path.name}: protected job {job} does not wait for admission")
     return found
@@ -139,6 +171,8 @@ def store_problems(store):
         found.append("store-release-draft.yml does not recheck after review")
     if "track: production" in store or "--track production" in store:
         found.append("store-release-draft.yml names the production track")
+    if re.search(r"(?m)^(env|defaults):", store):
+        found.append("store-release-draft.yml sets workflow-level env or defaults")
     if secrets_in(job_text(store, "admission")):
         found.append("store admission: holds a secret")
     for job, (order, expected, actions) in STORE_JOBS.items():
@@ -167,10 +201,20 @@ def store_problems(store):
         for _, text in steps:
             if UPLOAD_ARTIFACT in text and "path: ${{ runner.temp }}/may-handoff/handoff.age\n" not in text:
                 found.append(f"store {job}: uploads something other than the encrypted handoff")
+        for _, text in steps:
+            if ("upload-artifact@" in text or "download-artifact@" in text) and \
+                    not re.search(r"(?m)^          name: may-handoff-(android|ios)-\$\{\{ github\.run_attempt \}\}$", text):
+                found.append(f"store {job}: handoff artifact is not bound to this run attempt")
         if release:
+            all_secrets = set().union(*expected.values())
+            body = job_text(store, job)
+            if re.search(r"(?m)^\s+(shell|defaults|working-directory):", body):
+                found.append(f"store {job}: overrides the shell, defaults or working directory")
+            if not all(release_env_allowed(n, v, all_secrets) for n, v in env_entries(body)):
+                found.append(f"store {job}: sets an environment variable it does not declare")
             for name, text in steps:
                 for command in run_commands(text):
-                    if not (RELEASE_COMMAND.fullmatch(command) or command.startswith(("if [", "rm -rf --", "fi"))):
+                    if not RELEASE_COMMAND.fullmatch(command):
                         found.append(f"store {job}: runs a command that is not this repository's Python")
     return found
 

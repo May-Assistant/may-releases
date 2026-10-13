@@ -20,6 +20,7 @@ import io
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import subprocess
@@ -37,7 +38,8 @@ AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
 
 def expected_manifest(platform, target, source_sha, build_number):
     return {"format": FORMAT, "repository": os.environ.get("GITHUB_REPOSITORY", ""),
-            "run_id": os.environ.get("GITHUB_RUN_ID", ""), "platform": platform, "target": target,
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""), "platform": platform, "target": target,
             "source_sha": source_sha, "build_number": build_number, "product": PRODUCTS[platform]}
 
 
@@ -57,15 +59,123 @@ def write_tar(path, manifest, product):
         archive.add(product, arcname="product/" + product.name)
 
 
-def read_tar(path, staging, expected):
-    """Extract safely and return the product path, refusing anything unexpected."""
-    if not hasattr(tarfile, "data_filter"):
-        raise StoreError("Python lacks safe tar extraction")
+BUNDLE_SUFFIXES = (".app", ".appex", ".framework", ".bundle", ".xctest", ".dSYM", ".xcarchive")
+
+
+def bundle_root(name, product_root):
+    """The deepest bundle directory (an .app, .framework, ...) containing `name`."""
+    parts = name.split("/")
+    root = product_root
+    for depth in range(len(product_root.split("/")), len(parts)):
+        if parts[depth - 1].endswith(BUNDLE_SUFFIXES):
+            root = "/".join(parts[:depth])
+    return root
+
+
+def inside(path, root):
+    return path == root or path.startswith(root + "/")
+
+
+def resolve(path, links, product_root, limit=40):
+    """Resolve an archive path through the archive's own symlinks, never leaving product_root."""
+    pending, resolved, hops = path.split("/"), [], 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise StoreError("Build handoff contains an unsafe symlink")
+            resolved.pop()
+            if not inside("/".join(resolved), product_root):
+                raise StoreError("Build handoff contains an unsafe symlink")
+            continue
+        candidate = "/".join(resolved + [part])
+        if candidate in links:
+            hops += 1
+            if hops > limit:
+                raise StoreError("Build handoff contains a symlink loop")
+            # links[] holds the full archive path (link's directory + target).
+            pending, resolved = links[candidate].split("/") + pending, []
+            continue
+        resolved.append(part)
+    return "/".join(resolved)
+
+
+def checked_members(archive, product_root, allow_symlinks):
+    """Validate every product member before anything is written.
+
+    Only regular files, directories and (iOS only) relative symlinks. Every
+    symlink, followed through any chain of other symlinks in the archive, must
+    land on an existing file or directory inside its own bundle (an .app,
+    .framework, ... or else the product root). No absolute, dangling or escaping
+    target, no hard link, device or fifo, and nothing written through a symlink.
+    Paths must already be normal, relative and under product_root. This does not
+    rely on tarfile's extraction filters.
+    """
+    members, seen, links = archive.getmembers()[1:], set(), {}
+    if not members or members[0].name != product_root:
+        raise StoreError("Build handoff contents are unexpected")
+    for member in members:
+        name = member.name
+        if (not name or name.startswith("/") or "\\" in name or "\0" in name or name in seen
+                or posixpath.normpath(name) != name or ".." in name.split("/")
+                or not inside(name, product_root)):
+            raise StoreError("Build handoff contains an unsafe path")
+        if any(inside(name, link) for link in links):
+            raise StoreError("Build handoff writes through a symlink")
+        if member.issym():
+            target = member.linkname
+            if not allow_symlinks or not target or target.startswith("/") or "\0" in target or "\\" in target:
+                raise StoreError("Build handoff contains an unsafe symlink")
+            links[name] = posixpath.dirname(name) + "/" + target
+        elif not (member.isfile() and member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)) and not member.isdir():
+            raise StoreError("Build handoff contains an unsupported entry type")
+        seen.add(name)
+    entries = seen - set(links)
+    for name, joined in links.items():
+        final = resolve(joined, links, product_root)
+        if final not in entries or not inside(final, bundle_root(name, product_root)):
+            raise StoreError("Build handoff contains an unsafe symlink")
+    return members
+
+
+def extract(archive, members, product_root, destination):
+    """Write the validated members under destination, one by one, never following links."""
+    base = len(product_root) - len(product_root.split("/")[-1])
+    created = []
+    for member in members:
+        path = destination / member.name[base:]
+        if path.parent != destination and (not path.parent.is_dir() or path.parent.is_symlink()):
+            raise StoreError("Build handoff entry has no extracted parent directory")
+        if member.isdir():
+            path.mkdir(mode=0o700)
+        elif member.issym():
+            os.symlink(member.linkname, path)
+            created.append((path, member))
+        else:
+            mode = 0o700 if member.mode & 0o100 else 0o600
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            with os.fdopen(descriptor, "wb") as output:
+                shutil.copyfileobj(archive.extractfile(member), output)
+    # Re-check every symlink where it now lives, before any signing secret exists
+    # on this VM: it must resolve, strictly (so not dangling), inside its own bundle.
+    for path, member in created:
+        bundle = (destination / bundle_root(member.name, product_root)[base:]).resolve(strict=True)
+        try:
+            final = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise StoreError("Build handoff contains an unsafe symlink") from None
+        if not final.is_relative_to(bundle):
+            raise StoreError("Build handoff contains an unsafe symlink")
+
+
+def read_tar(path, destination, expected, allow_symlinks):
+    """Validate, then extract, the product into destination; return its path."""
+    product_root = "product/" + expected["product"]
     with tarfile.open(path) as archive:
         names = archive.getnames()
-        if len(names) != len(set(names)) or names[:1] != ["manifest.json"] or not all(
-                n == "product/" + expected["product"] or n.startswith("product/" + expected["product"] + "/")
-                for n in names[1:]) or len(names) < 2:
+        if len(names) < 2 or names[0] != "manifest.json" or not archive.getmembers()[0].isfile():
             raise StoreError("Build handoff contents are unexpected")
         try:
             manifest = json.loads(archive.extractfile("manifest.json").read())
@@ -73,9 +183,11 @@ def read_tar(path, staging, expected):
             raise StoreError("Build handoff manifest is invalid") from None
         if manifest != expected:
             raise StoreError("Build handoff does not match this run, target, source or build number")
-        staging.mkdir(mode=0o700)
-        archive.extractall(staging, members=archive.getmembers()[1:], filter="data")
-    return staging / "product" / expected["product"]
+        members = checked_members(archive, product_root, allow_symlinks)
+        if (members[0].isdir()) != (expected["platform"] == "ios"):
+            raise StoreError("Build handoff contents are unexpected")
+        extract(archive, members, product_root, destination)
+    return destination / expected["product"]
 
 
 def seal(platform, target, source_sha, build_number):
@@ -119,7 +231,7 @@ def open_handoff(platform, target, source_sha, build_number):
     private, out = root / "may-private", root / "may-release"
     private.mkdir(mode=0o700, exist_ok=True)
     out.mkdir(mode=0o700)
-    key, plain, staging = private / "handoff.key", private / "handoff.tar", private / "handoff-open"
+    key, plain = private / "handoff.key", private / "handoff.tar"
     env = child_env()
     quiet = dict(stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env)
     try:
@@ -129,16 +241,20 @@ def open_handoff(platform, target, source_sha, build_number):
                                      stdout=subprocess.PIPE, **quiet)
             if derived.returncode or derived.stdout.decode().strip() != recipient:
                 raise StoreError("Artifact decryption key does not match this target's committed public key")
+            write_private(plain, b"")  # 0600 before age writes the plaintext into it
             if subprocess.run([toolchain.tool_path("age", "age"), "-d", "-i", str(key), "-o", str(plain),
                                str(sealed)], stdout=subprocess.DEVNULL, **quiet).returncode:
                 raise StoreError("Build handoff failed to decrypt or authenticate")
         finally:
             key.unlink(missing_ok=True)
-        product = read_tar(plain, staging, expected_manifest(platform, target, source_sha, build_number))
-        shutil.move(str(product), str(out / product.name))
+        try:
+            read_tar(plain, out, expected_manifest(platform, target, source_sha, build_number),
+                     allow_symlinks=platform == "ios")
+        except BaseException:
+            shutil.rmtree(out, ignore_errors=True)
+            raise
     finally:
         plain.unlink(missing_ok=True)
-        shutil.rmtree(staging, ignore_errors=True)
     print("Build handoff decrypted and bound to this run, target, source and build number")
 
 

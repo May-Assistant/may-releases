@@ -137,11 +137,57 @@ class StaticCheckTests(unittest.TestCase):
         self.assertFlagged("store android-release: runs a command that is not this repository's Python")
         self.fresh()
         self.mutate(STORE, "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\n"
-                           "        with:\n          name: may-handoff-ios\n",
+                           "        with:\n          name: may-handoff-ios-${{ github.run_attempt }}\n",
                     "      - uses: some/action@" + "a" * 40 + "\n"
                     "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\n"
-                    "        with:\n          name: may-handoff-ios\n")
+                    "        with:\n          name: may-handoff-ios-${{ github.run_attempt }}\n")
         self.assertFlagged("store ios-release: uses an action it does not need")
+
+    def test_release_commands_cannot_chain_or_substitute(self):
+        base = 'run: python3 tools/may_release/sign.py --platform android --target "$MAY_TARGET"'
+        for injected in ('; curl https://x.example', ' | sh', ' && id', ' `id`', ' $(id)', ' > /tmp/x'):
+            with self.subTest(injected=injected):
+                self.fresh()
+                self.mutate(STORE, base, base + injected)
+                self.assertFlagged("store android-release: runs a command that is not this repository's Python")
+        self.fresh()
+        self.mutate(STORE, "        run: python3 tools/may_release/cleanup.py release\n",
+                    "        run: rm -rf -- \"$RUNNER_TEMP/may-private\"\n", 1)
+        self.assertFlagged("store android-release: runs a command that is not this repository's Python")
+
+    def test_release_jobs_take_no_undeclared_env_or_shell(self):
+        cases = (
+            ("    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: bash\n",
+             "store android-release: overrides the shell"),
+            ("      MAY_BUILD_NUMBER: ${{ inputs.build_number }}\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n      - name: Recheck protected destination after Samuel's review\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: python3 tools/may_release/gate.py --action android",
+             "      MAY_BUILD_NUMBER: ${{ inputs.build_number }}\n      LD_PRELOAD: /tmp/x.so\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n      - name: Recheck protected destination after Samuel's review\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: python3 tools/may_release/gate.py --action android",
+             "store android-release: sets an environment variable it does not declare"),
+            ("          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n",
+             "          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n          PYTHONPATH: /tmp\n",
+             "store android-release: sets an environment variable it does not declare"),
+            ("          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n",
+             "          MAY_PLAY_ACCOUNT: ${{ secrets.MAY_PLAY_JSON }}\n",
+             "store android-release: sets an environment variable it does not declare"),
+            ("        run: python3 tools/may_release/sign.py --platform ios",
+             "        shell: bash\n        run: python3 tools/may_release/sign.py --platform ios",
+             "store ios-release: overrides the shell"),
+            ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: read\nenv:\n  BASH_ENV: /tmp/x\nconcurrency:",
+             "sets workflow-level env or defaults"),
+        )
+        for old, new, expected in cases:
+            with self.subTest(expected=expected, new=new[-40:]):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged(expected)
+
+    def test_handoff_artifact_is_bound_to_the_run_attempt(self):
+        self.mutate(STORE, "          name: may-handoff-ios-${{ github.run_attempt }}\n", "          name: may-handoff-ios\n")
+        self.assertFlagged("handoff artifact is not bound to this run attempt")
+
+    def test_pinned_jdk_is_never_installed_on_macos(self):
+        self.mutate(".github/workflows/native-compile-draft.yml",
+                    "runs-on: ${{ inputs.platform == 'android' && 'ubuntu-24.04' || 'macos-15' }}", "runs-on: macos-15")
+        self.assertFlagged("native-compile-draft.yml: job native installs the linux-only pinned JDK on macOS")
 
     def test_only_the_encrypted_handoff_is_uploaded(self):
         self.mutate(STORE, "          path: ${{ runner.temp }}/may-handoff/handoff.age\n",

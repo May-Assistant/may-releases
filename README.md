@@ -73,7 +73,13 @@ Each store run is **two jobs on separate fresh VMs**:
    - uploads only the encrypted file, as a one-day artifact.
 2. **`*-release`** (the store environment; `needs: [admission, *-build]`):
    - on a fresh VM, runs no build toolchain. Its only actions are SHA-pinned `actions/checkout` and `actions/download-artifact`, used before any secret is present. Every command is this repository's Python, which calls the pinned, checksum-verified Temurin `jarsigner`, the pinned `age`, the system `openssl`, and Apple's `/usr/bin` tools.
-   - `handoff.py open` decrypts with `MAY_ARTIFACT_DECRYPT_KEY` and checks that key against the committed public key. It refuses the payload unless its manifest names exactly this repository, run ID, platform, target, source SHA and build number.
+   - `handoff.py open` decrypts with `MAY_ARTIFACT_DECRYPT_KEY` and checks that key against the committed public key. It refuses the payload unless its manifest names exactly this repository, run ID, **run attempt**, platform, target, source SHA and build number. The artifact name also carries the attempt.
+   - It then validates every tar member before writing anything, and extracts them one by one. It does not use `tarfile`'s extraction filters.
+     - Only regular files and directories are allowed, plus, for iOS, relative symlinks.
+     - Each symlink, followed through any chain of other links, must land on an existing entry inside its own bundle (`.app`, `.framework`, …) of the final product.
+     - Refused: absolute, escaping and dangling links, hard links, devices, fifos, `..`, absolute or non-normal paths, and anything written through a link.
+     - Every link is re-resolved in its final location before any signing secret is on the VM.
+   - Because the attempt is bound, re-running a store run means **re-running all jobs**. Re-running only the release job refuses the earlier attempt's handoff.
    - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads.
 
 Within a job, each step receives only its own secrets, and each script refuses to run if it finds another step's secret. Tools get an allowlisted environment. `static_check.py` enforces:
@@ -87,7 +93,8 @@ Within a job, each step receives only its own secrets, and each script refuses t
 
 - **Separate jobs are the real boundary.** Code from the build cannot reach the signing keystore, certificate, Play key or App Store Connect key, because it never runs on the VM that holds them. Steps *within* one job are not a security boundary: same user, same VM, shared files. That is why signing moved to its own job.
 - **The build job is trusted only for what it builds.** Third-party build code could make the build produce a malicious product, or tamper with the encryption step. Separation cannot prevent that. Signing re-verifies what it can (signature coverage and signer for the AAB; profile, bundle ID and build number for the IPA). It cannot vouch for the code inside.
-- **age gives confidentiality and integrity, not sender authentication.** Anyone holding the public key can encrypt. The run-bound manifest refuses another run's or target's artifact, and a tampered file fails decryption.
+- **age gives confidentiality and integrity, not sender authentication, and is not proof of reviewed build provenance.** Anyone holding the public key can encrypt. The manifest bound to the run and attempt refuses another run's, attempt's or target's artifact, and a tampered file fails decryption. The job split protects the keys, not the integrity of the product.
+- **age itself is installed in the build job before the third-party build runs.** A compromised build could replace it and leave the handoff unencrypted. The release side's authenticated decryption rejects that, so the risk is to confidentiality only, and a compromised build can break the product's confidentiality anyway.
 - The read-only source keys exist in the build job, in the fetch step only, and stay readable to the build within the limits of a same-VM step.
 
 ## Artifact key-pair setup
@@ -146,7 +153,7 @@ The gate keeps denying the target until step 4 is merged. `handoff.py open` refu
   - **Nothing is retried**: no refresh-and-resend on 401 for the upload or the commit. A 401 fails the run and deletes the edit.
 - **Build numbers** above 2,000,000,000 are refused everywhere.
 
-**Pinned toolchain** (`toolchain.py`; `actions/setup-java` is not used because it does not verify its download):
+**Pinned toolchain** (`toolchain.py`; `actions/setup-java` is not used because it does not verify its download). The JDK is pinned for linux x64 only, so every Android job, including the native compile, runs on `ubuntu-24.04`; `static_check.py` refuses the JDK on macOS:
 
 - Temurin JDK `21.0.12.1+1` for linux x64. Its SHA-256 equals Adoptium's published checksum.
 - age `v1.3.1` for linux amd64 and darwin arm64. Each archive was verified with `sigsum-verify` against age's published key and proofs.

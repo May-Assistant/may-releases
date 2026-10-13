@@ -120,6 +120,18 @@ class StoreTests(unittest.TestCase):
                 with self.assertRaises(StoreError):
                     build("android", "playground", "a" * 40, "9")
 
+    def test_cleanup_removes_only_task_owned_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("may-private", "may-release", "may-handoff-download", "may-tools", "_work"):
+                (root / name).mkdir()
+                (root / name / "f").write_text("x")
+            result = subprocess.run([sys.executable, "-s", str(HERE / "cleanup.py"), "release"],
+                                    env={"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": directory},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["_work", "may-tools"])
+
 
 if __name__ == "__main__":
     unittest.main()
