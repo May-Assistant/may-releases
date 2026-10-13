@@ -74,6 +74,28 @@ class CheckoutIntegrityTests(unittest.TestCase):
                 change()
                 self.assertEqual(integrity.problems(self.root), ["Checkout has modified, untracked or ignored files"])
 
+    def test_git_ignores_system_global_and_home_config(self):
+        with patch.dict(os.environ, {"HOME": "/home/attacker", "XDG_CONFIG_HOME": "/x", "GIT_DIR": "/elsewhere",
+                                     "GIT_CONFIG_GLOBAL": "/home/attacker/.gitconfig", "GIT_EXEC_PATH": "/x"}):
+            argv, env = integrity.git_command(self.root, "status")
+        self.assertEqual(argv[:3], ["git", "-c", "core.fsmonitor=false"])
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertFalse({"HOME", "XDG_CONFIG_HOME", "GIT_DIR", "GIT_EXEC_PATH"} & set(env))
+        # A hostile global config (here: an fsmonitor hook and an excludesFile that
+        # would hide a planted file) is never read.
+        home = Path(self.directory.name) / "home"
+        home.mkdir()
+        (home / "hidden").write_text("json.py\n")
+        (home / ".gitconfig").write_text("[core]\n\texcludesFile = %s\n\tfsmonitor = %s\n"
+                                         % (home / "hidden", home / "monitor.sh"))
+        (home / "monitor.sh").write_text("#!/bin/sh\ntouch %s\n" % (home / "MONITOR-RAN"))
+        (home / "monitor.sh").chmod(0o755)
+        (self.scripts / "json.py").write_text(SHADOW)
+        with patch.dict(os.environ, {"HOME": str(home), "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}):
+            self.assertEqual(integrity.problems(self.root), ["Checkout has modified, untracked or ignored files"])
+        self.assertFalse((home / "MONITOR-RAN").exists())
+
     def test_file_list_and_hashes_are_checked_even_if_git_status_is_fooled(self):
         real_git = integrity.git
 

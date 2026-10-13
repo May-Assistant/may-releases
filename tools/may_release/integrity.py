@@ -19,10 +19,21 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = "tools/may_release"
 
 
+# git must not take any setting (hooks, fsmonitor, aliases, safe.directory,
+# excludes) from system, global or HOME-based config: only PATH is passed.
+GIT_ENV_KEEP = ("PATH",)
+GIT_ISOLATION = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
+
+
+def git_command(root, *args):
+    env = {k: v for k, v in os.environ.items() if k in GIT_ENV_KEEP}
+    env.update(GIT_ISOLATION)
+    return ["git", "-c", "core.fsmonitor=false", "-C", str(root), *args], env
+
+
 def git(root, *args):
-    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME")}
-    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, stdin=subprocess.DEVNULL,
-                            env=env)
+    argv, env = git_command(root, *args)
+    result = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, env=env)
     if result.returncode:
         raise ValueError("git failed")
     return result.stdout

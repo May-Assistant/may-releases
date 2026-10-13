@@ -125,16 +125,29 @@ class GateTests(unittest.TestCase):
             self.assertIn("does not exist", denied.exception.args[0])
             self.assertFalse(os.path.exists(output))
 
+    def test_committed_artifact_keys_are_the_four_distinct_recipients(self):
+        # Provided by Dots from Samuel's Mac on 2026-10-13; private halves never left it.
+        expected = {
+            "may-ios-internal": "age1rxygmrkqmgaweevxdwpgpwwlgvf9haeulg4qwvv03mv7ml4rhqxsjsxfwl",
+            "may-ios-playground-internal": "age1q8mp85cgc9w5uyvjqy57y0r8dm4d5s88x7q24fmpel8vsw777gtsa8gxrf",
+            "may-android-internal": "age1kpcl62lf4hssansdlcu5zwde0esfwazvg3uuwddn4rru2zlrcceskyd7vg",
+            "may-android-playground-internal": "age1cv26vadk855hhzs6fljc6wvh3t96r2kklkg8uul62hwfjj5u8v9sex4n5j",
+        }
+        self.assertEqual({e: gate.artifact_recipient(e) for e in expected}, expected)
+        self.assertEqual(sorted(p.name for p in gate.ARTIFACT_KEYS.iterdir()),
+                         sorted(e + ".age.pub" for e in expected))
+
     def test_placeholder_artifact_key_denies_before_any_request(self):
-        for environment in ("may-ios-internal", "may-ios-playground-internal", "may-android-internal",
-                            "may-android-playground-internal"):
-            self.assertIsNone(gate.artifact_recipient(environment))  # committed placeholders
         with tempfile.TemporaryDirectory() as directory:
+            keys = Path(directory) / "keys"
+            keys.mkdir()
+            (keys / "may-ios-internal.age.pub").write_text(
+                "PLACEHOLDER: the setup lane replaces this whole file with the age public key.\n")
             env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH,
                    "GH_TOKEN": "fixture-token", "GITHUB_OUTPUT": os.path.join(directory, "output")}
             argv = ["gate.py", "--action", "ios", "--target", "production", "--source-sha", self.sha,
                     "--build-number", "9"]
-            with patch.dict(os.environ, env), patch("sys.argv", argv), \
+            with patch.dict(os.environ, env), patch("sys.argv", argv), patch("gate.ARTIFACT_KEYS", keys), \
                     patch("urllib.request.urlopen") as request:
                 with self.assertRaises(GateDenial) as denied:
                     gate.main()
