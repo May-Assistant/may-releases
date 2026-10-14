@@ -4,8 +4,9 @@ problems(root) returns fixed descriptions of every violated rule; the CLI exits
 non-zero if there is any. Dependency-free on purpose: it runs in the PR check.
 
 It also pins the store workflow's activation stage (STAGE, STORE_JOB_IF,
-UPLOAD_IF, PLAY_UPLOAD_TRACKS): exactly which jobs and steps carry the
-never-matching event guard, and which uploads may happen. Moving to another
+UPLOAD_IF, PLAY_UPLOAD_TRACKS, and the sign-only steps): exactly which jobs and
+steps carry the never-matching event guard, which uploads may happen, and the one
+sign-only publication of May production's encrypted signed bundle. Moving to another
 stage, or back to an earlier one, means changing those constants in the same
 reviewed change as the workflow, never the workflow alone.
 """
@@ -56,6 +57,9 @@ FETCH = "Fetch exact private source and pinned design system"
 DECRYPT = "Decrypt and check the build handoff"
 REPORT = "Report what the dry run would have uploaded"
 CONFIRM = "Fail unless the requested store upload succeeded"
+SEAL_SIGNED = "Seal the signed bundle for one Play Console upload"
+PUBLISH_SIGNED = "Publish the sealed signed bundle for 3 days"
+CONFIRM_SIGNED = "Fail unless the signed bundle was published, not uploaded"
 UPLOADS = {"android-release": "Upload update to the internal track only",
            "ios-release": "Upload verified IPA for internal TestFlight"}
 # Each upload step's id, which the loud-failure step reads (steps.<id>.outcome).
@@ -63,8 +67,9 @@ UPLOAD_IDS = {"android-release": "play_upload", "ios-release": "testflight_uploa
 # A job or step whose condition requires this event never runs: the workflow
 # registers only workflow_dispatch. That is how a job or step is held inert.
 INERT = "github.event_name == 'may-store-disabled-pending-review'"
-STAGE = "stage 2"
-# Activation stage 2 (Android uploads to the Play internal track). Each store
+STAGE = "stage 3"
+# Activation stage 3 (Android uploads to the Play internal track, May and May
+# Playground; sign-only for May production). Each store
 # job's exact job-level `if:` (None: no condition). Admission and the Android jobs
 # are active and keep their platform condition; the iOS jobs stay inert
 # (tools/release/ios.sh does not exist yet). The Android upload step is active and
@@ -73,14 +78,15 @@ STAGE = "stage 2"
 STORE_JOB_IF = {
     "admission": None,
     "android-build": "${{ inputs.platform == 'android' }}",
-    "android-release": "${{ inputs.platform == 'android' }}",
+    "android-release": "${{ inputs.platform == 'android' && github.event.inputs.sign_only != 'true' }}",
+    "android-sign-only": "${{ inputs.platform == 'android' && github.event.inputs.sign_only == 'true' }}",
     "ios-build": "${{ " + INERT + " && inputs.platform == 'ios' }}",
     "ios-release": "${{ " + INERT + " && inputs.platform == 'ios' }}",
 }
 # A store upload runs only when dry_run is exactly 'false' (github.event.inputs
 # holds booleans as strings, so a missing value never uploads), and the upload
 # script receives the same value to recheck. The report runs in every other case.
-# A held upload also carries the guard first (HELD_UPLOAD_IF). Stage 2: the
+# A held upload also carries the guard first (HELD_UPLOAD_IF). Stage 3: the
 # Android upload is active (DRY_RUN_UPLOAD_IF), the iOS upload is still held.
 DRY_RUN_UPLOAD_IF = "${{ github.event.inputs.dry_run == 'false' }}"
 HELD_UPLOAD_IF = "${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}"
@@ -91,12 +97,39 @@ REPORT_IF = "${{ github.event.inputs.dry_run != 'false' }}"
 # job unless that upload step's outcome is success. It never carries the guard, so
 # it is already in place when an upload's guard comes off.
 CONFIRM_IF = "${{ !cancelled() && github.event.inputs.dry_run == 'false' }}"
-# Stage 2: store.py's PLAY_UPLOAD_TRACKS must be exactly this (May Playground to
-# the Play internal track only), and play_upload.py's TRACK must be "internal".
-PLAY_UPLOAD_TRACKS = {"playground": "internal"}
+# Stage 3: store.py's PLAY_UPLOAD_TRACKS must be exactly this (May and May
+# Playground to the Play internal track only), and play_upload.py's TRACK must be
+# "internal".
+PLAY_UPLOAD_TRACKS = {"playground": "internal", "production": "internal"}
 DRY_RUN_ENV = "${{ github.event.inputs.dry_run }}"
 DRY_RUN_INPUT = ("      dry_run:\n        description: [^\n]+\n        required: true\n"
                  "        type: boolean\n        default: true\n")
+# Sign-only (stage 3, May production Android): a required boolean input that
+# defaults to false, so it is always an explicit choice. When it is 'true',
+# android-release does not run and SIGN_ONLY_JOB does (STORE_JOB_IF): the same
+# environment, decrypt, sign and verify, then its three sign-only steps, the
+# check also after an earlier failure unless the run was cancelled. That job
+# references no Play secret or variable, so MAY_PLAY_JSON never reaches its
+# runner (a job's referenced secrets reach the runner even when the step that
+# uses them is skipped).
+SIGN_ONLY_JOB = "android-sign-only"
+SIGN_ONLY_ENV = "${{ github.event.inputs.sign_only }}"
+SIGN_ONLY_INPUT = ("      sign_only:\n        description: [^\n]+\n        required: true\n"
+                   "        type: boolean\n        default: false\n")
+CONFIRM_SIGNED_IF = "${{ !cancelled() }}"
+SIGNED_ID = "signed_artifact"
+# The publish step, exactly: only the may-signed folder (the encrypted bundle, its
+# SHA-256 and its record), bound to the run attempt, kept 3 days.
+PUBLISH_SIGNED_STEP = (
+    "name: " + PUBLISH_SIGNED + "\n"
+    "        id: " + SIGNED_ID + "\n"
+    "        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
+    "        with:\n"
+    "          name: may-signed-android-${{ github.run_attempt }}\n"
+    "          path: ${{ runner.temp }}/may-signed/\n"
+    "          if-no-files-found: error\n"
+    "          retention-days: 3\n"
+    "          compression-level: 0\n")
 READ_KEYS = {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"}
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
@@ -112,6 +145,13 @@ STORE_JOBS = {
                                                 "MAY_ANDROID_KEY_PASSWORD"},
          "Upload update to the internal track only": {"MAY_PLAY_JSON"}},
         {CHECKOUT, DOWNLOAD_ARTIFACT}),
+    SIGN_ONLY_JOB: (
+        ["Install pinned JDK and age", DECRYPT, "Sign and verify Android App Bundle",
+         SEAL_SIGNED, PUBLISH_SIGNED, CONFIRM_SIGNED],
+        {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
+         "Sign and verify Android App Bundle": {"MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PASSWORD",
+                                                "MAY_ANDROID_KEY_PASSWORD"}},
+        {CHECKOUT, DOWNLOAD_ARTIFACT, UPLOAD_ARTIFACT}),
     "ios-build": (
         ["Install pinned age", FETCH, "Build unsigned iOS archive without secrets",
          "Encrypt unsigned archive to the target's public key"],
@@ -128,10 +168,11 @@ STORE_JOBS = {
 # In a release job every command is this repository's own Python, with arguments
 # from a safe character set: no ; | & ` ( ) < > { } or newline, so no $( or chaining.
 RELEASE_COMMAND = re.compile(
-    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|confirm_upload|dry_run|cleanup|integrity)\.py"
+    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|sign_only|play_upload|ios_upload|confirm_upload|dry_run|cleanup|integrity)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
 ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" '
-                  '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN"')
+                  '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN" '
+                  '--sign-only "$MAY_SIGN_ONLY"')
 CONTINUE_ON_ERROR = re.compile(r"(?m)^\s*(-\s+)?continue-on-error:")
 VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
@@ -207,7 +248,8 @@ LAYOUT_LINE = re.compile(r"( *)(- )?([A-Za-z][\w-]*):(?: (.*))?")
 LAYOUT_VALUE = re.compile(r"""[^\s&*!{}?|>%@`'"\[\]#,][^#]*|'(?:[^']|'')*'|\[[^\[\]{}'"#]*\]|[|>]-?""")
 ADMISSION_ENV = [("GH_TOKEN", "${{ github.token }}"), ("MAY_PLATFORM", "${{ inputs.platform }}"),
                  ("MAY_TARGET", "${{ inputs.target }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                 ("MAY_BUILD_NUMBER", "${{ inputs.build_number }}"), ("MAY_DRY_RUN", DRY_RUN_ENV)]
+                 ("MAY_BUILD_NUMBER", "${{ inputs.build_number }}"), ("MAY_DRY_RUN", DRY_RUN_ENV),
+                 ("MAY_SIGN_ONLY", SIGN_ONLY_ENV)]
 ADMISSION_OUTPUTS = ("    outputs:\n      environment: ${{ steps.gate.outputs.environment }}\n"
                      "      build_environment: ${{ steps.gate.outputs.build_environment }}\n")
 
@@ -274,7 +316,11 @@ def env_entries(text):
 
 def release_env_allowed(name, value, secrets, job):
     if name == "MAY_UPLOAD_OUTCOME":
-        return value == "${{ steps." + UPLOAD_IDS[job] + ".outcome }}"
+        return job in UPLOAD_IDS and value == "${{ steps." + UPLOAD_IDS[job] + ".outcome }}"
+    if name == "MAY_PUBLISH_OUTCOME":
+        return job == SIGN_ONLY_JOB and value == "${{ steps." + SIGNED_ID + ".outcome }}"
+    if name == "MAY_SIGN_ONLY":
+        return job == SIGN_ONLY_JOB and value == SIGN_ONLY_ENV
     if name in secrets:
         return value == "${{ secrets." + name + " }}"
     if name in VARS:
@@ -339,7 +385,7 @@ def store_problems(store):
     found = []
     found += stage_problems(store)
     found += layout_problems(store)
-    if store.count("Recheck protected destination after Samuel's review") != 2 or \
+    if store.count("Recheck protected destination after Samuel's review") != 3 or \
             store.count("Recheck build environment after Samuel's review") != 2:
         found.append("store-release-draft.yml does not recheck after review")
     if "track: production" in store or "--track production" in store:
@@ -362,10 +408,14 @@ def store_problems(store):
         found.append("store admission: does not pass the dispatch's dry_run to the gate")
     if not re.search(r"(?m)^" + DRY_RUN_INPUT, store.partition("\njobs:\n")[0]):
         found.append("store-release-draft.yml: dry_run is not a required boolean input defaulting to true")
+    if not re.search(r"(?m)^" + SIGN_ONLY_INPUT, store.partition("\njobs:\n")[0]):
+        found.append("store-release-draft.yml: sign_only is not a required boolean input defaulting to false")
+    if "          MAY_SIGN_ONLY: " + SIGN_ONLY_ENV + "\n" not in job_text(store, "admission"):
+        found.append("store admission: does not pass the dispatch's sign_only to the gate")
     for job, (order, expected, actions) in STORE_JOBS.items():
         header, steps = job_steps(store, job)
-        release = job.endswith("-release")
-        build = job.replace("-release", "-build")
+        release = job.endswith("-release") or job == SIGN_ONLY_JOB
+        build = job.split("-")[0] + "-build"
         environment = "needs.admission.outputs.environment" if release else "needs.admission.outputs.build_environment"
         if not header:
             found.append(f"store {job}: job is missing")
@@ -402,7 +452,7 @@ def store_problems(store):
             condition = step_condition(text)
             if step_condition_count(text) > 1:
                 found.append(f"store {job}: a step has more than one if:")
-            if release and name == UPLOADS[job]:
+            if release and name == UPLOADS.get(job):
                 # Together these require exactly UPLOAD_IF[job]: for a held upload
                 # the guard first, then exactly the dry-run condition; for an
                 # active one, exactly the dry-run condition with no guard.
@@ -417,21 +467,29 @@ def store_problems(store):
                     found.append(f"store {job}: a dry run would run the store upload")
             elif release and name == CONFIRM:
                 pass  # loud_failure_problems pins it exactly
+            elif job == SIGN_ONLY_JOB and name in (SEAL_SIGNED, PUBLISH_SIGNED, CONFIRM_SIGNED):
+                pass  # sign_only_problems pins them exactly
             elif release and name == REPORT:
                 if condition != REPORT_IF or not run_commands(text) or not run_commands(text)[0].startswith(
                         "python3 -I -S -B tools/may_release/dry_run.py --platform " + platform + " "):
                     found.append(f"store {job}: the dry run does not report what it would have uploaded")
             elif condition not in (None, "always()") or (condition == "always()" and "cleanup.py" not in text):
                 found.append(f"store {job}: a step other than the upload or dry-run report is conditional")
-        for _, text in steps:
-            if UPLOAD_ARTIFACT in text and "path: ${{ runner.temp }}/may-handoff/handoff.age\n" not in text:
-                found.append(f"store {job}: uploads something other than the encrypted handoff")
-        for _, text in steps:
+        for name, text in steps:
+            if UPLOAD_ARTIFACT in text and "path: ${{ runner.temp }}/may-handoff/handoff.age\n" not in text and \
+                    not (job == SIGN_ONLY_JOB and text == PUBLISH_SIGNED_STEP):
+                found.append(f"store {job}: uploads something other than the encrypted handoff "
+                             "(or, for sign-only, exactly the sealed signed bundle)")
+        for name, text in steps:
+            if job == SIGN_ONLY_JOB and text == PUBLISH_SIGNED_STEP:
+                continue  # pinned exactly, with its own run-attempt-bound name
             if ("upload-artifact@" in text or "download-artifact@" in text) and \
                     not re.search(r"(?m)^          name: may-handoff-(android|ios)-\$\{\{ github\.run_attempt \}\}$", text):
                 found.append(f"store {job}: handoff artifact is not bound to this run attempt")
         if release:
-            found += loud_failure_problems(store, job, steps)
+            if job in UPLOADS:
+                found += loud_failure_problems(store, job, steps)
+            found += sign_only_problems(store, job, steps)
             all_secrets = set().union(*expected.values())
             body = job_text(store, job)
             if re.search(r"(?m)^\s+(shell|defaults|working-directory):", body):
@@ -473,6 +531,45 @@ def loud_failure_problems(store, job, steps):
     return []
 
 
+def sign_only_problems(store, job, steps):
+    """Sign-only is SIGN_ONLY_JOB alone, which never references a Play secret or variable.
+
+    In that job the three sign-only steps come right after signing, in order: the
+    seal step runs sign_only.py with only MAY_SIGN_ONLY and MAY_DRY_RUN; the
+    publish step is exactly PUBLISH_SIGNED_STEP (the may-signed folder, 3 days);
+    the check runs confirm_upload.py --sign-only under exactly CONFIRM_SIGNED_IF,
+    reading only the publish step's outcome; then only the cleanup. No other job
+    has a sign-only step.
+    """
+    names = [name for name, _ in steps]
+    texts = dict(steps)
+    ours = [n for n in names if n in (SEAL_SIGNED, PUBLISH_SIGNED, CONFIRM_SIGNED)]
+    ids = len(re.findall(r"(?m)^\s*(?:-\s+)?id: " + SIGNED_ID + "$", job_text(store, job)))
+    if job != SIGN_ONLY_JOB:
+        if ours or ids or any("sign_only" in code_lines(text) for _, text in steps):
+            return [f"store {job}: has a sign-only step; sign-only runs only in {SIGN_ONLY_JOB}"]
+        return []
+    found = []
+    if re.search(r"MAY_PLAY_|secrets\.MAY_PLAY", code_lines(job_text(store, job))):
+        found.append(f"store {job}: references a Play secret or variable; its runner must never receive "
+                     "MAY_PLAY_JSON")
+    sign = "Sign and verify Android App Bundle"
+    tail = ("python3 -I -S -B tools/may_release/{} --target \"$MAY_TARGET\" --source-sha \"$MAY_SOURCE_SHA\" "
+            "--build-number \"$MAY_BUILD_NUMBER\"")
+    if ours != [SEAL_SIGNED, PUBLISH_SIGNED, CONFIRM_SIGNED] or sign not in names or \
+            names[names.index(sign) + 1:] != ours + ["Remove task-owned bundle, keys and logs"] or ids != 1 or \
+            step_condition(texts[SEAL_SIGNED]) is not None or \
+            run_commands(texts[SEAL_SIGNED]) != [tail.format("sign_only.py")] or \
+            env_entries(texts[SEAL_SIGNED]) != [("MAY_SIGN_ONLY", SIGN_ONLY_ENV), ("MAY_DRY_RUN", DRY_RUN_ENV)] or \
+            texts[PUBLISH_SIGNED] != PUBLISH_SIGNED_STEP or \
+            step_condition(texts[CONFIRM_SIGNED]) != CONFIRM_SIGNED_IF or \
+            run_commands(texts[CONFIRM_SIGNED]) != [tail.format("confirm_upload.py --platform android") + " --sign-only"] or \
+            env_entries(texts[CONFIRM_SIGNED]) != [("MAY_PUBLISH_OUTCOME", "${{ steps." + SIGNED_ID + ".outcome }}")]:
+        found.append(f"store {job}: the sign-only steps are missing or changed (seal, publish exactly the sealed "
+                     "bundle for 3 days, then fail unless it was published)")
+    return found
+
+
 def assigned_literal(path, name):
     """The literal value of a module-level `name = ...` in path, or None."""
     value = None
@@ -500,12 +597,12 @@ def held_uploads_problems(root, store):
 
 
 def upload_track_problems(root):
-    """Only the Play internal track is reachable, and in stage 2 only for May Playground."""
+    """Only the Play internal track is reachable (stage 3: for May and May Playground)."""
     found = []
     tracks = assigned_literal(root / "tools/may_release/store.py", "PLAY_UPLOAD_TRACKS")
     if not isinstance(tracks, dict) or tracks != PLAY_UPLOAD_TRACKS or set(tracks.values()) - {"internal"}:
         found.append(f"store.py: PLAY_UPLOAD_TRACKS is not exactly {STAGE}'s "
-                     "(May Playground to the Play internal track only)")
+                     "(May and May Playground to the Play internal track only)")
     uploader = (root / "tools/may_release/play_upload.py").read_text()
     if assigned_literal(root / "tools/may_release/play_upload.py", "TRACK") != "internal" or \
             uploader.count("/tracks/") != 1 or '/tracks/{TRACK}"' not in uploader:
@@ -657,6 +754,7 @@ if __name__ == "__main__":
         print("Static check failed: " + failure)
     if failures:
         sys.exit(1)
-    print("May store workflow is at activation stage 2 (Android uploads to the Play internal track for May "
-          "Playground only, each checked loudly; iOS inert), the native compile workflow is inert, and the "
-          "no-secret controls are structurally present")
+    print("May store workflow is at activation stage 3 (Android uploads to the Play internal track for May "
+          "and May Playground, May production sign-only in its own job with no Play secret, each checked "
+          "loudly; iOS inert), the native compile workflow is inert, and the no-secret controls are "
+          "structurally present")

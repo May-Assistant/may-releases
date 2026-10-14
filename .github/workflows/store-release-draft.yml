@@ -1,9 +1,15 @@
-name: May protected store release (stage 2, Android internal uploads; iOS inert)
-# Activation stage 2: an Android dispatch can dry-run or, with dry_run: false,
-# upload May Playground to the Play internal track. The iOS jobs and the iOS
-# upload step are still inert: they require an event name this workflow never
-# registers, so they are always skipped. static_check.py pins exactly where the
-# guard must and must not be for this stage.
+name: May protected store release (stage 3, Android internal uploads; iOS inert)
+# Activation stage 3: an Android dispatch can dry-run or, with dry_run: false,
+# upload May or May Playground to its Play internal track. May production can
+# also run sign_only: true (with dry_run: true), which signs and verifies exactly
+# as an upload would, makes no Play call, and publishes the signed bundle,
+# encrypted to Samuel's committed key, as a 3-day artifact for a manual Play
+# Console upload, without the keystore touching any other machine. Sign-only runs in
+# its own job, android-sign-only, instead of android-release, so that its runner
+# never receives MAY_PLAY_JSON. The iOS jobs and
+# the iOS upload step are still inert: they require an event name this workflow
+# never registers, so they are always skipped. static_check.py pins exactly where
+# the guard must and must not be for this stage.
 # Each run is two jobs on separate fresh VMs:
 #   *-build    environment may-native-compile (read-only source keys only). Runs
 #              the private build (Gradle / Xcode / SwiftPM: third-party code) and
@@ -11,6 +17,9 @@ name: May protected store release (stage 2, Android internal uploads; iOS inert)
 #   *-release  the target's store environment. Runs no build toolchain: only this
 #              repository's Python, checksum-verified Temurin jarsigner and age,
 #              and Apple's tools. Decrypts, signs, verifies and uploads.
+#   android-sign-only  replaces android-release for a sign-only dispatch: the same
+#              environment and the same decrypt, sign and verify, then publishes
+#              the encrypted signed bundle instead of uploading it.
 # Store environments, chosen by gate.py and never auto-created (a missing one is
 # a 404 and admission denies):
 #   android/production -> may-android-internal             (May, Play 4974275831988601568)
@@ -21,9 +30,11 @@ name: May protected store release (stage 2, Android internal uploads; iOS inert)
 # upload step, and reports what it would have uploaded. A real upload needs
 # dry_run: false, chosen explicitly at dispatch. Admission (gate.py --dry-run)
 # refuses dry_run: false before any approval, build or secret unless it is an
-# Android May Playground dispatch (UPLOADS_HELD, store.PLAY_UPLOAD_TRACKS). Once
-# admitted, a release job with dry_run: false fails unless its upload step
-# succeeded (confirm_upload.py), so it never ends green without uploading.
+# Android May or May Playground dispatch (UPLOADS_HELD, store.PLAY_UPLOAD_TRACKS),
+# and sign_only: true unless it is May production Android with dry_run: true.
+# Once admitted, a release job with dry_run: false fails unless its upload step
+# succeeded, and the sign-only job fails unless its signed bundle was published
+# (confirm_upload.py), so neither ever ends green without doing it.
 on:
   workflow_dispatch:
     inputs:
@@ -50,6 +61,11 @@ on:
         required: true
         type: boolean
         default: true
+      sign_only:
+        description: May production Android only, with dry_run true. Sign and verify, then publish the signed bundle encrypted for one manual Play Console upload; never uploads
+        required: true
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -59,7 +75,9 @@ jobs:
   admission:
     # Active. Runs for every dispatch and checks both environments the run will
     # use; an iOS dispatch then stops here, because the iOS jobs are inert. It also
-    # refuses dry_run: false for anything but an Android May Playground upload.
+    # refuses dry_run: false for anything but an Android May or May Playground
+    # upload, and sign_only: true for anything but May production Android with
+    # dry_run: true.
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -79,7 +97,8 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_BUILD_NUMBER: ${{ inputs.build_number }}
           MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
-        run: python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN"
+          MAY_SIGN_ONLY: ${{ github.event.inputs.sign_only }}
+        run: python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN" --sign-only "$MAY_SIGN_ONLY"
   android-build:
     needs: admission
     if: ${{ inputs.platform == 'android' }}
@@ -126,8 +145,11 @@ jobs:
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py build
   android-release:
+    # Uploads or dry-runs. Not for sign-only, which runs in android-sign-only so
+    # that its runner never receives MAY_PLAY_JSON (a job's referenced secrets
+    # reach its runner even when the step using them is skipped).
     needs: [admission, android-build]
-    if: ${{ inputs.platform == 'android' }}
+    if: ${{ inputs.platform == 'android' && github.event.inputs.sign_only != 'true' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 30
@@ -176,10 +198,11 @@ jobs:
       - name: Check the checkout is exactly its commit before uploading
         run: python3 -I -S -B tools/may_release/integrity.py
       - name: Upload update to the internal track only
-        # Stage 2: active, with no inert guard. github.event.inputs holds the
+        # Stage 3: active, with no inert guard. github.event.inputs holds the
         # boolean as a string, and == ignores case, so it runs on any casing of
         # 'false'; a missing value never does. The script then refuses everything
-        # but the exact string false, and any target but May Playground.
+        # but the exact string false, any target store.PLAY_UPLOAD_TRACKS does not
+        # map to internal, and another target's key, account or package.
         id: play_upload
         if: ${{ github.event.inputs.dry_run == 'false' }}
         env:
@@ -197,12 +220,97 @@ jobs:
         run: python3 -I -S -B tools/may_release/confirm_upload.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Report what the dry run would have uploaded
         if: ${{ github.event.inputs.dry_run != 'false' }}
+        env:
+          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}
         run: python3 -I -S -B tools/may_release/dry_run.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Remove task-owned bundle, keys and logs
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py release
+  android-sign-only:
+    # Sign-only (May production only; admission refuses it otherwise and requires
+    # dry_run to be true). Same environment and approval as an upload
+    # (may-android-internal), but its own job, which references no Play secret or
+    # variable, so MAY_PLAY_JSON never reaches this runner. It decrypts, signs and
+    # verifies exactly as android-release does, then encrypts the verified signed
+    # bundle to Samuel's committed Console-upload key and publishes it for 3 days.
+    needs: [admission, android-build]
+    if: ${{ inputs.platform == 'android' && github.event.inputs.sign_only == 'true' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAY_TARGET: ${{ inputs.target }}
+      MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+      MAY_BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Recheck protected destination after Samuel's review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/gate.py --action android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Install pinned JDK and age
+        run: |
+          python3 -I -S -B tools/may_release/toolchain.py jdk
+          python3 -I -S -B tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # A missing artifact (another attempt's build) is reported by the decrypt step.
+        continue-on-error: true
+        with:
+          name: may-handoff-android-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-handoff-download
+      - name: Check the checkout is exactly its commit before decrypting
+        run: python3 -I -S -B tools/may_release/integrity.py
+      - name: Decrypt and check the build handoff
+        env:
+          MAY_ARTIFACT_DECRYPT_KEY: ${{ secrets.MAY_ARTIFACT_DECRYPT_KEY }}
+        run: python3 -I -S -B tools/may_release/handoff.py open --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Check the checkout is exactly its commit before signing
+        run: python3 -I -S -B tools/may_release/integrity.py
+      - name: Sign and verify Android App Bundle
+        env:
+          MAY_ANDROID_KEYSTORE_BASE64: ${{ secrets.MAY_ANDROID_KEYSTORE_BASE64 }}
+          MAY_ANDROID_STORE_PASSWORD: ${{ secrets.MAY_ANDROID_STORE_PASSWORD }}
+          MAY_ANDROID_KEY_PASSWORD: ${{ secrets.MAY_ANDROID_KEY_PASSWORD }}
+          MAY_ANDROID_KEY_ALIAS: ${{ vars.MAY_ANDROID_KEY_ALIAS }}
+          MAY_ANDROID_CERT_SHA256: ${{ vars.MAY_ANDROID_CERT_SHA256 }}
+        run: python3 -I -S -B tools/may_release/sign.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Seal the signed bundle for one Play Console upload
+        # No secret, no network: rechecks the signer and the bundle's own package
+        # and versionCode, then encrypts it to Samuel's committed key and writes
+        # its SHA-256 and record.
+        env:
+          MAY_SIGN_ONLY: ${{ github.event.inputs.sign_only }}
+          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: python3 -I -S -B tools/may_release/sign_only.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Publish the sealed signed bundle for 3 days
+        id: signed_artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-signed-android-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-signed/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Fail unless the signed bundle was published, not uploaded
+        # Loud failure, like the upload check: unless the run was cancelled, even
+        # after an earlier failure, this fails the job unless the publish step
+        # succeeded and the record matches the signed bundle and the published
+        # file. It reports "signed, not uploaded".
+        if: ${{ !cancelled() }}
+        env:
+          MAY_PUBLISH_OUTCOME: ${{ steps.signed_artifact.outcome }}
+        run: python3 -I -S -B tools/may_release/confirm_upload.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --sign-only
+      - name: Remove task-owned bundle, keys and logs
+        if: always()
+        run: python3 -I -S -B tools/may_release/cleanup.py release
   ios-build:
-    # Inert in stage 2: tools/release/ios.sh does not exist in may-app yet.
+    # Inert in stage 3: tools/release/ios.sh does not exist in may-app yet.
     needs: admission
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
     runs-on: macos-15
@@ -246,7 +354,7 @@ jobs:
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py build
   ios-release:
-    # Inert in stage 2, like ios-build.
+    # Inert in stage 3, like ios-build.
     needs: [admission, ios-build]
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
     runs-on: macos-15

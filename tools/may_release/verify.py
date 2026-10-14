@@ -205,6 +205,165 @@ def aab_signer_sha256(path):
     return hashlib.sha256(sole_signer_certificate(block)).hexdigest()
 
 
+# The bundle's own manifest, which bundletool turns into every APK's: aapt2's
+# protobuf XmlNode (frameworks/base/tools/aapt2/Resources.proto). Only what the
+# release side must verify is decoded: the root <manifest> element's `package`
+# and android:versionCode. Field numbers used:
+#   XmlNode:      element = 1
+#   XmlElement:   name = 3, attribute = 4 (repeated)
+#   XmlAttribute: namespace_uri = 1, name = 2, value = 3, source = 4,
+#                 resource_id = 5, compiled_item = 6
+#   Item:         prim = 7, str = 2;  Primitive: int_decimal_value = 6
+# bundletool reads the version code as the first attribute whose resource ID is
+# android:versionCode's (0x0101021b), whatever its name, from its compiled
+# primitive, and the package from the compiled string when there is one. So the
+# identity read here must be the only reading possible: exactly one attribute
+# carries that ID, and it is android:versionCode with exactly one compiled
+# primitive; nothing carries versionCodeMajor's ID or name; `package` has no
+# compiled item or resource ID (aapt2 writes it as a plain string). A uint32 or
+# int32 field wider than its width is refused, never truncated: protobuf parsers
+# keep only the low bits, so a wider value would read differently there.
+MANIFEST_ENTRY = "base/manifest/AndroidManifest.xml"
+ANDROID_NS = "http://schemas.android.com/apk/res/android"
+MAX_MANIFEST_BYTES = 4 << 20
+# A real manifest's message has tens of fields; a pathological one is refused at once.
+MAX_PROTO_FIELDS = 10_000
+VERSION_CODE_ID = 0x0101021B
+VERSION_CODE_MAJOR_ID = 0x01010576
+
+
+def _varint(data, offset):
+    value = shift = 0
+    for _ in range(10):
+        if offset >= len(data):
+            raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, offset
+    raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+
+
+def _fields(data):
+    """[(field number, wire type, value)] of one protobuf message; groups and bad lengths refused."""
+    found, offset = [], 0
+    while offset < len(data):
+        key, offset = _varint(data, offset)
+        number, wire = key >> 3, key & 7
+        if number == 0:
+            raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+        if wire == 0:
+            value, offset = _varint(data, offset)
+        elif wire == 2:
+            size, offset = _varint(data, offset)
+            if offset + size > len(data):
+                raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+            value, offset = data[offset:offset + size], offset + size
+        elif wire in (1, 5):
+            width = 8 if wire == 1 else 4
+            if offset + width > len(data):
+                raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+            value, offset = data[offset:offset + width], offset + width
+        else:
+            raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+        found.append((number, wire, value))
+        if len(found) > MAX_PROTO_FIELDS:
+            raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+    return found
+
+
+def _one(fields, number, wire, required=True):
+    """The single value of a non-repeated field; a repeated or mistyped one is refused, never last-wins."""
+    values = [v for n, w, v in fields if n == number]
+    if len(values) > 1 or any(w != wire for n, w, _ in fields if n == number) or (required and not values):
+        raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+    return values[0] if values else None
+
+
+def _text(fields, number):
+    value = _one(fields, number, 2, required=False)
+    try:
+        return "" if value is None else value.decode("utf-8")
+    except UnicodeDecodeError:
+        raise VerifyError("Bundle manifest is not a readable aapt2 manifest") from None
+
+
+def manifest_identity(data):
+    """(package, versionCode as a decimal string) from a bundle's proto AndroidManifest.xml.
+
+    Refused unless the root is one <manifest> element with exactly one `package`
+    and exactly one android:versionCode whose string value and compiled integer
+    agree, and no android:versionCodeMajor (which would change the effective
+    version code).
+    """
+    element = _fields(_one(_fields(data), 1, 2))
+    if _text(element, 3) != "manifest":
+        raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+    packages, versions = [], []
+    for number, wire, raw in element:
+        if number != 4:
+            continue
+        if wire != 2:
+            raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
+        attribute = _fields(raw)
+        namespace, name = _text(attribute, 1), _text(attribute, 2)
+        resource_id = _one(attribute, 5, 0, required=False)
+        if resource_id is not None and resource_id > 0xFFFFFFFF:
+            # A uint32 field: protobuf parsers keep only its low 32 bits, and aapt2 never writes wider.
+            raise VerifyError("Bundle manifest resource ID is wider than 32 bits")
+        if resource_id == VERSION_CODE_MAJOR_ID or name == "versionCodeMajor":
+            raise VerifyError("Bundle manifest sets versionCodeMajor")
+        if (resource_id == VERSION_CODE_ID) != ((namespace, name) == (ANDROID_NS, "versionCode")):
+            raise VerifyError("Bundle manifest versionCode is not exactly android:versionCode")
+        if (namespace, name) == ("", "package"):
+            if resource_id is not None or _one(attribute, 6, 2, required=False) is not None:
+                raise VerifyError("Bundle manifest package is not a plain string")
+            packages.append(_text(attribute, 3))
+        elif resource_id == VERSION_CODE_ID:
+            text = _text(attribute, 3)
+            item = _fields(_one(attribute, 6, 2))
+            primitive = _fields(_one(item, 7, 2))
+            compiled = _one(primitive, 6, 0)
+            if compiled > 0x7FFFFFFF:
+                # An int32 field: a wider varint (or a negative value) would not read back as this number.
+                raise VerifyError("Bundle manifest versionCode is malformed")
+            if len(item) != 1 or len(primitive) != 1 or not re.fullmatch(r"[1-9][0-9]{0,9}", text) or \
+                    int(text) != compiled:
+                raise VerifyError("Bundle manifest versionCode is malformed")
+            versions.append(text)
+    if len(packages) != 1 or len(versions) != 1 or not re.fullmatch(r"[A-Za-z][\w]*(\.[A-Za-z][\w]*)+", packages[0]):
+        raise VerifyError("Bundle manifest must name exactly one package and one versionCode")
+    return packages[0], versions[0]
+
+
+def aab_identity(path):
+    """(package, versionCode) of an Android App Bundle, read from its base module manifest."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)) or names.count(MANIFEST_ENTRY) != 1:
+                raise VerifyError("Bundle must carry exactly one base manifest")
+            info = archive.getinfo(MANIFEST_ENTRY)
+            if info.file_size > MAX_MANIFEST_BYTES:
+                raise VerifyError("Bundle manifest is too large")
+            data = archive.read(MANIFEST_ENTRY)
+    except (zipfile.BadZipFile, KeyError, OSError):
+        raise VerifyError("Bundle is not a readable zip archive") from None
+    return manifest_identity(data)
+
+
+def check_aab_identity(path, package, build_number):
+    """Refuse a bundle whose own manifest is not exactly this app (package) at this build (versionCode)."""
+    found_package, found_version = aab_identity(path)
+    if found_package != package:
+        raise VerifyError("Bundle package is not this target's app")
+    if found_version != build_number:
+        raise VerifyError("Bundle versionCode is not the requested build number")
+    return found_package, found_version
+
+
 def profile_plist(blob):
     content = signed_data(blob)["content"]
     if not content:
