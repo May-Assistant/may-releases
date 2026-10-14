@@ -309,6 +309,9 @@ class AabManifestTests(unittest.TestCase):
                 "wide compiled": self.crafted(self.PACKAGE, version(item=fx._field(7, fx._field(6, (1 << 32) | 3)))),
                 "negative compiled": self.crafted(self.PACKAGE, version(
                     item=fx._field(7, fx._field(6, (1 << 64) - 3)))),
+                # String and compiled agree, but an int32 reader keeps the low 32 bits: 3.
+                "agreeing but wide": self.crafted(self.PACKAGE, version(str((1 << 32) | 3).encode())),
+                "just past int32": self.crafted(self.PACKAGE, version(b"2147483648")),
             },
         }
         for message, manifests in cases.items():
