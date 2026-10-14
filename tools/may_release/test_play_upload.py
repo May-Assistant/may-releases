@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -7,13 +8,14 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import traceback
 import unittest
 from unittest.mock import patch
 import urllib.error
 from urllib.parse import parse_qs
 
 import play_upload
-from play_upload import PlayRefusal, PlaySession, access_token, upload
+from play_upload import PlayRefusal, PlaySession, PlayStatusError, access_token, upload
 from store import StoreError
 
 HAS_OPENSSL = os.path.exists(play_upload.OPENSSL)
@@ -23,6 +25,10 @@ CREDENTIAL = json.dumps({"type": "service_account", "project_id": "may-assistant
                          "client_email": ACCOUNT, "private_key": "dummy"})
 BUNDLE = b"fixture signed bundle"
 PLAYGROUND = "io.github.mayassistant.may.playground"
+# Planted in every part of a fake Play error (body, reason, header, URL) and in
+# the bearer token: none of it may reach any output or exception text.
+SECRET = "MAY-PLANTED-SECRET-7f3c9a"
+TOKEN = "ya29." + SECRET + "-bearer"
 
 
 class Response:
@@ -201,6 +207,66 @@ class PlayUploadTests(unittest.TestCase):
             with self.assertRaises(StoreError):
                 upload("playground", "a" * 40, "9", session)
             self.assertFalse((Path(self.directory.name) / "may-release/upload-record.json").exists())
+
+    def run_cli(self, failure):
+        """Run play_upload's CLI against Play answering the tracks read with `failure`.
+
+        Returns (exit message, every printed line, the full formatted exit).
+        """
+        opener = Opener([Reply(200, b'{"id": "edit-1"}'), failure, Reply(204, b"")])
+        with patch("play_upload.access_token", return_value=TOKEN), \
+                patch("play_upload.PlaySession", lambda token: PlaySession(token, opener)), \
+                patch("sys.stdout", new_callable=io.StringIO) as output, \
+                patch("sys.stderr", new_callable=io.StringIO) as errors, \
+                self.assertRaises(SystemExit) as stopped:
+            play_upload.main(["--target", "playground", "--source-sha", "a" * 40, "--build-number", "9"])
+        self.assertEqual([request.get_method() for request in opener.requests], ["POST", "GET", "DELETE"])
+        exit_text = "".join(traceback.format_exception(stopped.exception))
+        return stopped.exception.code, output.getvalue() + errors.getvalue(), exit_text
+
+    def assertNoSecret(self, *texts):
+        for text in texts:
+            self.assertNotIn(SECRET, text)
+
+    def play_error(self, status):
+        return urllib.error.HTTPError(
+            "https://androidpublisher.googleapis.com/x?access_token=" + SECRET, status, "Denied " + SECRET,
+            {"X-Debug": SECRET}, io.BytesIO(b'{"error": {"status": "SERVICE_DISABLED", "detail": "' +
+                                            SECRET.encode() + b'"}}'))
+
+    def test_each_play_http_status_is_named_and_the_body_is_never_printed(self):
+        for status in (400, 401, 403, 404, 500):
+            with self.subTest(status=status):
+                message, printed, exit_text = self.run_cli(self.play_error(status))
+                self.assertEqual(message, "May Play upload stopped: Google Play request was rejected or uncertain "
+                                          f"(HTTP {status}); inspect the store before any retry")
+                self.assertNoSecret(message, printed, exit_text)
+                # The StoreError itself: the code alone, still a StoreError, never a refusal.
+                opener = Opener([Reply(200, b'{"id": "edit-1"}'), self.play_error(status), Reply(204, b"")])
+                with self.assertRaises(StoreError) as raised:
+                    upload("playground", "a" * 40, "9", PlaySession(TOKEN, opener))
+                self.assertNotIsInstance(raised.exception, PlayRefusal)
+                self.assertEqual(raised.exception.args, (
+                    f"Google Play request was rejected or uncertain (HTTP {status})",))
+                self.assertNoSecret(str(raised.exception), repr(raised.exception),
+                                    "".join(traceback.format_exception(raised.exception)))
+
+    def test_network_failure_says_no_http_status(self):
+        for failure in (urllib.error.URLError("unreachable " + SECRET), TimeoutError(SECRET), OSError(SECRET),
+                        http.client.BadStatusLine(SECRET), http.client.RemoteDisconnected(SECRET),
+                        http.client.IncompleteRead(SECRET.encode())):
+            with self.subTest(failure=type(failure).__name__):
+                message, printed, exit_text = self.run_cli(failure)
+                self.assertEqual(message, "May Play upload stopped: Google Play request was rejected or uncertain "
+                                          "(no HTTP status); inspect the store before any retry")
+                self.assertNoSecret(message, printed, exit_text)
+
+    def test_status_message_carries_only_an_integer_status(self):
+        self.assertEqual(PlayStatusError(403).args, ("Google Play request was rejected or uncertain (HTTP 403)",))
+        for status in (None, "403", "403 " + SECRET, True, 403.0, 99, 1000, -1):
+            with self.subTest(status=status):
+                self.assertEqual(PlayStatusError(status).args,
+                                 ("Google Play request was rejected or uncertain (no HTTP status)",))
 
     def test_upload_step_refuses_signing_secrets(self):
         session = Session()

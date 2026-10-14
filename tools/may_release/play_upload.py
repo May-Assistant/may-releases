@@ -32,6 +32,13 @@ Any failure deletes the edit. A failed or uncertain commit is never retried
 automatically; inspect Play before retry. The caller must already hold
 Samuel's protected-environment approval.
 
+Failure messages are fixed literals. The one exception is a non-2xx reply,
+whose message carries Play's numeric HTTP status and nothing else (for example
+"(HTTP 403)"), so a disabled API, a bad credential and a missing app can be
+told apart in the public log. Error bodies are still discarded unread; no body,
+header or URL is ever printed. A network error or timeout has no status and
+says "(no HTTP status)".
+
 No third-party code: this runs in the release job, where only this repository's
 Python, the system openssl and pinned tools run. The OAuth service-account
 grant is built here (RS256 JWT signed by /usr/bin/openssl, exchanged once at
@@ -43,6 +50,7 @@ host. A 401 fails the run and deletes the edit.
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -75,6 +83,25 @@ class PlayRefusal(StoreError):
     """A deliberate refusal before any change. Its message is a fixed literal."""
 
 
+# Play answered with a non-2xx HTTP status: rejected, or an uncertain outcome.
+# The message is a fixed literal plus the numeric status alone, and only when the
+# status is an int in 100..999 (http.client's own range for a status line);
+# anything else reads "no HTTP status". Only `<response>.status_code` is passed
+# in, and send() discards the error body unread, so no body, header or URL can
+# reach the message. This is the one printed error whose message is not a single
+# literal, so static_check.py pins this whole class (STATUS_ERROR_SOURCE): any
+# edit to it fails the check until that pinned copy is updated in the same
+# reviewed change.
+class PlayStatusError(StoreError):
+    """A non-2xx Play reply; the message names its numeric HTTP status and nothing else."""
+
+    def __init__(self, status):
+        if type(status) is int and 100 <= status <= 999:
+            super().__init__("Google Play request was rejected or uncertain (HTTP " + str(status) + ")")
+        else:
+            super().__init__("Google Play request was rejected or uncertain (no HTTP status)")
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None  # A redirect becomes an HTTP error; the token never leaves Google's hosts.
@@ -98,8 +125,9 @@ def send(opener, request, timeout):
     except urllib.error.HTTPError as error:
         error.close()
         return Response(error.code, b"")  # Provider error bodies are discarded unread.
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise StoreError("Google Play request was rejected or uncertain") from None
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
+        # No usable status (network, timeout, or a malformed or cut-off HTTP reply); nothing is read.
+        raise StoreError("Google Play request was rejected or uncertain (no HTTP status)") from None
 
 
 def b64url(data):
@@ -174,7 +202,7 @@ class PlaySession:
 
 def checked_json(response):
     if not 200 <= response.status_code < 300:
-        raise StoreError("Google Play request was rejected or uncertain")
+        raise PlayStatusError(response.status_code)  # The numeric status only; the body was never read.
     try:
         body = response.json()
     except (ValueError, TypeError):
@@ -273,12 +301,12 @@ def upload(target, source_sha, build_number, session=None):
     print("\n".join(report + ["Verify processing in Play Console separately."]))
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", choices=("production", "playground"), required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--build-number", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         upload(args.target, args.source_sha, args.build_number)
     except PlayRefusal as refusal:
@@ -289,3 +317,7 @@ if __name__ == "__main__":
     except Exception:
         # Provider/client exceptions can contain private response bodies or IDs.
         raise SystemExit("May Play upload failed or is uncertain; inspect the store before any retry") from None
+
+
+if __name__ == "__main__":
+    main()
