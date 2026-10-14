@@ -221,6 +221,7 @@ The gate denies a target whose committed key is missing, a placeholder or malfor
   - The RS256 service-account assertion goes once to `https://oauth2.googleapis.com/token`.
   - Requests are allowed only to the Play Developer API host, and redirects are refused.
   - **Nothing is retried**: no refresh-and-resend on 401 for the upload or the commit. A 401 fails the run and deletes the edit.
+  - **A refusal names Play's HTTP status, and nothing else.** A non-2xx reply stops the run with, for example, `May Play upload stopped: Google Play request was rejected or uncertain (HTTP 403); inspect the store before any retry`. A network error or timeout says `(no HTTP status)`. The error body is discarded unread, and no header, URL or token is printed. As a rough guide: 400, a request Play would not accept; 401, a credential problem; 403, a missing permission or a disabled API (see [Before the first real upload](#before-the-first-real-upload)); 404, the wrong package or an app Play does not know.
 - **Build numbers** above 2,000,000,000 are refused everywhere.
 
 **Pinned toolchain** (`toolchain.py`; `actions/setup-java` is not used because it does not verify its download). The JDK is pinned for linux x64 only, so every Android job, including the native compile, runs on `ubuntu-24.04`; `static_check.py` refuses the JDK on macOS:
@@ -279,6 +280,8 @@ The iOS jobs and the iOS upload stay inert until `ios.sh` exists and a macOS reh
 - **Never print the value**: no `cat`, no paste into a terminal, chat, issue or log.
 - Also confirm the variable `MAY_PLAY_ACCOUNT` is set to that address in the same environment.
 
+**Before the first automated upload for any new Play app, confirm that `androidpublisher.googleapis.com` (the Google Play Android Developer API) is enabled on the Cloud project that owns the service account** (`may-assistant-app`). Play Console does not show it, and manual Console uploads never need it, so nothing reveals it is off until the first API upload. The first real upload, run [38592266470](https://github.com/May-Assistant/may-releases/actions/runs/38592266470), failed with a 403 `SERVICE_DISABLED` for exactly this reason.
+
 ### The first real dispatch
 
 | Input | Value |
@@ -324,4 +327,4 @@ The Play client, keychain, export and upload paths have unit tests, but the Play
 
 No May backend deployment should be inferred from a mobile compile. Model-spend limits and default-off voice activation are separate staging admission gates.
 
-Public GitHub Actions logs are visible to everyone. Every failure path prints only fixed, nonsensitive messages (`static_check.py` checks that printed error messages are string literals). See [GitHub's environment availability rules](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) for why the control repository is public while the app repositories remain private.
+Public GitHub Actions logs are visible to everyone. Every failure path prints only fixed, nonsensitive messages (`static_check.py` checks that printed error messages are string literals). The one exception is `play_upload.PlayStatusError`, which adds Play's numeric HTTP status: `static_check.py` allows it only in `play_upload.py`, only with `<response>.status_code`, and only with a message built from literals and that number. See [GitHub's environment availability rules](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) for why the control repository is public while the app repositories remain private.

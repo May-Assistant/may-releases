@@ -258,6 +258,22 @@ class StaticCheckTests(unittest.TestCase):
              'raise HandoffError(str(names))'),
             ("tools/may_release/handoff.py", 'raise StoreError("Re-run all jobs: this release only accepts a build from the same run attempt")',
              'raise StoreError'),
+            # PlayStatusError may carry only <response>.status_code, only in play_upload.py, and builds
+            # its message only from literals and str() of a name.
+            ("tools/may_release/play_upload.py", "raise PlayStatusError(response.status_code)",
+             "raise PlayStatusError(response.body)"),
+            ("tools/may_release/play_upload.py", "raise PlayStatusError(response.status_code)",
+             "raise PlayStatusError(str(response.json()))"),
+            ("tools/may_release/play_upload.py", "raise PlayStatusError(response.status_code)",
+             "raise PlayStatusError(response.status_code, response.body)"),
+            ("tools/may_release/play_upload.py", '"Google Play request was rejected or uncertain (HTTP " + str(status) + ")"',
+             'f"Google Play request was rejected or uncertain (HTTP {status})"'),
+            ("tools/may_release/play_upload.py", '"Google Play request was rejected or uncertain (HTTP " + str(status) + ")"',
+             '"Google Play request was rejected or uncertain (HTTP " + str(status) + ") " + repr(self)'),
+            ("tools/may_release/play_upload.py", '"Google Play request was rejected or uncertain (no HTTP status)")\n',
+             '"Google Play request was rejected or uncertain: " + str(status.body))\n'),
+            ("tools/may_release/handoff.py", 'raise StoreError("Build handoff contents are unexpected")',
+             'raise PlayStatusError(reply.status_code)'),
         )
         for path, old, new in cases:
             with self.subTest(new=new):

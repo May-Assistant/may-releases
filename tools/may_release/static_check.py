@@ -20,6 +20,13 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError"}
+# The one printed error whose message is not a single literal: Play's numeric
+# HTTP status, so that a 403 can be told from a 401 or a 404 in the public log.
+# It is allowed only in play_upload.py, called with exactly one argument,
+# `<response>.status_code`, and its own message is built only from string
+# literals joined by + and str() of a name (the class checks that the name is an
+# int status). No body, header or URL can reach it.
+STATUS_ERRORS = {"PlayStatusError"}
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 UPLOAD_ARTIFACT = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 DOWNLOAD_ARTIFACT = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
@@ -529,17 +536,42 @@ def called_name(func):
     return None
 
 
+def one_literal(call):
+    return not call.keywords and len(call.args) == 1 and \
+        isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+
+
+def status_message(node):
+    """String literals joined by +, with str(<name>): the only form a STATUS_ERRORS message takes."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return status_message(node.left) and status_message(node.right)
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str" and \
+        not node.keywords and len(node.args) == 1 and isinstance(node.args[0], ast.Name)
+
+
 def message_problems(root):
     found = []
     trees = {path: ast.parse(path.read_text(), str(path))
              for path in sorted((root / "tools/may_release").glob("*.py")) if not path.name.startswith("test_")}
     printed = printed_error_classes(trees)
     for path, tree in trees.items():
+        status_allowed = path.name == "play_upload.py"
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and called_name(node.func) in printed:
-                if node.keywords or len(node.args) != 1 or not (
-                        isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+            if isinstance(node, ast.Call) and called_name(node.func) in printed and not one_literal(node):
+                if not (status_allowed and called_name(node.func) in STATUS_ERRORS and not node.keywords and
+                        len(node.args) == 1 and isinstance(node.args[0], ast.Attribute) and
+                        node.args[0].attr == "status_code"):
                     found.append(f"{path.name}:{node.lineno}: printed error message is not one string literal")
+            if isinstance(node, ast.ClassDef) and node.name in printed:
+                # A printed error's own constructor sets its message too.
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and called_name(call.func) == "__init__" and \
+                            not one_literal(call) and not (
+                                status_allowed and node.name in STATUS_ERRORS and not call.keywords and
+                                len(call.args) == 1 and status_message(call.args[0])):
+                        found.append(f"{path.name}:{call.lineno}: printed error message is not one string literal")
             if isinstance(node, ast.Raise) and node.exc is not None and not isinstance(node.exc, ast.Call) \
                     and called_name(node.exc) in printed:
                 found.append(f"{path.name}:{node.lineno}: printed error raised without a message")
