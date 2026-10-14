@@ -138,9 +138,9 @@ class DryRunWorkflowTests(unittest.TestCase):
                 self.assertEqual(result, "success")
                 for step in ("Sign and verify Android App Bundle", static_check.REPORT, static_check.SEAL_SIGNED,
                              static_check.PUBLISH_SIGNED, static_check.CONFIRM_SIGNED):
-                    self.assertEqual(outcomes[step], "success")
-                self.assertEqual(outcomes["Upload update to the internal track only"], "skipped")
-                self.assertEqual(outcomes[static_check.CONFIRM], "skipped")
+                    self.assertEqual(outcomes.get(step), "success")
+                self.assertEqual(outcomes.get("Upload update to the internal track only"), "skipped")
+                self.assertEqual(outcomes.get(static_check.CONFIRM), "skipped")
         # iOS has no sign-only steps at all.
         self.assertFalse(set(run_job("ios-release", "true", sign_only_input="true")[1]) &
                          {static_check.SEAL_SIGNED, static_check.PUBLISH_SIGNED, static_check.CONFIRM_SIGNED})
@@ -150,7 +150,7 @@ class DryRunWorkflowTests(unittest.TestCase):
             with self.subTest(publish=publish):
                 result, outcomes = run_job("android-release", "true", sign_only_input="true", publish_outcome=publish)
                 self.assertEqual(result, "failure")
-                self.assertEqual(outcomes[static_check.CONFIRM_SIGNED], "failure")
+                self.assertEqual(outcomes.get(static_check.CONFIRM_SIGNED), "failure")
         # The seal step failed, so the publish step was skipped: the check still runs and fails the job.
         broken = STORE.read_text()
         _, steps = static_check.job_steps(broken, "android-release")

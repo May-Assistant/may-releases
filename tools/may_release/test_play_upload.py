@@ -226,9 +226,14 @@ class PlayUploadTests(unittest.TestCase):
         env, keys = self.production()
         session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["2"], "status": "completed"}]}],
                           uploaded={"versionCode": 3, "sha256": hashlib.sha256(BUNDLE).hexdigest()})
-        with env, keys, patch("sys.stdout", new_callable=io.StringIO) as output:
+        with env, keys, patch("sys.stdout", new_callable=io.StringIO) as output, \
+                patch("play_upload.require_internal_release", wraps=require_internal_release) as track_guard, \
+                patch("play_upload.require_commit", wraps=require_commit) as commit_guard:
             upload("production", "a" * 40, "3", session)
         self.assertEqual(session.methods(), ["POST", "GET", "POST", "PUT", "POST"])
+        # Both writes went through their guards, with exactly what was sent.
+        self.assertEqual(track_guard.call_args[0][:2], (session.calls[3][1], session.calls[3][2]))
+        self.assertEqual(commit_guard.call_args[0][0], session.calls[4][1])
         # Every request names exactly the May package, never May Playground's.
         self.assertTrue(all("/" + PRODUCTION + "/edits" in call[1] for call in session.calls))
         self.assertFalse(any(PLAYGROUND in call[1] for call in session.calls))

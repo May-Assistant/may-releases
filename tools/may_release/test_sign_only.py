@@ -96,9 +96,14 @@ class SignOnlyTests(unittest.TestCase):
         self.assertFalse((self.root / "may-private/sign-only-check.key").exists())
 
     def assertRefused(self, message, **kwargs):
-        with self.assertRaises(StoreError) as refused:
+        """The seal refuses with exactly `message` and publishes nothing (any other outcome fails the test)."""
+        try:
             self.seal(**kwargs)
-        self.assertEqual(refused.exception.args[0], message)
+            raised = None
+        except Exception as error:  # an assertion, not an error, whatever a broken seal does
+            raised = error
+        self.assertIsInstance(raised, StoreError)
+        self.assertEqual(raised.args[0], message)
         self.assertFalse((self.root / SIGN_ONLY_DIR).exists())
 
     def test_refuses_unless_sign_only_is_exactly_true(self):
@@ -148,8 +153,14 @@ class SignOnlyTests(unittest.TestCase):
 
     def test_refuses_an_existing_folder_and_any_secret(self):
         (self.root / SIGN_ONLY_DIR).mkdir()
-        with self.assertRaises(StoreError):
+        try:
             self.seal()
+            raised = None
+        except Exception as error:
+            raised = error
+        self.assertIsInstance(raised, StoreError)
+        self.assertEqual(raised.args[0], "The sign-only folder already exists; nothing was published")
+        self.assertEqual(list((self.root / SIGN_ONLY_DIR).iterdir()), [])
         (self.root / SIGN_ONLY_DIR).rmdir()
         for name in SECRET_NAMES:
             with self.subTest(name=name), patch.dict(os.environ, {name: "present"}):
