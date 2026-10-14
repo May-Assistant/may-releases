@@ -1,4 +1,10 @@
-name: May protected store release (inactive draft)
+name: May protected store release (stage 1, Android dry runs only)
+# Activation stage 1: an Android dry run can be dispatched. Store uploads (both
+# platforms) and every iOS job are still inert: they require an event name this
+# workflow never registers, so they are always skipped. Stage 2 is a separate
+# reviewed change that removes that guard from the Android upload step, after a
+# successful Android dry run and Samuel's go. static_check.py pins exactly where
+# the guard must and must not be for this stage.
 # Each run is two jobs on separate fresh VMs:
 #   *-build    environment may-native-compile (read-only source keys only). Runs
 #              the private build (Gradle / Xcode / SwiftPM: third-party code) and
@@ -13,8 +19,9 @@ name: May protected store release (inactive draft)
 #   ios/production     -> may-ios-internal                 (May, ASC 6821782401)
 #   ios/playground     -> may-ios-playground-internal      (May Playground, ASC 6822072535)
 # dry_run (default true) runs build, seal, open, sign and verify, skips every store
-# upload step, and reports what it would have uploaded. A real upload needs
-# dry_run: false, chosen explicitly at dispatch.
+# upload step, and reports what it would have uploaded. A real upload will need
+# dry_run: false, chosen explicitly at dispatch, once stage 2 lands. In stage 1,
+# dry_run: false signs and verifies, then skips both the upload and the report.
 on:
   workflow_dispatch:
     inputs:
@@ -48,9 +55,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   admission:
-    # A later reviewed change must enable this job after all environments,
-    # artifact keys, signing credentials and store identities have been verified.
-    if: ${{ github.event_name == 'may-store-disabled-pending-review' }}
+    # Active (stage 1). Runs for every dispatch and checks both environments the
+    # run will use; an iOS dispatch then stops here, because the iOS jobs are inert.
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -72,7 +78,7 @@ jobs:
         run: python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
   android-build:
     needs: admission
-    if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'android' }}
+    if: ${{ inputs.platform == 'android' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.build_environment }}
     timeout-minutes: 90
@@ -117,7 +123,7 @@ jobs:
         run: python3 -I -S -B tools/may_release/cleanup.py build
   android-release:
     needs: [admission, android-build]
-    if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'android' }}
+    if: ${{ inputs.platform == 'android' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 30
@@ -166,10 +172,12 @@ jobs:
       - name: Check the checkout is exactly its commit before uploading
         run: python3 -I -S -B tools/may_release/integrity.py
       - name: Upload update to the internal track only
-        # github.event.inputs holds the boolean as a string, and == ignores case,
-        # so this runs on any casing of 'false'; a missing value never does. The
-        # script then refuses everything but the exact string false.
-        if: ${{ github.event.inputs.dry_run == 'false' }}
+        # Stage 1: held inert by the never-matching event guard, so this never runs,
+        # even when dry_run is false. Stage 2 removes only that guard, leaving the
+        # dry-run condition: github.event.inputs holds the boolean as a string, and
+        # == ignores case, so it runs on any casing of 'false'; a missing value
+        # never does. The script then refuses everything but the exact string false.
+        if: ${{ github.event_name == 'may-store-disabled-pending-review' && github.event.inputs.dry_run == 'false' }}
         env:
           MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
           MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}
@@ -182,6 +190,7 @@ jobs:
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py release
   ios-build:
+    # Inert in stage 1: tools/release/ios.sh does not exist in may-app yet.
     needs: admission
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
     runs-on: macos-15
@@ -225,6 +234,7 @@ jobs:
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py build
   ios-release:
+    # Inert in stage 1, like ios-build.
     needs: [admission, ios-build]
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
     runs-on: macos-15
@@ -271,10 +281,12 @@ jobs:
       - name: Check the checkout is exactly its commit before uploading
         run: python3 -I -S -B tools/may_release/integrity.py
       - name: Upload verified IPA for internal TestFlight
+        # Held inert by the never-matching event guard (as is this whole job), so it
+        # never runs. Once the guard is removed, the dry-run condition remains:
         # github.event.inputs holds the boolean as a string, and == ignores case,
-        # so this runs on any casing of 'false'; a missing value never does. The
+        # so it runs on any casing of 'false'; a missing value never does. The
         # script then refuses everything but the exact string false.
-        if: ${{ github.event.inputs.dry_run == 'false' }}
+        if: ${{ github.event_name == 'may-store-disabled-pending-review' && github.event.inputs.dry_run == 'false' }}
         env:
           MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
           MAY_ASC_KEY_BASE64: ${{ secrets.MAY_ASC_KEY_BASE64 }}
