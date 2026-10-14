@@ -155,6 +155,48 @@ def stage_problems(store):
     return found
 
 
+# Every code line of the store workflow is in this repository's plain block layout,
+# so the line-based rules here read what GitHub's YAML parser reads: no quoted,
+# spaced or explicit (`?`) keys, no anchors, aliases, tags or merge keys, no tabs,
+# no multi-line quoted, plain or flow values (block scalars only after `key: |`).
+LAYOUT_LINE = re.compile(r"( *)(- )?([A-Za-z][\w-]*):(?: (.*))?")
+LAYOUT_VALUE = re.compile(r"""[^\s&*!{}?|>%@`'"\[\]#,][^#]*|'(?:[^']|'')*'|\[[^\[\]{}'"#]*\]|[|>]-?""")
+ADMISSION_ENV = [("GH_TOKEN", "${{ github.token }}"), ("MAY_PLATFORM", "${{ inputs.platform }}"),
+                 ("MAY_TARGET", "${{ inputs.target }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
+                 ("MAY_BUILD_NUMBER", "${{ inputs.build_number }}"), ("MAY_DRY_RUN", DRY_RUN_ENV)]
+ADMISSION_OUTPUTS = ("    outputs:\n      environment: ${{ steps.gate.outputs.environment }}\n"
+                     "      build_environment: ${{ steps.gate.outputs.build_environment }}\n")
+
+
+def layout_problems(store):
+    found, block = [], None
+    for number, line in enumerate(store.splitlines(), 1):
+        indent = len(line) - len(line.lstrip(" "))
+        if block is not None and (not line.strip() or indent > block):
+            continue
+        block = None
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        match = LAYOUT_LINE.fullmatch(line)
+        value = re.sub(r"(^|\s)#.*$", "", (match.group(4) or "") if match else "").strip()
+        if "\t" in line or not match or (value and not LAYOUT_VALUE.fullmatch(value)):
+            found.append(f"store-release-draft.yml:{number}: is not a plain one-line `key: value` in this repository's layout")
+            continue
+        if value[:1] in ("|", ">"):
+            block = len(match.group(1)) + (2 if match.group(2) else 0)
+    if re.findall(r"(?m)^([\w-]+):", store) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append("store-release-draft.yml: top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    if re.findall(r"(?m)^  ([\w-]+):", store.partition("\non:\n")[2].partition("\npermissions:")[0]) != ["workflow_dispatch"]:
+        found.append("store-release-draft.yml: is triggered by something other than workflow_dispatch")
+    if re.findall(r"(?m)^  ([\w-]+):", store.partition("\njobs:\n")[2]) != list(STORE_JOB_IF):
+        found.append(f"store-release-draft.yml: jobs are not exactly the ones {STAGE} pins")
+    admission = job_text(store, "admission")
+    if uses_in(admission) != [CHECKOUT] or env_entries(admission) != ADMISSION_ENV or \
+            ADMISSION_OUTPUTS not in admission or admission.count("      - id: gate\n") != 1:
+        found.append("store admission: its actions, env or outputs are not exactly the gate's")
+    return found
+
+
 def secrets_in(text):
     return set(re.findall(r"secrets\.([A-Z0-9_]+)", text))
 
@@ -250,6 +292,7 @@ def workflow_problems(root):
 def store_problems(store):
     found = []
     found += stage_problems(store)
+    found += layout_problems(store)
     if store.count("Recheck protected destination after Samuel's review") != 2 or \
             store.count("Recheck build environment after Samuel's review") != 2:
         found.append("store-release-draft.yml does not recheck after review")

@@ -135,7 +135,7 @@ Samuel's decision (2026-10-14): relax the design-system pin match for internal b
 `store-release-draft.yml` has a `dry_run` boolean input, **default `true`**, so a real upload is always an explicit choice at dispatch.
 
 - A dry run still builds, seals, opens, signs and verifies.
-- It skips both store upload steps (`play_upload.py`, `ios_upload.py`), so the upload credentials never reach the VM.
+- It skips both store upload steps (`play_upload.py`, `ios_upload.py`), so the upload credentials are never exposed to any step. (The runner still receives a secret the job references if it is set in the environment; see [Prerequisites that remain](#prerequisites-that-remain).)
 - `dry_run.py` reports what would have been uploaded: package or bundle ID, versionCode or build number, track, and the signed artifact's SHA-256. For iOS, it re-verifies the IPA first.
 - Upload steps run only when `github.event.inputs.dry_run == 'false'`. That context holds the boolean as a string, so a missing value never uploads. The comparison ignores case, so any casing of `false` passes it.
 - Each upload script also refuses unless `MAY_DRY_RUN` is exactly `false`.
@@ -269,7 +269,7 @@ It proves, on real infrastructure:
 - signing with the real upload keystore and key, and verification against `MAY_ANDROID_CERT_SHA256`;
 - the report.
 
-It does **not** prove the upload. The Play client has never run against Play. `MAY_PLAY_JSON` never reaches the VM, so the service account, its grants, the edit, the versionCode check against every track, the `sha256` match and the commit are all unexercised. Build number `3` is checked against may-app's floor (`1` for Playground) but not against Play's tracks.
+It does **not** prove the upload. The Play client has never run against Play. The upload step is skipped, so `MAY_PLAY_JSON` is never exposed to any step, and the service account, its grants, the edit, the versionCode check against every track, the `sha256` match and the commit are all unexercised. Build number `3` is checked against may-app's floor (`1` for Playground) but not against Play's tracks.
 
 ### Stage 2: Android uploads
 
@@ -277,19 +277,22 @@ After the dry run passes and Samuel gives the go, a reviewed change removes the 
 
 ### Prerequisites that remain
 
-`gate.py` checks these for **both** `may-native-compile` and `may-android-playground-internal`, before any secret and again after each review. Any one failing denies the run:
+`gate.py` checks these, before any secret and again after each review. Any one failing denies the run. The environment checks apply to **both** `may-native-compile` and `may-android-playground-internal`:
 
 - the environment exists (a 404 denies; it is never auto-created);
 - **administrator bypass is off** (`can_admins_bypass: false`);
 - a **custom** deployment branch policy (not "protected branches") with exactly one rule, `main`;
 - exactly **one required-reviewer rule**, whose **sole** reviewer is Samuel (user ID `58840187`);
+- the self-review setting is readable, and it is not the deadlock case: the gate denies only when *Prevent self-review* is **on and** the sole reviewer (Samuel) dispatched the run, because that run could never be approved. It does not require the setting to be off in general. **In practice it must be off** for this dry run, because Samuel dispatches and approves it himself. That is Samuel's decision for internal builds only (see [Self-review](#environments-and-protection));
 - in stage 1, the dispatch's `dry_run` is `true` (admission only; see above);
-- **Prevent self-review is off** (`prevent_self_review: false`). Samuel dispatches and approves his own run; with it on, the gate denies, because the run could never be approved. This is Samuel's decision for internal builds only (see [Self-review](#environments-and-protection)).
+- the target's **artifact public key is committed** and well-formed: `tools/may_release/artifact_keys/may-android-playground-internal.age.pub` (`age1cv26…sex4n5j`, committed 2026-10-13). A placeholder or malformed key denies before any request. Its private half is that environment's `MAY_ARTIFACT_DECRYPT_KEY`, which `handoff.py open` checks against it.
 
 Also needed for the dry run, which the gate cannot see:
 
 - in `may-native-compile`: `MAY_APP_READ_KEY` and `MAY_DS_READ_KEY` (present);
-- in `may-android-playground-internal`: the secrets `MAY_ARTIFACT_DECRYPT_KEY` (still to be confirmed), `MAY_ANDROID_KEYSTORE_BASE64`, `MAY_ANDROID_STORE_PASSWORD`, `MAY_ANDROID_KEY_PASSWORD`, and the variables `MAY_ANDROID_KEY_ALIAS` and `MAY_ANDROID_CERT_SHA256` (still to be confirmed). `MAY_PLAY_JSON` and `MAY_PLAY_ACCOUNT` are needed only from stage 2.
+- in `may-android-playground-internal`: the secrets `MAY_ARTIFACT_DECRYPT_KEY` (still to be confirmed), `MAY_ANDROID_KEYSTORE_BASE64`, `MAY_ANDROID_STORE_PASSWORD`, `MAY_ANDROID_KEY_PASSWORD`, and the variables `MAY_ANDROID_KEY_ALIAS` and `MAY_ANDROID_CERT_SHA256` (still to be confirmed).
+
+Keep the secret `MAY_PLAY_JSON` and the variable `MAY_PLAY_ACCOUNT` **unset** in `may-android-playground-internal` until stage 2. The release job references `MAY_PLAY_JSON`, so if it is set, the runner receives it with the job even though no step is given it. The secrets table [above](#current-state) lists `MAY_PLAY_JSON` as present on 2026-10-13, so it has to be deleted from that environment before the dry run and set again for stage 2.
 
 The Play client, keychain, export and upload paths have unit tests, but none of them has yet run against a real store.
 
