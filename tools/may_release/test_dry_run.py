@@ -29,12 +29,15 @@ def runs(condition, dry_run_input):
     """Whether a step runs, for the only `if:` forms static_check allows in store jobs.
 
     `dry_run_input` is github.event.inputs.dry_run: the string 'true' or 'false',
-    or None if absent. Expression comparison of strings ignores case.
+    or None if absent. Expression comparison of strings ignores case. The event is
+    always workflow_dispatch, so a condition requiring the inert event never holds.
     """
     if condition in (None, "always()"):
         return True
     value = (dry_run_input or "").lower() if dry_run_input is not None else None
-    if condition == static_check.UPLOAD_IF:
+    if condition == static_check.UPLOAD_IF:  # stage 1: held inert
+        return False
+    if condition == static_check.DRY_RUN_UPLOAD_IF:  # what stage 2 leaves on the Android upload
         return value == "false"
     if condition == static_check.REPORT_IF:
         return value != "false"
@@ -67,9 +70,16 @@ class DryRunWorkflowTests(unittest.TestCase):
                     self.assertIn("Decrypt and check the build handoff", ran)
                     self.assertIn(static_check.REPORT, ran)
             with self.subTest(job=job, value="false"):
+                # Stage 1: admission refuses dry_run: false before these jobs start
+                # (gate.UPLOADS_HELD, test_gate). Even past it, the held upload never runs.
                 ran = steps_that_run(job, "false")
-                self.assertIn(upload, ran)
+                self.assertNotIn(upload, ran)
+                self.assertIn(sign, ran)
                 self.assertNotIn(static_check.REPORT, ran)
+        # Once only the guard is removed (stage 2), the dry-run condition alone decides.
+        for value, uploads in (("false", True), ("FALSE", True), ("true", False), (None, False), ("", False)):
+            with self.subTest(stage=2, value=value):
+                self.assertEqual(runs(static_check.UPLOAD_IF.replace(static_check.INERT + " && ", ""), value), uploads)
         # No store upload step anywhere else; build jobs are unaffected by the input.
         for job in ("android-build", "ios-build"):
             self.assertEqual(steps_that_run(job, "true"), steps_that_run(job, "false"))

@@ -1,7 +1,12 @@
-"""No-secret structural guard for this draft public control repository.
+"""No-secret structural guard for this public control repository.
 
 problems(root) returns fixed descriptions of every violated rule; the CLI exits
 non-zero if there is any. Dependency-free on purpose: it runs in the PR check.
+
+It also pins the store workflow's activation stage (STAGE, STORE_JOB_IF,
+UPLOAD_IF): exactly which jobs and steps carry the never-matching event guard.
+Moving to another stage, or back to fully inert, means changing those constants
+in the same reviewed change as the workflow, never the workflow alone.
 """
 
 import ast
@@ -22,10 +27,29 @@ DECRYPT = "Decrypt and check the build handoff"
 REPORT = "Report what the dry run would have uploaded"
 UPLOADS = {"android-release": "Upload update to the internal track only",
            "ios-release": "Upload verified IPA for internal TestFlight"}
+# A job or step whose condition requires this event never runs: the workflow
+# registers only workflow_dispatch. That is how a job or step is held inert.
+INERT = "github.event_name == 'may-store-disabled-pending-review'"
+STAGE = "stage 1"
+# Activation stage 1 (Android dry runs only). Each store job's exact job-level
+# `if:` (None: no condition). Admission and the Android jobs are active and keep
+# their platform condition; the iOS jobs stay inert (tools/release/ios.sh does not
+# exist yet). Every store upload step is inert too (UPLOAD_IF). The guard appears
+# nowhere else in the workflow's code.
+STORE_JOB_IF = {
+    "admission": None,
+    "android-build": "${{ inputs.platform == 'android' }}",
+    "android-release": "${{ inputs.platform == 'android' }}",
+    "ios-build": "${{ " + INERT + " && inputs.platform == 'ios' }}",
+    "ios-release": "${{ " + INERT + " && inputs.platform == 'ios' }}",
+}
 # A store upload runs only when dry_run is exactly 'false' (github.event.inputs
 # holds booleans as strings, so a missing value never uploads), and the upload
 # script receives the same value to recheck. The report runs in every other case.
-UPLOAD_IF = "${{ github.event.inputs.dry_run == 'false' }}"
+# In stage 1 each upload is also held inert (UPLOAD_IF), so no upload runs at all;
+# stage 2 removes the guard from the Android upload only, leaving DRY_RUN_UPLOAD_IF.
+DRY_RUN_UPLOAD_IF = "${{ github.event.inputs.dry_run == 'false' }}"
+UPLOAD_IF = "${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}"
 REPORT_IF = "${{ github.event.inputs.dry_run != 'false' }}"
 DRY_RUN_ENV = "${{ github.event.inputs.dry_run }}"
 DRY_RUN_INPUT = ("      dry_run:\n        description: [^\n]+\n        required: true\n"
@@ -63,6 +87,9 @@ STORE_JOBS = {
 RELEASE_COMMAND = re.compile(
     r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|dry_run|cleanup|integrity)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
+ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" '
+                  '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN"')
+CONTINUE_ON_ERROR = re.compile(r"(?m)^\s*(-\s+)?continue-on-error:")
 VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
 
@@ -88,6 +115,86 @@ def step_condition(step):
     """The step's `if:` expression, or None. It may be on the step's dash line, like name:."""
     match = re.search(r"(?m)^(?:        )?if: (.+)$", step)
     return match.group(1).strip() if match else None
+
+
+def step_condition_count(step):
+    return len(re.findall(r"(?m)^(?:        )?if: ", step))
+
+
+def code_lines(text):
+    """text without YAML comments, so a guard named in a comment is not counted."""
+    return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in text.splitlines())
+
+
+def stage_problems(store):
+    """Where the inert guard must, and must not, be in this activation stage."""
+    found = []
+    for job, expected in STORE_JOB_IF.items():
+        header = job_text(store, job).partition("    steps:\n")[0]
+        if not header:
+            found.append(f"store {job}: job is missing")
+            continue
+        conditions = [c.strip() for c in re.findall(r"(?m)^    if: (.+)$", header)]
+        if len(conditions) > 1:
+            found.append(f"store {job}: has more than one job-level if:")
+        condition = conditions[0] if conditions else None
+        if expected is not None and INERT in expected:
+            if condition is None or INERT not in condition:
+                found.append(f"store {job}: the job is not held inert ({STAGE})")
+            elif condition != expected:
+                found.append(f"store {job}: the inert job does not keep its exact platform condition")
+        elif condition is not None and INERT in condition:
+            found.append(f"store {job}: the job is held inert, but {STAGE} activates it "
+                         "(stage mismatch: change STORE_JOB_IF in static_check.py on purpose)")
+        elif condition != expected:
+            found.append(f"store {job}: does not keep its platform condition" if expected else
+                         f"store {job}: its job-level condition is not the one {STAGE} expects")
+    held = sum(1 for c in STORE_JOB_IF.values() if c and INERT in c) + len(UPLOADS)
+    if code_lines(store).count(INERT) != held:
+        found.append(f"store-release-draft.yml: the inert guard appears or is missing somewhere {STAGE} does not expect")
+    return found
+
+
+# Every code line of the store workflow is in this repository's plain block layout,
+# so the line-based rules here read what GitHub's YAML parser reads: no quoted,
+# spaced or explicit (`?`) keys, no anchors, aliases, tags or merge keys, no tabs,
+# no multi-line quoted, plain or flow values (block scalars only after `key: |`).
+LAYOUT_LINE = re.compile(r"( *)(- )?([A-Za-z][\w-]*):(?: (.*))?")
+LAYOUT_VALUE = re.compile(r"""[^\s&*!{}?|>%@`'"\[\]#,][^#]*|'(?:[^']|'')*'|\[[^\[\]{}'"#]*\]|[|>]-?""")
+ADMISSION_ENV = [("GH_TOKEN", "${{ github.token }}"), ("MAY_PLATFORM", "${{ inputs.platform }}"),
+                 ("MAY_TARGET", "${{ inputs.target }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
+                 ("MAY_BUILD_NUMBER", "${{ inputs.build_number }}"), ("MAY_DRY_RUN", DRY_RUN_ENV)]
+ADMISSION_OUTPUTS = ("    outputs:\n      environment: ${{ steps.gate.outputs.environment }}\n"
+                     "      build_environment: ${{ steps.gate.outputs.build_environment }}\n")
+
+
+def layout_problems(store):
+    found, block = [], None
+    for number, line in enumerate(store.splitlines(), 1):
+        indent = len(line) - len(line.lstrip(" "))
+        if block is not None and (not line.strip() or indent > block):
+            continue
+        block = None
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        match = LAYOUT_LINE.fullmatch(line)
+        value = re.sub(r"(^|\s)#.*$", "", (match.group(4) or "") if match else "").strip()
+        if "\t" in line or not match or (value and not LAYOUT_VALUE.fullmatch(value)):
+            found.append(f"store-release-draft.yml:{number}: is not a plain one-line `key: value` in this repository's layout")
+            continue
+        if value[:1] in ("|", ">"):
+            block = len(match.group(1)) + (2 if match.group(2) else 0)
+    if re.findall(r"(?m)^([\w-]+):", store) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append("store-release-draft.yml: top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    if re.findall(r"(?m)^  ([\w-]+):", store.partition("\non:\n")[2].partition("\npermissions:")[0]) != ["workflow_dispatch"]:
+        found.append("store-release-draft.yml: is triggered by something other than workflow_dispatch")
+    if re.findall(r"(?m)^  ([\w-]+):", store.partition("\njobs:\n")[2]) != list(STORE_JOB_IF):
+        found.append(f"store-release-draft.yml: jobs are not exactly the ones {STAGE} pins")
+    admission = job_text(store, "admission")
+    if uses_in(admission) != [CHECKOUT] or env_entries(admission) != ADMISSION_ENV or \
+            ADMISSION_OUTPUTS not in admission or admission.count("      - id: gate\n") != 1:
+        found.append("store admission: its actions, env or outputs are not exactly the gate's")
+    return found
 
 
 def secrets_in(text):
@@ -184,8 +291,8 @@ def workflow_problems(root):
 
 def store_problems(store):
     found = []
-    if store.count("github.event_name == 'may-store-disabled-pending-review'") != 5:
-        found.append("store-release-draft.yml is not inert")
+    found += stage_problems(store)
+    found += layout_problems(store)
     if store.count("Recheck protected destination after Samuel's review") != 2 or \
             store.count("Recheck build environment after Samuel's review") != 2:
         found.append("store-release-draft.yml does not recheck after review")
@@ -195,6 +302,18 @@ def store_problems(store):
         found.append("store-release-draft.yml sets workflow-level env or defaults")
     if secrets_in(job_text(store, "admission")):
         found.append("store admission: holds a secret")
+    # Admission is active: its gate chooses and checks the environments every later
+    # job uses, so it runs exactly the gate, and no admission step may be skipped
+    # or allowed to fail.
+    _, admission_steps = job_steps(store, "admission")
+    if [run_commands(text) for _, text in admission_steps if run_commands(text)] != [[ADMISSION_GATE]] or \
+            any(step_condition(text) is not None for _, text in admission_steps) or \
+            CONTINUE_ON_ERROR.search(job_text(store, "admission")):
+        found.append("store admission: does not run exactly the gate, unconditionally")
+    # The gate refuses dry_run: false while uploads are held (stage 1), so such a
+    # dispatch fails at admission instead of finishing green without uploading.
+    if "          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n" not in job_text(store, "admission"):
+        found.append("store admission: does not pass the dispatch's dry_run to the gate")
     if not re.search(r"(?m)^" + DRY_RUN_INPUT, store.partition("\njobs:\n")[0]):
         found.append("store-release-draft.yml: dry_run is not a required boolean input defaulting to true")
     for job, (order, expected, actions) in STORE_JOBS.items():
@@ -211,6 +330,11 @@ def store_problems(store):
             found.append(f"store {job}: does not run after its own build job")
         if secrets_in(header):
             found.append(f"store {job}: job-level environment holds a secret")
+        # Only the handoff download may fail without failing the job: a missing
+        # artifact is reported by the decrypt step.
+        if CONTINUE_ON_ERROR.search(header) or any(
+                CONTINUE_ON_ERROR.search(text) and DOWNLOAD_ARTIFACT not in text for _, text in steps):
+            found.append(f"store {job}: a step other than the handoff download may fail without failing the job")
         if any("${{" in text.partition("run:")[2] for _, text in steps):
             found.append(f"store {job}: a run script interpolates an expression into shell")
         names = [name for name, _ in steps]
@@ -229,8 +353,15 @@ def store_problems(store):
         # upload and the report are conditional (cleanup always runs).
         for name, text in steps:
             condition = step_condition(text)
+            if step_condition_count(text) > 1:
+                found.append(f"store {job}: a step has more than one if:")
             if release and name == UPLOADS[job]:
-                if condition != UPLOAD_IF or ("          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n") not in text:
+                # Together these require exactly UPLOAD_IF: the guard first, then
+                # exactly the dry-run condition stage 2 will leave in place.
+                if condition is None or not condition.startswith("${{ " + INERT + " && "):
+                    found.append(f"store {job}: the upload is not held inert ({STAGE})")
+                if (condition or "").replace(INERT + " && ", "", 1) != DRY_RUN_UPLOAD_IF or \
+                        ("          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n") not in text:
                     found.append(f"store {job}: a dry run would run the store upload")
             elif release and name == REPORT:
                 if condition != REPORT_IF or not run_commands(text) or not run_commands(text)[0].startswith(
@@ -264,6 +395,26 @@ def store_problems(store):
     return found
 
 
+def held_uploads_problems(root, store):
+    """gate.py's UPLOADS_HELD must name exactly the platforms whose upload step is held."""
+    held = set()
+    for job, name in UPLOADS.items():
+        for step_name, text in job_steps(store, job)[1]:
+            if step_name == name and INERT in (step_condition(text) or ""):
+                held.add(job.split("-")[0])
+    declared = None
+    for node in ast.parse((root / "tools/may_release/gate.py").read_text()).body:
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["UPLOADS_HELD"]:
+            try:
+                declared = ast.literal_eval(node.value)
+            except ValueError:
+                declared = None
+    if not isinstance(declared, set) or declared != held:
+        return [f"gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held, so {STAGE} "
+                "would not refuse dry_run: false at admission"]
+    return []
+
+
 def control_problems(root):
     found = []
     flows = root / ".github/workflows"
@@ -283,7 +434,7 @@ def control_problems(root):
         found.append("native-compile-draft.yml does not recheck after review")
     if "--source-sha '${{ inputs.source_sha }}'" in compile_workflow or "--platform '${{ inputs.platform }}'" in compile_workflow:
         found.append("native-compile-draft.yml interpolates inputs into shell")
-    return found + store_problems(store)
+    return found + store_problems(store) + held_uploads_problems(root, store)
 
 
 def printed_error_classes(trees):
@@ -336,4 +487,5 @@ if __name__ == "__main__":
         print("Static check failed: " + failure)
     if failures:
         sys.exit(1)
-    print("May public draft is inert and its no-secret controls are structurally present")
+    print("May store workflow is at activation stage 1 (Android dry runs only; uploads and iOS inert), "
+          "the native compile workflow is inert, and the no-secret controls are structurally present")

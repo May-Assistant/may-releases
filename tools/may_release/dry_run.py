@@ -2,7 +2,7 @@
 
 This runs in the release job only when the `dry_run` input is not false, after
 the handoff was opened and the product signed and verified. The store upload
-step is skipped, so no upload credential reaches the VM. This step holds no
+step is skipped, so no upload credential is exposed to any step. This one holds no
 secret at all and makes no network call.
 
 It prints the store destination this repository's own code fixes (package or

@@ -20,6 +20,11 @@ this repository targets internal testing alone (the Play `internal` track and
 internal-only TestFlight); there is no track input to choose anything else.
 Before any production or public-beta release, Prevent self-review must be on and
 a second reviewer added (README, "Before any non-internal release").
+
+Activation stage: while a platform's store upload is held (UPLOADS_HELD), admission
+refuses any dispatch for it whose dry_run is not true. A dispatch with dry_run: false
+then fails at once, before any approval, build or secret, rather than finishing
+green without having uploaded anything.
 """
 
 import argparse
@@ -41,6 +46,10 @@ ENVIRONMENTS = {
     ("android", "playground"): "may-android-playground-internal",
 }
 MAX_BUILD_NUMBER = 2_000_000_000
+# Stage 1: the store upload step of each platform listed here carries the inert
+# guard, so it can never run; static_check.py requires this set to be exactly the
+# platforms whose upload step is held. Stage 2 removes "android".
+UPLOADS_HELD = {"android", "ios"}
 ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
 AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
@@ -70,6 +79,18 @@ def validate_run(repo, ref, event, sha, action, build_number=None, target="produ
                                     and int(build_number) <= MAX_BUILD_NUMBER):
         raise GateDenial("Store build number must be a positive integer no greater than 2000000000")
     return ENVIRONMENTS[key]
+
+
+def validate_dry_run(action, dry_run):
+    """Admission passes the dispatch's dry_run (github.event.inputs.dry_run, a string).
+    The rechecks inside protected jobs pass none, so None is not checked."""
+    if dry_run is None:
+        return
+    if dry_run not in ("true", "false"):
+        raise GateDenial("dry_run must be true or false")
+    if action in UPLOADS_HELD and dry_run != "true":
+        raise GateDenial("Stage 1: uploads are held; this run did not upload anything. "
+                         "dry_run: false fails in stage 1 by design; dispatch with dry_run: true")
 
 
 def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=None):
@@ -126,10 +147,12 @@ def main():
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--build-number")
     parser.add_argument("--target", choices=("production", "playground"), default="production")
+    parser.add_argument("--dry-run")
     args = parser.parse_args()
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
+    validate_dry_run(args.action, args.dry_run)
     build_env = ENVIRONMENTS["compile"]
     if args.action != "compile" and artifact_recipient(env) is None:
         raise GateDenial("Artifact encryption public key for this target is still a placeholder; "
