@@ -46,6 +46,16 @@ PRODUCTION = "io.github.mayassistant.may"
 COMMITTED_KEYS = store.ANDROID_UPLOAD_KEYS  # as committed, before any test patches it
 
 
+def refusal(test, kind, call, *args):
+    """The exception call(*args) raises, failing the test on an assertion unless it is a `kind`."""
+    try:
+        call(*args)
+    except Exception as error:  # any other outcome is an assertion failure, never a test error
+        test.assertIsInstance(error, kind)
+        return error
+    test.fail(kind.__name__ + " not raised")
+
+
 def upload_keys(playground=FIXTURE_CERT, production=OTHER_CERT):
     """store.ANDROID_UPLOAD_KEYS with the real aliases and accounts and the given certificate pins."""
     return {"production": dict(COMMITTED_KEYS["production"], cert=production),
@@ -209,11 +219,10 @@ class PlayUploadTests(unittest.TestCase):
                 for patched in (patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": track, "production": track}),
                                 patch("play_upload.TRACK", track)):
                     session = Session()
-                    with self.subTest(target=target, track=track), patched, self.assertRaises(PlayRefusal) as refused:
-                        upload(target, "a" * 40, "9", session)
-                    self.assertEqual(refused.exception.args[0],
-                                     "Only May and May Playground uploads to the Play internal track are allowed.")
-                    self.assertEqual(session.calls, [])
+                    with self.subTest(target=target, track=track), patched:
+                        self.assertEqual(refusal(self, PlayRefusal, upload, target, "a" * 40, "9", session).args[0],
+                                         "Only May and May Playground uploads to the Play internal track are allowed.")
+                        self.assertEqual(session.calls, [])
         with patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": "internal"}), self.assertRaises(PlayRefusal):
             upload("production", "a" * 40, "9", Session())
 
@@ -232,6 +241,7 @@ class PlayUploadTests(unittest.TestCase):
             upload("production", "a" * 40, "3", session)
         self.assertEqual(session.methods(), ["POST", "GET", "POST", "PUT", "POST"])
         # Both writes went through their guards, with exactly what was sent.
+        self.assertEqual((track_guard.call_count, commit_guard.call_count), (1, 1))
         self.assertEqual(track_guard.call_args[0][:2], (session.calls[3][1], session.calls[3][2]))
         self.assertEqual(commit_guard.call_args[0][0], session.calls[4][1])
         # Every request names exactly the May package, never May Playground's.
@@ -249,9 +259,9 @@ class PlayUploadTests(unittest.TestCase):
         # The fixture key is Playground's upload key; May production's is another.
         env, keys = self.production(production_cert=OTHER_CERT, playground_cert=FIXTURE_CERT)
         session = Session()
-        with env, keys, self.assertRaises(StoreError) as refused:
-            upload("production", "a" * 40, "9", session)
-        self.assertEqual(refused.exception.args[0], "Signed Android App Bundle is not signed with this target's upload key")
+        with env, keys:
+            self.assertEqual(refusal(self, StoreError, upload, "production", "a" * 40, "9", session).args[0],
+                             "Signed Android App Bundle is not signed with this target's upload key")
         self.assertEqual(session.calls, [])
         # Nor with the committed production pin: the fixture key is not May's.
         env, _ = self.production()
@@ -262,9 +272,9 @@ class PlayUploadTests(unittest.TestCase):
         # Playground's Play account is refused for May production, before any request.
         env, keys = self.production(account=PLAYGROUND_ACCOUNT)
         session = Session()
-        with env, keys, self.assertRaises(StoreError) as refused:
-            upload("production", "a" * 40, "9", session)
-        self.assertEqual(refused.exception.args[0], "MAY_PLAY_ACCOUNT is not this target's Play service account")
+        with env, keys:
+            self.assertEqual(refusal(self, StoreError, upload, "production", "a" * 40, "9", session).args[0],
+                             "MAY_PLAY_ACCOUNT is not this target's Play service account")
         self.assertEqual(session.calls, [])
 
     def test_a_may_production_key_or_account_never_uploads_as_playground(self):
@@ -295,10 +305,10 @@ class PlayUploadTests(unittest.TestCase):
         env, keys = self.production()
         for number in ("1", "2"):
             session = Session()
-            with self.subTest(number=number), env, keys, self.assertRaises(PlayRefusal) as refused:
-                upload("production", "a" * 40, number, session)
-            self.assertEqual(refused.exception.args[0], "Build number is below this app's floor (May production starts at 3).")
-            self.assertEqual(session.calls, [])
+            with self.subTest(number=number), env, keys:
+                self.assertEqual(refusal(self, PlayRefusal, upload, "production", "a" * 40, number, session).args[0],
+                                 "Build number is below this app's floor (May production starts at 3).")
+                self.assertEqual(session.calls, [])
         # Playground has no floor here beyond Play's own check.
         session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["1"], "status": "completed"}]}],
                           uploaded={"versionCode": 2, "sha256": hashlib.sha256(BUNDLE).hexdigest()})
@@ -335,9 +345,9 @@ class PlayUploadTests(unittest.TestCase):
         }
         for message, writes in cases.items():
             for track_url, body in writes:
-                with self.subTest(track_url=track_url, body=body), self.assertRaises(PlayRefusal) as refused:
-                    require_internal_release(track_url, body, "9")
-                self.assertEqual(refused.exception.args[0], message)
+                with self.subTest(track_url=track_url, body=body):
+                    self.assertEqual(refusal(self, PlayRefusal, require_internal_release, track_url, body, "9").args[0],
+                                     message)
         with patch("play_upload.TRACK", "production"), self.assertRaises(PlayRefusal):
             require_internal_release(url, internal_release("9"), "9")
 
@@ -363,10 +373,9 @@ class PlayUploadTests(unittest.TestCase):
                     edit + ":commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW#x",
                     edit + "-2:commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW",
                     edit + ":validate?changesInReviewBehavior=ERROR_IF_IN_REVIEW"):
-            with self.subTest(url=url), self.assertRaises(PlayRefusal) as refused:
-                require_commit(url, edit)
-            self.assertEqual(refused.exception.args[0],
-                             "The Play commit must be exactly ERROR_IF_IN_REVIEW; changesNotSentForReview is refused.")
+            with self.subTest(url=url):
+                self.assertEqual(refusal(self, PlayRefusal, require_commit, url, edit).args[0],
+                                 "The Play commit must be exactly ERROR_IF_IN_REVIEW; changesNotSentForReview is refused.")
 
     def test_the_log_names_the_play_request_that_did_not_complete(self):
         for session, step, hint in ((Session(insert_status=403), "edit insert", True),

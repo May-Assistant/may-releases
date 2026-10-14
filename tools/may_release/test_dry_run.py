@@ -16,7 +16,7 @@ import static_check
 import signing_fixtures as fx
 from store import SECRET_NAMES, StoreError
 from test_play_upload import (FIXTURE_CERT, OTHER_CERT, PLAYGROUND_ACCOUNT, PRODUCTION_ACCOUNT, Session,
-                              upload_keys)
+                              refusal, upload_keys)
 from test_sign import fixture_ipa
 import verify
 
@@ -154,7 +154,8 @@ class DryRunWorkflowTests(unittest.TestCase):
         # The seal step failed, so the publish step was skipped: the check still runs and fails the job.
         broken = STORE.read_text()
         _, steps = static_check.job_steps(broken, "android-release")
-        self.assertEqual(static_check.step_condition(dict(steps)[static_check.CONFIRM_SIGNED]),
+        self.assertIn(static_check.CONFIRM_SIGNED, dict(steps))
+        self.assertEqual(static_check.step_condition(dict(steps).get(static_check.CONFIRM_SIGNED, "")),
                          static_check.CONFIRM_SIGNED_IF)
         self.assertTrue(runs(static_check.CONFIRM_SIGNED_IF, "true", failed=True, sign_only_input="true"))
 
@@ -237,9 +238,8 @@ class DryRunReportTests(unittest.TestCase):
             (("playground", "3", PRODUCTION_ACCOUNT, upload_keys()), "MAY_PLAY_ACCOUNT is not this target's Play service account"),
         )
         for args, message in cases:
-            with self.subTest(args=args[:3]), self.assertRaises(StoreError) as refused:
-                self.summary(*args)
-            self.assertEqual(refused.exception.args[0], message)
+            with self.subTest(args=args[:3]):
+                self.assertEqual(refusal(self, StoreError, self.summary, *args).args[0], message)
         (self.root / "may-release/signed.aab").write_bytes(b"not a signed bundle")
         with self.assertRaises(verify.VerifyError):
             self.summary("production", "3", PRODUCTION_ACCOUNT, mine)

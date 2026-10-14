@@ -14,7 +14,7 @@ import play_upload
 import sign_only
 from store import SECRET_NAMES, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, UPLOAD_RECORD, StoreError, write_upload_record
 from test_play_upload import (ACCOUNT, BUNDLE, CREDENTIAL, FIXTURE_CERT, OTHER_CERT, PRODUCTION_ACCOUNT, Session,
-                              credential, upload_keys)
+                              credential, refusal, upload_keys)
 
 HERE = Path(__file__).resolve().parent
 SHA = "a" * 40
@@ -200,10 +200,10 @@ class ConfirmSignOnlyTests(unittest.TestCase):
 
     def test_a_publish_step_that_did_not_succeed_fails_the_job(self):
         for outcome in NOT_SUCCESS:
-            with self.subTest(outcome=outcome), self.assertRaises(StoreError) as refused:
-                self.confirm(outcome)
-            self.assertEqual(refused.exception.args[0], "sign_only was true, but the signed bundle was not published "
-                             "(the publish step failed, was skipped or was cancelled); nothing is ready for Play Console")
+            with self.subTest(outcome=outcome):
+                self.assertEqual(refusal(self, StoreError, self.confirm, outcome).args[0],
+                                 "sign_only was true, but the signed bundle was not published (the publish step "
+                                 "failed, was skipped or was cancelled); nothing is ready for Play Console")
 
     def test_a_sign_only_run_that_uploaded_fails(self):
         (self.root / "may-release" / UPLOAD_RECORD).write_text("{}")

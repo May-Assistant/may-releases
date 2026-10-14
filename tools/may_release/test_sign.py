@@ -156,10 +156,14 @@ class AndroidSigningIsolationTests(unittest.TestCase):
             env = dict(self.env, MAY_ANDROID_KEY_ALIAS=alias, MAY_ANDROID_CERT_SHA256=cert)
             with self.subTest(target=target, alias=alias, cert=cert), patch.dict(os.environ, env, clear=True), \
                     patch("sign.run_private") as runner:
-                with self.assertRaises(StoreError) as refused:
+                raised = None
+                try:
                     sign.sign_android(target, "a" * 40, "9")
+                except Exception as error:  # any other outcome is an assertion failure, never a test error
+                    raised = error
+                self.assertIsInstance(raised, StoreError)
                 runner.assert_not_called()
-                self.assertEqual(refused.exception.args[0], message)
+                self.assertEqual(raised.args[0], message)
         # The committed production alias and pin pass this check (jarsigner itself is faked here).
         env = dict(self.env, MAY_ANDROID_KEY_ALIAS="may-upload", MAY_ANDROID_CERT_SHA256=production.upper())
         with patch.dict(os.environ, env, clear=True), patch("store.ANDROID_UPLOAD_KEYS", COMMITTED_KEYS), \
