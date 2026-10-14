@@ -11,8 +11,9 @@ platform, target, source SHA and build number.
 The manifest also carries both design-system pins (`design_system`: iOS and
 Android) that prepare.py recorded, so drift is recorded on every release. Both
 sides re-apply store.design_system_pins: the pins may differ only for an
-internal target. The public log says only whether they match; the revisions
-themselves stay inside the encrypted handoff.
+internal target. `seal` also rechecks that the design-system checkout is still
+exactly the built platform's pin. The public log says only whether they match;
+the revisions themselves stay inside the encrypted handoff.
 
 age is authenticated encryption (ChaCha20-Poly1305), so the payload cannot be
 altered without failing decryption. It is not sender authentication: anyone
@@ -39,6 +40,7 @@ import unicodedata
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from gate import ENVIRONMENTS, artifact_recipient
+from prepare import checkout_is
 from store import (DESIGN_SYSTEM_RECORD, HANDOFF_SECRETS, StoreError, child_env, design_system_pins, identity,
                    require_step_secrets, runner_root, write_private)
 import toolchain
@@ -55,16 +57,20 @@ def expected_manifest(platform, target, source_sha, build_number):
             "source_sha": source_sha, "build_number": build_number, "product": PRODUCTS[platform]}
 
 
-def recorded_pins(root, platform, target):
-    """Both pins prepare.py recorded for exactly this platform and target."""
+def recorded_pins(root, platform, target, source_sha):
+    """Both pins prepare.py recorded for exactly this build, rechecked against the checkout."""
     try:
         record = json.loads((root / "may-private" / DESIGN_SYSTEM_RECORD).read_text())
     except (OSError, ValueError):
         raise StoreError("Design-system pin record is missing or malformed") from None
-    if not isinstance(record, dict) or sorted(record) != ["design_system", "platform", "target"] or \
-            (record["platform"], record["target"]) != (platform, target):
-        raise StoreError("Design-system pin record is not for this platform and target")
-    return design_system_pins(record["design_system"], platform, target)
+    if not isinstance(record, dict) or sorted(record) != ["design_system", "platform", "source_sha", "target"] or \
+            (record["platform"], record["target"], record["source_sha"]) != (platform, target, source_sha):
+        raise StoreError("Design-system pin record is not for this platform, target and source")
+    pins = design_system_pins(record["design_system"], platform, target)
+    # The build ran in between: the design system it used must still be exactly the built pin.
+    if not checkout_is(root / "may-source/android/build-deps/may-design-system", pins[platform]):
+        raise StoreError("Design-system checkout is no longer exactly the built platform's pin")
+    return pins
 
 
 def recipient_for(platform, target):
@@ -264,7 +270,7 @@ def seal(platform, target, source_sha, build_number):
     require_step_secrets(())
     recipient = recipient_for(platform, target)
     root = runner_root()
-    pins = recorded_pins(root, platform, target)
+    pins = recorded_pins(root, platform, target, source_sha)
     product = root / "may-release" / PRODUCTS[platform]
     if not product.exists() or product.is_symlink():
         raise StoreError("Unsigned product is unavailable")

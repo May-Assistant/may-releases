@@ -85,8 +85,8 @@ def job_steps(workflow, job):
 
 
 def step_condition(step):
-    """The step's `if:` expression, or None."""
-    match = re.search(r"(?m)^        if: (.+)$", step)
+    """The step's `if:` expression, or None. It may be on the step's dash line, like name:."""
+    match = re.search(r"(?m)^(?:        )?if: (.+)$", step)
     return match.group(1).strip() if match else None
 
 
@@ -259,6 +259,8 @@ def store_problems(store):
             for previous, current in zip(steps, steps[1:]):
                 if secrets_in(current[1]) and run_commands(previous[1]) != ["python3 -I -S -B tools/may_release/integrity.py"]:
                     found.append(f"store {job}: a secret step is not preceded by the checkout integrity check")
+                if secrets_in(current[1]) and step_condition(previous[1]) is not None:
+                    found.append(f"store {job}: the integrity check before a secret step is conditional")
     return found
 
 

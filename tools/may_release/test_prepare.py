@@ -5,12 +5,15 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import gate
+import play_upload
 from prepare import PrepareError, exact_sha, fetch, pins, prepare
 import store
 from store import DESIGN_SYSTEM_RECORD, StoreError
 
 DS_URL = "https://github.com/May-Assistant/may-design-system"
 IOS_PIN, ANDROID_PIN = "1" * 40, "2" * 40  # differing, as on may-app main today
+PINS = {"ios": IOS_PIN, "android": ANDROID_PIN}
 
 
 def project_yml(revision=IOS_PIN, url=DS_URL):
@@ -121,13 +124,11 @@ class PerPlatformPinTests(unittest.TestCase):
             return fetched, self.record, (root / "may-source/ios/project.yml").read_text()
 
     def test_internal_android_run_with_mismatched_pins_passes(self):
-        for target in ("playground", "production"):
-            with self.subTest(target=target):
-                fetched, record, project = self.run_prepare("android", target)
-                self.assertEqual(fetched, [ANDROID_PIN])  # its own platform's pin, nothing else
-                self.assertEqual(project, project_yml())  # iOS spec left untouched: it pins another revision
-                self.assertEqual(record, {"platform": "android", "target": target,
-                                          "design_system": {"ios": IOS_PIN, "android": ANDROID_PIN}})
+        fetched, record, project = self.run_prepare("android", "playground")
+        self.assertEqual(fetched, [ANDROID_PIN])  # its own platform's pin, nothing else
+        self.assertEqual(project, project_yml())  # iOS spec left untouched: it pins another revision
+        self.assertEqual(record, {"platform": "android", "target": "playground", "source_sha": "a" * 40,
+                                  "design_system": {"ios": IOS_PIN, "android": ANDROID_PIN}})
 
     def test_internal_ios_run_with_mismatched_pins_builds_the_ios_pin(self):
         fetched, record, project = self.run_prepare("ios", "playground")
@@ -166,16 +167,23 @@ class PerPlatformPinTests(unittest.TestCase):
                 self.run_prepare("android", "playground", project=project)
             self.assertEqual(self.fetched, [])
 
+    def test_production_with_mismatched_pins_fails(self):
+        # The real May app can be promoted by hand from internal testing, so its pins must match.
+        for platform in ("android", "ios"):
+            with self.subTest(platform=platform):
+                with self.assertRaises(StoreError):
+                    store.design_system_pins({"ios": IOS_PIN, "android": ANDROID_PIN}, platform, "production")
+                with self.assertRaises(StoreError):
+                    self.run_prepare(platform, "production")
+                self.assertEqual(self.fetched, [])
+                self.assertIsNone(self.record)
+                fetched, record, _ = self.run_prepare(platform, "production", lock=lock_file(IOS_PIN))
+                self.assertEqual(fetched, [IOS_PIN])
+                self.assertEqual(record["design_system"], {"ios": IOS_PIN, "android": IOS_PIN})
+                # The Playground target next to it may still differ.
+                self.assertEqual(self.run_prepare(platform, "playground")[1]["design_system"], PINS)
+
     def test_non_internal_target_with_mismatched_pins_fails(self):
-        # No such target exists yet: model one by taking a pair off the internal list.
-        with patch.object(store, "INTERNAL_TARGETS", store.INTERNAL_TARGETS - {("android", "production")}):
-            with self.assertRaises(StoreError):
-                self.run_prepare("android", "production")
-            self.assertEqual(self.fetched, [])
-            fetched, record, _ = self.run_prepare("android", "production", lock=lock_file(IOS_PIN))
-            self.assertEqual(fetched, [IOS_PIN])
-            # The internal pair next to it is unaffected.
-            self.run_prepare("android", "playground")
         for platform, target in (("android", "public-beta"), (None, None)):
             with self.subTest(target=target), self.assertRaises(StoreError):
                 store.design_system_pins({"ios": IOS_PIN, "android": ANDROID_PIN}, platform, target)
@@ -190,9 +198,15 @@ class PerPlatformPinTests(unittest.TestCase):
                 self.run_prepare(platform, target)
 
     def test_internal_targets_are_one_explicit_list(self):
-        self.assertEqual(store.INTERNAL_TARGETS, {("ios", "production"), ("ios", "playground"),
-                                                  ("android", "production"), ("android", "playground")})
-        self.assertLessEqual(store.INTERNAL_TARGETS, set(store.APP_IDS))
+        self.assertEqual(store.INTERNAL_TARGETS, {("ios", "playground"), ("android", "playground")})
+        self.assertFalse(store.is_internal("ios", "production"))
+        self.assertFalse(store.is_internal("android", "production"))
+        # Each entry is a real target, uploaded only to internal testing, in an internal environment.
+        for entry in store.INTERNAL_TARGETS:
+            with self.subTest(entry=entry):
+                self.assertIn(entry, store.APP_IDS)
+                self.assertTrue(gate.ENVIRONMENTS[entry].endswith("-internal"))
+        self.assertEqual(play_upload.TRACK, "internal")
         # Adding an app ID does not make it internal.
         with patch.dict(store.APP_IDS, {("android", "public"): "io.github.mayassistant.may"}):
             self.assertFalse(store.is_internal("android", "public"))

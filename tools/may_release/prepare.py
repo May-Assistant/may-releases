@@ -76,6 +76,13 @@ def head_revision(checkout):
     return result.stdout.decode().strip() if not result.returncode else ""
 
 
+def checkout_is(checkout, revision):
+    """Whether checkout is exactly revision, with no change to a tracked file."""
+    env = child_env(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    return head_revision(checkout) == revision and not git_status(
+        ["git", "-C", str(checkout), "diff", "--quiet", "HEAD", "--"], env=env)
+
+
 def private_runner_root():
     raw = os.environ.get("RUNNER_TEMP")
     if not raw:
@@ -175,8 +182,8 @@ def prepare(source_sha, platform=None, target=None):
         project = project_path.read_text()
         project_path.write_text(project.replace(old_spec, "  MayDesignSystem:\n    path: " + str(ds_local), 1))
     write_private(private / DESIGN_SYSTEM_RECORD,
-                  json.dumps({"platform": platform, "target": target, "design_system": record},
-                             sort_keys=True).encode())
+                  json.dumps({"platform": platform, "target": target, "source_sha": source_sha,
+                              "design_system": record}, sort_keys=True).encode())
     print("Exact private May app and design-system sources prepared on protected runner")
 
 

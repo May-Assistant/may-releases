@@ -29,15 +29,14 @@ APP_IDS = {
     ("android", "production"): "io.github.mayassistant.may",
     ("android", "playground"): "io.github.mayassistant.may.playground",
 }
-# The one list of internal-testing targets. Each goes only to Play's `internal`
-# track or to internal-only TestFlight. A (platform, target) not listed here is
-# non-internal: its iOS and Android design-system pins must match
-# (design_system_pins). It is deliberately not derived from APP_IDS, so a new
-# target is non-internal until someone adds it here on purpose.
-INTERNAL_TARGETS = frozenset({
-    ("ios", "production"), ("ios", "playground"),
-    ("android", "production"), ("android", "playground"),
-})
+# The one list of targets whose iOS and Android design-system pins may differ
+# (design_system_pins). Only the Playground apps (Samuel's decision, fail closed).
+# The real May app (`production`) is left out: its internal-track or TestFlight
+# build can be promoted to production by hand in Play Console or App Store
+# Connect, where no control here runs, so its pins must match. It is
+# deliberately not derived from APP_IDS, so a new target needs matching pins
+# until someone adds it here on purpose.
+INTERNAL_TARGETS = frozenset({("ios", "playground"), ("android", "playground")})
 APPLE_TEAM = "R6A892D599"
 APPLE_CERT_SHA1 = "A4AB0BB2786164506FDB2538320703B41B7ED30A"
 APPLE_KEY_ID = "23VX669FGY"

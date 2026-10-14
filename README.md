@@ -91,7 +91,8 @@ Within a job, each step receives only its own secrets, and each script refuses t
 - the job and step layout and the step-to-secret map;
 - the allowed actions and commands in release jobs;
 - that only the `.age` file is uploaded;
-- the `dry_run` input (a required boolean defaulting to `true`), that only the store upload and the dry-run report steps are conditional, and their exact conditions;
+- the `dry_run` input (a required boolean defaulting to `true`), that only the store upload and the dry-run report steps are conditional (an `if:` on a step's dash line counts), and their exact conditions;
+- that an unconditional `integrity.py` step comes right before each secret step;
 - that each build job prepares the design system for its own platform and target;
 - that no `setup-java` or `pip install` appears in any workflow.
 
@@ -107,12 +108,12 @@ Within a job, each step receives only its own secrets, and each script refuses t
 
 `may-app` pins the May design system twice: `ios/project.yml` (`MayDesignSystem` `url` + `revision`) and `android/design-system.lock` (`repository=` + `revision=`). They can drift, and on may-app main today they differ.
 
-Samuel's decision (2026-10-14): relax the design-system pin match for internal builds only; production still requires it; drift recorded on every build.
+Samuel's decision (2026-10-14): relax the design-system pin match for internal builds only; production still requires it; drift recorded on every build. Follow-up decision (fail closed): only the Playground targets count as internal. A build of the real May app (`production`) goes to Play `internal` or internal TestFlight too, but can be promoted to production by hand in Play Console or App Store Connect, where no control in this repository runs, so its pins must match.
 
 - **Every build** requires both pins to be well-formed (40-hex) and trusted (`https://github.com/May-Assistant/may-design-system`), including the pin that is not built. Drift is only meaningful between two exact revisions of the one trusted repository. A pin that points elsewhere, or at a branch or path, is a different dependency for the same commit, which will also be built for the other platform.
-- **Internal targets** (`INTERNAL_TARGETS` in `store.py`, the single list; today all four May and Playground targets, which go only to the Play `internal` track or internal-only TestFlight): `prepare.py --platform P --target T` fetches only P's pin and refuses unless that exact revision is what is checked out. The other platform's pin may differ.
-- **Any other target**, including any future production or public target, which is non-internal unless it is added to that list on purpose: the two pins must match. The native compile (`prepare.py` with no platform or target) also still requires the match.
-- **Record.** `prepare.py` writes both pins to the build job's private folder. `handoff.py seal` puts them into the encrypted manifest (`design_system`), and `handoff.py open` re-applies the same rule. The public log says only whether they **match** or **differ**; the revisions stay in the encrypted handoff, because the no-commit-metadata rule covers the private design system too.
+- **Internal targets** (`INTERNAL_TARGETS` in `store.py`, the single list; today only iOS and Android `playground`): `prepare.py --platform P --target T` fetches only P's pin and refuses unless that exact revision is what is checked out. The other platform's pin may differ.
+- **Any other target**, including iOS and Android `production` and any future target, which is non-internal unless it is added to that list on purpose: the two pins must match. The native compile (`prepare.py` with no platform or target) also still requires the match.
+- **Record.** `prepare.py` writes both pins, with the platform, target and source SHA, to the build job's private folder. `handoff.py seal` checks that record is for this build and that the design-system checkout is still exactly the built platform's pin with no tracked change, then puts both pins into the encrypted manifest (`design_system`). `handoff.py open` re-applies the same rule for its own target. The public log says only whether they **match** or **differ**; the revisions stay in the encrypted handoff, because the no-commit-metadata rule covers the private design system too.
 
 ## Dry run
 
@@ -121,7 +122,7 @@ Samuel's decision (2026-10-14): relax the design-system pin match for internal b
 - A dry run still builds, seals, opens, signs and verifies.
 - It skips both store upload steps (`play_upload.py`, `ios_upload.py`), so the upload credentials never reach the VM.
 - `dry_run.py` reports what would have been uploaded: package or bundle ID, versionCode or build number, track, and the signed artifact's SHA-256. For iOS, it re-verifies the IPA first.
-- Upload steps run only when `github.event.inputs.dry_run == 'false'`. That context holds the boolean as a string, so a missing value never uploads.
+- Upload steps run only when `github.event.inputs.dry_run == 'false'`. That context holds the boolean as a string, so a missing value never uploads. The comparison ignores case, so any casing of `false` passes it.
 - Each upload script also refuses unless `MAY_DRY_RUN` is exactly `false`.
 
 ## Artifact key-pair setup

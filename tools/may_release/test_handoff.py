@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import handoff
+import prepare
 import store
 from store import StoreError
 
@@ -19,15 +20,16 @@ HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
 RUN = {"GITHUB_REPOSITORY": "May-Assistant/may-releases", "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1"}
 IOS_PIN, ANDROID_PIN = "1" * 40, "2" * 40
 PINS = {"ios": IOS_PIN, "android": ANDROID_PIN}  # differing, as on may-app main today
+DS_CHECKOUT = "may-source/android/build-deps/may-design-system"
 
 
 def system_tool(name, relative):
     return shutil.which(Path(relative).name)
 
 
-def expected(build="9", run="123456", platform="android", attempt="1"):
+def expected(build="9", run="123456", platform="android", attempt="1", target="playground"):
     with patch.dict(os.environ, dict(RUN, GITHUB_RUN_ID=run, GITHUB_RUN_ATTEMPT=attempt)):
-        return handoff.expected_manifest(platform, "playground", SHA, build)
+        return handoff.expected_manifest(platform, target, SHA, build)
 
 
 def entry(name, kind="file", data=b"x", link="", mode=0o644):
@@ -146,6 +148,22 @@ class TarRulesTests(unittest.TestCase):
                                  allow_symlinks=False)
             self.assertIn("pins differ", refused.exception.args[0])
             self.assertEqual(list(out.iterdir()), [])
+
+    def test_open_applies_the_pin_rule_to_its_own_target(self):
+        # Differing pins pass for each Playground target and are refused for each May production target.
+        products = {"android": [entry("product/unsigned.aab")], "ios": [entry("product/May.xcarchive", "dir")]}
+        for platform, members in products.items():
+            for target in ("playground", "production"):
+                with self.subTest(platform=platform, target=target):
+                    manifest, out = expected(platform=platform, target=target), self.destination()
+                    path = self.tar(manifest, members)
+                    if target == "playground":
+                        self.assertEqual(handoff.read_tar(path, out, manifest, platform == "ios")[1], PINS)
+                        continue
+                    with self.assertRaises(StoreError) as refused:
+                        handoff.read_tar(path, out, manifest, platform == "ios")
+                    self.assertIn("pins differ", refused.exception.args[0])
+                    self.assertEqual(list(out.iterdir()), [])
 
     def test_unexpected_members_are_refused(self):
         ios = expected(platform="ios")
@@ -326,7 +344,10 @@ class AgeRoundTripTests(unittest.TestCase):
         self.patches = [patch.dict(os.environ, dict(RUN, RUNNER_TEMP=self.directory.name, PATH=os.environ["PATH"]),
                                    clear=True),
                         patch("handoff.toolchain.tool_path", side_effect=system_tool),
-                        patch("handoff.artifact_recipient", return_value=self.public)]
+                        patch("handoff.artifact_recipient", return_value=self.public),
+                        # Real git is used in test_seal_rechecks_the_design_system_checkout.
+                        patch("handoff.checkout_is", side_effect=lambda checkout, revision: checkout == self.ds)]
+        self.ds = self.root / DS_CHECKOUT
         for item in self.patches:
             item.start()
 
@@ -335,12 +356,12 @@ class AgeRoundTripTests(unittest.TestCase):
             item.stop()
         self.directory.cleanup()
 
-    def record(self, platform, design_system=PINS, target="playground"):
+    def record(self, platform, design_system=PINS, target="playground", source_sha=SHA):
         """What prepare.py leaves in may-private for the seal step."""
         private = self.root / "may-private"
         private.mkdir(exist_ok=True)
         (private / handoff.DESIGN_SYSTEM_RECORD).write_text(json.dumps(
-            {"platform": platform, "target": target, "design_system": design_system}))
+            {"platform": platform, "target": target, "source_sha": source_sha, "design_system": design_system}))
 
     def carry(self):
         """Simulate the artifact hop to a fresh release VM."""
@@ -399,6 +420,7 @@ class AgeRoundTripTests(unittest.TestCase):
                 ("missing", lambda: (self.root / "may-private" / handoff.DESIGN_SYSTEM_RECORD).unlink()),
                 ("other-platform", lambda: self.record("ios")),
                 ("other-target", lambda: self.record("android", target="production")),
+                ("other-source", lambda: self.record("android", source_sha="b" * 40)),
                 ("ios-missing", lambda: self.record("android", {"android": ANDROID_PIN})),
                 ("android-missing", lambda: self.record("android", {"ios": IOS_PIN})),
                 ("not-json", lambda: (self.root / "may-private" / handoff.DESIGN_SYSTEM_RECORD).write_text("{"))):
@@ -414,6 +436,41 @@ class AgeRoundTripTests(unittest.TestCase):
         with patch.object(store, "INTERNAL_TARGETS", frozenset()), self.assertRaises(StoreError):
             handoff.seal("android", "playground", SHA, "9")
         self.assertFalse((self.root / "may-handoff/handoff.age").exists())
+        for platform in ("android", "ios"):  # the real May app, on either platform
+            with self.subTest(platform=platform):
+                self.record(platform, target="production")
+                with self.assertRaises(StoreError) as refused:
+                    handoff.seal(platform, "production", SHA, "9")
+                self.assertIn("pins differ", refused.exception.args[0])
+                self.assertFalse((self.root / "may-handoff/handoff.age").exists())
+
+    def test_seal_rechecks_the_design_system_checkout(self):
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(self.ds)]
+        self.ds.mkdir(parents=True)
+        (self.ds / "tokens.json").write_text("{}")
+        for argv in (["init", "-q"], ["add", "tokens.json"], ["commit", "-q", "-m", "pin"]):
+            subprocess.run(git + argv, check=True, capture_output=True)
+        head = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        cases = (  # (name, pins, change to the checkout, sealed)
+            ("built-pin-is-not-head", {"ios": head, "android": ANDROID_PIN}, None, False),
+            ("built-pin-is-head", {"ios": IOS_PIN, "android": head}, None, True),
+            ("dirty", {"ios": IOS_PIN, "android": head}, lambda: (self.ds / "tokens.json").write_text("[]"), False),
+            ("missing", {"ios": IOS_PIN, "android": head}, lambda: shutil.rmtree(self.ds), False),
+        )
+        with patch("handoff.checkout_is", prepare.checkout_is):
+            for name, pins, change, sealed in cases:
+                with self.subTest(name=name):
+                    shutil.rmtree(self.root / "may-handoff", ignore_errors=True)
+                    self.record("android", pins)
+                    if change:
+                        change()
+                    if sealed:
+                        self.assertEqual(self.sealed_manifest()["design_system"], pins)
+                        continue
+                    with self.assertRaises(StoreError) as refused:
+                        handoff.seal("android", "playground", SHA, "9")
+                    self.assertIn("no longer exactly the built platform's pin", refused.exception.args[0])
+                    self.assertFalse((self.root / "may-handoff").exists())
 
     def test_ios_archive_round_trip_keeps_internal_symlinks(self):
         shutil.rmtree(self.root / "may-release")

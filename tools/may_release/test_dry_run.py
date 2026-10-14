@@ -21,6 +21,8 @@ import verify
 HERE = Path(__file__).resolve().parent
 STORE = static_check.ROOT / ".github/workflows/store-release-draft.yml"
 SHA = "a" * 40
+# MAY_DRY_RUN values that must not get past either upload script's guard: only the exact "false" may.
+NOT_FALSE = (None, "true", "True", "False", "FALSE", " false", "false\n", "", "0", "no")
 
 
 def runs(condition, dry_run_input):
@@ -137,7 +139,7 @@ class UploadScriptsRefuseADryRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "may-release").mkdir()
             (Path(directory) / "may-release/signed.aab").write_bytes(b"x")
-            for value in (None, "true", "", "False", "0"):
+            for value in NOT_FALSE:
                 env = {"RUNNER_TEMP": directory}
                 if value is not None:
                     env["MAY_DRY_RUN"] = value
@@ -153,13 +155,18 @@ class UploadScriptsRefuseADryRunTests(unittest.TestCase):
             env = {"RUNNER_TEMP": directory, "PATH": "/usr/bin", "MAY_ASC_KEY_ID": "23VX669FGY",
                    "MAY_ASC_KEY_BASE64": base64.b64encode(b"-----BEGIN PRIVATE KEY-----\n").decode(),
                    "MAY_ASC_ISSUER_ID": "00000000-1111-2222-3333-444444444444"}
-            for value in (None, "true"):
+            for value in NOT_FALSE + ("false",):
                 with self.subTest(value=value), \
-                        patch.dict(os.environ, dict(env, **({"MAY_DRY_RUN": value} if value else {})), clear=True), \
+                        patch.dict(os.environ, dict(env, **({"MAY_DRY_RUN": value} if value is not None else {})),
+                                   clear=True), \
                         patch("ios_upload.run_private") as runner:
-                    with self.assertRaises(StoreError):
+                    with self.assertRaises(StoreError) as refused:
                         ios_upload.upload("playground", SHA, "9")
                     runner.assert_not_called()
+                    if value == "false":  # past the guard; stops later, at the missing IPA
+                        self.assertEqual(refused.exception.args[0], "Signed iOS IPA is unavailable")
+                    else:
+                        self.assertEqual(refused.exception.args[0], "Dry run: no store upload was requested")
 
 
 if __name__ == "__main__":

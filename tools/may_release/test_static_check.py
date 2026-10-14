@@ -187,6 +187,21 @@ class StaticCheckTests(unittest.TestCase):
                            "        run: python3 -I -S -B tools/may_release/integrity.py\n", "", 1)
         self.assertFlagged("store android-release: a secret step is not preceded by the checkout integrity check")
 
+    def test_integrity_check_cannot_be_skipped_by_a_dash_line_if(self):
+        check = "Check the checkout is exactly its commit before uploading"
+        for job, at in (("android-release", 0), ("ios-release", 1)):
+            with self.subTest(job=job):
+                self.fresh()
+                path = self.root / STORE
+                text = path.read_text()
+                old = "      - name: " + check + "\n"
+                start = text.find(old) if at == 0 else text.find(old, text.find(old) + 1)
+                self.assertGreaterEqual(start, 0)
+                path.write_text(text[:start] + "      - if: ${{ github.event.inputs.dry_run == 'true' }}\n"
+                                "        name: " + check + "\n" + text[start + len(old):])
+                self.assertFlagged("store " + job + ": a step other than the upload or dry-run report is conditional")
+                self.assertFlagged("store " + job + ": the integrity check before a secret step is conditional")
+
     def test_flow_style_env_is_refused(self):
         self.mutate(STORE, "        env:\n          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n"
                            "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"

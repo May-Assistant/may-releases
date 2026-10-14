@@ -166,8 +166,9 @@ jobs:
       - name: Check the checkout is exactly its commit before uploading
         run: python3 -I -S -B tools/may_release/integrity.py
       - name: Upload update to the internal track only
-        # github.event.inputs holds the boolean as a string: only an explicit
-        # false uploads, and a missing value never does. The script rechecks.
+        # github.event.inputs holds the boolean as a string, and == ignores case,
+        # so this runs on any casing of 'false'; a missing value never does. The
+        # script then refuses everything but the exact string false.
         if: ${{ github.event.inputs.dry_run == 'false' }}
         env:
           MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
@@ -270,8 +271,9 @@ jobs:
       - name: Check the checkout is exactly its commit before uploading
         run: python3 -I -S -B tools/may_release/integrity.py
       - name: Upload verified IPA for internal TestFlight
-        # github.event.inputs holds the boolean as a string: only an explicit
-        # false uploads, and a missing value never does. The script rechecks.
+        # github.event.inputs holds the boolean as a string, and == ignores case,
+        # so this runs on any casing of 'false'; a missing value never does. The
+        # script then refuses everything but the exact string false.
         if: ${{ github.event.inputs.dry_run == 'false' }}
         env:
           MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
