@@ -4,9 +4,10 @@ problems(root) returns fixed descriptions of every violated rule; the CLI exits
 non-zero if there is any. Dependency-free on purpose: it runs in the PR check.
 
 It also pins the store workflow's activation stage (STAGE, STORE_JOB_IF,
-UPLOAD_IF): exactly which jobs and steps carry the never-matching event guard.
-Moving to another stage, or back to fully inert, means changing those constants
-in the same reviewed change as the workflow, never the workflow alone.
+UPLOAD_IF, PLAY_UPLOAD_TRACKS): exactly which jobs and steps carry the
+never-matching event guard, and which uploads may happen. Moving to another
+stage, or back to an earlier one, means changing those constants in the same
+reviewed change as the workflow, never the workflow alone.
 """
 
 import ast
@@ -25,17 +26,21 @@ DOWNLOAD_ARTIFACT = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbd
 FETCH = "Fetch exact private source and pinned design system"
 DECRYPT = "Decrypt and check the build handoff"
 REPORT = "Report what the dry run would have uploaded"
+CONFIRM = "Fail unless the requested store upload succeeded"
 UPLOADS = {"android-release": "Upload update to the internal track only",
            "ios-release": "Upload verified IPA for internal TestFlight"}
+# Each upload step's id, which the loud-failure step reads (steps.<id>.outcome).
+UPLOAD_IDS = {"android-release": "play_upload", "ios-release": "testflight_upload"}
 # A job or step whose condition requires this event never runs: the workflow
 # registers only workflow_dispatch. That is how a job or step is held inert.
 INERT = "github.event_name == 'may-store-disabled-pending-review'"
-STAGE = "stage 1"
-# Activation stage 1 (Android dry runs only). Each store job's exact job-level
-# `if:` (None: no condition). Admission and the Android jobs are active and keep
-# their platform condition; the iOS jobs stay inert (tools/release/ios.sh does not
-# exist yet). Every store upload step is inert too (UPLOAD_IF). The guard appears
-# nowhere else in the workflow's code.
+STAGE = "stage 2"
+# Activation stage 2 (Android uploads to the Play internal track). Each store
+# job's exact job-level `if:` (None: no condition). Admission and the Android jobs
+# are active and keep their platform condition; the iOS jobs stay inert
+# (tools/release/ios.sh does not exist yet). The Android upload step is active and
+# the iOS upload step is still held (UPLOAD_IF). The guard appears nowhere else in
+# the workflow's code.
 STORE_JOB_IF = {
     "admission": None,
     "android-build": "${{ inputs.platform == 'android' }}",
@@ -46,11 +51,20 @@ STORE_JOB_IF = {
 # A store upload runs only when dry_run is exactly 'false' (github.event.inputs
 # holds booleans as strings, so a missing value never uploads), and the upload
 # script receives the same value to recheck. The report runs in every other case.
-# In stage 1 each upload is also held inert (UPLOAD_IF), so no upload runs at all;
-# stage 2 removes the guard from the Android upload only, leaving DRY_RUN_UPLOAD_IF.
+# A held upload also carries the guard first (HELD_UPLOAD_IF). Stage 2: the
+# Android upload is active (DRY_RUN_UPLOAD_IF), the iOS upload is still held.
 DRY_RUN_UPLOAD_IF = "${{ github.event.inputs.dry_run == 'false' }}"
-UPLOAD_IF = "${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}"
+HELD_UPLOAD_IF = "${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}"
+UPLOAD_IF = {"android-release": DRY_RUN_UPLOAD_IF, "ios-release": HELD_UPLOAD_IF}
 REPORT_IF = "${{ github.event.inputs.dry_run != 'false' }}"
+# Loud failure: right after each upload step, whenever dry_run is false (unless the
+# run was cancelled, and even after an earlier failure), confirm_upload.py fails the
+# job unless that upload step's outcome is success. It never carries the guard, so
+# it is already in place when an upload's guard comes off.
+CONFIRM_IF = "${{ !cancelled() && github.event.inputs.dry_run == 'false' }}"
+# Stage 2: store.py's PLAY_UPLOAD_TRACKS must be exactly this (May Playground to
+# the Play internal track only), and play_upload.py's TRACK must be "internal".
+PLAY_UPLOAD_TRACKS = {"playground": "internal"}
 DRY_RUN_ENV = "${{ github.event.inputs.dry_run }}"
 DRY_RUN_INPUT = ("      dry_run:\n        description: [^\n]+\n        required: true\n"
                  "        type: boolean\n        default: true\n")
@@ -63,7 +77,7 @@ STORE_JOBS = {
         {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "android-release": (
         ["Install pinned JDK and age", DECRYPT, "Sign and verify Android App Bundle",
-         "Upload update to the internal track only", REPORT],
+         "Upload update to the internal track only", CONFIRM, REPORT],
         {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
          "Sign and verify Android App Bundle": {"MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PASSWORD",
                                                 "MAY_ANDROID_KEY_PASSWORD"},
@@ -75,7 +89,7 @@ STORE_JOBS = {
         {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "ios-release": (
         ["Install pinned age", DECRYPT, "Sign and verify internal-TestFlight IPA",
-         "Upload verified IPA for internal TestFlight", REPORT],
+         "Upload verified IPA for internal TestFlight", CONFIRM, REPORT],
         {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
          "Sign and verify internal-TestFlight IPA": {"MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD",
                                                      "MAY_IOS_PROFILE_BASE64"},
@@ -85,7 +99,7 @@ STORE_JOBS = {
 # In a release job every command is this repository's own Python, with arguments
 # from a safe character set: no ; | & ` ( ) < > { } or newline, so no $( or chaining.
 RELEASE_COMMAND = re.compile(
-    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|dry_run|cleanup|integrity)\.py"
+    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|confirm_upload|dry_run|cleanup|integrity)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
 ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" '
                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN"')
@@ -149,7 +163,8 @@ def stage_problems(store):
         elif condition != expected:
             found.append(f"store {job}: does not keep its platform condition" if expected else
                          f"store {job}: its job-level condition is not the one {STAGE} expects")
-    held = sum(1 for c in STORE_JOB_IF.values() if c and INERT in c) + len(UPLOADS)
+    held = sum(1 for c in STORE_JOB_IF.values() if c and INERT in c) + \
+        sum(1 for c in UPLOAD_IF.values() if INERT in c)
     if code_lines(store).count(INERT) != held:
         found.append(f"store-release-draft.yml: the inert guard appears or is missing somewhere {STAGE} does not expect")
     return found
@@ -228,7 +243,9 @@ def env_entries(text):
     return found
 
 
-def release_env_allowed(name, value, secrets):
+def release_env_allowed(name, value, secrets, job):
+    if name == "MAY_UPLOAD_OUTCOME":
+        return value == "${{ steps." + UPLOAD_IDS[job] + ".outcome }}"
     if name in secrets:
         return value == "${{ secrets." + name + " }}"
     if name in VARS:
@@ -310,8 +327,8 @@ def store_problems(store):
             any(step_condition(text) is not None for _, text in admission_steps) or \
             CONTINUE_ON_ERROR.search(job_text(store, "admission")):
         found.append("store admission: does not run exactly the gate, unconditionally")
-    # The gate refuses dry_run: false while uploads are held (stage 1), so such a
-    # dispatch fails at admission instead of finishing green without uploading.
+    # The gate refuses dry_run: false for a held upload or an upload this stage does
+    # not allow, so such a dispatch fails at admission instead of finishing green.
     if "          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n" not in job_text(store, "admission"):
         found.append("store admission: does not pass the dispatch's dry_run to the gate")
     if not re.search(r"(?m)^" + DRY_RUN_INPUT, store.partition("\njobs:\n")[0]):
@@ -350,19 +367,27 @@ def store_problems(store):
         if not release and [run_commands(text) for name, text in steps if name == FETCH] != [[prepare]]:
             found.append(f"store {job}: does not prepare the design system for its own platform and target")
         # The dry run must still build, seal, open, sign and verify: only the
-        # upload and the report are conditional (cleanup always runs).
+        # upload, the loud-failure check and the report are conditional (cleanup
+        # always runs).
         for name, text in steps:
             condition = step_condition(text)
             if step_condition_count(text) > 1:
                 found.append(f"store {job}: a step has more than one if:")
             if release and name == UPLOADS[job]:
-                # Together these require exactly UPLOAD_IF: the guard first, then
-                # exactly the dry-run condition stage 2 will leave in place.
-                if condition is None or not condition.startswith("${{ " + INERT + " && "):
-                    found.append(f"store {job}: the upload is not held inert ({STAGE})")
+                # Together these require exactly UPLOAD_IF[job]: for a held upload
+                # the guard first, then exactly the dry-run condition; for an
+                # active one, exactly the dry-run condition with no guard.
+                if INERT in UPLOAD_IF[job]:
+                    if condition is None or not condition.startswith("${{ " + INERT + " && "):
+                        found.append(f"store {job}: the upload is not held inert ({STAGE})")
+                elif INERT in (condition or ""):
+                    found.append(f"store {job}: the upload is held inert, but {STAGE} activates it "
+                                 "(stage mismatch: change UPLOAD_IF in static_check.py on purpose)")
                 if (condition or "").replace(INERT + " && ", "", 1) != DRY_RUN_UPLOAD_IF or \
                         ("          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n") not in text:
                     found.append(f"store {job}: a dry run would run the store upload")
+            elif release and name == CONFIRM:
+                pass  # loud_failure_problems pins it exactly
             elif release and name == REPORT:
                 if condition != REPORT_IF or not run_commands(text) or not run_commands(text)[0].startswith(
                         "python3 -I -S -B tools/may_release/dry_run.py --platform " + platform + " "):
@@ -377,11 +402,12 @@ def store_problems(store):
                     not re.search(r"(?m)^          name: may-handoff-(android|ios)-\$\{\{ github\.run_attempt \}\}$", text):
                 found.append(f"store {job}: handoff artifact is not bound to this run attempt")
         if release:
+            found += loud_failure_problems(store, job, steps)
             all_secrets = set().union(*expected.values())
             body = job_text(store, job)
             if re.search(r"(?m)^\s+(shell|defaults|working-directory):", body):
                 found.append(f"store {job}: overrides the shell, defaults or working directory")
-            if not all(release_env_allowed(n, v, all_secrets) for n, v in env_entries(body)):
+            if not all(release_env_allowed(n, v, all_secrets, job) for n, v in env_entries(body)):
                 found.append(f"store {job}: sets an environment variable it does not declare")
             for name, text in steps:
                 for command in run_commands(text):
@@ -395,6 +421,41 @@ def store_problems(store):
     return found
 
 
+def loud_failure_problems(store, job, steps):
+    """A dispatch with dry_run: false must never end green without uploading.
+
+    Right after the upload step, exactly one CONFIRM step runs confirm_upload.py
+    for this platform under exactly CONFIRM_IF (never the guard), reading only the
+    upload step's outcome, and the upload step carries the id it reads.
+    """
+    platform, upload_id = job.split("-")[0], UPLOAD_IDS[job]
+    names = [name for name, _ in steps]
+    confirms = [text for name, text in steps if name == CONFIRM]
+    command = ("python3 -I -S -B tools/may_release/confirm_upload.py --platform " + platform +
+               ' --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
+    uploads = [text for name, text in steps if name == UPLOADS[job]]
+    if len(confirms) != 1 or UPLOADS[job] not in names or names.index(CONFIRM) != names.index(UPLOADS[job]) + 1 or \
+            step_condition(confirms[0]) != CONFIRM_IF or run_commands(confirms[0]) != [command] or \
+            env_entries(confirms[0]) != [("MAY_UPLOAD_OUTCOME", "${{ steps." + upload_id + ".outcome }}")] or \
+            len(uploads) != 1 or not re.search(r"(?m)^(?:        )?id: " + upload_id + "$", uploads[0]) or \
+            len(re.findall(r"(?m)^\s*(?:-\s+)?id: " + upload_id + "$", job_text(store, job))) != 1:
+        return [f"store {job}: a dispatch with dry_run: false could end green without uploading "
+                "(the loud-failure check after the upload is missing or changed)"]
+    return []
+
+
+def assigned_literal(path, name):
+    """The literal value of a module-level `name = ...` in path, or None."""
+    value = None
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == [name]:
+            try:
+                value = ast.literal_eval(node.value)
+            except ValueError:
+                value = None
+    return value
+
+
 def held_uploads_problems(root, store):
     """gate.py's UPLOADS_HELD must name exactly the platforms whose upload step is held."""
     held = set()
@@ -402,17 +463,25 @@ def held_uploads_problems(root, store):
         for step_name, text in job_steps(store, job)[1]:
             if step_name == name and INERT in (step_condition(text) or ""):
                 held.add(job.split("-")[0])
-    declared = None
-    for node in ast.parse((root / "tools/may_release/gate.py").read_text()).body:
-        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["UPLOADS_HELD"]:
-            try:
-                declared = ast.literal_eval(node.value)
-            except ValueError:
-                declared = None
+    declared = assigned_literal(root / "tools/may_release/gate.py", "UPLOADS_HELD")
     if not isinstance(declared, set) or declared != held:
-        return [f"gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held, so {STAGE} "
-                "would not refuse dry_run: false at admission"]
+        return [f"gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held ({STAGE}), so "
+                "admission would admit dry_run: false for a held upload or refuse it for an active one"]
     return []
+
+
+def upload_track_problems(root):
+    """Only the Play internal track is reachable, and in stage 2 only for May Playground."""
+    found = []
+    tracks = assigned_literal(root / "tools/may_release/store.py", "PLAY_UPLOAD_TRACKS")
+    if not isinstance(tracks, dict) or tracks != PLAY_UPLOAD_TRACKS or set(tracks.values()) - {"internal"}:
+        found.append(f"store.py: PLAY_UPLOAD_TRACKS is not exactly {STAGE}'s "
+                     "(May Playground to the Play internal track only)")
+    uploader = (root / "tools/may_release/play_upload.py").read_text()
+    if assigned_literal(root / "tools/may_release/play_upload.py", "TRACK") != "internal" or \
+            uploader.count("/tracks/") != 1 or '/tracks/{TRACK}"' not in uploader:
+        found.append("play_upload.py: writes a track other than the Play internal track (TRACK)")
+    return found
 
 
 def control_problems(root):
@@ -434,7 +503,7 @@ def control_problems(root):
         found.append("native-compile-draft.yml does not recheck after review")
     if "--source-sha '${{ inputs.source_sha }}'" in compile_workflow or "--platform '${{ inputs.platform }}'" in compile_workflow:
         found.append("native-compile-draft.yml interpolates inputs into shell")
-    return found + store_problems(store) + held_uploads_problems(root, store)
+    return found + store_problems(store) + held_uploads_problems(root, store) + upload_track_problems(root)
 
 
 def printed_error_classes(trees):
@@ -487,5 +556,6 @@ if __name__ == "__main__":
         print("Static check failed: " + failure)
     if failures:
         sys.exit(1)
-    print("May store workflow is at activation stage 1 (Android dry runs only; uploads and iOS inert), "
-          "the native compile workflow is inert, and the no-secret controls are structurally present")
+    print("May store workflow is at activation stage 2 (Android uploads to the Play internal track for May "
+          "Playground only, each checked loudly; iOS inert), the native compile workflow is inert, and the "
+          "no-secret controls are structurally present")

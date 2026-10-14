@@ -1,10 +1,9 @@
-name: May protected store release (stage 1, Android dry runs only)
-# Activation stage 1: an Android dry run can be dispatched. Store uploads (both
-# platforms) and every iOS job are still inert: they require an event name this
-# workflow never registers, so they are always skipped. Stage 2 is a separate
-# reviewed change that removes that guard from the Android upload step, after a
-# successful Android dry run and Samuel's go. static_check.py pins exactly where
-# the guard must and must not be for this stage.
+name: May protected store release (stage 2, Android internal uploads; iOS inert)
+# Activation stage 2: an Android dispatch can dry-run or, with dry_run: false,
+# upload May Playground to the Play internal track. The iOS jobs and the iOS
+# upload step are still inert: they require an event name this workflow never
+# registers, so they are always skipped. static_check.py pins exactly where the
+# guard must and must not be for this stage.
 # Each run is two jobs on separate fresh VMs:
 #   *-build    environment may-native-compile (read-only source keys only). Runs
 #              the private build (Gradle / Xcode / SwiftPM: third-party code) and
@@ -19,10 +18,12 @@ name: May protected store release (stage 1, Android dry runs only)
 #   ios/production     -> may-ios-internal                 (May, ASC 6821782401)
 #   ios/playground     -> may-ios-playground-internal      (May Playground, ASC 6822072535)
 # dry_run (default true) runs build, seal, open, sign and verify, skips every store
-# upload step, and reports what it would have uploaded. A real upload will need
-# dry_run: false, chosen explicitly at dispatch, once stage 2 lands. In stage 1,
-# dry_run: false fails by design: admission (gate.py --dry-run, UPLOADS_HELD)
-# refuses it before any approval, build or secret.
+# upload step, and reports what it would have uploaded. A real upload needs
+# dry_run: false, chosen explicitly at dispatch. Admission (gate.py --dry-run)
+# refuses dry_run: false before any approval, build or secret unless it is an
+# Android May Playground dispatch (UPLOADS_HELD, store.PLAY_UPLOAD_TRACKS). Once
+# admitted, a release job with dry_run: false fails unless its upload step
+# succeeded (confirm_upload.py), so it never ends green without uploading.
 on:
   workflow_dispatch:
     inputs:
@@ -56,9 +57,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   admission:
-    # Active (stage 1). Runs for every dispatch and checks both environments the
-    # run will use; an iOS dispatch then stops here, because the iOS jobs are inert.
-    # It also refuses dry_run: false while that platform's uploads are held.
+    # Active. Runs for every dispatch and checks both environments the run will
+    # use; an iOS dispatch then stops here, because the iOS jobs are inert. It also
+    # refuses dry_run: false for anything but an Android May Playground upload.
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -175,17 +176,25 @@ jobs:
       - name: Check the checkout is exactly its commit before uploading
         run: python3 -I -S -B tools/may_release/integrity.py
       - name: Upload update to the internal track only
-        # Stage 1: held inert by the never-matching event guard, so this never runs,
-        # even when dry_run is false. Stage 2 removes only that guard, leaving the
-        # dry-run condition: github.event.inputs holds the boolean as a string, and
-        # == ignores case, so it runs on any casing of 'false'; a missing value
-        # never does. The script then refuses everything but the exact string false.
-        if: ${{ github.event_name == 'may-store-disabled-pending-review' && github.event.inputs.dry_run == 'false' }}
+        # Stage 2: active, with no inert guard. github.event.inputs holds the
+        # boolean as a string, and == ignores case, so it runs on any casing of
+        # 'false'; a missing value never does. The script then refuses everything
+        # but the exact string false, and any target but May Playground.
+        id: play_upload
+        if: ${{ github.event.inputs.dry_run == 'false' }}
         env:
           MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
           MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}
           MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}
         run: python3 -I -S -B tools/may_release/play_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Fail unless the requested store upload succeeded
+        # Loud failure: whenever dry_run is false (unless the run was cancelled),
+        # even after an earlier failure, this fails the job unless the upload step
+        # succeeded and left its upload record. A skipped upload never goes green.
+        if: ${{ !cancelled() && github.event.inputs.dry_run == 'false' }}
+        env:
+          MAY_UPLOAD_OUTCOME: ${{ steps.play_upload.outcome }}
+        run: python3 -I -S -B tools/may_release/confirm_upload.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Report what the dry run would have uploaded
         if: ${{ github.event.inputs.dry_run != 'false' }}
         run: python3 -I -S -B tools/may_release/dry_run.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
@@ -193,7 +202,7 @@ jobs:
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py release
   ios-build:
-    # Inert in stage 1: tools/release/ios.sh does not exist in may-app yet.
+    # Inert in stage 2: tools/release/ios.sh does not exist in may-app yet.
     needs: admission
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
     runs-on: macos-15
@@ -237,7 +246,7 @@ jobs:
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py build
   ios-release:
-    # Inert in stage 1, like ios-build.
+    # Inert in stage 2, like ios-build.
     needs: [admission, ios-build]
     if: ${{ github.event_name == 'may-store-disabled-pending-review' && inputs.platform == 'ios' }}
     runs-on: macos-15
@@ -289,6 +298,7 @@ jobs:
         # github.event.inputs holds the boolean as a string, and == ignores case,
         # so it runs on any casing of 'false'; a missing value never does. The
         # script then refuses everything but the exact string false.
+        id: testflight_upload
         if: ${{ github.event_name == 'may-store-disabled-pending-review' && github.event.inputs.dry_run == 'false' }}
         env:
           MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
@@ -296,6 +306,15 @@ jobs:
           MAY_ASC_KEY_ID: ${{ vars.MAY_ASC_KEY_ID }}
           MAY_ASC_ISSUER_ID: ${{ secrets.MAY_ASC_ISSUER_ID }}
         run: python3 -I -S -B tools/may_release/ios_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Fail unless the requested store upload succeeded
+        # The same loud failure as Android's, deliberately without the inert guard:
+        # it is inert only because this job is. If the job's guard comes off while
+        # the upload's stays, a dispatch asking to upload fails here instead of
+        # going green with the upload skipped.
+        if: ${{ !cancelled() && github.event.inputs.dry_run == 'false' }}
+        env:
+          MAY_UPLOAD_OUTCOME: ${{ steps.testflight_upload.outcome }}
+        run: python3 -I -S -B tools/may_release/confirm_upload.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Report what the dry run would have uploaded
         if: ${{ github.event.inputs.dry_run != 'false' }}
         run: python3 -I -S -B tools/may_release/dry_run.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"

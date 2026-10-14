@@ -21,10 +21,13 @@ internal-only TestFlight); there is no track input to choose anything else.
 Before any production or public-beta release, Prevent self-review must be on and
 a second reviewer added (README, "Before any non-internal release").
 
-Activation stage: while a platform's store upload is held (UPLOADS_HELD), admission
-refuses any dispatch for it whose dry_run is not true. A dispatch with dry_run: false
-then fails at once, before any approval, build or secret, rather than finishing
-green without having uploaded anything.
+Activation stage 2: admission refuses any dispatch whose dry_run is not true unless
+it asks for an upload this stage allows: a platform whose upload is not held
+(UPLOADS_HELD) and, for Android, a target store.PLAY_UPLOAD_TRACKS maps to the
+Play `internal` track (stage 2: May Playground only). Any other dry_run: false
+dispatch fails at once, before any approval, build or secret, rather than
+finishing green without having uploaded anything. (A dispatch that is admitted
+and then does not upload still fails: confirm_upload.py, after the upload step.)
 """
 
 import argparse
@@ -32,8 +35,15 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import urllib.error
 import urllib.request
+
+# Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
+# after the standard library. A file planted here cannot shadow a stdlib import.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from store import PLAY_UPLOAD_TRACKS
 
 CONTROL_REPO = "May-Assistant/may-releases"
 OWNER_ID = 58840187
@@ -46,10 +56,10 @@ ENVIRONMENTS = {
     ("android", "playground"): "may-android-playground-internal",
 }
 MAX_BUILD_NUMBER = 2_000_000_000
-# Stage 1: the store upload step of each platform listed here carries the inert
+# Stage 2: the store upload step of each platform listed here carries the inert
 # guard, so it can never run; static_check.py requires this set to be exactly the
-# platforms whose upload step is held. Stage 2 removes "android".
-UPLOADS_HELD = {"android", "ios"}
+# platforms whose upload step is held. Stage 1 held both; stage 2 lifted Android.
+UPLOADS_HELD = {"ios"}
 ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
 AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
@@ -81,16 +91,21 @@ def validate_run(repo, ref, event, sha, action, build_number=None, target="produ
     return ENVIRONMENTS[key]
 
 
-def validate_dry_run(action, dry_run):
+def validate_dry_run(action, dry_run, target="production"):
     """Admission passes the dispatch's dry_run (github.event.inputs.dry_run, a string).
     The rechecks inside protected jobs pass none, so None is not checked."""
     if dry_run is None:
         return
     if dry_run not in ("true", "false"):
         raise GateDenial("dry_run must be true or false")
-    if action in UPLOADS_HELD and dry_run != "true":
-        raise GateDenial("Stage 1: uploads are held; this run did not upload anything. "
-                         "dry_run: false fails in stage 1 by design; dispatch with dry_run: true")
+    if dry_run == "true":
+        return
+    if action in UPLOADS_HELD:
+        raise GateDenial("Uploads are held for this platform (stage 2 holds iOS); this run did not upload "
+                         "anything. dry_run: false fails here by design; dispatch with dry_run: true")
+    if action != "android" or PLAY_UPLOAD_TRACKS.get(target) != "internal":
+        raise GateDenial("Stage 2 admits only a May Playground Android upload to the Play internal track; "
+                         "this run did not upload anything. Dispatch with dry_run: true")
 
 
 def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=None):
@@ -152,7 +167,7 @@ def main():
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
-    validate_dry_run(args.action, args.dry_run)
+    validate_dry_run(args.action, args.dry_run, args.target)
     build_env = ENVIRONMENTS["compile"]
     if args.action != "compile" and artifact_recipient(env) is None:
         raise GateDenial("Artifact encryption public key for this target is still a placeholder; "

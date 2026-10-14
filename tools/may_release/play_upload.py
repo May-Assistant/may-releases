@@ -13,6 +13,17 @@ one. Otherwise, inside one edit, it:
    every other track untouched;
 4. commits with ERROR_IF_IN_REVIEW, so an in-review change is never cancelled.
 
+Track: only `internal`, and only for the targets in store.PLAY_UPLOAD_TRACKS
+(stage 2: May Playground alone). TRACK is the one track this script ever
+writes; there is no track input, and a target the table does not map to TRACK
+is refused before any request (gate.py refuses it at admission first).
+
+Report: after the commit, it records the upload (store.UPLOAD_RECORD) and prints
+the package, versionCode, track, signed AAB SHA-256 and the committed edit ID.
+The workflow's next step (confirm_upload.py) fails the job unless this step
+succeeded and left that record, so dry_run: false can never end green without
+an upload.
+
 Dry run: the workflow skips this step unless `dry_run` is false, and this
 script also refuses unless MAY_DRY_RUN is exactly "false", so a real upload is
 always an explicit choice. dry_run.py reports instead.
@@ -46,8 +57,8 @@ import sys
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import (PLAY_UPLOAD_SECRETS, StoreError, child_env, file_sha256, identity, play_identity,
-                   require_step_secrets, runner_root, write_private)
+from store import (PLAY_UPLOAD_SECRETS, PLAY_UPLOAD_TRACKS, StoreError, child_env, file_sha256, identity,
+                   play_identity, require_step_secrets, runner_root, write_private, write_upload_record)
 
 SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 API = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications"
@@ -219,6 +230,8 @@ def upload(target, source_sha, build_number, session=None):
     require_step_secrets(PLAY_UPLOAD_SECRETS)
     if os.environ.get("MAY_DRY_RUN") != "false":
         raise PlayRefusal("Dry run: no store upload was requested.")
+    if TRACK != "internal" or PLAY_UPLOAD_TRACKS.get(target) != TRACK:
+        raise PlayRefusal("Only May Playground uploads to the Play internal track are allowed.")
     raw = os.environ.get("MAY_PLAY_JSON", "")
     play_identity(raw, os.environ.get("MAY_PLAY_ACCOUNT", ""))
     bundle = runner_root() / "may-release/signed.aab"
@@ -256,7 +269,8 @@ def upload(target, source_sha, build_number, session=None):
     except BaseException:
         delete_edit(session, f"{base}/{edit}")
         raise
-    print("May App Bundle submitted to Google Play internal testing; verify processing separately")
+    report = write_upload_record("android", package, build_number, TRACK, local_sha256, edit)
+    print("\n".join(report + ["Verify processing in Play Console separately."]))
 
 
 if __name__ == "__main__":

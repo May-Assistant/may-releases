@@ -44,6 +44,21 @@ PLAY_ACCOUNT_DOMAIN = "@may-assistant-app.iam.gserviceaccount.com"
 XCODE_DEVELOPER_DIR = "/Applications/Xcode_26.3.app/Contents/Developer"
 # Play's hard limit is 2,100,000,000; stay clear of it.
 MAX_BUILD_NUMBER = 2_000_000_000
+# Stage 2: the Play uploads this repository may make, as target -> the one track
+# that upload writes. Only "internal" may appear (static_check.py pins this table
+# exactly for the stage), and there is no track input, so no production, beta or
+# alpha track is reachable. The real May app (`production`) is left out on
+# purpose: no dry run has proven its upload, and its internal build can be
+# promoted to production by hand in Play Console, where no control here runs.
+# gate.py refuses dry_run: false for any other target at admission, and
+# play_upload.py refuses it again before any request.
+PLAY_UPLOAD_TRACKS = {"playground": "internal"}
+# The only TestFlight destination ios_upload.py's export can reach
+# (testFlightInternalTestingOnly); reported by dry_run.py and confirm_upload.py.
+IOS_TRACK = "TestFlight internal testing only"
+# Written under may-release by play_upload.py or ios_upload.py once an upload has
+# succeeded; confirm_upload.py requires it whenever dry_run is false.
+UPLOAD_RECORD = "upload-record.json"
 
 # Every secret any May release step can hold. Each step names the subset it may
 # see; a step that finds any other one present refuses to run.
@@ -128,6 +143,32 @@ def play_identity(value, expected_account):
             credential.get("project_id") != "may-assistant-app" or
             not credential.get("private_key")):
         raise StoreError("Protected May Play identity does not match")
+
+
+def upload_report(record):
+    """The lines a successful upload prints, from its upload record."""
+    if record["platform"] == "android":
+        return ["Store upload made: Google Play accepted and committed:",
+                "  package: " + record["app_id"],
+                "  versionCode: " + record["build_number"],
+                "  track: " + record["track"],
+                "  signed AAB SHA-256: " + record["sha256"],
+                "  Play edit (committed): " + record["store_id"]]
+    return ["Store upload made: App Store Connect accepted:",
+            "  bundle: " + record["app_id"],
+            "  build number (CFBundleVersion): " + record["build_number"],
+            "  track: " + record["track"],
+            "  signed IPA SHA-256: " + record["sha256"],
+            "  upload ID: not reported (the upload tool's output stays in the private log); "
+            "verify processing in App Store Connect"]
+
+
+def write_upload_record(platform, app_id, build_number, track, sha256, store_id=None):
+    """Record a successful upload for confirm_upload.py, and return its report lines."""
+    record = {"platform": platform, "app_id": app_id, "build_number": build_number, "track": track,
+              "sha256": sha256, "store_id": store_id}
+    write_private(runner_root() / "may-release" / UPLOAD_RECORD, json.dumps(record, sort_keys=True).encode())
+    return upload_report(record)
 
 
 def require_step_secrets(allowed):

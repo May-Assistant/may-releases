@@ -20,7 +20,7 @@ import sys
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import APPLE_TEAM, StoreError, file_sha256, identity, require_step_secrets, runner_root
+from store import APPLE_TEAM, IOS_TRACK, StoreError, file_sha256, identity, require_step_secrets, runner_root
 import play_upload
 import verify
 
@@ -46,7 +46,7 @@ def summary(platform, target, source_sha, build_number):
     return ["Dry run: no store upload was made. App Store Connect would have received:",
             "  bundle: " + app_id,
             "  build number (CFBundleVersion): " + build_number,
-            "  track: TestFlight internal testing only",
+            "  track: " + IOS_TRACK,
             "  signed IPA SHA-256: " + file_sha256(artifact)]
 
 
