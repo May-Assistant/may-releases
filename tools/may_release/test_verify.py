@@ -294,6 +294,31 @@ class AabManifestTests(unittest.TestCase):
                     raised = error
                 self.assertIsInstance(raised, verify.VerifyError)
 
+    def test_fields_wider_than_their_protobuf_type_are_refused(self):
+        """Parsers keep the low 32 bits of a uint32 or int32; a wider value must not read differently here (T1-T3)."""
+        version = self.version
+        cases = {
+            "Bundle manifest resource ID is wider than 32 bits": {
+                "T1": self.crafted(self.PACKAGE, version(b"2100000000", b"http://x", b"vc", (1 << 32) | 0x0101021B),
+                                   version()),
+                "T2": self.crafted(self.PACKAGE, version(), version(b"1", b"http://x", b"major", (1 << 32) | 0x01010576)),
+                "T3": self.crafted(self.PACKAGE, version(resource_id=(1 << 63) | 0x0101021B)),
+            },
+            "Bundle manifest versionCode is malformed": {
+                # The compiled int32: its low 32 bits would be 3, the full varint is not.
+                "wide compiled": self.crafted(self.PACKAGE, version(item=fx._field(7, fx._field(6, (1 << 32) | 3)))),
+                "negative compiled": self.crafted(self.PACKAGE, version(
+                    item=fx._field(7, fx._field(6, (1 << 64) - 3)))),
+            },
+        }
+        for message, manifests in cases.items():
+            for case, manifest in manifests.items():
+                with self.subTest(case=case):
+                    self.refused(manifest, message)
+        # At the widths aapt2 writes, the same shapes still read.
+        self.assertEqual(verify.manifest_identity(self.crafted(self.PACKAGE, version(b"2147483647"))),
+                         ("io.github.mayassistant.may", "2147483647"))
+
     def test_wrong_wire_types_are_refused(self):
         # N3: a varint where a string or message belongs, and a string where a varint belongs.
         version = self.version

@@ -220,7 +220,9 @@ def aab_signer_sha256(path):
 # identity read here must be the only reading possible: exactly one attribute
 # carries that ID, and it is android:versionCode with exactly one compiled
 # primitive; nothing carries versionCodeMajor's ID or name; `package` has no
-# compiled item or resource ID (aapt2 writes it as a plain string).
+# compiled item or resource ID (aapt2 writes it as a plain string). A uint32 or
+# int32 field wider than its width is refused, never truncated: protobuf parsers
+# keep only the low bits, so a wider value would read differently there.
 MANIFEST_ENTRY = "base/manifest/AndroidManifest.xml"
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 MAX_MANIFEST_BYTES = 4 << 20
@@ -308,6 +310,9 @@ def manifest_identity(data):
         attribute = _fields(raw)
         namespace, name = _text(attribute, 1), _text(attribute, 2)
         resource_id = _one(attribute, 5, 0, required=False)
+        if resource_id is not None and resource_id > 0xFFFFFFFF:
+            # A uint32 field: protobuf parsers keep only its low 32 bits, and aapt2 never writes wider.
+            raise VerifyError("Bundle manifest resource ID is wider than 32 bits")
         if resource_id == VERSION_CODE_MAJOR_ID or name == "versionCodeMajor":
             raise VerifyError("Bundle manifest sets versionCodeMajor")
         if (resource_id == VERSION_CODE_ID) != ((namespace, name) == (ANDROID_NS, "versionCode")):
@@ -321,6 +326,9 @@ def manifest_identity(data):
             item = _fields(_one(attribute, 6, 2))
             primitive = _fields(_one(item, 7, 2))
             compiled = _one(primitive, 6, 0)
+            if compiled > 0x7FFFFFFF:
+                # An int32 field: a wider varint (or a negative value) would not read back as this number.
+                raise VerifyError("Bundle manifest versionCode is malformed")
             if len(item) != 1 or len(primitive) != 1 or not re.fullmatch(r"[1-9][0-9]{0,9}", text) or \
                     int(text) != compiled:
                 raise VerifyError("Bundle manifest versionCode is malformed")
