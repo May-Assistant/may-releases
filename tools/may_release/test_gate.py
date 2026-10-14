@@ -188,14 +188,14 @@ class GateTests(unittest.TestCase):
 
 
     def run_admission(self, dry_run, action="android", target="playground", sign_only="false", build="3",
-                      console_key=True):
+                      console_key=True, console_value=None):
         """gate.main() as admission runs it, with fixture metadata. Returns (denial, output, requests)."""
         with tempfile.TemporaryDirectory() as directory:
             keys = Path(directory)
             for environment in gate.ENVIRONMENTS.values():
                 (keys / (environment + ".age.pub")).write_text("age1" + "q" * 58 + "\n")
             (keys / (gate.SIGN_ONLY_RECIPIENT + ".age.pub")).write_text(
-                "age1" + "p" * 58 + "\n" if console_key else "PLACEHOLDER: Samuel's key\n")
+                (console_value or "age1" + "p" * 58) + "\n" if console_key else "PLACEHOLDER: Samuel's key\n")
             output = os.path.join(directory, "output")
             env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH,
                    "GH_TOKEN": "fixture-token", "GITHUB_OUTPUT": output}
@@ -221,8 +221,8 @@ class GateTests(unittest.TestCase):
             "dry_run: false fails here by design; dispatch with dry_run: true")
     NOT_ADMITTED = ("Stage 3 admits only an Android May or May Playground upload to the Play internal track; "
                     "this run did not upload anything. Dispatch with dry_run: true")
-    FLOOR = ("Store build number is below this app's floor (May production Android starts at 3: versionCode 1 "
-             "was a manual upload and 2 was built for Dots)")
+    FLOOR = ("Store build number is below this app's floor (May production Android starts at 3: versionCodes 1 "
+             "and 2 have been built, and a floor stays above every built versionCode)")
 
     def test_stage_3_admits_a_may_playground_android_upload(self):
         self.assertEqual(gate.UPLOADS_HELD, {"ios"})
@@ -319,6 +319,12 @@ class GateTests(unittest.TestCase):
                                                        console_key=False)
         self.assertEqual(denial, "The Console-upload public key (artifact_keys/may-android-console-upload.age.pub) is "
                                  "still a placeholder; Samuel's public key must be committed before sign_only can run")
+        self.assertEqual((written, requests), (None, []))
+        # Nor a Console key that is one of the environments' handoff keys, whose private halves are CI secrets.
+        denial, written, requests = self.run_admission("true", "android", "production", sign_only="true",
+                                                       console_value="age1" + "q" * 58)
+        self.assertEqual(denial, "The Console-upload key must not be any environment's handoff key, whose private "
+                                 "half is a CI secret; commit a key only Samuel holds")
         self.assertEqual((written, requests), (None, []))
         # A plain dry run of the same target does not need it.
         denial, _, _ = self.run_admission("true", "android", "production", console_key=False)

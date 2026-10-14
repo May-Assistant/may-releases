@@ -28,9 +28,11 @@ ERROR_IF_IN_REVIEW (require_commit); changesNotSentForReview is refused.
 
 Target binding: before any request, MAY_PLAY_ACCOUNT must be the target's own
 Play account, the signed bundle's sole signer must be the target's own upload
-certificate (store.ANDROID_UPLOAD_KEYS), and the build number must be at least
-the app's floor (store.MIN_BUILD_NUMBERS: May production starts at 3). The
-package is store.APP_IDS[target]; Play refuses a bundle whose package differs.
+certificate (store.ANDROID_UPLOAD_KEYS), the bundle's own manifest must be
+exactly store.APP_IDS[target] at the requested versionCode
+(verify.check_aab_identity, read on this side rather than trusted from the build
+job), and the build number must be at least the app's floor
+(store.MIN_BUILD_NUMBERS: May production starts at 3).
 
 Report: after the commit, it records the upload (store.UPLOAD_RECORD) and prints
 the package, versionCode, track, signed AAB SHA-256 and the committed edit ID.
@@ -334,6 +336,7 @@ def upload(target, source_sha, build_number, session=None):
     except verify.VerifyError:
         raise StoreError("Signed Android App Bundle has no single verifiable signer") from None
     check_android_signer(target, signer)
+    verify.check_aab_identity(bundle, package, build_number)
     local_sha256 = file_sha256(bundle)
     if session is None:
         work = runner_root() / "may-private"
@@ -388,6 +391,8 @@ def main(argv=None):
     try:
         upload(args.target, args.source_sha, args.build_number)
     except PlayRefusal as refusal:
+        raise SystemExit("May Play upload refused before any change: " + refusal.args[0]) from None
+    except verify.VerifyError as refusal:  # the bundle's own manifest, checked before any request
         raise SystemExit("May Play upload refused before any change: " + refusal.args[0]) from None
     except StoreError as error:
         raise SystemExit("May Play upload stopped: " + error.args[0] +

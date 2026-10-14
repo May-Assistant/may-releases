@@ -87,11 +87,13 @@ def confirm_signed(platform, target, source_sha, build_number):
     if os.environ.get("MAY_PUBLISH_OUTCOME") != "success":
         raise StoreError("sign_only was true, but the signed bundle was not published (the publish step failed, "
                          "was skipped or was cancelled); nothing is ready for Play Console")
+    if platform != "android":
+        raise StoreError("Sign-only is Android only; nothing is ready for Play Console")
     root = runner_root()
     if (root / "may-release" / UPLOAD_RECORD).exists():
         raise StoreError("A sign-only run left an upload record; it must never upload")
     out, signed = root / SIGN_ONLY_DIR, root / "may-release" / ARTIFACTS["android"]
-    if platform != "android" or not out.is_dir() or out.is_symlink() or not signed.is_file() or signed.is_symlink():
+    if not out.is_dir() or out.is_symlink() or not signed.is_file() or signed.is_symlink():
         raise StoreError("The sign-only step left no signed bundle to publish; nothing is ready for Play Console")
     files = {path.name: path for path in out.iterdir()}
     if set(files) != sign_only.FILES or any(path.is_symlink() or not path.is_file() for path in files.values()):

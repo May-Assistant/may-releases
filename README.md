@@ -12,15 +12,15 @@ This repository only performs later updates. It refuses an app whose tracks show
 
 ## Current state
 
-**Activation status: stage 3, Android uploads to the Play internal track (May and May Playground), plus sign-only for May production.** The [store-release workflow](.github/workflows/store-release-draft.yml) can run an Android **dry run**, or, with `dry_run: false`, upload **May** or **May Playground** to its Play **`internal`** track, or, for May production with `sign_only: true` and `dry_run: true`, sign and verify and then publish the signed bundle, encrypted, for one manual Play Console upload. Promoting a build from internal to production stays a manual step in Play Console (Samuel's decision, 14 Oct). A job or step is held **inert** by a condition that requires an event name the workflow never registers (`may-store-disabled-pending-review`), so it is always skipped. In stage 3:
+**Activation status: stage 3, Android uploads to the Play internal track (May and May Playground), plus sign-only for May production.** The [store-release workflow](.github/workflows/store-release-draft.yml) can run an Android **dry run**, or, with `dry_run: false`, upload **May** or **May Playground** to its Play **`internal`** track, or, for May production with `sign_only: true` and `dry_run: true`, sign and verify in a separate `android-sign-only` job (no Play secret) and then publish the signed bundle, encrypted, for a manual Play Console upload. Promoting a build from internal to production stays a manual step in Play Console (Samuel's decision, 14 Oct). A job or step is held **inert** by a condition that requires an event name the workflow never registers (`may-store-disabled-pending-review`), so it is always skipped. In stage 3:
 
 | Part of the store workflow | Stage 3 |
 | --- | --- |
 | `admission` | active (runs on every dispatch) |
-| `android-build`, `android-release` | active when `platform` is `android` |
+| `android-build`, `android-release` | active when `platform` is `android` (`android-release` only when `sign_only` is not `true`) |
 | Android upload step (`play_upload.py`) | **active** when `dry_run` is `false`; admission admits that for target `playground` or `production` (track `internal` only) |
 | Android loud-failure check (`confirm_upload.py`) | runs whenever `dry_run` is `false`; fails the job unless the upload step succeeded |
-| Sign-only steps (`sign_only.py`, the publish step, `confirm_upload.py --sign-only`) | run only when `sign_only` is `true`; admission admits that only for May production Android with `dry_run: true`, and only once Samuel's Console-upload key is committed (it is a placeholder today) |
+| `android-sign-only` (`sign_only.py`, the publish step, `confirm_upload.py --sign-only`) | runs instead of `android-release` when `sign_only` is `true`; admission admits that only for May production Android with `dry_run: true`, and only once Samuel's Console-upload key is committed (it is a placeholder today). The job references no Play secret or variable |
 | `ios-build`, `ios-release` (and the iOS upload step) | **inert**: `tools/release/ios.sh` does not exist yet. The iOS loud-failure check is in place but inert with its job |
 | Dry-run report (`dry_run.py`) | runs whenever `dry_run` is not `false`; for Android it now also rechecks the build-number floor, the signer and the Play account |
 
@@ -90,7 +90,7 @@ Each store run is **two jobs on separate fresh VMs**:
    - runs the private build script for an **unsigned** product (`store.py`). This step runs third-party code: Gradle and its plugins, SwiftPM, and Xcode build phases.
    - encrypts the product, with a manifest that also records both design-system pins, using [age](https://age-encryption.org) to the target's public key committed in `tools/may_release/artifact_keys/` (`handoff.py seal`);
    - uploads only the encrypted file, as a one-day artifact.
-2. **`*-release`** (the store environment; `needs: [admission, *-build]`):
+2. **`*-release`**, or **`android-sign-only`** for a [sign-only](#sign-only) dispatch (the store environment; `needs: [admission, *-build]`):
    - on a fresh VM, runs no build toolchain. Its only actions are SHA-pinned `actions/checkout` and `actions/download-artifact`, used before any secret is present. Every command is this repository's Python, run as `python3 -I -S -B` (isolated: neither the script folder nor site-packages comes before the standard library, so a planted file cannot shadow a stdlib import), which calls the pinned, checksum-verified Temurin `jarsigner`, the pinned `age`, the system `openssl`, and Apple's `/usr/bin` tools.
    - `handoff.py open` decrypts with `MAY_ARTIFACT_DECRYPT_KEY` and checks that key against the committed public key. It refuses the payload unless its manifest names exactly this repository, run ID, **run attempt**, platform, target, source SHA and build number. The artifact name also carries the attempt.
    - It then validates every tar member before writing anything, and extracts them one by one. It does not use `tarfile`'s extraction filters.
@@ -102,7 +102,7 @@ Each store run is **two jobs on separate fresh VMs**:
      - Every link is re-resolved in its final location before any signing secret is on the VM.
    - `integrity.py` runs before each secret step (decrypt, sign, upload). It refuses unless `git status --ignored` is empty and every file under `tools/may_release/` matches the checked-out commit's blob, mode and file list. It runs git with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `-c core.fsmonitor=false` and only `PATH` in its environment, so no system, global or `HOME`-based setting (hooks, fsmonitor, excludes) applies.
    - Because the attempt is bound, re-running a store run means **re-running all jobs**. Re-running only the release job finds no artifact for the new attempt and stops with "Re-run all jobs: this release only accepts a build from the same run attempt".
-   - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads, unless this is a [dry run](#dry-run). In [stage 3](#current-state) only the Android upload step can run (May and May Playground), or, for May production, the [sign-only](#sign-only) steps instead.
+   - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads, unless this is a [dry run](#dry-run). In [stage 3](#current-state) only the Android upload step can run (May and May Playground), or, for May production, the [sign-only](#sign-only) job instead, which publishes the encrypted signed bundle and holds no Play secret.
    - Whenever `dry_run` is `false`, `confirm_upload.py` then fails the job unless the upload step's outcome is `success` and it left its upload record (see [Fail loudly](#fail-loudly)).
 
 Within a job, each step receives only its own secrets, and each script refuses to run if it finds another step's secret. Tools get an allowlisted environment. `static_check.py` enforces:
@@ -149,16 +149,16 @@ Samuel's decision (2026-10-14): relax the design-system pin match for internal b
 - Upload steps run only when `github.event.inputs.dry_run == 'false'`. That context holds the boolean as a string, so a missing value never uploads. The comparison ignores case, so any casing of `false` passes it.
 - Each upload script also refuses unless `MAY_DRY_RUN` is exactly `false`.
 - **In stage 3 the iOS upload step is still held inert.** Admission (`gate.py --dry-run`) refuses `dry_run: false` for iOS (`UPLOADS_HELD`) and for any Android target `store.PLAY_UPLOAD_TRACKS` does not map to `internal`, before any approval, build or secret, rather than finishing green without uploading.
-- **What an Android dry run proves.** It runs everything except the Play client: admission and both environments' protection, the build-number floor, the build, seal and open, signing with the target's own key (`sign.py` refuses another target's alias or certificate pin), verification, and then `dry_run.py`, which rechecks, as `play_upload.py` would before any request, the floor, that the signed bundle's sole signer is the target's pinned upload certificate, and that `MAY_PLAY_ACCOUNT` is the target's own Play account. It does not contact Play: the token, edit, track read, bundle upload, track update and commit run only in a real upload. So a dry run cannot see whether the app has a first release; a real run refuses that case clearly (see [Store records](#store-records)).
+- **What an Android dry run proves.** It runs everything except the Play client: admission and both environments' protection, the build-number floor, the build, seal and open, signing with the target's own key (`sign.py` refuses another target's alias or certificate pin), verification, and then `dry_run.py`, which rechecks, as `play_upload.py` would before any request, the floor, that `MAY_PLAY_ACCOUNT` is the target's own Play account, that the signed bundle's sole signer is the target's pinned upload certificate, and that the bundle's own manifest names the target's package at the requested versionCode. The package and versionCode it prints are the ones read from the signed bundle. It does not contact Play: the token, edit, track read, bundle upload, track update and commit run only in a real upload. So a dry run cannot see whether the app has a first release; a real run refuses that case clearly (see [Store records](#store-records)).
 
 ### Sign-only
 
-`sign_only` is a second boolean dispatch input, **default `false`**, so it is always an explicit choice. It exists for May production's [first upload](#first-production-upload-checklist-0b), which Play's API cannot make.
+`sign_only` is a second boolean dispatch input, **default `false`**, so it is always an explicit choice. It exists for May production's [first upload](#first-production-upload-checklist-0b), which Play's API cannot make. Nothing limits it to one use: it serves any later build that has to go through Play Console too.
 
-- **Admission** admits `sign_only: true` only for `platform: android`, `target: production`, with `dry_run: true`, and only once Samuel's Console-upload public key is committed (`tools/may_release/artifact_keys/may-android-console-upload.age.pub`; a placeholder today, so admission denies it until then). Everything else is denied before any approval, build or secret.
-- **Same approvals as an upload.** It runs in the same `android-release` job, so it needs Samuel's approval for `may-native-compile` and then for `may-android-internal`, and it builds, seals, opens, signs (with `may-upload`, checked against the committed pin) and verifies exactly as an upload would. The upload step does not run (`dry_run` is `true`), so no step receives `MAY_PLAY_JSON` and nothing calls Play.
-- **What it publishes.** `sign_only.py` (no secret, no network) rechecks the signer, encrypts the signed bundle with age to Samuel's key plus a throwaway check key, decrypts it with the check key to prove it is byte-for-byte the signed bundle, and deletes the check key. The workflow then publishes `may-signed-android-<attempt>` for **3 days**, holding exactly three files: `signed.aab.age`, `signed.aab.sha256` and `sign-only-record.json` (mode, package, versionCode, the signed SHA-256 and the encrypted file's SHA-256). No keystore, Play credential or decrypted handoff is in it. It is encrypted because this repository is public, and so are its Actions artifacts.
-- **Loud failure.** `Fail unless the signed bundle was published, not uploaded` (`confirm_upload.py --sign-only`) runs whenever `sign_only` is `true`, even after an earlier failure. It fails the job unless the publish step succeeded, the folder holds exactly those three files, and the record matches the signed bundle still on the runner and the encrypted file that was published. It reports **"Signed, not uploaded"**, never an upload; the upload check, for its part, refuses a run that published a sign-only bundle.
+- **Admission** admits `sign_only: true` only for `platform: android`, `target: production`, with `dry_run: true`, and only once Samuel's Console-upload public key is committed (`tools/may_release/artifact_keys/may-android-console-upload.age.pub`; a placeholder today, so admission denies it until then) and is not any environment's handoff key. Everything else is denied before any approval, build or secret.
+- **Its own job, the same approvals.** A sign-only dispatch runs `android-sign-only` **instead of** `android-release` (each job's `if:` names `sign_only`). It uses the same environment, so it needs Samuel's approval for `may-native-compile` and then for `may-android-internal`, and it decrypts, signs (with `may-upload`, checked against the committed pin) and verifies exactly as `android-release` does. **The job references no Play secret or variable**, so `MAY_PLAY_JSON` never reaches its runner: GitHub sends a job's referenced secrets to the runner even for a step that is skipped, which is why sign-only is not a step of `android-release`. `static_check.py` pins that.
+- **What it checks and publishes.** `sign_only.py` (no secret, no network) rechecks the signer, then reads the signed bundle's own manifest (`base/manifest/AndroidManifest.xml`, aapt2's protobuf `XmlNode`, decoded by `verify.py` without any dependency). It refuses unless the package is `io.github.mayassistant.may` and `android:versionCode` is the requested build number, with no `versionCodeMajor`. Play fixes an app's package at its first upload, which this is, so the build job's own check is not trusted for it. It then encrypts the bundle with age to Samuel's key plus a throwaway check key, decrypts it with the check key to prove it is byte-for-byte the signed bundle, and deletes the check key. The job publishes `may-signed-android-<attempt>` for **3 days**, holding exactly three files: `signed.aab.age`, `signed.aab.sha256` and `sign-only-record.json`. The record holds the mode, the package and versionCode as read from the bundle, the signed SHA-256 and the encrypted file's SHA-256. No keystore, Play credential or decrypted handoff is in it. It is encrypted because this repository is public, and so are its Actions artifacts.
+- **Loud failure.** `Fail unless the signed bundle was published, not uploaded` (`confirm_upload.py --sign-only`) runs unless the run was cancelled, even after an earlier failure. It fails the job unless the publish step succeeded, the folder holds exactly those three files, and the record matches the signed bundle still on the runner and the encrypted file that was published. It reports **"Signed, not uploaded"**, never an upload; the upload check, for its part, refuses a run that published a sign-only bundle.
 
 ### Fail loudly
 
@@ -205,9 +205,10 @@ The gate denies a target whose committed key is missing, a placeholder or malfor
 
 ### Samuel's Console-upload key (sign-only)
 
-[Sign-only](#sign-only) encrypts May production's signed bundle to one more committed public key, `tools/may_release/artifact_keys/may-android-console-upload.age.pub`, whose private half **only Samuel keeps, on his Mac**. It is not an environment secret: nothing in CI ever decrypts with it. It is a placeholder today, and admission denies `sign_only: true` until it is committed. On Samuel's Mac:
+[Sign-only](#sign-only) encrypts May production's signed bundle to one more committed public key, `tools/may_release/artifact_keys/may-android-console-upload.age.pub`, whose private half **only Samuel keeps, on his Mac**. It is not an environment secret: nothing in CI ever decrypts with it. It must be a new key pair: admission and `sign_only.py` refuse a Console key that equals any environment's handoff key, because those private halves are CI secrets. It is a placeholder today, and admission denies `sign_only: true` until it is committed. On Samuel's Mac:
 
 ```
+mkdir -p ~/.may && chmod 700 ~/.may
 umask 077
 age-keygen -o ~/.may/console-upload.agekey     # keep this file; it opens each sign-only artifact
 age-keygen -y ~/.may/console-upload.agekey     # the one age1… line for a reviewed PR
@@ -245,7 +246,11 @@ A reviewed PR replaces the placeholder with exactly that `age1…` line. Unlike 
 
   Any failure deletes the edit, and the log names the request that did not complete (`edit insert`, `track read`, `bundle upload`, `internal track update` or `commit`; a fixed line). Before step 4 is sent, `require_internal_release` refuses anything but exactly one `completed` release of exactly the new build on `internal`: no other track, no `userFraction`, `countryTargeting`, `inAppUpdatePriority` or other field, no `inProgress`, `halted` or `draft` status, and no existing versionCode (a promotion). Before step 5, `require_commit` refuses any query but `changesInReviewBehavior=ERROR_IF_IN_REVIEW`, so `changesNotSentForReview` is refused.
 
-  Before any request it refuses: a target that `store.PLAY_UPLOAD_TRACKS` does not map to `internal` (stage 3: `playground` and `production`); a build number below the app's floor (`store.MIN_BUILD_NUMBERS`: May production starts at **3**, because versionCode 1 was a manual upload and 2 was built for Dots; admission refuses it first, dry runs included); a `MAY_PLAY_ACCOUNT` that is not the target's own account; and a signed bundle whose sole signer is not the target's own upload certificate. So a Playground key, account or package can never be uploaded as May production, or the reverse. The package is `store.APP_IDS[target]`, and Play refuses a bundle whose package differs from the app in the request.
+  Before any request it refuses: a target that `store.PLAY_UPLOAD_TRACKS` does not map to `internal` (stage 3: `playground` and `production`); a build number below the app's floor (`store.MIN_BUILD_NUMBERS`: May production starts at **3**; admission refuses it first, dry runs included); a `MAY_PLAY_ACCOUNT` that is not the target's own account; a signed bundle whose sole signer is not the target's own upload certificate; and a signed bundle whose own manifest is not exactly the target's package (`store.APP_IDS[target]`) at the requested versionCode. The manifest is read on the release side by `verify.check_aab_identity` (aapt2's protobuf `XmlNode`, decoded without a dependency); the build job's own check is not trusted for it. So a Playground key, account or package can never be uploaded as May production, or the reverse.
+
+  **The floor.** May production has **no release at all** (Samuel, 14 Oct): versionCodes 1 and 2 were built but never uploaded, 2 for manual signing by Dots. A floor stays above every built versionCode, so that one number never names two different builds; this repository starts May production at 3. That is stricter than may-app's `tools/release/build-number-floors` (production `1`), which `android.sh` applies in the build job, and is not derived from it.
+
+  **`changesNotSentForReview`.** If Play ever answers a commit with HTTP 400 asking for `changesNotSentForReview` (Play does this when an app has changes it rejected or will not review automatically), the fix is in Play Console: resolve or send the pending changes there. The workflow will not send that parameter; `require_commit` refuses it.
 - **Play client.** It uses only the standard library and the system `openssl`, with no third-party package:
   - The RS256 service-account assertion goes once to `https://oauth2.googleapis.com/token`.
   - Requests are allowed only to the Play Developer API host, and redirects are refused.
@@ -296,10 +301,11 @@ Samuel's decision (14 Oct): may-releases may upload the production May app to it
 
 - adds `"production": "internal"` to `store.PLAY_UPLOAD_TRACKS` (and to `static_check.PLAY_UPLOAD_TRACKS`); admission and `play_upload.py` now admit May production, to `internal` only;
 - binds every Android target to its own upload key and Play account in code (`store.ANDROID_UPLOAD_KEYS`): `sign.py` refuses another target's alias or certificate pin before signing, and `dry_run.py`, `play_upload.py` and `sign_only.py` refuse a signed bundle whose sole signer is not the target's key; `play_upload.py` and `dry_run.py` refuse another target's `MAY_PLAY_ACCOUNT`;
-- adds the build-number floor (`store.MIN_BUILD_NUMBERS`: May production starts at 3), checked at admission (dry runs included), in the dry-run report, in `sign_only.py` and in `play_upload.py`, next to Play's own check that the versionCode exceeds every versionCode on every track;
+- adds the build-number floor (`store.MIN_BUILD_NUMBERS`: May production starts at 3, above every built versionCode; see [Verification and upload](#verification-and-upload)), checked at admission (dry runs included), in the dry-run report, in `sign_only.py` and in `play_upload.py`, next to Play's own check that the versionCode exceeds every versionCode on every track;
 - refuses in code any track write but one completed internal release of the new build, and any commit but `ERROR_IF_IN_REVIEW`;
 - names, in the log, the Play request that did not complete;
-- adds [sign-only](#sign-only) for May production's first, manual Console upload;
+- adds [sign-only](#sign-only), in its own `android-sign-only` job with no Play secret, for May production's first, manual Console upload;
+- reads every signed bundle's own manifest on the release side (`verify.check_aab_identity`) and refuses another package or versionCode, in `dry_run.py`, `sign_only.py` and `play_upload.py`;
 - moves `static_check.py` to stage 3.
 
 `confirm_upload.py` checks May production exactly as it checks Playground: package, versionCode, track `internal`, signed SHA-256 and committed edit ID. The iOS jobs and the iOS upload stay inert until `ios.sh` exists and a macOS rehearsal has passed.
@@ -309,7 +315,7 @@ Samuel's decision (14 Oct): may-releases may upload the production May app to it
 Each run below needs Samuel's two approvals, as every store run does: `may-native-compile` for `android-build`, then `may-android-internal` for `android-release`.
 
 1. **Production dry run first.** Dispatch `platform: android`, `target: production`, a reviewed may-app `main` SHA, `build_number` 3 or higher, `dry_run: true`, `sign_only: false`, and approve both gates. It must pass: it proves May's key, pin, account variable and floor, and reports package `io.github.mayassistant.may`, the versionCode, track `internal` and the signed SHA-256.
-2. **First production upload, by hand** ([checklist 0b](#first-production-upload-checklist-0b)): either a sign-only run and one Console upload, or Dots's manually signed AAB.
+2. **First production upload, by hand** ([checklist 0b](#first-production-upload-checklist-0b)): either a sign-only run and a Console upload, or Dots's manually signed AAB.
 3. **Then real stage-3 uploads**, from the next versionCode: dispatch the same with `dry_run: false` and approve both gates. The run ends with the upload report and the committed Play edit ID; confirm the release in Play Console's internal testing track.
 4. **Promotion to production, if Samuel ever wants it,** is done by hand in Play Console (Testing > Internal testing > Promote release). Nothing in this repository can do it.
 
@@ -318,9 +324,16 @@ Each run below needs Samuel's two approvals, as every store run does: `may-nativ
 May production shows **Draft**, with no release on any track. Play's API cannot make its first release (see [Store records](#store-records)), so **the first production AAB must be uploaded by hand in Play Console**. There are two ways to get a signed AAB for it:
 
 - **Sign-only (preferred).** It keeps the `may-upload` keystore in the protected environment and off Samuel's machine.
-  1. Once only: generate the [Console-upload key](#samuels-console-upload-key-sign-only) on Samuel's Mac and commit its public half in a reviewed PR. Until then admission denies sign-only.
-  2. Dispatch `platform: android`, `target: production`, a reviewed may-app `main` SHA, `build_number` **3** or higher, `dry_run: true`, `sign_only: true`. Approve `may-native-compile`, then `may-android-internal`.
-  3. The run ends with "Signed, not uploaded" and the signed SHA-256. Download the artifact `may-signed-android-<attempt>` from the run page within 3 days.
+  1. Once: generate the [Console-upload key](#samuels-console-upload-key-sign-only) on Samuel's Mac (`mkdir -p ~/.may` first) and commit its public half in a reviewed PR. Until then admission denies sign-only.
+  2. Dispatch `platform: android`, `target: production`, a reviewed may-app `main` SHA, `build_number` **3** or higher, `dry_run: true`, `sign_only: true`. Approve `may-native-compile`, then `may-android-internal` (for the `android-sign-only` job).
+  3. The run ends with "Signed, not uploaded", the package and versionCode read from the bundle, and the signed SHA-256. Within 3 days, download the artifact into an empty folder, either with the CLI:
+
+     ```
+     mkdir -p ~/may-signed && cd ~/may-signed
+     gh run download <run-id> -n may-signed-android-<attempt> -R May-Assistant/may-releases
+     ```
+
+     or from the run page (Artifacts), then `unzip may-signed-android-<attempt>.zip` in that folder.
   4. Decrypt and check it on the Mac:
 
      ```
@@ -328,14 +341,14 @@ May production shows **Draft**, with no release on any track. Play's API cannot 
      shasum -a 256 -c signed.aab.sha256
      ```
 
-  5. Upload `signed.aab` once in Play Console: May > Testing > Internal testing > Create new release (setting up Play App Signing if Console asks, since this is the first release), then roll it out to internal testers.
-- **Dots's manual build.** Checklist 0b names `May-production-vc2-1b73881-unsigned.aab`, signed by Dots with `may-upload`. That is versionCode 2, below this repository's floor, so it can only go up by hand; it is not a sign-only input.
+  5. Upload `signed.aab` in Play Console: May > Testing > Internal testing > Create new release, then roll it out to internal testers. This is the first release, so Console sets up **Play App Signing**: **keep the app signing key Google generates** (do not upload your own). The certificate of this first bundle, `may-upload`, then becomes the app's **upload key**, matching the pin committed here (`9E2FE9C8…1E899815`), which every later stage-3 upload is checked against.
+- **Dots's manual build.** Checklist 0b names `May-production-vc2-1b73881-unsigned.aab`, for Dots to sign with `may-upload`. That is versionCode 2, below this repository's floor, so this repository will not sign or upload it; if it goes up, it goes by hand. Its versionCode was built before the floor existed, which is why the floor starts at 3.
 
 Either way, the next stage-3 upload must use a versionCode above that first upload (for example 4 after a sign-only vc3), and above every versionCode on every track. A stage-3 upload dispatched before the first release exists is refused, red, before anything is uploaded, with `First release must be uploaded in Play Console: …`.
 
 ### Dispatch examples
 
-| Input | Production dry run | Sign-only (first upload) | Production upload | Playground upload |
+| Input | Production dry run | Sign-only (Console upload) | Production upload | Playground upload |
 | --- | --- | --- | --- | --- |
 | `platform` | `android` | `android` | `android` | `android` |
 | `target` | `production` | `production` | `production` | `playground` |
@@ -369,7 +382,7 @@ Also needed, which the gate cannot see:
 - in `may-android-internal`: the secrets `MAY_ARTIFACT_DECRYPT_KEY`, `MAY_ANDROID_KEYSTORE_BASE64` (the `may-upload` keystore), `MAY_ANDROID_STORE_PASSWORD`, `MAY_ANDROID_KEY_PASSWORD` and, for an upload, `MAY_PLAY_JSON` for `may-play-upload@may-assistant-app.iam.gserviceaccount.com`; the variables `MAY_ANDROID_KEY_ALIAS=may-upload`, `MAY_ANDROID_CERT_SHA256` (must equal the committed pin) and `MAY_PLAY_ACCOUNT=may-play-upload@may-assistant-app.iam.gserviceaccount.com`;
 - that service account holds May's "Release apps to testing tracks" permission in Play Console (an open check: without it the edit or the upload fails with HTTP 403, named in the log).
 
-The release job references `MAY_PLAY_JSON`, so once it is set the runner receives it with every `android-release` job, dry runs and sign-only runs included, even though only the upload step is given it.
+`android-release` references `MAY_PLAY_JSON`, so once it is set the runner receives it with every `android-release` job, dry runs included, even though only the upload step is given it. A sign-only run does not run `android-release`; its own job references no Play secret.
 
 The Play client has run against Play for May Playground (build 5). It has not yet run for May production, and the iOS paths have not yet run against App Store Connect.
 

@@ -140,5 +140,103 @@ class IosVerificationTests(unittest.TestCase):
                     verify.ipa_identity(path, TEAM, expected_bundle, "9")
 
 
+
+class AabManifestTests(unittest.TestCase):
+    """verify.manifest_identity: the bundle's own package and versionCode, read on the release side."""
+
+    PRODUCTION, PLAYGROUND = "io.github.mayassistant.may", "io.github.mayassistant.may.playground"
+
+    def refused(self, data, message="Bundle manifest is not a readable aapt2 manifest"):
+        try:
+            verify.manifest_identity(data)
+            raised = None
+        except Exception as error:  # any other outcome is an assertion failure, never a test error
+            raised = error
+        self.assertIsInstance(raised, verify.VerifyError)
+        self.assertEqual(raised.args[0], message)
+
+    def test_real_aapt2_manifests_are_read(self):
+        self.assertEqual(verify.manifest_identity(fx.MANIFEST_PRODUCTION_VC3), (self.PRODUCTION, "3"))
+        self.assertEqual(verify.manifest_identity(fx.MANIFEST_PLAYGROUND_VC9), (self.PLAYGROUND, "9"))
+        # The test encoder writes what aapt2 writes for these two attributes.
+        self.assertEqual(verify.manifest_identity(fx.proto_manifest(self.PRODUCTION, "3")), (self.PRODUCTION, "3"))
+
+    def test_a_real_bundle_entry_is_read_and_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "signed.aab"
+            path.write_bytes(fx.with_manifest(fx.MANIFEST_PRODUCTION_VC3))
+            self.assertEqual(verify.aab_identity(path), (self.PRODUCTION, "3"))
+            self.assertEqual(verify.check_aab_identity(path, self.PRODUCTION, "3"), (self.PRODUCTION, "3"))
+            for package, number, message in ((self.PLAYGROUND, "3", "Bundle package is not this target's app"),
+                                             (self.PRODUCTION, "4", "Bundle versionCode is not the requested build number"),
+                                             (self.PRODUCTION, "03", "Bundle versionCode is not the requested build number")):
+                with self.subTest(package=package, number=number), self.assertRaises(verify.VerifyError) as refused:
+                    verify.check_aab_identity(path, package, number)
+                self.assertEqual(refused.exception.args[0], message)
+
+    def test_mutated_manifests_are_refused(self):
+        ns = fx.ANDROID_NS
+        cases = {
+            "Bundle manifest must name exactly one package and one versionCode": [
+                fx._field(1, fx._field(3, b"manifest") + fx.version_code("3")),  # no package
+                fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode())),  # no versionCode
+                fx.proto_manifest(self.PRODUCTION, "3", fx.attribute(b"package", self.PLAYGROUND.encode())),
+                fx.proto_manifest(self.PRODUCTION, "3", fx.version_code("4")),
+                fx.proto_manifest("may", "3"), fx.proto_manifest("", "3"), fx.proto_manifest("io.github.may/x", "3"),
+            ],
+            "Bundle manifest sets versionCodeMajor": [
+                fx.proto_manifest(self.PRODUCTION, "3", fx.attribute(b"versionCodeMajor", b"1", ns, 1)),
+                fx.proto_manifest(self.PRODUCTION, "3", fx.attribute(b"versionCodeMajor", b"0", ns, 0)),
+            ],
+            "Bundle manifest versionCode is malformed": [
+                fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
+                          fx.version_code("3", compiled=4)),  # string and compiled value disagree
+                fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
+                          fx.attribute(b"versionCode", b"03", ns, 3)),
+                fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
+                          fx.attribute(b"versionCode", b"0x3", ns, 3)),
+            ],
+            "Bundle manifest is not a readable aapt2 manifest": [
+                b"", b"fixture manifest", fx.MANIFEST_PRODUCTION_VC3[:40], fx.MANIFEST_PRODUCTION_VC3[:-300],
+                fx.proto_manifest(self.PRODUCTION, "3", name=b"application"),
+                fx.MANIFEST_PRODUCTION_VC3 + fx.MANIFEST_PRODUCTION_VC3,  # two root elements
+                fx._field(1, fx._field(3, b"manifest") + fx._field(3, b"manifest") +
+                          fx.attribute(b"package", self.PRODUCTION.encode()) + fx.version_code("3")),  # name twice
+                fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
+                          fx.attribute(b"versionCode", b"3", ns)),  # no compiled value
+                fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
+                          fx._field(4, fx._field(1, ns) + fx._field(2, b"versionCode") + fx._field(3, b"3") +
+                                    fx._field(3, b"4") + fx._field(6, fx._field(7, fx._field(6, 3))))),  # value twice
+                b"\x0b\x0c",  # a group
+                b"\x0a\xff\xff\xff\xff\x0f",  # a length past the end
+                fx._field(1, b"\xff" * 11),  # an over-long varint
+            ],
+        }
+        for message, manifests in cases.items():
+            for manifest in manifests:
+                with self.subTest(message=message[:40], manifest=manifest[:30]):
+                    self.refused(manifest, message)
+
+    def test_a_bundle_without_exactly_one_readable_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "x.aab"
+            for build, message in ((lambda z: z.writestr("base/other", b"x"), "Bundle must carry exactly one base manifest"),
+                                   (None, "Bundle is not a readable zip archive")):
+                if build:
+                    with zipfile.ZipFile(path, "w") as archive:
+                        build(archive)
+                else:
+                    path.write_bytes(b"not a zip")
+                with self.subTest(message=message), self.assertRaises(verify.VerifyError) as refused:
+                    verify.aab_identity(path)
+                self.assertEqual(refused.exception.args[0], message)
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("base/manifest/AndroidManifest.xml", fx.MANIFEST_PRODUCTION_VC3)
+                archive.writestr("base/manifest/AndroidManifest.xml", fx.MANIFEST_PLAYGROUND_VC9)
+            with self.assertRaises(verify.VerifyError) as refused:
+                verify.aab_identity(path)
+            self.assertEqual(refused.exception.args[0], "Bundle must carry exactly one base manifest")
+
+
 if __name__ == "__main__":
     unittest.main()

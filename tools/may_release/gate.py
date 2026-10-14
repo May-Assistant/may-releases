@@ -50,7 +50,7 @@ import urllib.request
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import (PLAY_UPLOAD_TRACKS, SIGN_ONLY_RECIPIENT, SIGN_ONLY_TARGETS, build_number_floor_ok)
+from store import PLAY_UPLOAD_TRACKS, SIGN_ONLY_RECIPIENT, SIGN_ONLY_TARGETS, build_number_floor_ok
 
 CONTROL_REPO = "May-Assistant/may-releases"
 OWNER_ID = 58840187
@@ -97,7 +97,7 @@ def validate_run(repo, ref, event, sha, action, build_number=None, target="produ
         raise GateDenial("Store build number must be a positive integer no greater than 2000000000")
     if action != "compile" and not build_number_floor_ok(action, target, build_number):
         raise GateDenial("Store build number is below this app's floor (May production Android starts at 3: "
-                         "versionCode 1 was a manual upload and 2 was built for Dots)")
+                         "versionCodes 1 and 2 have been built, and a floor stays above every built versionCode)")
     return ENVIRONMENTS[key]
 
 
@@ -131,9 +131,13 @@ def validate_sign_only(action, sign_only, dry_run, target="production"):
                          "nothing was signed. Dispatch without sign_only")
     if dry_run != "true":
         raise GateDenial("sign_only never uploads: dispatch it with dry_run: true; nothing was signed")
-    if artifact_recipient(SIGN_ONLY_RECIPIENT) is None:
+    console = artifact_recipient(SIGN_ONLY_RECIPIENT)
+    if console is None:
         raise GateDenial("The Console-upload public key (artifact_keys/may-android-console-upload.age.pub) is "
                          "still a placeholder; Samuel's public key must be committed before sign_only can run")
+    if console in {artifact_recipient(environment) for environment in ENVIRONMENTS.values()}:
+        raise GateDenial("The Console-upload key must not be any environment's handoff key, whose private half "
+                         "is a CI secret; commit a key only Samuel holds")
 
 
 def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=None):

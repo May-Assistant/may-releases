@@ -11,9 +11,22 @@ Generated once on 2026-10-13 with throwaway keys that were then discarded:
   -nodetach -stream -outform DER`, which yields the BER indefinite-length encoding
   that Apple's profiles use. PROFILE_CERT_SHA1 is the SHA-1 of the one entry in
   its DeveloperCertificates (`openssl x509 -fingerprint -sha1`).
+- MANIFEST_PRODUCTION_VC3 / MANIFEST_PLAYGROUND_VC9: real aapt2 proto manifests
+  (the format of a bundle's base/manifest/AndroidManifest.xml), made on
+  2026-10-14 by aapt2 2.20-13193326 (build-tools 36.0.0) with `aapt2 link
+  --proto-format -I android-36/android.jar` from a public three-line manifest
+  (`package`, `android:versionCode`, `android:versionName="0.1.0"`, an empty
+  <application android:label="Fixture">). No May source is in them.
+- with_manifest() puts a manifest into SIGNED_AAB's signed entry. The jar digest
+  then no longer matches, which only jarsigner -verify (sign.py) checks;
+  verify.aab_signer_sha256 and verify.aab_identity read structure, so tests can
+  give the fixture signer any manifest. proto_manifest() writes the same fields
+  aapt2 writes for `package` and `versionCode`, so tests can vary them.
 """
 
 import base64
+import io
+import zipfile
 
 AAB_CERT_SHA256 = "A9:1D:CF:CF:66:50:B9:AC:4E:C3:A5:77:46:8F:50:A9:F9:B7:28:A1:3B:B2:FF:80:FE:54:0B:17:9A:44:17:D9"
 PROFILE_CERT_SHA1 = "7F7DEB851E478E0082DD33F46BCDA23B8007DDA8"
@@ -120,3 +133,81 @@ PROFILE_BER = base64.b64decode(
     "8XLBd1tE9MXo1KzNGby65+uGX+w9O9nzcUYhAamWW/L6CSJjDI+17TKPv5JvXEuC/OgYgpaE7054tyF5G4pxYDf5"
     "+1ojLQ2IlNrEOH9Pg0erpHEhpiF3AAAAAAAA"
 )
+
+MANIFEST_PRODUCTION_VC3 = base64.b64decode(
+    "Cu8ECjkKB2FuZHJvaWQSKmh0dHA6Ly9zY2hlbWFzLmFuZHJvaWQuY29tL2Fway9yZXMvYW5kcm9pZBoCCAIaCG1hbmlmZXN0"
+    "IiUSB3BhY2thZ2UaGmlvLmdpdGh1Yi5tYXlhc3Npc3RhbnQubWF5IksKKmh0dHA6Ly9zY2hlbWFzLmFuZHJvaWQuY29tL2Fw"
+    "ay9yZXMvYW5kcm9pZBILdmVyc2lvbkNvZGUaATMiAggCKJuEhAgyBDoCMAMiRQoqaHR0cDovL3NjaGVtYXMuYW5kcm9pZC5j"
+    "b20vYXBrL3Jlcy9hbmRyb2lkEgt2ZXJzaW9uTmFtZRoFMC4xLjAonISECCJSCipodHRwOi8vc2NoZW1hcy5hbmRyb2lkLmNv"
+    "bS9hcGsvcmVzL2FuZHJvaWQSEWNvbXBpbGVTZGtWZXJzaW9uGgIzNiICCAIo8oqECDIEOgIwJCIoEhhwbGF0Zm9ybUJ1aWxk"
+    "VmVyc2lvbkNvZGUaAjM2IgIIAjIEOgIwJCJQCipodHRwOi8vc2NoZW1hcy5hbmRyb2lkLmNvbS9hcGsvcmVzL2FuZHJvaWQS"
+    "GWNvbXBpbGVTZGtWZXJzaW9uQ29kZW5hbWUaAjE2KPOKhAgiKBIYcGxhdGZvcm1CdWlsZFZlcnNpb25OYW1lGgIxNiICCAIy"
+    "BDoCMBAqDhIFCiAgICAaBQgCEJ4BKlgKUBoLYXBwbGljYXRpb24iQQoqaHR0cDovL3NjaGVtYXMuYW5kcm9pZC5jb20vYXBr"
+    "L3Jlcy9hbmRyb2lkEgVsYWJlbBoHRml4dHVyZSiBgIQIGgQIAxAEKgkSAQoaBAgDECsaAggC"
+)
+
+MANIFEST_PLAYGROUND_VC9 = base64.b64decode(
+    "CvoECjkKB2FuZHJvaWQSKmh0dHA6Ly9zY2hlbWFzLmFuZHJvaWQuY29tL2Fway9yZXMvYW5kcm9pZBoCCAIaCG1hbmlmZXN0"
+    "IjASB3BhY2thZ2UaJWlvLmdpdGh1Yi5tYXlhc3Npc3RhbnQubWF5LnBsYXlncm91bmQiSwoqaHR0cDovL3NjaGVtYXMuYW5k"
+    "cm9pZC5jb20vYXBrL3Jlcy9hbmRyb2lkEgt2ZXJzaW9uQ29kZRoBOSICCAIom4SECDIEOgIwCSJFCipodHRwOi8vc2NoZW1h"
+    "cy5hbmRyb2lkLmNvbS9hcGsvcmVzL2FuZHJvaWQSC3ZlcnNpb25OYW1lGgUwLjEuMCichIQIIlIKKmh0dHA6Ly9zY2hlbWFz"
+    "LmFuZHJvaWQuY29tL2Fway9yZXMvYW5kcm9pZBIRY29tcGlsZVNka1ZlcnNpb24aAjM2IgIIAijyioQIMgQ6AjAkIigSGHBs"
+    "YXRmb3JtQnVpbGRWZXJzaW9uQ29kZRoCMzYiAggCMgQ6AjAkIlAKKmh0dHA6Ly9zY2hlbWFzLmFuZHJvaWQuY29tL2Fway9y"
+    "ZXMvYW5kcm9pZBIZY29tcGlsZVNka1ZlcnNpb25Db2RlbmFtZRoCMTYo84qECCIoEhhwbGF0Zm9ybUJ1aWxkVmVyc2lvbk5h"
+    "bWUaAjE2IgIIAjIEOgIwECoOEgUKICAgIBoFCAIQqQEqWApQGgthcHBsaWNhdGlvbiJBCipodHRwOi8vc2NoZW1hcy5hbmRy"
+    "b2lkLmNvbS9hcGsvcmVzL2FuZHJvaWQSBWxhYmVsGgdGaXh0dXJlKIGAhAgaBAgDEAQqCRIBChoECAMQKxoCCAI="
+)
+
+ANDROID_NS = b"http://schemas.android.com/apk/res/android"
+
+
+def _varint(value):
+    out = b""
+    while True:
+        byte, value = value & 0x7F, value >> 7
+        out += bytes([byte | (0x80 if value else 0)])
+        if not value:
+            return out
+
+
+def _field(number, value):
+    """One protobuf field: an int as a varint, bytes as length-delimited."""
+    if isinstance(value, int):
+        return _varint(number << 3) + _varint(value)
+    return _varint(number << 3 | 2) + _varint(len(value)) + value
+
+
+def attribute(name, value, namespace=b"", compiled=None, resource_id=None):
+    """An aapt2 XmlAttribute; `compiled` is an int_decimal_value primitive."""
+    body = (_field(1, namespace) if namespace else b"") + _field(2, name) + _field(3, value)
+    if resource_id is not None:
+        body += _field(5, resource_id)
+    if compiled is not None:
+        body += _field(6, _field(7, _field(6, compiled)))
+    return _field(4, body)
+
+
+def version_code(text, compiled=None):
+    return attribute(b"versionCode", text.encode(), ANDROID_NS, int(text) if compiled is None else compiled,
+                     0x0101021B)
+
+
+def proto_manifest(package, code, extra=b"", name=b"manifest"):
+    """An aapt2-shaped proto manifest: <manifest package=... android:versionCode=...>."""
+    element = _field(3, name) + attribute(b"package", package.encode()) + version_code(code) + extra
+    return _field(1, element)
+
+
+def with_manifest(manifest, bundle=SIGNED_AAB):
+    """SIGNED_AAB with its base/manifest/AndroidManifest.xml entry replaced by `manifest`."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(bundle)) as source, zipfile.ZipFile(out, "w") as target:
+        for info in source.infolist():
+            data = manifest if info.filename == "base/manifest/AndroidManifest.xml" else source.read(info)
+            target.writestr(info, data)
+    return out.getvalue()
+
+
+def signed_bundle(package, code):
+    """The fixture signer's bundle for this package and versionCode."""
+    return with_manifest(proto_manifest(package, code))

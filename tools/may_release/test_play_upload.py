@@ -38,11 +38,12 @@ CREDENTIAL = credential(ACCOUNT)
 # A real jarsigner-signed fixture bundle (signing_fixtures.SIGNED_AAB), signed by a
 # throwaway key: Play never sees it. Tests make that key one target's upload key
 # (upload_keys) to show the other target refuses it.
-BUNDLE = fx.SIGNED_AAB
-FIXTURE_CERT = verify.normalize_fingerprint(fx.AAB_CERT_SHA256)
-OTHER_CERT = "0123456789abcdef" * 4
 PLAYGROUND = "io.github.mayassistant.may.playground"
 PRODUCTION = "io.github.mayassistant.may"
+BUNDLE = fx.signed_bundle(PLAYGROUND, "9")  # May Playground, versionCode 9
+PRODUCTION_BUNDLE = fx.signed_bundle(PRODUCTION, "3")  # May production, versionCode 3
+FIXTURE_CERT = verify.normalize_fingerprint(fx.AAB_CERT_SHA256)
+OTHER_CERT = "0123456789abcdef" * 4
 COMMITTED_KEYS = store.ANDROID_UPLOAD_KEYS  # as committed, before any test patches it
 
 
@@ -125,6 +126,11 @@ class PlayUploadTests(unittest.TestCase):
         self.output = patch("sys.stdout", new_callable=io.StringIO)  # the upload report
         self.output.start()
 
+    def bundle(self, content):
+        """Put `content` on the runner as the signed bundle, returning what Play would report for it."""
+        (Path(self.directory.name) / "may-release/signed.aab").write_bytes(content)
+        return hashlib.sha256(content).hexdigest()
+
     def tearDown(self):
         self.output.stop()
         self.keys.stop()
@@ -164,15 +170,18 @@ class PlayUploadTests(unittest.TestCase):
                 ("9", [{"track": "internal", "releases": [{"versionCodes": ["8"], "status": "completed"},
                                                          {"versionCodes": ["10"], "status": "draft"}]}])):
             with self.subTest(build_number=build_number):
+                self.bundle(fx.signed_bundle(PLAYGROUND, build_number))
                 session = Session(tracks=tracks)
                 with self.assertRaises(PlayRefusal):
                     upload("playground", "a" * 40, build_number, session)
                 self.assertEqual(session.methods(), ["POST", "GET", "DELETE"])
 
     def test_version_code_jump_ceiling(self):
+        sha = self.bundle(fx.signed_bundle(PLAYGROUND, "1008"))
         session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["8"], "status": "completed"}]}],
-                          uploaded={"versionCode": 1008, "sha256": hashlib.sha256(BUNDLE).hexdigest()})
+                          uploaded={"versionCode": 1008, "sha256": sha})
         upload("playground", "a" * 40, "1008", session)
+        self.bundle(fx.signed_bundle(PLAYGROUND, "1009"))
         session = Session()
         with self.assertRaises(PlayRefusal):
             upload("playground", "a" * 40, "1009", session)
@@ -233,8 +242,9 @@ class PlayUploadTests(unittest.TestCase):
 
     def test_may_production_uploads_to_its_own_internal_track(self):
         env, keys = self.production()
+        sha = self.bundle(PRODUCTION_BUNDLE)
         session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["2"], "status": "completed"}]}],
-                          uploaded={"versionCode": 3, "sha256": hashlib.sha256(BUNDLE).hexdigest()})
+                          uploaded={"versionCode": 3, "sha256": sha})
         with env, keys, patch("sys.stdout", new_callable=io.StringIO) as output, \
                 patch("play_upload.require_internal_release", wraps=require_internal_release) as track_guard, \
                 patch("play_upload.require_commit", wraps=require_commit) as commit_guard:
@@ -292,6 +302,49 @@ class PlayUploadTests(unittest.TestCase):
         self.assertEqual(refused.exception.args[0], "MAY_PLAY_ACCOUNT is not this target's Play service account")
         self.assertEqual(session.calls, [])
 
+    def test_the_bundles_own_package_and_version_code_must_be_this_build(self):
+        """The release side reads the signed bundle's manifest; it does not trust the build job's check."""
+        env, keys = self.production()
+        cases = (
+            # (target, the bundle's own manifest, requested build number, refusal)
+            ("production", fx.proto_manifest(PLAYGROUND, "3"), "3", "Bundle package is not this target's app"),
+            ("production", fx.proto_manifest(PRODUCTION, "4"), "3",
+             "Bundle versionCode is not the requested build number"),
+            ("production", fx.MANIFEST_PLAYGROUND_VC9, "9", "Bundle package is not this target's app"),
+            ("production", fx.proto_manifest(PRODUCTION, "3", fx.attribute(b"versionCodeMajor", b"1", fx.ANDROID_NS, 1)),
+             "3", "Bundle manifest sets versionCodeMajor"),
+            ("production", b"fixture manifest", "3", "Bundle manifest is not a readable aapt2 manifest"),
+        )
+        for target, manifest, number, message in cases:
+            self.bundle(fx.with_manifest(manifest))
+            session = Session()
+            with self.subTest(manifest=manifest[:40], number=number), env, keys:
+                self.assertEqual(refusal(self, verify.VerifyError, upload, target, "a" * 40, number, session).args[0],
+                                 message)
+                self.assertEqual(session.calls, [])
+        # And the reverse: May's own manifest is never uploaded as May Playground.
+        self.bundle(fx.with_manifest(fx.MANIFEST_PRODUCTION_VC3))
+        session = Session()
+        self.assertEqual(refusal(self, verify.VerifyError, upload, "playground", "a" * 40, "3", session).args[0],
+                         "Bundle package is not this target's app")
+        self.assertEqual(session.calls, [])
+
+    def test_a_real_aapt2_manifest_uploads(self):
+        env, keys = self.production()
+        sha = self.bundle(fx.with_manifest(fx.MANIFEST_PRODUCTION_VC3))
+        session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["2"], "status": "completed"}]}],
+                          uploaded={"versionCode": 3, "sha256": sha})
+        with env, keys:
+            upload("production", "a" * 40, "3", session)
+        self.assertEqual(session.methods(), ["POST", "GET", "POST", "PUT", "POST"])
+
+    def test_cli_refuses_another_apps_manifest_before_any_change(self):
+        self.bundle(fx.with_manifest(fx.MANIFEST_PRODUCTION_VC3))
+        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as stopped:
+            play_upload.main(["--target", "playground", "--source-sha", "a" * 40, "--build-number", "9"])
+        self.assertEqual(stopped.exception.code,
+                         "May Play upload refused before any change: Bundle package is not this target's app")
+
     def test_an_unsigned_or_doubly_signed_bundle_is_refused_before_any_request(self):
         bundle = Path(self.directory.name) / "may-release/signed.aab"
         for content in (b"not a zip", b""):
@@ -310,8 +363,9 @@ class PlayUploadTests(unittest.TestCase):
                                  "Build number is below this app's floor (May production starts at 3).")
                 self.assertEqual(session.calls, [])
         # Playground has no floor here beyond Play's own check.
+        sha = self.bundle(fx.signed_bundle(PLAYGROUND, "2"))
         session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["1"], "status": "completed"}]}],
-                          uploaded={"versionCode": 2, "sha256": hashlib.sha256(BUNDLE).hexdigest()})
+                          uploaded={"versionCode": 2, "sha256": sha})
         upload("playground", "a" * 40, "2", session)
         self.assertEqual(session.methods()[-1], "POST")
 

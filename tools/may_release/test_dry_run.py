@@ -43,8 +43,8 @@ def runs(condition, dry_run_input, failed=False, sign_only_input=None):
         return True
     if condition == static_check.CONFIRM_IF:  # !cancelled() && dry_run == 'false'
         return value == "false"
-    if condition == static_check.CONFIRM_SIGNED_IF:  # !cancelled() && sign_only == 'true'
-        return signing == "true"
+    if condition == static_check.CONFIRM_SIGNED_IF:  # !cancelled(), in the sign-only job
+        return True
     if failed:
         return False
     if condition is None:
@@ -55,9 +55,24 @@ def runs(condition, dry_run_input, failed=False, sign_only_input=None):
         return value == "false"
     if condition == static_check.REPORT_IF:
         return value != "false"
-    if condition == static_check.SIGN_ONLY_IF:
-        return signing == "true"
     raise AssertionError("unmodelled condition: " + condition)
+
+
+def job_runs(job, platform, sign_only_input):
+    """Whether an Android or admission job runs, for the job-level `if:` forms STORE_JOB_IF pins."""
+    condition = static_check.STORE_JOB_IF[job]
+    signing = (sign_only_input or "").lower() if sign_only_input is not None else None
+    if condition is None:
+        return True
+    if condition == "${{ inputs.platform == 'android' }}":
+        return platform == "android"
+    if condition == "${{ inputs.platform == 'android' && github.event.inputs.sign_only != 'true' }}":
+        return platform == "android" and signing != "true"
+    if condition == "${{ inputs.platform == 'android' && github.event.inputs.sign_only == 'true' }}":
+        return platform == "android" and signing == "true"
+    if static_check.INERT in condition:
+        return False
+    raise AssertionError("unmodelled job condition: " + condition)
 
 
 def run_job(job, dry_run_input, upload_outcome="success", workflow=None, sign_only_input="false",
@@ -121,9 +136,11 @@ class DryRunWorkflowTests(unittest.TestCase):
                     self.assertIn(sign, ran)
                     self.assertIn("Decrypt and check the build handoff", ran)
                     self.assertIn(static_check.REPORT, ran)
-                    # A plain dry run publishes nothing.
-                    for step in (static_check.SEAL_SIGNED, static_check.PUBLISH_SIGNED, static_check.CONFIRM_SIGNED):
-                        self.assertNotIn(step, ran)
+        # A plain dry run (or upload) runs android-release, never the sign-only job.
+        for value in ("false", "FALSE", None, ""):
+            with self.subTest(sign_only=value):
+                self.assertTrue(job_runs("android-release", "android", value))
+                self.assertFalse(job_runs(static_check.SIGN_ONLY_JOB, "android", value))
         # No store upload step anywhere else; build jobs are unaffected by the input.
         for job in ("android-build", "ios-build"):
             self.assertEqual(steps_that_run(job, "true"), steps_that_run(job, "false"))
@@ -131,30 +148,34 @@ class DryRunWorkflowTests(unittest.TestCase):
         self.assertEqual(text.count("tools/may_release/play_upload.py"), 1)
         self.assertEqual(text.count("tools/may_release/ios_upload.py"), 1)
 
-    def test_sign_only_signs_reports_and_publishes_but_never_uploads(self):
+    def test_sign_only_runs_its_own_job_which_signs_and_publishes_but_never_uploads(self):
         for value in ("true", "TRUE"):
             with self.subTest(value=value):
-                result, outcomes = run_job("android-release", "true", sign_only_input=value)
+                # android-release (which references MAY_PLAY_JSON) does not run at all.
+                self.assertFalse(job_runs("android-release", "android", value))
+                self.assertTrue(job_runs(static_check.SIGN_ONLY_JOB, "android", value))
+                result, outcomes = run_job(static_check.SIGN_ONLY_JOB, "true", sign_only_input=value)
                 self.assertEqual(result, "success")
-                for step in ("Sign and verify Android App Bundle", static_check.REPORT, static_check.SEAL_SIGNED,
-                             static_check.PUBLISH_SIGNED, static_check.CONFIRM_SIGNED):
+                for step in ("Decrypt and check the build handoff", "Sign and verify Android App Bundle",
+                             static_check.SEAL_SIGNED, static_check.PUBLISH_SIGNED, static_check.CONFIRM_SIGNED):
                     self.assertEqual(outcomes.get(step), "success")
-                self.assertEqual(outcomes.get("Upload update to the internal track only"), "skipped")
-                self.assertEqual(outcomes.get(static_check.CONFIRM), "skipped")
-        # iOS has no sign-only steps at all.
-        self.assertFalse(set(run_job("ios-release", "true", sign_only_input="true")[1]) &
-                         {static_check.SEAL_SIGNED, static_check.PUBLISH_SIGNED, static_check.CONFIRM_SIGNED})
+                self.assertFalse({"Upload update to the internal track only", static_check.CONFIRM} & set(outcomes))
+        # No iOS or build job runs a sign-only step, and nothing in the sign-only job names a Play secret.
+        for job in ("ios-release", "android-build", "android-release"):
+            self.assertFalse(set(run_job(job, "true", sign_only_input="true")[1]) &
+                             {static_check.SEAL_SIGNED, static_check.PUBLISH_SIGNED, static_check.CONFIRM_SIGNED})
+        self.assertNotIn("MAY_PLAY", static_check.code_lines(
+            static_check.job_text(STORE.read_text(), static_check.SIGN_ONLY_JOB)))
 
     def test_sign_only_never_ends_green_without_publishing(self):
         for publish in ("failure", "skipped"):
             with self.subTest(publish=publish):
-                result, outcomes = run_job("android-release", "true", sign_only_input="true", publish_outcome=publish)
+                result, outcomes = run_job(static_check.SIGN_ONLY_JOB, "true", sign_only_input="true",
+                                           publish_outcome=publish)
                 self.assertEqual(result, "failure")
                 self.assertEqual(outcomes.get(static_check.CONFIRM_SIGNED), "failure")
-        # The seal step failed, so the publish step was skipped: the check still runs and fails the job.
-        broken = STORE.read_text()
-        _, steps = static_check.job_steps(broken, "android-release")
-        self.assertIn(static_check.CONFIRM_SIGNED, dict(steps))
+        # After an earlier failure the check still runs (unless the run was cancelled), and fails the job.
+        _, steps = static_check.job_steps(STORE.read_text(), static_check.SIGN_ONLY_JOB)
         self.assertEqual(static_check.step_condition(dict(steps).get(static_check.CONFIRM_SIGNED, "")),
                          static_check.CONFIRM_SIGNED_IF)
         self.assertTrue(runs(static_check.CONFIRM_SIGNED_IF, "true", failed=True, sign_only_input="true"))
@@ -210,20 +231,20 @@ class DryRunReportTests(unittest.TestCase):
 
     def test_android_report_names_package_version_track_and_signed_sha256(self):
         bundle = self.root / "may-release/signed.aab"
-        bundle.write_bytes(fx.SIGNED_AAB)
+        bundle.write_bytes(fx.signed_bundle("io.github.mayassistant.may.playground", "2"))
         lines = self.summary()
         self.assertEqual(lines, [
             "Dry run: no store upload was made. Google Play would have received:",
             "  package: io.github.mayassistant.may.playground",
             "  versionCode: 2",
             "  track: internal",
-            "  signed AAB SHA-256: " + hashlib.sha256(fx.SIGNED_AAB).hexdigest(),
+            "  signed AAB SHA-256: " + hashlib.sha256(bundle.read_bytes()).hexdigest(),
             "  signer: this target's pinned upload certificate",
             "  Play account (MAY_PLAY_ACCOUNT): " + PLAYGROUND_ACCOUNT])
         self.assertEqual(play_upload.TRACK, "internal")  # the track the real upload writes
 
     def test_may_production_dry_run_checks_everything_but_the_play_client(self):
-        (self.root / "may-release/signed.aab").write_bytes(fx.SIGNED_AAB)
+        (self.root / "may-release/signed.aab").write_bytes(fx.with_manifest(fx.MANIFEST_PRODUCTION_VC3))
         mine = upload_keys(playground=OTHER_CERT, production=FIXTURE_CERT)
         lines = self.summary("production", "3", PRODUCTION_ACCOUNT, mine)
         self.assertEqual(lines[1:3], ["  package: io.github.mayassistant.may", "  versionCode: 3"])
@@ -240,6 +261,14 @@ class DryRunReportTests(unittest.TestCase):
         for args, message in cases:
             with self.subTest(args=args[:3]):
                 self.assertEqual(refusal(self, StoreError, self.summary, *args).args[0], message)
+        # The package and versionCode it reports are read from the signed bundle itself.
+        for manifest, build, message in ((fx.MANIFEST_PLAYGROUND_VC9, "9", "Bundle package is not this target's app"),
+                                         (fx.MANIFEST_PRODUCTION_VC3, "4",
+                                          "Bundle versionCode is not the requested build number")):
+            (self.root / "may-release/signed.aab").write_bytes(fx.with_manifest(manifest))
+            with self.subTest(build=build):
+                self.assertEqual(refusal(self, verify.VerifyError, self.summary, "production", build,
+                                         PRODUCTION_ACCOUNT, mine).args[0], message)
         (self.root / "may-release/signed.aab").write_bytes(b"not a signed bundle")
         with self.assertRaises(verify.VerifyError):
             self.summary("production", "3", PRODUCTION_ACCOUNT, mine)
@@ -258,14 +287,14 @@ class DryRunReportTests(unittest.TestCase):
     def test_report_refuses_missing_artifact_and_any_secret(self):
         with self.assertRaises(StoreError):
             self.summary()
-        (self.root / "may-release/signed.aab").write_bytes(fx.SIGNED_AAB)
+        (self.root / "may-release/signed.aab").write_bytes(fx.signed_bundle("io.github.mayassistant.may.playground", "2"))
         for name in SECRET_NAMES:
             with self.subTest(name=name), patch.dict(os.environ, {name: "present"}), self.assertRaises(StoreError):
                 self.summary()
 
     def test_report_cli_runs_isolated_and_refuses_another_targets_key(self):
         # The committed pins: the fixture bundle is signed by neither app's key, so the report refuses it.
-        (self.root / "may-release/signed.aab").write_bytes(fx.SIGNED_AAB)
+        (self.root / "may-release/signed.aab").write_bytes(fx.with_manifest(fx.MANIFEST_PRODUCTION_VC3))
         result = subprocess.run([sys.executable, "-I", "-S", "-B", str(HERE / "dry_run.py"), "--platform", "android",
                                  "--target", "production", "--source-sha", SHA, "--build-number", "3"],
                                 capture_output=True, text=True, cwd=self.directory.name,

@@ -12,6 +12,7 @@ from unittest.mock import patch
 import confirm_upload
 import play_upload
 import sign_only
+import signing_fixtures as fx
 from store import SECRET_NAMES, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, UPLOAD_RECORD, StoreError, write_upload_record
 from test_play_upload import (ACCOUNT, BUNDLE, CREDENTIAL, FIXTURE_CERT, OTHER_CERT, PRODUCTION_ACCOUNT, Session,
                               credential, refusal, upload_keys)
@@ -20,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 SHA = "a" * 40
 PLAYGROUND = "io.github.mayassistant.may.playground"
 PRODUCTION = "io.github.mayassistant.may"
+PRODUCTION_BUNDLE = fx.signed_bundle(PRODUCTION, "9")
 NOT_SUCCESS = (None, "", "skipped", "failure", "cancelled", "Success", "success ")
 
 
@@ -42,10 +44,14 @@ class ConfirmUploadTests(unittest.TestCase):
         """A real play_upload.upload() against the fake Play session; it writes the record."""
         account = ACCOUNT if target == "playground" else PRODUCTION_ACCOUNT
         keys = upload_keys() if target == "playground" else upload_keys(playground=OTHER_CERT, production=FIXTURE_CERT)
+        if target == "production":
+            (self.root / "may-release/signed.aab").write_bytes(PRODUCTION_BUNDLE)
         with patch.dict(os.environ, {"MAY_PLAY_JSON": credential(account), "MAY_PLAY_ACCOUNT": account,
                                      "MAY_DRY_RUN": "false"}), patch("sys.stdout", new_callable=io.StringIO), \
                 patch("store.ANDROID_UPLOAD_KEYS", keys):
-            play_upload.upload(target, SHA, "9", Session())
+            bundle = (self.root / "may-release/signed.aab").read_bytes()
+            play_upload.upload(target, SHA, "9", Session(uploaded={
+                "versionCode": 9, "sha256": hashlib.sha256(bundle).hexdigest()}))
 
     def confirm(self, outcome="success", platform="android", build_number="9", target="playground"):
         env = {} if outcome is None else {"MAY_UPLOAD_OUTCOME": outcome}
@@ -70,7 +76,7 @@ class ConfirmUploadTests(unittest.TestCase):
             "  package: " + PRODUCTION,
             "  versionCode: 9",
             "  track: internal",
-            "  signed AAB SHA-256: " + hashlib.sha256(BUNDLE).hexdigest(),
+            "  signed AAB SHA-256: " + hashlib.sha256(PRODUCTION_BUNDLE).hexdigest(),
             "  Play edit (committed): edit-1"])
         # The record is May's: it confirms nothing for May Playground, and the checks are the same.
         with self.assertRaises(StoreError):
@@ -248,8 +254,9 @@ class ConfirmSignOnlyTests(unittest.TestCase):
     def test_only_the_android_production_record_is_confirmed(self):
         with self.assertRaises(StoreError):
             self.confirm(target="playground")
-        with patch.dict(os.environ, {"MAY_PUBLISH_OUTCOME": "success"}), self.assertRaises(StoreError):
-            confirm_upload.confirm_signed("ios", "production", SHA, "9")
+        with patch.dict(os.environ, {"MAY_PUBLISH_OUTCOME": "success"}):
+            self.assertEqual(refusal(self, StoreError, confirm_upload.confirm_signed, "ios", "production", SHA, "9").args[0],
+                             "Sign-only is Android only; nothing is ready for Play Console")
 
     def test_holds_no_secret(self):
         for name in SECRET_NAMES:

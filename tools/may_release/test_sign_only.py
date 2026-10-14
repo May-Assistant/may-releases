@@ -12,6 +12,7 @@ from unittest.mock import patch
 import confirm_upload
 import sign_only
 import signing_fixtures as fx
+import verify
 from store import SECRET_NAMES, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, SIGN_ONLY_TARGETS, StoreError
 from test_play_upload import FIXTURE_CERT, OTHER_CERT, upload_keys
 
@@ -38,17 +39,23 @@ class SignOnlyTests(unittest.TestCase):
         self.public = subprocess.run(["age-keygen", "-y"], input=self.secret, capture_output=True,
                                      text=True, check=True).stdout.strip()
         (self.root / "may-release").mkdir()
-        (self.root / "may-release/signed.aab").write_bytes(fx.SIGNED_AAB)
+        # The fixture signer's bundle with a real aapt2 manifest: May production, versionCode 3.
+        self.bundle = fx.with_manifest(fx.MANIFEST_PRODUCTION_VC3)
+        (self.root / "may-release/signed.aab").write_bytes(self.bundle)
         self.patches = [
             patch.dict(os.environ, {"RUNNER_TEMP": self.directory.name, "PATH": os.environ["PATH"],
                                     "MAY_SIGN_ONLY": "true", "MAY_DRY_RUN": "true"}, clear=True),
             patch("sign_only.toolchain.tool_path", side_effect=system_tool),
-            patch("sign_only.artifact_recipient", return_value=self.public),
+            patch("sign_only.artifact_recipient", side_effect=self.recipients),
             # The fixture bundle's signer is May production's upload key in these tests.
             patch("store.ANDROID_UPLOAD_KEYS", upload_keys(playground=OTHER_CERT, production=FIXTURE_CERT)),
         ]
         for item in self.patches:
             item.start()
+
+    def recipients(self, environment):
+        """The committed keys: Samuel's Console-upload key, and distinct environment handoff keys."""
+        return self.public if environment == "may-android-console-upload" else "age1" + "q" * 57 + str(len(environment) % 8)
 
     def tearDown(self):
         for item in reversed(self.patches):
@@ -70,12 +77,12 @@ class SignOnlyTests(unittest.TestCase):
         lines = self.seal()
         out = self.root / SIGN_ONLY_DIR
         self.assertEqual(sorted(p.name for p in out.iterdir()), sorted(sign_only.FILES))
-        sha = hashlib.sha256(fx.SIGNED_AAB).hexdigest()
+        sha = hashlib.sha256(self.bundle).hexdigest()
         sealed = (out / sign_only.SEALED).read_bytes()
-        self.assertNotIn(fx.SIGNED_AAB[:200], sealed)
+        self.assertNotIn(self.bundle[:200], sealed)
         self.assertTrue(sealed.startswith(b"age-encryption.org/v1\n"))
         # Samuel's key opens it to exactly the signed bundle, which the hash file and record name.
-        self.assertEqual(self.decrypt(), fx.SIGNED_AAB)
+        self.assertEqual(self.decrypt(), self.bundle)
         self.assertEqual((out / sign_only.HASH_FILE).read_text(), sha + "  signed.aab\n")
         self.assertEqual(json.loads((out / SIGN_ONLY_RECORD).read_text()), {
             "mode": "sign-only", "platform": "android", "app_id": PRODUCTION, "build_number": "3",
@@ -131,6 +138,38 @@ class SignOnlyTests(unittest.TestCase):
     def test_refuses_while_samuels_key_is_a_placeholder(self):
         with patch("sign_only.artifact_recipient", return_value=None):
             self.assertRefused("The Console-upload public key is still a placeholder; nothing was published")
+
+    def test_refuses_a_console_key_that_is_an_environment_handoff_key(self):
+        # The handoff keys' private halves are CI secrets, so CI could open the bundle with one.
+        for environment in ("may-android-internal", "may-android-playground-internal", "may-ios-internal"):
+            reuse = lambda name, environment=environment: self.public if name in (
+                "may-android-console-upload", environment) else None
+            with self.subTest(environment=environment), patch("sign_only.artifact_recipient", side_effect=reuse):
+                self.assertRefused("The Console-upload key must not be an environment's handoff key; "
+                                   "nothing was published")
+
+    def test_publishes_only_this_apps_manifest_at_this_build(self):
+        """The record and report carry the package and versionCode read from the signed bundle itself."""
+        cases = (
+            (fx.MANIFEST_PLAYGROUND_VC9, "9", "Bundle package is not this target's app"),
+            (fx.proto_manifest("io.github.mayassistant.may", "4"), "3",
+             "Bundle versionCode is not the requested build number"),
+            (fx.proto_manifest("io.github.mayassistant.may", "3",
+                               fx.attribute(b"versionCodeMajor", b"1", fx.ANDROID_NS, 1)), "3",
+             "Bundle manifest sets versionCodeMajor"),
+            (b"fixture manifest", "3", "Bundle manifest is not a readable aapt2 manifest"),
+        )
+        for manifest, build, message in cases:
+            (self.root / "may-release/signed.aab").write_bytes(fx.with_manifest(manifest))
+            with self.subTest(message=message, build=build):
+                try:
+                    self.seal(build=build)
+                    raised = None
+                except Exception as error:
+                    raised = error
+                self.assertIsInstance(raised, verify.VerifyError)
+                self.assertEqual(raised.args[0], message)
+                self.assertFalse((self.root / SIGN_ONLY_DIR).exists())
 
     def test_a_playground_key_is_never_published_as_may_production(self):
         with patch("store.ANDROID_UPLOAD_KEYS", upload_keys(playground=FIXTURE_CERT, production=OTHER_CERT)):

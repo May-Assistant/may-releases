@@ -21,6 +21,8 @@ ANDROID_UPLOAD_COMMENT = "".join("        # " + line + "\n" for line in (
     "map to internal, and another target's key, account or package."))
 IOS_UPLOAD = "      - name: Upload verified IPA for internal TestFlight\n"
 CONFIRM = "      - name: " + static_check.CONFIRM + "\n"
+RELEASE_IF = "    if: " + static_check.STORE_JOB_IF["android-release"] + "\n"
+SIGN_ONLY_IF = "    if: " + static_check.STORE_JOB_IF["android-sign-only"] + "\n"
 
 
 class StaticCheckTests(unittest.TestCase):
@@ -351,48 +353,75 @@ class StaticCheckTests(unittest.TestCase):
         self.assertEqual(store.count("        if: " + static_check.CONFIRM_IF + "\n"), 2)
         self.assertEqual(static_check.PLAY_UPLOAD_TRACKS, {"playground": "internal", "production": "internal"})
 
-    def test_sign_only_is_three_pinned_android_release_steps_after_the_report(self):
+    def test_sign_only_is_its_own_job_with_no_play_secret(self):
         store = (ROOT / STORE).read_text()
-        _, steps = static_check.job_steps(store, "android-release")
+        job = static_check.SIGN_ONLY_JOB
+        self.assertEqual(static_check.STORE_JOB_IF[job],
+                         "${{ inputs.platform == 'android' && github.event.inputs.sign_only == 'true' }}")
+        self.assertEqual(static_check.STORE_JOB_IF["android-release"],
+                         "${{ inputs.platform == 'android' && github.event.inputs.sign_only != 'true' }}")
+        text = static_check.job_text(store, job)
+        self.assertIn("    environment: ${{ needs.admission.outputs.environment }}\n", text)
+        self.assertEqual(static_check.secrets_in(text), {"MAY_ARTIFACT_DECRYPT_KEY", "MAY_ANDROID_KEYSTORE_BASE64",
+                                                         "MAY_ANDROID_STORE_PASSWORD", "MAY_ANDROID_KEY_PASSWORD"})
+        self.assertNotIn("MAY_PLAY", static_check.code_lines(text))
+        _, steps = static_check.job_steps(store, job)
         names = [name for name, _ in steps]
-        at = names.index(static_check.REPORT)
-        self.assertEqual(names[at + 1:at + 4], [static_check.SEAL_SIGNED, static_check.PUBLISH_SIGNED,
-                                                static_check.CONFIRM_SIGNED])
+        at = names.index("Sign and verify Android App Bundle")
+        self.assertEqual(names[at + 1:], [static_check.SEAL_SIGNED, static_check.PUBLISH_SIGNED,
+                                          static_check.CONFIRM_SIGNED, "Remove task-owned bundle, keys and logs"])
         self.assertEqual(dict(steps)[static_check.PUBLISH_SIGNED], static_check.PUBLISH_SIGNED_STEP)
         self.assertIn("          retention-days: 3\n", static_check.PUBLISH_SIGNED_STEP)
         self.assertIn("          path: ${{ runner.temp }}/may-signed/\n", static_check.PUBLISH_SIGNED_STEP)
         self.assertEqual(store.count("sign_only.py"), 1)
         self.assertEqual(store.count("--sign-only\n"), 1)
-        for job in ("ios-build", "ios-release", "android-build"):
-            self.assertNotIn("sign_only", static_check.code_lines(static_check.job_text(store, job)))
+        for other in ("ios-build", "ios-release", "android-build", "android-release"):
+            _, other_steps = static_check.job_steps(store, other)
+            self.assertFalse(any("sign_only" in static_check.code_lines(t) for _, t in other_steps), other)
+        self.assertNotIn(static_check.UPLOAD_ARTIFACT, static_check.job_text(store, "android-release"))
+
+    def test_a_play_secret_or_variable_in_the_sign_only_job_is_flagged(self):
+        play = "store android-sign-only: references a Play secret or variable; its runner must never receive MAY_PLAY_JSON"
+        seal_env = "          MAY_SIGN_ONLY: ${{ github.event.inputs.sign_only }}\n          MAY_DRY_RUN:"
+        job_env = ("      MAY_BUILD_NUMBER: ${{ inputs.build_number }}\n    steps:\n      - uses: actions/checkout@"
+                   "11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n"
+                   "      - name: Recheck protected destination after Samuel's review\n")
+        # The secret or variable anywhere in the job: a step's env, the job's env, or an unused step env.
+        for old, new, nth in ((seal_env, "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n" + seal_env, 0),
+                              (seal_env, "          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n" + seal_env, 0),
+                              ("          MAY_PUBLISH_OUTCOME: ${{ steps.signed_artifact.outcome }}\n",
+                               "          MAY_PUBLISH_OUTCOME: ${{ steps.signed_artifact.outcome }}\n"
+                               "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n", 0),
+                              (job_env, "      MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n" + job_env, 1)):
+            with self.subTest(new=new.strip()[:60]):
+                self.fresh()
+                self.mutate_nth(old, new, nth)
+                self.assertFlagged(play)
 
     def test_changed_or_missing_sign_only_steps_are_flagged(self):
-        seal_if = "        if: ${{ github.event.inputs.sign_only == 'true' }}\n        env:\n          MAY_SIGN_ONLY:"
-        confirm_if = "        if: " + static_check.CONFIRM_SIGNED_IF + "\n"
-        sign_only = ("store android-release: the sign-only steps are missing or changed (seal, publish exactly the "
+        sign_only = ("store android-sign-only: the sign-only steps are missing or changed (seal, publish exactly the "
                      "sealed bundle for 3 days, then fail unless it was published)")
-        uploads = "store android-release: uploads something other than the encrypted handoff"
+        uploads = "store android-sign-only: uploads something other than the encrypted handoff"
+        seal_env = "        env:\n          MAY_SIGN_ONLY: ${{ github.event.inputs.sign_only }}\n"
         cases = (
             ("          retention-days: 3\n", "          retention-days: 30\n", sign_only),
             ("          retention-days: 3\n", "          retention-days: 30\n", uploads),
             ("          path: ${{ runner.temp }}/may-signed/\n", "          path: ${{ runner.temp }}/\n", uploads),
             ("          path: ${{ runner.temp }}/may-signed/\n", "          path: ${{ runner.temp }}/may-release/\n", sign_only),
             ("          name: may-signed-android-${{ github.run_attempt }}\n", "          name: may-signed-android\n", sign_only),
-            ("        id: signed_artifact\n        if: ${{ github.event.inputs.sign_only == 'true' }}\n",
-             "        id: signed_artifact\n        if: ${{ github.event.inputs.dry_run != 'false' }}\n", sign_only),
-            (seal_if, "        if: ${{ github.event.inputs.dry_run != 'false' }}\n        env:\n          MAY_SIGN_ONLY:",
-             sign_only),
+            ("        id: signed_artifact\n        uses:", "        id: signed_artifact\n        if: ${{ github.event.inputs.dry_run != 'false' }}\n        uses:", sign_only),
+            (seal_env, "        if: ${{ github.event.inputs.dry_run != 'false' }}\n" + seal_env, sign_only),
             ("          MAY_SIGN_ONLY: ${{ github.event.inputs.sign_only }}\n          MAY_DRY_RUN:",
              "          MAY_SIGN_ONLY: 'true'\n          MAY_DRY_RUN:", sign_only),
-            (confirm_if, "        if: ${{ github.event.inputs.sign_only == 'true' }}\n", sign_only),
+            ("        if: ${{ !cancelled() }}\n", "", sign_only),
             ("          MAY_PUBLISH_OUTCOME: ${{ steps.signed_artifact.outcome }}\n",
              "          MAY_PUBLISH_OUTCOME: success\n", sign_only),
             (' --build-number "$MAY_BUILD_NUMBER" --sign-only\n', ' --build-number "$MAY_BUILD_NUMBER"\n', sign_only),
             ("      - name: " + static_check.CONFIRM_SIGNED + "\n", "      - name: Check something\n",
-             "store android-release: its steps are missing or out of order"),
+             "store android-sign-only: its steps are missing or out of order"),
             ("      - name: " + static_check.SEAL_SIGNED + "\n", "      - name: Seal something\n",
-             "store android-release: its steps are missing or out of order"),
-            ("        default: false\n", "        default: true\n",
+             "store android-sign-only: its steps are missing or out of order"),
+            ("        type: boolean\n        default: false\n", "        type: boolean\n        default: true\n",
              "store-release-draft.yml: sign_only is not a required boolean input defaulting to false"),
             ("          MAY_SIGN_ONLY: ${{ github.event.inputs.sign_only }}\n        run: python3 -I -S -B tools/may_release/gate.py",
              "        run: python3 -I -S -B tools/may_release/gate.py",
@@ -407,19 +436,22 @@ class StaticCheckTests(unittest.TestCase):
 
     def test_sign_only_steps_out_of_place_are_flagged(self):
         store = (self.root / STORE).read_text()
-        _, steps = static_check.job_steps(store, "android-release")
-        publish = "      - " + dict(steps)[static_check.PUBLISH_SIGNED]
-        # The publish step moved before the dry-run report, or copied into the iOS release job.
-        self.mutate(STORE, publish, "")
-        self.mutate(STORE, "      - name: Report what the dry run would have uploaded\n        if: ${{ github.event.inputs."
-                           "dry_run != 'false' }}\n        env:", publish + "      - name: Report what the dry run would have "
-                           "uploaded\n        if: ${{ github.event.inputs.dry_run != 'false' }}\n        env:")
-        self.assertFlagged("store android-release: the sign-only steps are missing or changed")
+        _, steps = static_check.job_steps(store, static_check.SIGN_ONLY_JOB)
+        publish = "      - " + dict(steps).get(static_check.PUBLISH_SIGNED, "")
+        self.assertIn("upload-artifact", publish)
+        # The publish step copied into android-release, whose job references MAY_PLAY_JSON, or into iOS.
+        for job, anchor in (("android-release", "      - name: Remove task-owned bundle, keys and logs\n"),
+                            ("ios-release", "      - name: Remove task-owned archive, keys and logs\n")):
+            with self.subTest(job=job):
+                self.fresh()
+                self.mutate(STORE, anchor, publish + anchor)
+                self.assertFlagged("store " + job + ": has a sign-only step; sign-only runs only in android-sign-only")
+                self.assertFlagged("store " + job + ": uses an action it does not need")
+        # The seal step's command moved into android-release.
         self.fresh()
-        self.mutate(STORE, "      - name: Remove task-owned archive, keys and logs\n",
-                    publish + "      - name: Remove task-owned archive, keys and logs\n")
-        self.assertFlagged("store ios-release: has a sign-only step; sign-only is May production Android only")
-        self.assertFlagged("store ios-release: uses an action it does not need")
+        self.mutate(STORE, "        run: python3 -I -S -B tools/may_release/dry_run.py --platform android",
+                    "        run: python3 -I -S -B tools/may_release/sign_only.py --platform android")
+        self.assertFlagged("store android-release: has a sign-only step; sign-only runs only in android-sign-only")
 
     def test_android_upload_with_its_guard_left_on_is_a_stage_mismatch(self):
         # Stage 1's line kept on the Android upload, with gate.py still saying it is active.
@@ -445,11 +477,13 @@ class StaticCheckTests(unittest.TestCase):
         # The pre-activation layout: all five jobs guarded, uploads only dry-run-conditional.
         self.mutate(STORE, "  admission:\n", "  admission:\n    if: ${{ " + INERT + " }}\n")
         self.mutate(STORE, "    if: ${{ inputs.platform == 'android' }}\n",
-                    "    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n", 2)
+                    "    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n")
+        self.mutate(STORE, RELEASE_IF, "    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n")
+        self.mutate(STORE, SIGN_ONLY_IF, "    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n")
         self.mutate(STORE, UPLOAD_LINE, ANDROID_LINE)
         self.mutate("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = set()')
         found = static_check.problems(self.root)
-        for job in ("admission", "android-build", "android-release"):
+        for job in ("admission", "android-build", "android-release", "android-sign-only"):
             self.assertTrue(any(p.startswith("store " + job + ": the job is held inert, but stage 3 activates it")
                                 for p in found), found)
         self.assertIn("store ios-release: the upload is not held inert (stage 3)", found)
@@ -529,8 +563,10 @@ class StaticCheckTests(unittest.TestCase):
             ("admission", "  admission:\n", "  admission:\n    if: ${{ " + INERT + " }}\n"),
             ("android-build", "  android-build:\n    needs: admission\n    if: ${{ inputs.platform == 'android' }}\n",
              "  android-build:\n    needs: admission\n    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n"),
-            ("android-release", "    if: ${{ inputs.platform == 'android' }}\n    runs-on: ubuntu-24.04\n    environment: ${{ needs.admission.outputs.environment }}\n",
-             "    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n    runs-on: ubuntu-24.04\n    environment: ${{ needs.admission.outputs.environment }}\n"),
+            ("android-release", RELEASE_IF,
+             "    if: ${{ " + INERT + " && inputs.platform == 'android' && github.event.inputs.sign_only != 'true' }}\n"),
+            ("android-sign-only", SIGN_ONLY_IF,
+             "    if: ${{ " + INERT + " && inputs.platform == 'android' && github.event.inputs.sign_only == 'true' }}\n"),
         )
         for job, old, new in cases:
             with self.subTest(job=job):
@@ -541,12 +577,22 @@ class StaticCheckTests(unittest.TestCase):
 
     def test_android_jobs_keep_their_platform_condition(self):
         for new in ("", "    if: ${{ inputs.platform == 'ios' }}\n", "    if: always()\n",
-                    "    if: ${{ inputs.platform == 'android' || true }}\n"):
-            for job, nth in (("android-build", 0), ("android-release", 1)):
+                    "    if: ${{ inputs.platform == 'android' || true }}\n", "    if: ${{ inputs.platform == 'android' }}\n"):
+            for job, old in (("android-build", "    if: ${{ inputs.platform == 'android' }}\n"),
+                             ("android-release", RELEASE_IF), ("android-sign-only", SIGN_ONLY_IF)):
+                if new == old:
+                    continue
                 with self.subTest(job=job, new=new.strip()):
                     self.fresh()
-                    self.mutate_nth("    if: ${{ inputs.platform == 'android' }}\n", new, nth)
+                    self.mutate(STORE, old, new)
                     self.assertFlagged("store " + job + ": does not keep its platform condition")
+        # A sign-only dispatch must not also run android-release (which references MAY_PLAY_JSON), or the reverse.
+        for old, new, job in ((RELEASE_IF, "    if: ${{ inputs.platform == 'android' }}\n", "android-release"),
+                              (SIGN_ONLY_IF, RELEASE_IF, "android-sign-only")):
+            with self.subTest(job=job, new=new.strip()):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged("store " + job + ": does not keep its platform condition")
 
     def test_guard_anywhere_else_is_flagged(self):
         self.mutate(STORE, "      MAY_TARGET: ${{ inputs.target }}\n",

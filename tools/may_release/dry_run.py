@@ -10,8 +10,11 @@ bundle ID, track), the build number the artifact carries, and the SHA-256 of
 the signed artifact. The IPA is re-verified first, as ios_upload.py would. For
 Android it rechecks, as play_upload.py would before any request, everything
 that needs no Play credential: the build number floor, that the signed bundle's
-sole signer is the target's own upload certificate, and that MAY_PLAY_ACCOUNT is
-the target's own Play account (store.ANDROID_UPLOAD_KEYS). So a dry run exercises
+sole signer is the target's own upload certificate, that the bundle's own
+manifest is exactly the target's package at the requested versionCode
+(verify.check_aab_identity), and that MAY_PLAY_ACCOUNT is the target's own Play
+account (store.ANDROID_UPLOAD_KEYS). The package and versionCode it prints are
+the ones read from the signed bundle. So a dry run exercises
 the whole path except the Play client itself (token, edit, track read, bundle
 upload, track update and commit). Every value is an input already validated by
 store.identity, a code constant, or a hex digest: nothing from the private source.
@@ -42,11 +45,12 @@ def summary(platform, target, source_sha, build_number):
             raise StoreError("Signed Android App Bundle is unavailable")
         if not build_number_floor_ok("android", target, build_number):
             raise StoreError("Build number is below this app's floor (May production starts at 3)")
-        check_android_signer(target, verify.aab_signer_sha256(artifact))
         account = play_account(target, os.environ.get("MAY_PLAY_ACCOUNT", ""))
+        check_android_signer(target, verify.aab_signer_sha256(artifact))
+        package, version_code = verify.check_aab_identity(artifact, app_id, build_number)
         return ["Dry run: no store upload was made. Google Play would have received:",
-                "  package: " + app_id,
-                "  versionCode: " + build_number,
+                "  package: " + package,
+                "  versionCode: " + version_code,
                 "  track: " + play_upload.TRACK,
                 "  signed AAB SHA-256: " + file_sha256(artifact),
                 "  signer: this target's pinned upload certificate",

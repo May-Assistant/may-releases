@@ -75,17 +75,22 @@ ANDROID_UPLOAD_KEYS = {
                    "cert": "db087802f802f2a1",
                    "account": "may-playground-upload@may-assistant-app.iam.gserviceaccount.com"},
 }
-# The lowest build number (versionCode) each store app may use here, mirroring
-# may-app's tools/release/build-number-floors. May production: versionCode 1 was
-# a manual upload and 2 was built for Dots, so this repository starts at 3.
-# gate.py refuses a lower one at admission (dry runs included), and
-# play_upload.py and sign_only.py refuse it again; Play's own check (greater
-# than every versionCode on every track) still applies on upload.
+# The lowest build number (versionCode) each store app may use here. May
+# production has no release at all (Samuel, 14 Oct): versionCodes 1 and 2 were
+# built but never uploaded, 2 for manual signing by Dots. A floor stays above
+# every built versionCode, so a number that names two different builds can never
+# reach Play: this repository starts May production at 3. That is stricter than
+# may-app's tools/release/build-number-floors (production 1), which android.sh
+# applies in the build job. gate.py refuses a lower one at admission (dry runs
+# included), and dry_run.py, sign_only.py and play_upload.py refuse it again;
+# Play's own check (greater than every versionCode on every track) still applies
+# on upload.
 MIN_BUILD_NUMBERS = {("android", "production"): 3}
-# Sign-only (stage 3): the targets whose release job may publish the signed
-# bundle, encrypted, for one manual Play Console upload instead of uploading it.
-# Only the real May app: its first release must be a Console upload (README,
-# "First production upload").
+# Sign-only (stage 3): the targets whose android-sign-only job may publish the
+# signed bundle, encrypted, for a manual Play Console upload instead of uploading
+# it. Only the real May app: its first release must be a Console upload (README,
+# "First production upload"). Nothing limits it to one use, so it also serves a
+# later build that has to go through Console.
 SIGN_ONLY_TARGETS = frozenset({("android", "production")})
 # The folder sign_only.py writes and the workflow publishes (3-day artifact):
 # the encrypted signed bundle, its SHA-256 file and SIGN_ONLY_RECORD. Nothing else.

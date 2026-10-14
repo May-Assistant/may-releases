@@ -18,8 +18,14 @@ script makes no network call and holds no secret. It refuses unless:
 2. the target is in store.SIGN_ONLY_TARGETS and the build number is at least its
    floor (store.MIN_BUILD_NUMBERS: May production starts at 3);
 3. Samuel's Console-upload public key (store.SIGN_ONLY_RECIPIENT) is committed;
-4. the signed bundle's sole signer is the target's own upload certificate
-   (store.ANDROID_UPLOAD_KEYS).
+4. the Console-upload key is not any environment's handoff key (whose private
+   half is a CI secret);
+5. the signed bundle's sole signer is the target's own upload certificate
+   (store.ANDROID_UPLOAD_KEYS);
+6. the signed bundle's own manifest (verify.check_aab_identity, read here on the
+   release side, not trusted from the build job) is exactly this app's package
+   at the requested versionCode. The record and the report carry those verified
+   values only: Play fixes an app's package at its first upload, which this is.
 
 The repository is public and so are its Actions artifacts, so the bundle is
 encrypted with age to Samuel's committed public key. A throwaway identity is
@@ -50,7 +56,7 @@ import sys
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from gate import AGE_RECIPIENT, artifact_recipient
+from gate import AGE_RECIPIENT, ENVIRONMENTS, artifact_recipient
 from store import (SIGN_ONLY_DIR, SIGN_ONLY_RECIPIENT, SIGN_ONLY_RECORD, SIGN_ONLY_TARGETS, StoreError,
                    build_number_floor_ok, check_android_signer, child_env, file_sha256, identity,
                    require_step_secrets, runner_root, write_private)
@@ -95,6 +101,8 @@ def seal_signed(target, source_sha, build_number):
     recipient = artifact_recipient(SIGN_ONLY_RECIPIENT)
     if recipient is None:
         raise StoreError("The Console-upload public key is still a placeholder; nothing was published")
+    if recipient in {artifact_recipient(environment) for environment in ENVIRONMENTS.values()}:
+        raise StoreError("The Console-upload key must not be an environment's handoff key; nothing was published")
     root = runner_root()
     signed = root / "may-release/signed.aab"
     if not signed.is_file() or signed.is_symlink() or signed.stat().st_size == 0:
@@ -104,6 +112,7 @@ def seal_signed(target, source_sha, build_number):
     except verify.VerifyError:
         raise StoreError("Signed Android App Bundle has no single verifiable signer") from None
     check_android_signer(target, signer)
+    package, version_code = verify.check_aab_identity(signed, app_id, build_number)
     sha256 = file_sha256(signed)
     out = root / SIGN_ONLY_DIR
     if out.exists() or out.is_symlink():
@@ -135,7 +144,7 @@ def seal_signed(target, source_sha, build_number):
         finally:
             check_key.unlink(missing_ok=True)
             check_plain.unlink(missing_ok=True)
-        record = {"mode": MODE, "platform": "android", "app_id": app_id, "build_number": build_number,
+        record = {"mode": MODE, "platform": "android", "app_id": package, "build_number": version_code,
                   "sha256": sha256, "encrypted_sha256": file_sha256(sealed)}
         write_private(out / SIGN_ONLY_RECORD, (json.dumps(record, sort_keys=True, indent=2) + "\n").encode())
         write_private(out / HASH_FILE, hash_line(sha256).encode())
@@ -153,7 +162,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         lines = seal_signed(args.target, args.source_sha, args.build_number)
-    except StoreError as error:
+    except (StoreError, verify.VerifyError) as error:
         raise SystemExit("May sign-only refused: " + error.args[0]) from None
     except Exception:
         raise SystemExit("May sign-only failed; nothing was published") from None
