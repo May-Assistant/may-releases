@@ -8,6 +8,12 @@ MAY_ARTIFACT_DECRYPT_KEY, checks the key matches the committed public key, and
 refuses the payload unless its manifest names exactly this repository, run,
 platform, target, source SHA and build number.
 
+The manifest also carries both design-system pins (`design_system`: iOS and
+Android) that prepare.py recorded, so drift is recorded on every release. Both
+sides re-apply store.design_system_pins: the pins may differ only for an
+internal target. The public log says only whether they match; the revisions
+themselves stay inside the encrypted handoff.
+
 age is authenticated encryption (ChaCha20-Poly1305), so the payload cannot be
 altered without failing decryption. It is not sender authentication: anyone
 holding the public key can encrypt. The run-bound manifest stops replay or
@@ -33,8 +39,8 @@ import unicodedata
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from gate import ENVIRONMENTS, artifact_recipient
-from store import (HANDOFF_SECRETS, StoreError, child_env, identity, require_step_secrets, runner_root,
-                   write_private)
+from store import (DESIGN_SYSTEM_RECORD, HANDOFF_SECRETS, StoreError, child_env, design_system_pins, identity,
+                   require_step_secrets, runner_root, write_private)
 import toolchain
 
 FORMAT = "may-handoff-1"
@@ -47,6 +53,18 @@ def expected_manifest(platform, target, source_sha, build_number):
             "run_id": os.environ.get("GITHUB_RUN_ID", ""),
             "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""), "platform": platform, "target": target,
             "source_sha": source_sha, "build_number": build_number, "product": PRODUCTS[platform]}
+
+
+def recorded_pins(root, platform, target):
+    """Both pins prepare.py recorded for exactly this platform and target."""
+    try:
+        record = json.loads((root / "may-private" / DESIGN_SYSTEM_RECORD).read_text())
+    except (OSError, ValueError):
+        raise StoreError("Design-system pin record is missing or malformed") from None
+    if not isinstance(record, dict) or sorted(record) != ["design_system", "platform", "target"] or \
+            (record["platform"], record["target"]) != (platform, target):
+        raise StoreError("Design-system pin record is not for this platform and target")
+    return design_system_pins(record["design_system"], platform, target)
 
 
 def recipient_for(platform, target):
@@ -218,7 +236,7 @@ def extract(archive, members, product_root, destination, resolver=strict_resolve
 
 
 def read_tar(path, destination, expected, allow_symlinks):
-    """Validate, then extract, the product into destination; return its path."""
+    """Validate, then extract, the product into destination; return (its path, both pins)."""
     product_root = "product/" + expected["product"]
     with tarfile.open(path) as archive:
         names = archive.getnames()
@@ -228,13 +246,17 @@ def read_tar(path, destination, expected, allow_symlinks):
             manifest = json.loads(archive.extractfile("manifest.json").read())
         except (ValueError, AttributeError):
             raise StoreError("Build handoff manifest is invalid") from None
+        if not isinstance(manifest, dict):
+            raise StoreError("Build handoff manifest is invalid")
+        pins = manifest.pop("design_system", None)
         if manifest != expected:
             raise StoreError("Build handoff does not match this run, target, source or build number")
+        pins = design_system_pins(pins, expected["platform"], expected["target"])
         members = checked_members(archive, product_root, allow_symlinks)
         if (members[0].isdir()) != (expected["platform"] == "ios"):
             raise StoreError("Build handoff contents are unexpected")
         extract(archive, members, product_root, destination)
-    return destination / expected["product"]
+    return destination / expected["product"], pins
 
 
 def seal(platform, target, source_sha, build_number):
@@ -242,6 +264,7 @@ def seal(platform, target, source_sha, build_number):
     require_step_secrets(())
     recipient = recipient_for(platform, target)
     root = runner_root()
+    pins = recorded_pins(root, platform, target)
     product = root / "may-release" / PRODUCTS[platform]
     if not product.exists() or product.is_symlink():
         raise StoreError("Unsigned product is unavailable")
@@ -249,7 +272,8 @@ def seal(platform, target, source_sha, build_number):
     handoff.mkdir(mode=0o700)
     plain = handoff / "handoff.tar"
     try:
-        write_tar(plain, expected_manifest(platform, target, source_sha, build_number), product)
+        write_tar(plain, dict(expected_manifest(platform, target, source_sha, build_number), design_system=pins),
+                  product)
         result = subprocess.run([toolchain.tool_path("age", "age"), "-r", recipient, "-o",
                                  str(handoff / "handoff.age"), str(plain)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -295,14 +319,19 @@ def open_handoff(platform, target, source_sha, build_number):
         finally:
             key.unlink(missing_ok=True)
         try:
-            read_tar(plain, out, expected_manifest(platform, target, source_sha, build_number),
-                     allow_symlinks=platform == "ios")
+            _, pins = read_tar(plain, out, expected_manifest(platform, target, source_sha, build_number),
+                               allow_symlinks=platform == "ios")
         except BaseException:
             shutil.rmtree(out, ignore_errors=True)
             raise
     finally:
         plain.unlink(missing_ok=True)
     print("Build handoff decrypted and bound to this run, target, source and build number")
+    if pins["ios"] == pins["android"]:
+        print("Design-system pins recorded in the sealed manifest: iOS and Android match")
+    else:
+        print("Design-system pins recorded in the sealed manifest: iOS and Android differ "
+              "(allowed for this internal target only)")
 
 
 if __name__ == "__main__":

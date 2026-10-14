@@ -34,7 +34,8 @@ class IsolatedModeTests(unittest.TestCase):
 
     def test_planted_stdlib_shadow_is_ignored_in_isolated_mode(self):
         for script, args in (("cleanup.py", ["release"]), ("handoff.py", ["--help"]), ("sign.py", ["--help"]),
-                             ("play_upload.py", ["--help"]), ("gate.py", ["--help"]), ("integrity.py", [])):
+                             ("play_upload.py", ["--help"]), ("dry_run.py", ["--help"]), ("gate.py", ["--help"]),
+                             ("integrity.py", [])):
             with self.subTest(script=script):
                 self.run_script("-I", "-S", "-B", str(self.copy / script), *args)
                 self.assertFalse((self.copy / "SHADOW-RAN").exists())

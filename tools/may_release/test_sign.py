@@ -230,7 +230,8 @@ class IosUploadTests(unittest.TestCase):
         fixture_ipa(self.work.root / "may-release/May.ipa")
         self.env = {"RUNNER_TEMP": str(self.work.root), "PATH": "/usr/bin",
                     "MAY_ASC_KEY_BASE64": base64.b64encode(b"-----BEGIN PRIVATE KEY-----\nfixture\n").decode(),
-                    "MAY_ASC_KEY_ID": "23VX669FGY", "MAY_ASC_ISSUER_ID": "00000000-1111-2222-3333-444444444444"}
+                    "MAY_ASC_KEY_ID": "23VX669FGY", "MAY_ASC_ISSUER_ID": "00000000-1111-2222-3333-444444444444",
+                    "MAY_DRY_RUN": "false"}
 
     def tearDown(self):
         self.work.directory.cleanup()

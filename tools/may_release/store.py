@@ -16,6 +16,7 @@ CLI prints it.
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,15 @@ APP_IDS = {
     ("android", "production"): "io.github.mayassistant.may",
     ("android", "playground"): "io.github.mayassistant.may.playground",
 }
+# The one list of internal-testing targets. Each goes only to Play's `internal`
+# track or to internal-only TestFlight. A (platform, target) not listed here is
+# non-internal: its iOS and Android design-system pins must match
+# (design_system_pins). It is deliberately not derived from APP_IDS, so a new
+# target is non-internal until someone adds it here on purpose.
+INTERNAL_TARGETS = frozenset({
+    ("ios", "production"), ("ios", "playground"),
+    ("android", "production"), ("android", "playground"),
+})
 APPLE_TEAM = "R6A892D599"
 APPLE_CERT_SHA1 = "A4AB0BB2786164506FDB2538320703B41B7ED30A"
 APPLE_KEY_ID = "23VX669FGY"
@@ -53,6 +63,8 @@ ANDROID_SIGNING_SECRETS = ("MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PAS
 IOS_SIGNING_SECRETS = ("MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD", "MAY_IOS_PROFILE_BASE64")
 PLAY_UPLOAD_SECRETS = ("MAY_PLAY_JSON",)
 IOS_UPLOAD_SECRETS = ("MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID")
+# prepare.py writes this under may-private; handoff.py seals it into the manifest.
+DESIGN_SYSTEM_RECORD = "design-system-pins.json"
 # Only these reach a child tool. Nothing is inherited wholesale from os.environ.
 PASS_THROUGH = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "CI",
                 "RUNNER_TEMP", "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT")
@@ -80,6 +92,27 @@ def identity(platform, target, source_sha, build_number):
     if not build_number_ok(build_number):
         raise StoreError("Store build number is invalid")
     return app_id
+
+
+def is_internal(platform, target):
+    return (platform, target) in INTERNAL_TARGETS
+
+
+def design_system_pins(record, platform, target):
+    """Both design-system pins of one build, checked; refuse drift for a non-internal target.
+
+    `record` is {"ios": <40-hex>, "android": <40-hex>}. Samuel's decision
+    (2026-10-14): an internal build checks only its own platform's pin against
+    the checkout, so the two may differ; any other target, or no target (the
+    native compile), still requires them to match. Both are always recorded so
+    drift stays visible on every release.
+    """
+    if (not isinstance(record, dict) or sorted(record) != ["android", "ios"] or
+            not all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{40}", v) for v in record.values())):
+        raise StoreError("Design-system pin record is missing or malformed")
+    if record["ios"] != record["android"] and not is_internal(platform, target):
+        raise StoreError("iOS and Android design-system pins differ; only an internal target may differ")
+    return {"ios": record["ios"], "android": record["android"]}
 
 
 def play_identity(value, expected_account):
@@ -145,6 +178,14 @@ def prepared(root, source_sha):
     if result.returncode or result.stdout.decode().strip() != source_sha:
         raise StoreError("Prepared source SHA differs")
     return source, private
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def run_private(argv, cwd, log, env):

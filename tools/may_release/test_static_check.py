@@ -188,7 +188,8 @@ class StaticCheckTests(unittest.TestCase):
         self.assertFlagged("store android-release: a secret step is not preceded by the checkout integrity check")
 
     def test_flow_style_env_is_refused(self):
-        self.mutate(STORE, "        env:\n          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
+        self.mutate(STORE, "        env:\n          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n"
+                           "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
                            "          MAY_PLAY_ACCOUNT: ${{ vars.MAY_PLAY_ACCOUNT }}\n",
                     "        env: { MAY_PLAY_JSON: '${{ secrets.MAY_PLAY_JSON }}', LD_PRELOAD: /tmp/x.so }\n")
         self.assertFlagged("store-release-draft.yml: uses a flow-style env mapping")
@@ -233,6 +234,80 @@ class StaticCheckTests(unittest.TestCase):
         self.mutate(STORE, "if: ${{ github.event_name == 'may-store-disabled-pending-review' }}",
                     "if: ${{ github.event_name == 'workflow_dispatch' }}")
         self.assertFlagged("store-release-draft.yml is not inert")
+
+    def test_dry_run_input_must_be_a_boolean_defaulting_to_true(self):
+        for old, new in (("        type: boolean\n        default: true\n", "        type: boolean\n        default: false\n"),
+                         ("        type: boolean\n        default: true\n", "        type: boolean\n"),
+                         ("        type: boolean\n        default: true\n", "        type: string\n        default: true\n"),
+                         ("      dry_run:\n", "      dry_run_disabled:\n")):
+            with self.subTest(new=new.strip()):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged("dry_run is not a required boolean input defaulting to true")
+
+    def test_dry_run_never_reaches_a_store_upload(self):
+        upload_if = "        if: ${{ github.event.inputs.dry_run == 'false' }}\n"
+        cases = (
+            (upload_if, ""),
+            (upload_if, "        if: ${{ github.event.inputs.dry_run != 'true' }}\n"),
+            (upload_if, "        if: ${{ !inputs.dry_run }}\n"),
+            (upload_if, "        if: always()\n"),
+            ("          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n", ""),
+            ("          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n", "          MAY_DRY_RUN: 'false'\n"),
+        )
+        for job in ("android-release", "ios-release"):
+            for old, new in cases:
+                with self.subTest(job=job, new=new.strip()):
+                    self.fresh()
+                    # The android job comes first in the file; the second occurrence is iOS.
+                    path = self.root / STORE
+                    text = path.read_text()
+                    at = text.find(old) if job == "android-release" else text.find(old, text.find(old) + 1)
+                    self.assertGreaterEqual(at, 0)
+                    path.write_text(text[:at] + new + text[at + len(old):])
+                    found = static_check.problems(self.root)
+                    self.assertTrue(any(p.startswith("store " + job) for p in found), found)
+
+    def test_dry_run_still_signs_and_reports(self):
+        cases = (
+            ("        run: python3 -I -S -B tools/may_release/sign.py --platform android",
+             "        if: ${{ github.event.inputs.dry_run == 'false' }}\n"
+             "        run: python3 -I -S -B tools/may_release/sign.py --platform android",
+             "store android-release: a step other than the upload or dry-run report is conditional"),
+            ("        run: python3 -I -S -B tools/may_release/handoff.py open --platform ios",
+             "        if: ${{ github.event.inputs.dry_run == 'false' }}\n"
+             "        run: python3 -I -S -B tools/may_release/handoff.py open --platform ios",
+             "store ios-release: a step other than the upload or dry-run report is conditional"),
+            ("        run: python3 -I -S -B tools/may_release/store.py --platform android",
+             "        if: ${{ github.event.inputs.dry_run == 'false' }}\n"
+             "        run: python3 -I -S -B tools/may_release/store.py --platform android",
+             "store android-build: a step other than the upload or dry-run report is conditional"),
+            ("        if: ${{ github.event.inputs.dry_run != 'false' }}\n"
+             "        run: python3 -I -S -B tools/may_release/dry_run.py --platform android",
+             "        if: ${{ github.event.inputs.dry_run == 'true' }}\n"
+             "        run: python3 -I -S -B tools/may_release/dry_run.py --platform android",
+             "store android-release: the dry run does not report what it would have uploaded"),
+            ("tools/may_release/dry_run.py --platform ios", "tools/may_release/dry_run.py --platform android",
+             "store ios-release: the dry run does not report what it would have uploaded"),
+            ("      - name: Report what the dry run would have uploaded\n", "      - name: Report something\n",
+             "store android-release: its steps are missing or out of order"),
+        )
+        for old, new, expected in cases:
+            with self.subTest(expected=expected):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged(expected)
+
+    def test_each_build_prepares_its_own_platform_and_target(self):
+        for old, new, job in (
+                ("prepare.py --platform android --target", "prepare.py --platform ios --target", "android-build"),
+                ('prepare.py --platform ios --target "$MAY_TARGET"', 'prepare.py --platform ios --target playground',
+                 "ios-build"),
+                ('prepare.py --platform ios --target "$MAY_TARGET" ', "prepare.py ", "ios-build")):
+            with self.subTest(new=new):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged("store " + job + ": does not prepare the design system for its own platform")
 
     def test_protected_job_must_wait_for_admission(self):
         self.mutate(STORE, "  android-build:\n    needs: admission\n", "  android-build:\n")

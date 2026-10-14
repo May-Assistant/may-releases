@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -10,11 +11,14 @@ import unittest
 from unittest.mock import patch
 
 import handoff
+import store
 from store import StoreError
 
 SHA = "a" * 40
 HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
 RUN = {"GITHUB_REPOSITORY": "May-Assistant/may-releases", "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1"}
+IOS_PIN, ANDROID_PIN = "1" * 40, "2" * 40
+PINS = {"ios": IOS_PIN, "android": ANDROID_PIN}  # differing, as on may-app main today
 
 
 def system_tool(name, relative):
@@ -41,7 +45,10 @@ class TarRulesTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def tar(self, manifest, members):
+    def tar(self, manifest, members, design_system=PINS):
+        """A plaintext handoff; the manifest carries `design_system` unless it is None."""
+        if design_system is not None:
+            manifest = dict(manifest, design_system=design_system)
         self.count += 1
         path = self.root / ("handoff-%d.tar" % self.count)
         types = {"file": tarfile.REGTYPE, "dir": tarfile.DIRTYPE, "sym": tarfile.SYMTYPE,
@@ -75,8 +82,9 @@ class TarRulesTests(unittest.TestCase):
     def test_matching_android_manifest_yields_product(self):
         out = self.destination()
         path = self.tar(expected(), [entry("product/unsigned.aab", data=b"bundle")])
-        product = handoff.read_tar(path, out, expected(), allow_symlinks=False)
+        product, pins = handoff.read_tar(path, out, expected(), allow_symlinks=False)
         self.assertEqual(product.read_bytes(), b"bundle")
+        self.assertEqual(pins, PINS)
         self.assertEqual(oct(product.stat().st_mode & 0o777), oct(0o600))
 
     def test_ios_archive_with_internal_bundle_symlinks_is_extracted(self):
@@ -93,8 +101,8 @@ class TarRulesTests(unittest.TestCase):
                    entry(fw + "/Headers", "sym", link="Versions/Current/Headers"),
                    entry(fw + "/Resources", "sym", link="Versions/Current/Resources")]
         out = self.destination()
-        product = handoff.read_tar(self.tar(expected(platform="ios"), members), out, expected(platform="ios"),
-                                   allow_symlinks=True)
+        product, _ = handoff.read_tar(self.tar(expected(platform="ios"), members), out, expected(platform="ios"),
+                                      allow_symlinks=True)
         binary = product / "Products/Applications/May.app/May"
         self.assertEqual(binary.stat().st_mode & 0o777, 0o700)
         kit = product / "Products/Applications/May.app/Frameworks/Kit.framework"
@@ -112,6 +120,32 @@ class TarRulesTests(unittest.TestCase):
                 path = self.tar(manifest, [entry("product/unsigned.aab")])
                 with self.assertRaises(StoreError):
                     handoff.read_tar(path, self.destination(), expected(), allow_symlinks=False)
+
+    def test_design_system_record_must_carry_both_valid_pins(self):
+        cases = {"missing": None, "ios-only": {"ios": IOS_PIN}, "android-only": {"android": ANDROID_PIN},
+                 "extra": dict(PINS, web=IOS_PIN), "short": dict(PINS, ios="1" * 39),
+                 "upper": dict(PINS, android="A" * 40), "not-a-dict": [IOS_PIN, ANDROID_PIN], "empty": {}}
+        for name, record in cases.items():
+            with self.subTest(name=name):
+                path = self.tar(expected(), [entry("product/unsigned.aab")],
+                                design_system=record if record is not None else None)
+                out = self.destination()
+                with self.assertRaises(StoreError):
+                    handoff.read_tar(path, out, expected(), allow_symlinks=False)
+                self.assertEqual(list(out.iterdir()), [])
+        same = {"ios": IOS_PIN, "android": IOS_PIN}
+        _, pins = handoff.read_tar(self.tar(expected(), [entry("product/unsigned.aab")], design_system=same),
+                                   self.destination(), expected(), allow_symlinks=False)
+        self.assertEqual(pins, same)
+
+    def test_non_internal_handoff_with_differing_pins_is_refused(self):
+        with patch.object(store, "INTERNAL_TARGETS", frozenset()):
+            out = self.destination()
+            with self.assertRaises(StoreError) as refused:
+                handoff.read_tar(self.tar(expected(), [entry("product/unsigned.aab")]), out, expected(),
+                                 allow_symlinks=False)
+            self.assertIn("pins differ", refused.exception.args[0])
+            self.assertEqual(list(out.iterdir()), [])
 
     def test_unexpected_members_are_refused(self):
         ios = expected(platform="ios")
@@ -288,6 +322,7 @@ class AgeRoundTripTests(unittest.TestCase):
                                      text=True, check=True).stdout.strip()
         (self.root / "may-release").mkdir()
         (self.root / "may-release/unsigned.aab").write_bytes(b"unsigned bundle")
+        self.record("android")
         self.patches = [patch.dict(os.environ, dict(RUN, RUNNER_TEMP=self.directory.name, PATH=os.environ["PATH"]),
                                    clear=True),
                         patch("handoff.toolchain.tool_path", side_effect=system_tool),
@@ -300,6 +335,13 @@ class AgeRoundTripTests(unittest.TestCase):
             item.stop()
         self.directory.cleanup()
 
+    def record(self, platform, design_system=PINS, target="playground"):
+        """What prepare.py leaves in may-private for the seal step."""
+        private = self.root / "may-private"
+        private.mkdir(exist_ok=True)
+        (private / handoff.DESIGN_SYSTEM_RECORD).write_text(json.dumps(
+            {"platform": platform, "target": target, "design_system": design_system}))
+
     def carry(self):
         """Simulate the artifact hop to a fresh release VM."""
         download = self.root / "may-handoff-download"
@@ -307,6 +349,7 @@ class AgeRoundTripTests(unittest.TestCase):
         shutil.move(str(self.root / "may-handoff/handoff.age"), str(download / "handoff.age"))
         shutil.rmtree(self.root / "may-release")
         shutil.rmtree(self.root / "may-handoff")
+        shutil.rmtree(self.root / "may-private")  # the build VM's pin record does not travel
 
     def test_round_trip_restores_exact_product_and_leaves_no_key(self):
         handoff.seal("android", "playground", SHA, "9")
@@ -319,6 +362,59 @@ class AgeRoundTripTests(unittest.TestCase):
         self.assertEqual((self.root / "may-release/unsigned.aab").read_bytes(), b"unsigned bundle")
         self.assertEqual(sorted(p.name for p in (self.root / "may-private").iterdir()), [])
 
+    def sealed_manifest(self, platform="android"):
+        """Seal, and return the manifest that went into the encrypted tar."""
+        real_write_tar, seen = handoff.write_tar, []
+
+        def capture(path, manifest, product):
+            seen.append(manifest)
+            return real_write_tar(path, manifest, product)
+
+        with patch("handoff.write_tar", side_effect=capture):
+            handoff.seal(platform, "playground", SHA, "9")
+        return seen[0]
+
+    def test_both_pins_are_sealed_into_the_manifest_and_reported(self):
+        manifest = self.sealed_manifest()
+        self.assertEqual(manifest["design_system"], {"ios": IOS_PIN, "android": ANDROID_PIN})
+        self.carry()
+        printed = io.StringIO()
+        with patch.dict(os.environ, MAY_ARTIFACT_DECRYPT_KEY=self.keyfile), contextlib.redirect_stdout(printed):
+            handoff.open_handoff("android", "playground", SHA, "9")
+        self.assertIn("iOS and Android differ (allowed for this internal target only)", printed.getvalue())
+        self.assertNotIn(IOS_PIN, printed.getvalue())  # the revisions stay in the encrypted manifest
+        self.assertNotIn(ANDROID_PIN, printed.getvalue())
+
+    def test_matching_pins_are_reported_as_matching(self):
+        self.record("android", {"ios": IOS_PIN, "android": IOS_PIN})
+        self.assertEqual(self.sealed_manifest()["design_system"], {"ios": IOS_PIN, "android": IOS_PIN})
+        self.carry()
+        printed = io.StringIO()
+        with patch.dict(os.environ, MAY_ARTIFACT_DECRYPT_KEY=self.keyfile), contextlib.redirect_stdout(printed):
+            handoff.open_handoff("android", "playground", SHA, "9")
+        self.assertIn("iOS and Android match", printed.getvalue())
+
+    def test_seal_refuses_a_missing_wrong_or_partial_pin_record(self):
+        for name, write in (
+                ("missing", lambda: (self.root / "may-private" / handoff.DESIGN_SYSTEM_RECORD).unlink()),
+                ("other-platform", lambda: self.record("ios")),
+                ("other-target", lambda: self.record("android", target="production")),
+                ("ios-missing", lambda: self.record("android", {"android": ANDROID_PIN})),
+                ("android-missing", lambda: self.record("android", {"ios": IOS_PIN})),
+                ("not-json", lambda: (self.root / "may-private" / handoff.DESIGN_SYSTEM_RECORD).write_text("{"))):
+            with self.subTest(name=name):
+                self.record("android")
+                write()
+                shutil.rmtree(self.root / "may-handoff", ignore_errors=True)
+                with self.assertRaises(StoreError):
+                    handoff.seal("android", "playground", SHA, "9")
+                self.assertFalse((self.root / "may-handoff/handoff.age").exists())
+
+    def test_seal_refuses_differing_pins_for_a_non_internal_target(self):
+        with patch.object(store, "INTERNAL_TARGETS", frozenset()), self.assertRaises(StoreError):
+            handoff.seal("android", "playground", SHA, "9")
+        self.assertFalse((self.root / "may-handoff/handoff.age").exists())
+
     def test_ios_archive_round_trip_keeps_internal_symlinks(self):
         shutil.rmtree(self.root / "may-release")
         fw = self.root / "may-release/May.xcarchive/Products/Applications/May.app/Frameworks/Kit.framework"
@@ -326,6 +422,7 @@ class AgeRoundTripTests(unittest.TestCase):
         (fw / "Versions/A/Kit").write_bytes(b"lib")
         os.symlink("A", fw / "Versions/Current")
         os.symlink("Versions/Current/Kit", fw / "Kit")
+        self.record("ios")
         handoff.seal("ios", "playground", SHA, "9")
         download = self.root / "may-handoff-download"
         download.mkdir()

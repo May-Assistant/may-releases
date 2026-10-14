@@ -57,6 +57,7 @@ Before the first production or public-beta release:
 1. Turn **Prevent self-review on** in every environment involved.
 2. Add a **second required reviewer**.
 3. Update `gate.py` (`OWNER_ID` sole-reviewer rule and self-review handling) and its tests in the same reviewed change that adds any non-internal track.
+4. Leave the new target out of `INTERNAL_TARGETS` in `store.py`. Anything not listed there is non-internal, so its iOS and Android design-system pins must match.
 
 The current code must not be extended to a non-internal track without these.
 
@@ -67,9 +68,9 @@ The current code must not be extended to a non-internal track without these.
 Each store run is **two jobs on separate fresh VMs**:
 
 1. **`*-build`** (`may-native-compile`, read-only source keys only):
-   - fetches the exact private source (`prepare.py`);
+   - fetches the exact private source and the design system pinned for the platform being built (`prepare.py`; see [Design-system pins](#design-system-pins));
    - runs the private build script for an **unsigned** product (`store.py`). This step runs third-party code: Gradle and its plugins, SwiftPM, and Xcode build phases.
-   - encrypts the product with [age](https://age-encryption.org) to the target's public key committed in `tools/may_release/artifact_keys/` (`handoff.py seal`);
+   - encrypts the product, with a manifest that also records both design-system pins, using [age](https://age-encryption.org) to the target's public key committed in `tools/may_release/artifact_keys/` (`handoff.py seal`);
    - uploads only the encrypted file, as a one-day artifact.
 2. **`*-release`** (the store environment; `needs: [admission, *-build]`):
    - on a fresh VM, runs no build toolchain. Its only actions are SHA-pinned `actions/checkout` and `actions/download-artifact`, used before any secret is present. Every command is this repository's Python, run as `python3 -I -S -B` (isolated: neither the script folder nor site-packages comes before the standard library, so a planted file cannot shadow a stdlib import), which calls the pinned, checksum-verified Temurin `jarsigner`, the pinned `age`, the system `openssl`, and Apple's `/usr/bin` tools.
@@ -83,13 +84,15 @@ Each store run is **two jobs on separate fresh VMs**:
      - Every link is re-resolved in its final location before any signing secret is on the VM.
    - `integrity.py` runs before each secret step (decrypt, sign, upload). It refuses unless `git status --ignored` is empty and every file under `tools/may_release/` matches the checked-out commit's blob, mode and file list. It runs git with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `-c core.fsmonitor=false` and only `PATH` in its environment, so no system, global or `HOME`-based setting (hooks, fsmonitor, excludes) applies.
    - Because the attempt is bound, re-running a store run means **re-running all jobs**. Re-running only the release job finds no artifact for the new attempt and stops with "Re-run all jobs: this release only accepts a build from the same run attempt".
-   - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads.
+   - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads, unless this is a [dry run](#dry-run).
 
 Within a job, each step receives only its own secrets, and each script refuses to run if it finds another step's secret. Tools get an allowlisted environment. `static_check.py` enforces:
 
 - the job and step layout and the step-to-secret map;
 - the allowed actions and commands in release jobs;
 - that only the `.age` file is uploaded;
+- the `dry_run` input (a required boolean defaulting to `true`), that only the store upload and the dry-run report steps are conditional, and their exact conditions;
+- that each build job prepares the design system for its own platform and target;
 - that no `setup-java` or `pip install` appears in any workflow.
 
 **What this gives, and what it does not:**
@@ -99,6 +102,27 @@ Within a job, each step receives only its own secrets, and each script refuses t
 - **age gives confidentiality and integrity, not sender authentication, and is not proof of reviewed build provenance.** Anyone holding the public key can encrypt. The manifest bound to the run and attempt refuses another run's, attempt's or target's artifact, and a tampered file fails decryption. The job split protects the keys, not the integrity of the product.
 - **age itself is installed in the build job before the third-party build runs.** A compromised build could replace it and leave the handoff unencrypted. The release side's authenticated decryption rejects that, so the risk is to confidentiality only, and a compromised build can break the product's confidentiality anyway.
 - The read-only source keys exist in the build job, in the fetch step only, and stay readable to the build within the limits of a same-VM step.
+
+## Design-system pins
+
+`may-app` pins the May design system twice: `ios/project.yml` (`MayDesignSystem` `url` + `revision`) and `android/design-system.lock` (`repository=` + `revision=`). They can drift, and on may-app main today they differ.
+
+Samuel's decision (2026-10-14): relax the design-system pin match for internal builds only; production still requires it; drift recorded on every build.
+
+- **Every build** requires both pins to be well-formed (40-hex) and trusted (`https://github.com/May-Assistant/may-design-system`), including the pin that is not built. Drift is only meaningful between two exact revisions of the one trusted repository. A pin that points elsewhere, or at a branch or path, is a different dependency for the same commit, which will also be built for the other platform.
+- **Internal targets** (`INTERNAL_TARGETS` in `store.py`, the single list; today all four May and Playground targets, which go only to the Play `internal` track or internal-only TestFlight): `prepare.py --platform P --target T` fetches only P's pin and refuses unless that exact revision is what is checked out. The other platform's pin may differ.
+- **Any other target**, including any future production or public target, which is non-internal unless it is added to that list on purpose: the two pins must match. The native compile (`prepare.py` with no platform or target) also still requires the match.
+- **Record.** `prepare.py` writes both pins to the build job's private folder. `handoff.py seal` puts them into the encrypted manifest (`design_system`), and `handoff.py open` re-applies the same rule. The public log says only whether they **match** or **differ**; the revisions stay in the encrypted handoff, because the no-commit-metadata rule covers the private design system too.
+
+## Dry run
+
+`store-release-draft.yml` has a `dry_run` boolean input, **default `true`**, so a real upload is always an explicit choice at dispatch.
+
+- A dry run still builds, seals, opens, signs and verifies.
+- It skips both store upload steps (`play_upload.py`, `ios_upload.py`), so the upload credentials never reach the VM.
+- `dry_run.py` reports what would have been uploaded: package or bundle ID, versionCode or build number, track, and the signed artifact's SHA-256. For iOS, it re-verifies the IPA first.
+- Upload steps run only when `github.event.inputs.dry_run == 'false'`. That context holds the boolean as a string, so a missing value never uploads.
+- Each upload script also refuses unless `MAY_DRY_RUN` is exactly `false`.
 
 ## Artifact key-pair setup
 
@@ -172,7 +196,7 @@ The gate denies a target whose committed key is missing, a placeholder or malfor
 
 ## Private release script interface
 
-`may-app` main does not yet have `android/`, `ios/` or `tools/release/*.sh`; that work is in progress and tracked in [May app issue #52](https://github.com/May-Assistant/may-app/issues/52). This repository expects:
+`may-app` main has `ios/` and `android/`, but no `tools/release/*.sh` yet. May app PR #105 adds `tools/release/android.sh build-unsigned` (Android only for now); `ios.sh archive-unsigned` is a follow-up. The work is tracked in [May app issue #52](https://github.com/May-Assistant/may-app/issues/52). This repository expects:
 
 - `bash tools/release/android.sh build-unsigned`
   - Inputs: `MAY_TARGET`, `MAY_SOURCE_SHA`, `MAY_BUILD_NUMBER`, `MAY_APP_ID`/`MAY_ANDROID_APP_ID` and `MAY_ARTIFACT_DIR`, with `JAVA_HOME` set to the pinned JDK.
@@ -193,7 +217,7 @@ Before dispatch, these must all be in place:
 - the four artifact public keys committed and their private keys set;
 - an exact-head app review and build;
 - a store-ready `may-app` main commit;
-- a protected, exact-head rehearsal;
+- a protected, exact-head rehearsal, run as a dry run (`dry_run: true`, the default);
 - a separate, reviewed activation change.
 
 The Play client, keychain, export and upload paths have unit tests, but none of them has yet run against a real store.

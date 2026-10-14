@@ -75,7 +75,7 @@ class PlayUploadTests(unittest.TestCase):
         (root / "may-release").mkdir()
         (root / "may-release/signed.aab").write_bytes(BUNDLE)
         self.env = patch.dict(os.environ, RUNNER_TEMP=self.directory.name, MAY_PLAY_JSON=CREDENTIAL,
-                              MAY_PLAY_ACCOUNT=ACCOUNT)
+                              MAY_PLAY_ACCOUNT=ACCOUNT, MAY_DRY_RUN="false")
         self.env.start()
 
     def tearDown(self):

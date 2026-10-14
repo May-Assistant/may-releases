@@ -19,6 +19,17 @@ UPLOAD_ARTIFACT = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607f
 DOWNLOAD_ARTIFACT = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 FETCH = "Fetch exact private source and pinned design system"
 DECRYPT = "Decrypt and check the build handoff"
+REPORT = "Report what the dry run would have uploaded"
+UPLOADS = {"android-release": "Upload update to the internal track only",
+           "ios-release": "Upload verified IPA for internal TestFlight"}
+# A store upload runs only when dry_run is exactly 'false' (github.event.inputs
+# holds booleans as strings, so a missing value never uploads), and the upload
+# script receives the same value to recheck. The report runs in every other case.
+UPLOAD_IF = "${{ github.event.inputs.dry_run == 'false' }}"
+REPORT_IF = "${{ github.event.inputs.dry_run != 'false' }}"
+DRY_RUN_ENV = "${{ github.event.inputs.dry_run }}"
+DRY_RUN_INPUT = ("      dry_run:\n        description: [^\n]+\n        required: true\n"
+                 "        type: boolean\n        default: true\n")
 READ_KEYS = {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"}
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
@@ -28,7 +39,7 @@ STORE_JOBS = {
         {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "android-release": (
         ["Install pinned JDK and age", DECRYPT, "Sign and verify Android App Bundle",
-         "Upload update to the internal track only"],
+         "Upload update to the internal track only", REPORT],
         {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
          "Sign and verify Android App Bundle": {"MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PASSWORD",
                                                 "MAY_ANDROID_KEY_PASSWORD"},
@@ -40,7 +51,7 @@ STORE_JOBS = {
         {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "ios-release": (
         ["Install pinned age", DECRYPT, "Sign and verify internal-TestFlight IPA",
-         "Upload verified IPA for internal TestFlight"],
+         "Upload verified IPA for internal TestFlight", REPORT],
         {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
          "Sign and verify internal-TestFlight IPA": {"MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD",
                                                      "MAY_IOS_PROFILE_BASE64"},
@@ -50,7 +61,7 @@ STORE_JOBS = {
 # In a release job every command is this repository's own Python, with arguments
 # from a safe character set: no ; | & ` ( ) < > { } or newline, so no $( or chaining.
 RELEASE_COMMAND = re.compile(
-    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|cleanup|integrity)\.py"
+    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|dry_run|cleanup|integrity)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
 VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
@@ -71,6 +82,12 @@ def job_steps(workflow, job):
         name = re.search(r"(?m)^(?:        )?name: (.+)$", chunk)
         steps.append((name.group(1).strip() if name else "", chunk))
     return header, steps
+
+
+def step_condition(step):
+    """The step's `if:` expression, or None."""
+    match = re.search(r"(?m)^        if: (.+)$", step)
+    return match.group(1).strip() if match else None
 
 
 def secrets_in(text):
@@ -111,7 +128,8 @@ def release_env_allowed(name, value, secrets):
         return value == "${{ vars." + name + " }}"
     if name in INPUTS:
         return value == "${{ inputs." + INPUTS[name] + " }}"
-    return (name, value) in {("PYTHONDONTWRITEBYTECODE", "'1'"), ("GH_TOKEN", "${{ github.token }}")}
+    return (name, value) in {("PYTHONDONTWRITEBYTECODE", "'1'"), ("GH_TOKEN", "${{ github.token }}"),
+                             ("MAY_DRY_RUN", DRY_RUN_ENV)}
 
 
 def bare_secret_references(text):
@@ -177,6 +195,8 @@ def store_problems(store):
         found.append("store-release-draft.yml sets workflow-level env or defaults")
     if secrets_in(job_text(store, "admission")):
         found.append("store admission: holds a secret")
+    if not re.search(r"(?m)^" + DRY_RUN_INPUT, store.partition("\njobs:\n")[0]):
+        found.append("store-release-draft.yml: dry_run is not a required boolean input defaulting to true")
     for job, (order, expected, actions) in STORE_JOBS.items():
         header, steps = job_steps(store, job)
         release = job.endswith("-release")
@@ -200,6 +220,24 @@ def store_problems(store):
             found.append(f"store {job}: a step holds secrets it does not need")
         if set(uses_in(job_text(store, job))) - actions:
             found.append(f"store {job}: uses an action it does not need")
+        platform = job.split("-")[0]
+        prepare = ('python3 -I -S -B tools/may_release/prepare.py --platform ' + platform +
+                   ' --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA"')
+        if not release and [run_commands(text) for name, text in steps if name == FETCH] != [[prepare]]:
+            found.append(f"store {job}: does not prepare the design system for its own platform and target")
+        # The dry run must still build, seal, open, sign and verify: only the
+        # upload and the report are conditional (cleanup always runs).
+        for name, text in steps:
+            condition = step_condition(text)
+            if release and name == UPLOADS[job]:
+                if condition != UPLOAD_IF or ("          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n") not in text:
+                    found.append(f"store {job}: a dry run would run the store upload")
+            elif release and name == REPORT:
+                if condition != REPORT_IF or not run_commands(text) or not run_commands(text)[0].startswith(
+                        "python3 -I -S -B tools/may_release/dry_run.py --platform " + platform + " "):
+                    found.append(f"store {job}: the dry run does not report what it would have uploaded")
+            elif condition not in (None, "always()") or (condition == "always()" and "cleanup.py" not in text):
+                found.append(f"store {job}: a step other than the upload or dry-run report is conditional")
         for _, text in steps:
             if UPLOAD_ARTIFACT in text and "path: ${{ runner.temp }}/may-handoff/handoff.age\n" not in text:
                 found.append(f"store {job}: uploads something other than the encrypted handoff")
