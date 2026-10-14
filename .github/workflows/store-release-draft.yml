@@ -4,7 +4,7 @@ name: May protected store release (stage 3, Android internal uploads; iOS inert)
 # also run sign_only: true (with dry_run: true), which signs and verifies exactly
 # as an upload would, makes no Play call, and publishes the signed bundle,
 # encrypted to Samuel's committed key, as a 3-day artifact for a manual Play
-# Console upload (the API cannot make an app's first release). Sign-only runs in
+# Console upload, without the keystore touching any other machine. Sign-only runs in
 # its own job, android-sign-only, instead of android-release, so that its runner
 # never receives MAY_PLAY_JSON. The iOS jobs and
 # the iOS upload step are still inert: they require an event name this workflow

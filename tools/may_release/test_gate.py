@@ -221,8 +221,8 @@ class GateTests(unittest.TestCase):
             "dry_run: false fails here by design; dispatch with dry_run: true")
     NOT_ADMITTED = ("Stage 3 admits only an Android May or May Playground upload to the Play internal track; "
                     "this run did not upload anything. Dispatch with dry_run: true")
-    FLOOR = ("Store build number is below this app's floor (May production Android starts at 3: versionCodes 1 "
-             "and 2 have been built, and a floor stays above every built versionCode)")
+    FLOOR = ("Store build number is below this app's floor (May production Android starts at 3: its first "
+             "release, versionCode 2, was uploaded by hand on 14 Oct)")
 
     def test_stage_3_admits_a_may_playground_android_upload(self):
         self.assertEqual(gate.UPLOADS_HELD, {"ios"})

@@ -555,9 +555,8 @@ class CommittedUploadKeyTests(unittest.TestCase):
 
 
 FIRST_RELEASE = ("First release must be uploaded in Play Console: no track of this app has a rolled-out "
-                 "release, and Play's API cannot make an app's first release. Upload the first build by hand "
-                 "(May production: a sign_only run, then one Console upload to internal testing), then dispatch "
-                 "the next build here.")
+                 "release, and Play's API cannot make an app's first release. Upload the first build by hand in "
+                 "Play Console (a sign_only run can produce it, signed in CI), then dispatch the next build here.")
 
 
 class Reply:

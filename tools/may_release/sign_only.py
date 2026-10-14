@@ -1,11 +1,13 @@
-"""Sign-only: publish the signed May production bundle, encrypted, for one manual Play Console upload.
+"""Sign-only: publish the signed May production bundle, encrypted, for a manual Play Console upload.
 
-Google's Play Developer API cannot make an app's first release: its Edits guide
-says the API changes only an existing app "that has at least one APK uploaded",
-so the first upload must go through Play Console. May production has no release
-yet. Sign-only lets that first Console upload use a bundle built, sealed, signed
-and verified by this workflow exactly as an upload would be, so the upload
-keystore stays in the protected environment and never reaches Samuel's machine.
+Sign-only gives Samuel a May production bundle built, sealed, signed and verified
+by this workflow exactly as an upload would be, without the upload keystore
+touching any machine but the protected runner, for a build that has to go
+through Play Console by hand. (Google's Play Developer API cannot make an app's
+first release: its Edits guide says the API changes only an existing app "that
+has at least one APK uploaded". May production's first release, vc2, was
+uploaded by hand on 14 Oct, signed on Samuel's machine; later builds upload
+through the workflow, so sign-only is for the exceptions.)
 
 This runs in the release job, after the dry-run report, only when the dispatch
 asked for it (`sign_only: true`, never the default) together with `dry_run: true`.
@@ -25,7 +27,7 @@ script makes no network call and holds no secret. It refuses unless:
 6. the signed bundle's own manifest (verify.check_aab_identity, read here on the
    release side, not trusted from the build job) is exactly this app's package
    at the requested versionCode. The record and the report carry those verified
-   values only: Play fixes an app's package at its first upload, which this is.
+   values only: a bundle uploaded by hand gets none of play_upload.py's checks.
 
 The repository is public and so are its Actions artifacts, so the bundle is
 encrypted with age to Samuel's committed public key. A throwaway identity is

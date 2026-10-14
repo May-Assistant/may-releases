@@ -76,10 +76,10 @@ ANDROID_UPLOAD_KEYS = {
                    "account": "may-playground-upload@may-assistant-app.iam.gserviceaccount.com"},
 }
 # The lowest build number (versionCode) each store app may use here. May
-# production has no release at all (Samuel, 14 Oct): versionCodes 1 and 2 were
-# built but never uploaded, 2 for manual signing by Dots. A floor stays above
-# every built versionCode, so a number that names two different builds can never
-# reach Play: this repository starts May production at 3. That is stricter than
+# production's first release is versionCode 2 (0.1.0), signed on Samuel's machine
+# and uploaded by hand to the internal track on 14 Oct; workflow uploads start at
+# 3, so the floor keeps every later build above vc2 (and above vc1, which was
+# built but never uploaded) even before Play's own check sees it. That is stricter than
 # may-app's tools/release/build-number-floors (production 1), which android.sh
 # applies in the build job. gate.py refuses a lower one at admission (dry runs
 # included), and dry_run.py, sign_only.py and play_upload.py refuse it again;
@@ -88,9 +88,8 @@ ANDROID_UPLOAD_KEYS = {
 MIN_BUILD_NUMBERS = {("android", "production"): 3}
 # Sign-only (stage 3): the targets whose android-sign-only job may publish the
 # signed bundle, encrypted, for a manual Play Console upload instead of uploading
-# it. Only the real May app: its first release must be a Console upload (README,
-# "First production upload"). Nothing limits it to one use, so it also serves a
-# later build that has to go through Console.
+# it: a CI-signed bundle without the upload keystore touching any other machine,
+# for a build that has to go through Console by hand. Only the real May app.
 SIGN_ONLY_TARGETS = frozenset({("android", "production")})
 # The folder sign_only.py writes and the workflow publishes (3-day artifact):
 # the encrypted signed bundle, its SHA-256 file and SIGN_ONLY_RECORD. Nothing else.

@@ -14,7 +14,7 @@ with dry_run: false can never end green without uploading. It refuses unless:
 
 It then prints the upload report. It holds no secret and makes no network call.
 
-With --sign-only (May production's sign_only run, which never uploads), it
+With --sign-only (a May production sign_only run, which never uploads), it
 instead confirms a "signed, not uploaded" outcome, and never reports an upload.
 The workflow runs it right after the publish step whenever sign_only is true (and
 the run was not cancelled). It refuses unless:

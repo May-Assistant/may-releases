@@ -97,7 +97,7 @@ def validate_run(repo, ref, event, sha, action, build_number=None, target="produ
         raise GateDenial("Store build number must be a positive integer no greater than 2000000000")
     if action != "compile" and not build_number_floor_ok(action, target, build_number):
         raise GateDenial("Store build number is below this app's floor (May production Android starts at 3: "
-                         "versionCodes 1 and 2 have been built, and a floor stays above every built versionCode)")
+                         "its first release, versionCode 2, was uploaded by hand on 14 Oct)")
     return ENVIRONMENTS[key]
 
 

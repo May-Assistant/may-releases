@@ -4,9 +4,9 @@ Update mode only. Google's Edits guide says the API can change only an existing
 app "that has at least one APK uploaded", so the first upload must go through
 Play Console (and Play accepts only `status: draft` releases through the API
 until an app's first release has been rolled out). Each app's first release is
-therefore a manual Play Console upload (for May production: sign_only.py, then
-one Console upload). This adapter refuses an app whose tracks show no rolled-out
-release, with a message saying so. Otherwise, inside one edit, it:
+therefore a manual Play Console upload; May Playground's (vc1, 13 Oct) and May
+production's (vc2, 14 Oct) were. This adapter refuses any app whose tracks show
+no rolled-out release, with a message saying so. Otherwise, inside one edit, it:
 
 1. reads every track and requires the new versionCode to be greater than every
    versionCode on every track, and no more than MAX_VERSION_JUMP above it;
@@ -256,8 +256,8 @@ def highest_version_code(tracks):
     if not rolled_out or not codes:
         raise PlayRefusal("First release must be uploaded in Play Console: no track of this app has a "
                           "rolled-out release, and Play's API cannot make an app's first release. "
-                          "Upload the first build by hand (May production: a sign_only run, then one "
-                          "Console upload to internal testing), then dispatch the next build here.")
+                          "Upload the first build by hand in Play Console (a sign_only run can produce "
+                          "it, signed in CI), then dispatch the next build here.")
     return max(codes)
 
 
@@ -307,7 +307,7 @@ def name_failed_request(step):
     if step in ("edit insert", "internal track update"):
         print("May Play upload: if this app has never had an upload in Play Console, that is the cause: "
               "Play's API cannot make an app's first release, so it must be uploaded by hand (README, "
-              "\"First production upload\").", file=sys.stderr)
+              "\"Store records\").", file=sys.stderr)
 
 
 def delete_edit(session, url):
