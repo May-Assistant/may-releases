@@ -8,6 +8,11 @@ TestFlight processing and group assignment need separate readback.
 Dry run: the workflow skips this step unless `dry_run` is false, and this
 script also refuses unless MAY_DRY_RUN is exactly "false". dry_run.py reports
 instead.
+
+Report: after a successful upload it records it (store.UPLOAD_RECORD) and prints
+the bundle, build number, track and signed IPA SHA-256. The workflow's next step
+(confirm_upload.py) fails the job unless this step succeeded and left that
+record. Both steps are inert while the iOS jobs are.
 """
 
 import argparse
@@ -20,9 +25,9 @@ import sys
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import (APPLE_KEY_ID, APPLE_TEAM, IOS_UPLOAD_SECRETS, XCODE_DEVELOPER_DIR, StoreError,
-                   child_env, identity, require_step_secrets, run_private, runner_root, secret_bytes,
-                   write_private)
+from store import (APPLE_KEY_ID, APPLE_TEAM, IOS_TRACK, IOS_UPLOAD_SECRETS, XCODE_DEVELOPER_DIR, StoreError,
+                   child_env, file_sha256, identity, require_step_secrets, run_private, runner_root,
+                   secret_bytes, write_private, write_upload_record)
 import verify
 
 
@@ -41,6 +46,7 @@ def upload(target, source_sha, build_number):
     if not ipa.is_file() or ipa.is_symlink():
         raise StoreError("Signed iOS IPA is unavailable")
     verify.ipa_identity(ipa, APPLE_TEAM, app_id, build_number)
+    ipa_sha256 = file_sha256(ipa)
     key = secret_bytes("MAY_ASC_KEY_BASE64")
     if not key.startswith(b"-----BEGIN PRIVATE KEY-----"):
         raise StoreError("App Store Connect key is not a PEM private key")
@@ -54,7 +60,7 @@ def upload(target, source_sha, build_number):
                     private, private / "ios-upload.log", env)
     finally:
         shutil.rmtree(keys, ignore_errors=True)
-    print("May IPA submitted for internal TestFlight; verify processing separately")
+    print("\n".join(write_upload_record("ios", app_id, build_number, IOS_TRACK, ipa_sha256)))
 
 
 if __name__ == "__main__":

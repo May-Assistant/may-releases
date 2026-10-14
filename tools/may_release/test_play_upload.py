@@ -77,8 +77,11 @@ class PlayUploadTests(unittest.TestCase):
         self.env = patch.dict(os.environ, RUNNER_TEMP=self.directory.name, MAY_PLAY_JSON=CREDENTIAL,
                               MAY_PLAY_ACCOUNT=ACCOUNT, MAY_DRY_RUN="false")
         self.env.start()
+        self.output = patch("sys.stdout", new_callable=io.StringIO)  # the upload report
+        self.output.start()
 
     def tearDown(self):
+        self.output.stop()
         self.env.stop()
         self.directory.cleanup()
 
@@ -159,6 +162,45 @@ class PlayUploadTests(unittest.TestCase):
                 with self.assertRaises(StoreError):
                     upload("playground", "a" * 40, "9", session)
                 self.assertEqual(session.methods()[-1], "DELETE")
+
+    def test_only_the_internal_track_of_may_playground_is_reachable(self):
+        # The one write is the internal track (test above); nothing else can be chosen.
+        self.assertEqual(play_upload.TRACK, "internal")
+        self.assertEqual(play_upload.PLAY_UPLOAD_TRACKS, {"playground": "internal"})
+        # The real May app is refused in stage 2, before any request.
+        session = Session()
+        with self.assertRaises(PlayRefusal) as refused:
+            upload("production", "a" * 40, "9", session)
+        self.assertEqual(refused.exception.args[0], "Only May Playground uploads to the Play internal track are allowed.")
+        self.assertEqual(session.calls, [])
+        # Neither a non-internal track in the table nor a changed TRACK gets past it.
+        for track in ("production", "beta", "alpha", "qa"):
+            for patched in (patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": track}),
+                            patch("play_upload.TRACK", track)):
+                session = Session()
+                with self.subTest(track=track), patched, self.assertRaises(PlayRefusal):
+                    upload("playground", "a" * 40, "9", session)
+                self.assertEqual(session.calls, [])
+        with patch("play_upload.TRACK", "production"), \
+                patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": "production"}), self.assertRaises(PlayRefusal):
+            upload("playground", "a" * 40, "9", Session())
+
+    def test_successful_upload_records_and_reports_what_it_committed(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            upload("playground", "a" * 40, "9", Session())
+        record = json.loads((Path(self.directory.name) / "may-release/upload-record.json").read_text())
+        self.assertEqual(record, {"platform": "android", "app_id": PLAYGROUND, "build_number": "9",
+                                  "track": "internal", "sha256": hashlib.sha256(BUNDLE).hexdigest(),
+                                  "store_id": "edit-1"})
+        self.assertEqual(output.getvalue().splitlines()[1:6], [
+            "  package: " + PLAYGROUND, "  versionCode: 9", "  track: internal",
+            "  signed AAB SHA-256: " + hashlib.sha256(BUNDLE).hexdigest(), "  Play edit (committed): edit-1"])
+        # A refused or failed upload leaves no record, so the loud-failure step fails.
+        (Path(self.directory.name) / "may-release/upload-record.json").unlink()
+        for session in (Session(commit_status=400), Session(uploaded={"versionCode": 9, "sha256": "0" * 64})):
+            with self.assertRaises(StoreError):
+                upload("playground", "a" * 40, "9", session)
+            self.assertFalse((Path(self.directory.name) / "may-release/upload-record.json").exists())
 
     def test_upload_step_refuses_signing_secrets(self):
         session = Session()

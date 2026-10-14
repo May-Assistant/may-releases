@@ -8,6 +8,7 @@ from unittest.mock import patch
 import urllib.error
 
 import gate
+import play_upload
 from gate import GateDenial, validate_environment, validate_run
 
 REPO, MAIN, DISPATCH = "May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch"
@@ -183,7 +184,7 @@ class GateTests(unittest.TestCase):
                     self.assertIsNone(gate.artifact_recipient("x"))
 
 
-    def run_admission(self, dry_run, action="android"):
+    def run_admission(self, dry_run, action="android", target="playground"):
         """gate.main() as admission runs it, with fixture metadata. Returns (denial, output, requests)."""
         with tempfile.TemporaryDirectory() as directory:
             keys = Path(directory)
@@ -192,7 +193,7 @@ class GateTests(unittest.TestCase):
             output = os.path.join(directory, "output")
             env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH,
                    "GH_TOKEN": "fixture-token", "GITHUB_OUTPUT": output}
-            argv = ["gate.py", "--action", action, "--target", "playground", "--source-sha", self.sha,
+            argv = ["gate.py", "--action", action, "--target", target, "--source-sha", self.sha,
                     "--build-number", "3", "--dry-run", dry_run]
             requests = []
 
@@ -207,16 +208,27 @@ class GateTests(unittest.TestCase):
                     gate.main()
                 except GateDenial as error:
                     denial = error.args[0]
-            written = open(output).read() if os.path.exists(output) else None
+            written = Path(output).read_text() if os.path.exists(output) else None
             return denial, written, requests
 
-    def test_stage_1_admission_refuses_dry_run_false_before_anything_else(self):
-        self.assertEqual(gate.UPLOADS_HELD, {"android", "ios"})
-        for action in ("android", "ios"):
-            with self.subTest(action=action):
-                denial, written, requests = self.run_admission("false", action)
-                self.assertEqual(denial, "Stage 1: uploads are held; this run did not upload anything. "
-                                         "dry_run: false fails in stage 1 by design; dispatch with dry_run: true")
+    HELD = ("Uploads are held for this platform (stage 2 holds iOS); this run did not upload anything. "
+            "dry_run: false fails here by design; dispatch with dry_run: true")
+    NOT_ADMITTED = ("Stage 2 admits only a May Playground Android upload to the Play internal track; "
+                    "this run did not upload anything. Dispatch with dry_run: true")
+
+    def test_stage_2_admits_a_may_playground_android_upload(self):
+        self.assertEqual(gate.UPLOADS_HELD, {"ios"})
+        denial, written, requests = self.run_admission("false")
+        self.assertIsNone(denial)
+        self.assertEqual(written, "environment=may-android-playground-internal\nbuild_environment=may-native-compile\n")
+        self.assertTrue(requests)
+
+    def test_stage_2_refuses_every_other_upload_before_anything_else(self):
+        for action, target, expected in (("ios", "playground", self.HELD), ("ios", "production", self.HELD),
+                                         ("android", "production", self.NOT_ADMITTED)):
+            with self.subTest(action=action, target=target):
+                denial, written, requests = self.run_admission("false", action, target)
+                self.assertEqual(denial, expected)
                 self.assertIsNone(written)  # no environment output, so no later job can start
                 self.assertEqual(requests, [])  # refused before any metadata request
         for value in ("False", "FALSE", "", "0", "yes", "true "):
@@ -225,19 +237,31 @@ class GateTests(unittest.TestCase):
                 self.assertIsNotNone(denial)
                 self.assertIsNone(written)
 
-    def test_stage_1_admission_passes_a_dry_run(self):
-        denial, written, requests = self.run_admission("true")
-        self.assertIsNone(denial)
-        self.assertEqual(written, "environment=may-android-playground-internal\nbuild_environment=may-native-compile\n")
-        self.assertTrue(requests)
+    def test_admission_refuses_any_track_but_internal(self):
+        for track in ("production", "beta", "alpha", "qa", None):
+            with self.subTest(track=track), patch("gate.PLAY_UPLOAD_TRACKS", {"playground": track}):
+                denial, written, requests = self.run_admission("false")
+                self.assertEqual(denial, self.NOT_ADMITTED)
+                self.assertEqual((written, requests), (None, []))
+        # The table admission reads is the one play_upload.py writes from.
+        self.assertIs(gate.PLAY_UPLOAD_TRACKS, play_upload.PLAY_UPLOAD_TRACKS)
 
-    def test_rechecks_pass_no_dry_run_and_stage_2_would_admit_android_uploads(self):
+    def test_admission_passes_a_dry_run_for_every_target(self):
+        for action in ("android", "ios"):
+            for target in ("playground", "production"):
+                with self.subTest(action=action, target=target):
+                    denial, written, requests = self.run_admission("true", action, target)
+                    self.assertIsNone(denial)
+                    self.assertTrue(written)
+                    self.assertTrue(requests)
+
+    def test_rechecks_pass_no_dry_run(self):
         gate.validate_dry_run("android", None)  # the in-job rechecks
         gate.validate_dry_run("compile", None)
-        with patch("gate.UPLOADS_HELD", {"ios"}):
-            gate.validate_dry_run("android", "false")
-            with self.assertRaises(GateDenial):
-                gate.validate_dry_run("ios", "false")
+        with self.assertRaises(GateDenial):
+            gate.validate_dry_run("compile", "false")
+        with patch("gate.UPLOADS_HELD", set()), self.assertRaises(GateDenial):
+            gate.validate_dry_run("ios", "false", "playground")  # unheld later: still needs its own rule
 
 
 if __name__ == "__main__":

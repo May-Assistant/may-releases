@@ -25,28 +25,64 @@ SHA = "a" * 40
 NOT_FALSE = (None, "true", "True", "False", "FALSE", " false", "false\n", "", "0", "no")
 
 
-def runs(condition, dry_run_input):
+def runs(condition, dry_run_input, failed=False):
     """Whether a step runs, for the only `if:` forms static_check allows in store jobs.
 
     `dry_run_input` is github.event.inputs.dry_run: the string 'true' or 'false',
     or None if absent. Expression comparison of strings ignores case. The event is
     always workflow_dispatch, so a condition requiring the inert event never holds.
+    `failed` is whether an earlier step of the job failed: a condition without a
+    status function is implicitly `success() && ...`, so it then does not run.
     """
-    if condition in (None, "always()"):
-        return True
     value = (dry_run_input or "").lower() if dry_run_input is not None else None
-    if condition == static_check.UPLOAD_IF:  # stage 1: held inert
+    if condition == "always()":
+        return True
+    if condition == static_check.CONFIRM_IF:  # !cancelled() && dry_run == 'false'
+        return value == "false"
+    if failed:
         return False
-    if condition == static_check.DRY_RUN_UPLOAD_IF:  # what stage 2 leaves on the Android upload
+    if condition is None:
+        return True
+    if condition == static_check.HELD_UPLOAD_IF:  # held inert
+        return False
+    if condition == static_check.DRY_RUN_UPLOAD_IF:  # an active upload
         return value == "false"
     if condition == static_check.REPORT_IF:
         return value != "false"
     raise AssertionError("unmodelled condition: " + condition)
 
 
+def run_job(job, dry_run_input, upload_outcome="success", workflow=None):
+    """(job result, {step: outcome}) for a release job whose other steps all succeed.
+
+    `upload_outcome` is what the upload step ends with when it runs (e.g. a
+    failure). The loud-failure step is modelled as confirm_upload.py behaves
+    (ConfirmUploadTests): it fails unless the outcome it reads is success.
+    """
+    _, steps = static_check.job_steps(workflow or STORE.read_text(), job)
+    outcomes, by_id, failed = {}, {}, False
+    for name, text in steps:
+        if not runs(static_check.step_condition(text), dry_run_input, failed):
+            outcome = "skipped"
+        elif name == static_check.UPLOADS.get(job):
+            outcome = upload_outcome
+        elif name == static_check.CONFIRM:
+            # steps.<id>.outcome: an id no earlier step carries reads as empty.
+            read = dict(static_check.env_entries(text)).get("MAY_UPLOAD_OUTCOME", "")
+            match = re.fullmatch(r"\$\{\{ steps\.(\w+)\.outcome \}\}", read)
+            outcome = "success" if match and by_id.get(match.group(1)) == "success" else "failure"
+        else:
+            outcome = "success"
+        failed |= outcome == "failure"
+        outcomes[name or text.split("\n")[0]] = outcome
+        step_id = re.search(r"(?m)^(?:        )?id: (\w+)$", text)
+        if step_id:
+            by_id[step_id.group(1)] = outcome
+    return ("failure" if failed else "success"), outcomes
+
+
 def steps_that_run(job, dry_run_input):
-    _, steps = static_check.job_steps(STORE.read_text(), job)
-    return [name or text.split("\n")[0] for name, text in steps if runs(static_check.step_condition(text), dry_run_input)]
+    return [name for name, outcome in run_job(job, dry_run_input)[1].items() if outcome != "skipped"]
 
 
 class DryRunWorkflowTests(unittest.TestCase):
@@ -64,28 +100,51 @@ class DryRunWorkflowTests(unittest.TestCase):
                                    "Sign and verify internal-TestFlight IPA")):
             for value in ("true", "TRUE", None, ""):  # default, any casing, or no value at all
                 with self.subTest(job=job, value=value):
+                    result, outcomes = run_job(job, value)
                     ran = steps_that_run(job, value)
+                    self.assertEqual(result, "success")
                     self.assertNotIn(upload, ran)
+                    self.assertNotIn(static_check.CONFIRM, ran)
                     self.assertIn(sign, ran)
                     self.assertIn("Decrypt and check the build handoff", ran)
                     self.assertIn(static_check.REPORT, ran)
-            with self.subTest(job=job, value="false"):
-                # Stage 1: admission refuses dry_run: false before these jobs start
-                # (gate.UPLOADS_HELD, test_gate). Even past it, the held upload never runs.
-                ran = steps_that_run(job, "false")
-                self.assertNotIn(upload, ran)
-                self.assertIn(sign, ran)
-                self.assertNotIn(static_check.REPORT, ran)
-        # Once only the guard is removed (stage 2), the dry-run condition alone decides.
-        for value, uploads in (("false", True), ("FALSE", True), ("true", False), (None, False), ("", False)):
-            with self.subTest(stage=2, value=value):
-                self.assertEqual(runs(static_check.UPLOAD_IF.replace(static_check.INERT + " && ", ""), value), uploads)
         # No store upload step anywhere else; build jobs are unaffected by the input.
         for job in ("android-build", "ios-build"):
             self.assertEqual(steps_that_run(job, "true"), steps_that_run(job, "false"))
         text = STORE.read_text()
         self.assertEqual(text.count("tools/may_release/play_upload.py"), 1)
         self.assertEqual(text.count("tools/may_release/ios_upload.py"), 1)
+
+    def test_stage_2_uploads_android_only_when_dry_run_is_false(self):
+        for value in ("false", "FALSE"):
+            with self.subTest(value=value):
+                result, outcomes = run_job("android-release", value)
+                self.assertEqual(result, "success")
+                self.assertEqual(outcomes["Upload update to the internal track only"], "success")
+                self.assertEqual(outcomes[static_check.CONFIRM], "success")
+                self.assertEqual(outcomes[static_check.REPORT], "skipped")
+        # The iOS upload is still held: even inside its (inert) job, it never runs.
+        self.assertEqual(run_job("ios-release", "false")[1]["Upload verified IPA for internal TestFlight"], "skipped")
+
+    def test_dry_run_false_never_ends_green_without_uploading(self):
+        # Android: the upload ran and failed, or an earlier step failed so it was skipped.
+        for upload_outcome in ("failure", "skipped"):
+            with self.subTest(job="android-release", upload_outcome=upload_outcome):
+                result, outcomes = run_job("android-release", "false", upload_outcome)
+                self.assertEqual(result, "failure")
+                self.assertEqual(outcomes.get(static_check.CONFIRM), "failure")
+        # iOS: the upload is still held (skipped), so if the job ever ran with
+        # dry_run: false, the loud-failure step fails it rather than going green.
+        result, outcomes = run_job("ios-release", "false")
+        self.assertEqual(result, "failure")
+        self.assertEqual(outcomes.get("Upload verified IPA for internal TestFlight"), "skipped")
+        self.assertEqual(outcomes.get(static_check.CONFIRM), "failure")
+        # Android with its guard put back: the skipped upload must not go green either.
+        held = STORE.read_text().replace("        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n",
+                                         "        if: " + static_check.HELD_UPLOAD_IF + "\n", 1)
+        result, outcomes = run_job("android-release", "false", workflow=held)
+        self.assertEqual(result, "failure")
+        self.assertEqual(outcomes.get("Upload update to the internal track only"), "skipped")
 
 
 class DryRunReportTests(unittest.TestCase):

@@ -9,9 +9,17 @@ import static_check
 ROOT = static_check.ROOT
 STORE = ".github/workflows/store-release-draft.yml"
 INERT = static_check.INERT
-UPLOAD_LINE = "        if: " + static_check.UPLOAD_IF + "\n"
+# The held (iOS) upload's if: line, and the active (Android) upload's.
+UPLOAD_LINE = "        if: " + static_check.HELD_UPLOAD_IF + "\n"
+ANDROID_LINE = "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n"
 ANDROID_UPLOAD = "      - name: Upload update to the internal track only\n"
+ANDROID_UPLOAD_COMMENT = "".join("        # " + line + "\n" for line in (
+    "Stage 2: active, with no inert guard. github.event.inputs holds the",
+    "boolean as a string, and == ignores case, so it runs on any casing of",
+    "'false'; a missing value never does. The script then refuses everything",
+    "but the exact string false, and any target but May Playground."))
 IOS_UPLOAD = "      - name: Upload verified IPA for internal TestFlight\n"
+CONFIRM = "      - name: " + static_check.CONFIRM + "\n"
 
 
 class StaticCheckTests(unittest.TestCase):
@@ -266,36 +274,93 @@ class StaticCheckTests(unittest.TestCase):
                     "if: ${{ github.event_name == 'workflow_dispatch' }}")
         self.assertFlagged("native-compile-draft.yml is not inert")
 
-    def test_stage_1_is_exactly_android_dry_runs(self):
+    def test_stage_2_is_exactly_android_uploads(self):
         store = (ROOT / STORE).read_text()
         for job, expected in static_check.STORE_JOB_IF.items():
             header = static_check.job_text(store, job).partition("    steps:\n")[0]
             with self.subTest(job=job):
                 self.assertEqual([c.strip() for c in re.findall(r"(?m)^    if: (.+)$", header)],
                                  [expected] if expected else [])
+        self.assertEqual(static_check.STAGE, "stage 2")
         self.assertEqual(static_check.STORE_JOB_IF["admission"], None)
         self.assertNotIn(INERT, static_check.STORE_JOB_IF["android-build"] + static_check.STORE_JOB_IF["android-release"])
         self.assertIn(INERT, static_check.STORE_JOB_IF["ios-build"])
         self.assertIn(INERT, static_check.STORE_JOB_IF["ios-release"])
-        self.assertEqual(static_check.UPLOAD_IF, "${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}")
-        self.assertEqual(store.count(UPLOAD_LINE), 2)
+        # The Android upload is active with no guard; the iOS upload is still held.
+        self.assertEqual(static_check.UPLOAD_IF, {"android-release": "${{ github.event.inputs.dry_run == 'false' }}",
+                                                  "ios-release": "${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}"})
+        self.assertEqual(store.count(ANDROID_UPLOAD + ANDROID_UPLOAD_COMMENT + "        id: play_upload\n" + ANDROID_LINE), 1)
+        self.assertEqual(store.count(UPLOAD_LINE), 1)
         self.assertEqual(store.count("        if: " + static_check.REPORT_IF + "\n"), 2)
+        self.assertEqual(store.count("        if: " + static_check.CONFIRM_IF + "\n"), 2)
+        self.assertEqual(static_check.PLAY_UPLOAD_TRACKS, {"playground": "internal"})
+
+    def test_android_upload_with_its_guard_left_on_is_a_stage_mismatch(self):
+        # Stage 1's line kept on the Android upload, with gate.py still saying it is active.
+        self.mutate(STORE, ANDROID_LINE, UPLOAD_LINE)
+        self.assertEqual(sorted(static_check.problems(self.root)), sorted([
+            "store android-release: the upload is held inert, but stage 2 activates it "
+            "(stage mismatch: change UPLOAD_IF in static_check.py on purpose)",
+            "store-release-draft.yml: the inert guard appears or is missing somewhere stage 2 does not expect",
+            "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held (stage 2), so admission would "
+            "admit dry_run: false for a held upload or refuse it for an active one"]))
+
+    def test_full_revert_to_stage_1_is_flagged_not_accepted(self):
+        # The guard back on the Android upload and "android" back in UPLOADS_HELD:
+        # consistent with each other, but not stage 2.
+        self.mutate(STORE, ANDROID_LINE, UPLOAD_LINE)
+        self.mutate("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = {"android", "ios"}')
+        found = static_check.problems(self.root)
+        self.assertIn("store android-release: the upload is held inert, but stage 2 activates it "
+                      "(stage mismatch: change UPLOAD_IF in static_check.py on purpose)", found)
+        self.assertIn("store-release-draft.yml: the inert guard appears or is missing somewhere stage 2 does not expect", found)
+
+    def test_full_revert_to_inert_is_flagged_not_accepted(self):
+        # The pre-activation layout: all five jobs guarded, uploads only dry-run-conditional.
+        self.mutate(STORE, "  admission:\n", "  admission:\n    if: ${{ " + INERT + " }}\n")
+        self.mutate(STORE, "    if: ${{ inputs.platform == 'android' }}\n",
+                    "    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n", 2)
+        self.mutate(STORE, UPLOAD_LINE, ANDROID_LINE)
+        self.mutate("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = set()')
+        found = static_check.problems(self.root)
+        for job in ("admission", "android-build", "android-release"):
+            self.assertTrue(any(p.startswith("store " + job + ": the job is held inert, but stage 2 activates it")
+                                for p in found), found)
+        self.assertIn("store ios-release: the upload is not held inert (stage 2)", found)
+
+    def test_ios_upload_unguarded_is_flagged(self):
+        # A partial lift: the iOS upload loses its guard, with gate.py following it.
+        self.mutate(STORE, UPLOAD_LINE, ANDROID_LINE)
+        self.mutate("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = set()')
+        self.assertEqual(sorted(static_check.problems(self.root)), sorted([
+            "store ios-release: the upload is not held inert (stage 2)",
+            "store-release-draft.yml: the inert guard appears or is missing somewhere stage 2 does not expect"]))
+        # Without gate.py following, admission would refuse it: also flagged.
+        self.fresh()
+        self.mutate(STORE, UPLOAD_LINE, ANDROID_LINE)
+        self.assertFlagged("gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held (stage 2)")
+        self.assertFlagged("store ios-release: the upload is not held inert (stage 2)")
+
+    def test_ios_jobs_unguarded_are_flagged(self):
+        guarded = "    if: ${{ " + INERT + " && inputs.platform == 'ios' }}\n"
+        self.mutate(STORE, guarded, "    if: ${{ inputs.platform == 'ios' }}\n", 2)
+        self.assertEqual(sorted(static_check.problems(self.root)), sorted([
+            "store ios-build: the job is not held inert (stage 2)",
+            "store ios-release: the job is not held inert (stage 2)",
+            "store-release-draft.yml: the inert guard appears or is missing somewhere stage 2 does not expect"]))
 
     def test_upload_guard_cannot_be_removed(self):
-        # Removing the guard leaves stage 2's condition: the dry-run rule alone would accept it.
-        for job, nth in (("android-release", 0), ("ios-release", 1)):
-            with self.subTest(job=job):
-                self.fresh()
-                self.mutate_nth(UPLOAD_LINE, "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n", nth)
-                found = static_check.problems(self.root)
-                # gate.py's UPLOADS_HELD must follow, or admission would still refuse dry_run: false.
-                self.assertEqual(sorted(found), sorted([
-                    "store " + job + ": the upload is not held inert (stage 1)",
-                    "store-release-draft.yml: the inert guard appears or is missing somewhere stage 1 does not expect",
-                    "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held, so stage 1 "
-                    "would not refuse dry_run: false at admission"]))
+        # Removing the iOS upload's guard leaves the active form: the dry-run rule alone would accept it.
+        self.mutate(STORE, UPLOAD_LINE, ANDROID_LINE)
+        found = static_check.problems(self.root)
+        # gate.py's UPLOADS_HELD must follow, or admission would still refuse dry_run: false.
+        self.assertEqual(sorted(found), sorted([
+            "store ios-release: the upload is not held inert (stage 2)",
+            "store-release-draft.yml: the inert guard appears or is missing somewhere stage 2 does not expect",
+            "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held (stage 2), so admission would "
+            "admit dry_run: false for a held upload or refuse it for an active one"]))
 
-    def test_upload_guard_must_be_exactly_the_stage_1_form(self):
+    def test_held_upload_guard_must_be_exactly_its_form(self):
         for new in ("${{ " + INERT + " }}",
                     "${{ " + INERT + " && github.event.inputs.dry_run != 'true' }}",
                     "${{ " + INERT + " || github.event.inputs.dry_run == 'false' }}",
@@ -303,16 +368,30 @@ class StaticCheckTests(unittest.TestCase):
                     "${{ " + INERT + " && github.event.inputs.dry_run == 'false' || always() }}"):
             with self.subTest(new=new):
                 self.fresh()
-                self.mutate_nth(UPLOAD_LINE, "        if: " + new + "\n", 0)
-                self.assertFlagged("store android-release: ")
+                self.mutate(STORE, UPLOAD_LINE, "        if: " + new + "\n")
                 self.assertTrue(any(fragment in problem for problem in static_check.problems(self.root)
-                                    for fragment in ("the upload is not held inert", "a dry run would run the store upload")))
+                                    for fragment in ("store ios-release: the upload is not held inert",
+                                                     "store ios-release: a dry run would run the store upload")))
+
+    def test_active_upload_must_be_exactly_the_stage_2_form(self):
+        for new in ("${{ github.event.inputs.dry_run != 'true' }}",
+                    "${{ !inputs.dry_run }}",
+                    "always()",
+                    "${{ github.event.inputs.dry_run == 'false' || always() }}",
+                    "${{ " + INERT + " || github.event.inputs.dry_run == 'false' }}",
+                    "${{ github.event.inputs.dry_run == 'false' && " + INERT + " }}"):
+            with self.subTest(new=new):
+                self.fresh()
+                self.mutate(STORE, ANDROID_LINE, "        if: " + new + "\n")
+                self.assertTrue(any(fragment in problem for problem in static_check.problems(self.root)
+                                    for fragment in ("store android-release: the upload is held inert",
+                                                     "store android-release: a dry run would run the store upload")))
 
     def test_ios_jobs_stay_inert(self):
         guarded = "    if: ${{ " + INERT + " && inputs.platform == 'ios' }}\n"
         for job, nth in (("ios-build", 0), ("ios-release", 1)):
-            for new, expected in (("    if: ${{ inputs.platform == 'ios' }}\n", "the job is not held inert (stage 1)"),
-                                  ("", "the job is not held inert (stage 1)"),
+            for new, expected in (("    if: ${{ inputs.platform == 'ios' }}\n", "the job is not held inert (stage 2)"),
+                                  ("", "the job is not held inert (stage 2)"),
                                   ("    if: ${{ " + INERT + " }}\n", "the inert job does not keep its exact platform condition")):
                 with self.subTest(job=job, new=new.strip()):
                     self.fresh()
@@ -331,20 +410,8 @@ class StaticCheckTests(unittest.TestCase):
             with self.subTest(job=job):
                 self.fresh()
                 self.mutate(STORE, old, new)
-                self.assertFlagged("store " + job + ": the job is held inert, but stage 1 activates it (stage mismatch")
-                self.assertFlagged("the inert guard appears or is missing somewhere stage 1 does not expect")
-
-    def test_full_revert_to_inert_is_flagged_not_accepted(self):
-        # The pre-activation layout: all five jobs guarded, uploads only dry-run-conditional.
-        self.mutate(STORE, "  admission:\n", "  admission:\n    if: ${{ " + INERT + " }}\n")
-        self.mutate(STORE, "    if: ${{ inputs.platform == 'android' }}\n",
-                    "    if: ${{ " + INERT + " && inputs.platform == 'android' }}\n", 2)
-        self.mutate(STORE, UPLOAD_LINE, "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n", 2)
-        found = static_check.problems(self.root)
-        for job in ("admission", "android-build", "android-release"):
-            self.assertTrue(any(p.startswith("store " + job + ": the job is held inert") for p in found), found)
-        for job in ("android-release", "ios-release"):
-            self.assertIn("store " + job + ": the upload is not held inert (stage 1)", found)
+                self.assertFlagged("store " + job + ": the job is held inert, but stage 2 activates it (stage mismatch")
+                self.assertFlagged("the inert guard appears or is missing somewhere stage 2 does not expect")
 
     def test_android_jobs_keep_their_platform_condition(self):
         for new in ("", "    if: ${{ inputs.platform == 'ios' }}\n", "    if: always()\n",
@@ -358,37 +425,117 @@ class StaticCheckTests(unittest.TestCase):
     def test_guard_anywhere_else_is_flagged(self):
         self.mutate(STORE, "      MAY_TARGET: ${{ inputs.target }}\n",
                     "      MAY_TARGET: ${{ inputs.target }}\n      MAY_HELD: ${{ " + INERT + " }}\n")
-        self.assertFlagged("the inert guard appears or is missing somewhere stage 1 does not expect")
+        self.assertFlagged("the inert guard appears or is missing somewhere stage 2 does not expect")
         self.fresh()
         # Named in a comment, it is prose and does not count.
         self.mutate(STORE, "  admission:\n", "  admission:\n    # was: if: ${{ " + INERT + " }}\n")
         self.assertEqual(static_check.problems(self.root), [])
 
     def test_dash_line_if_is_still_caught(self):
-        # The upload's guard moved to the dash line is the same condition and passes.
-        self.mutate_nth(UPLOAD_LINE, "", 0)
-        self.mutate(STORE, ANDROID_UPLOAD, "      - if: " + static_check.UPLOAD_IF + "\n        " + ANDROID_UPLOAD[8:])
-        self.assertEqual(static_check.problems(self.root), [])
-        # Without the guard, on the dash line, it is not held inert.
-        for job, header, nth in (("android-release", ANDROID_UPLOAD, 0), ("ios-release", IOS_UPLOAD, 1)):
+        # Each upload's condition moved to the dash line is the same condition and passes.
+        for line, header, step_id in ((UPLOAD_LINE, IOS_UPLOAD, "testflight_upload"),
+                                      (ANDROID_LINE, ANDROID_UPLOAD, "play_upload")):
+            with self.subTest(step_id=step_id):
+                self.fresh()
+                self.mutate(STORE, line, "")
+                self.mutate(STORE, header, "      - " + line.strip() + "\n        " + header[8:])
+                self.assertEqual(static_check.problems(self.root), [])
+        # Without the guard, on the dash line, the iOS upload is not held inert;
+        # with it, the Android upload is a stage mismatch.
+        self.fresh()
+        self.mutate(STORE, UPLOAD_LINE, "")
+        self.mutate(STORE, IOS_UPLOAD, "      - " + ANDROID_LINE.strip() + "\n        " + IOS_UPLOAD[8:])
+        self.assertFlagged("store ios-release: the upload is not held inert (stage 2)")
+        self.fresh()
+        self.mutate(STORE, ANDROID_LINE, "")
+        self.mutate(STORE, ANDROID_UPLOAD, "      - " + UPLOAD_LINE.strip() + "\n        " + ANDROID_UPLOAD[8:])
+        self.assertFlagged("store android-release: the upload is held inert, but stage 2 activates it")
+        # A second, dash-line if: beside the existing one is refused whichever one GitHub would read.
+        for line, header, job in ((UPLOAD_LINE, IOS_UPLOAD, "ios-release"),
+                                  (ANDROID_LINE, ANDROID_UPLOAD, "android-release")):
             with self.subTest(job=job):
                 self.fresh()
-                self.mutate_nth(UPLOAD_LINE, "", nth)
                 self.mutate(STORE, header, "      - if: " + static_check.DRY_RUN_UPLOAD_IF + "\n        " + header[8:])
-                self.assertFlagged("store " + job + ": the upload is not held inert (stage 1)")
-        # A second, dash-line if: beside the guarded one is refused whichever one GitHub would read.
-        self.fresh()
-        self.mutate(STORE, ANDROID_UPLOAD, "      - if: " + static_check.DRY_RUN_UPLOAD_IF + "\n        " + ANDROID_UPLOAD[8:])
-        self.assertFlagged("store android-release: a step has more than one if:")
-        self.fresh()
-        self.mutate(STORE, UPLOAD_LINE, UPLOAD_LINE + "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n")
-        self.assertFlagged("store android-release: a step has more than one if:")
+                self.assertFlagged("store " + job + ": a step has more than one if:")
+                self.fresh()
+                self.mutate(STORE, line, line + "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n")
+                self.assertFlagged("store " + job + ": a step has more than one if:")
         # A dash-line guard on another step is conditional and an unexpected guard.
         self.fresh()
         self.mutate(STORE, "      - name: Sign and verify Android App Bundle\n",
                     "      - if: ${{ " + INERT + " }}\n        name: Sign and verify Android App Bundle\n")
         self.assertFlagged("store android-release: a step other than the upload or dry-run report is conditional")
-        self.assertFlagged("the inert guard appears or is missing somewhere stage 1 does not expect")
+        self.assertFlagged("the inert guard appears or is missing somewhere stage 2 does not expect")
+
+    def test_loud_failure_check_follows_each_upload(self):
+        loud = ": a dispatch with dry_run: false could end green without uploading"
+        for job, platform, step_id in (("android-release", "android", "play_upload"),
+                                       ("ios-release", "ios", "testflight_upload")):
+            text = (ROOT / STORE).read_text()
+            start = text.find(CONFIRM, text.find("  " + job + ":\n"))
+            end = text.find("      - name: ", start + 1)
+            step = text[start:end]
+            confirm_line = "        if: " + static_check.CONFIRM_IF + "\n"
+            outcome = "          MAY_UPLOAD_OUTCOME: ${{ steps." + step_id + ".outcome }}\n"
+            mutations = (
+                (step, ""),  # removed: a skipped upload would go green
+                (step, step.replace(confirm_line, "")),  # unconditional: a failed earlier step skips it
+                (step, step.replace(confirm_line, "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n")),
+                (step, step.replace(confirm_line, "        if: ${{ always() && github.event.inputs.dry_run == 'true' }}\n")),
+                (step, step.replace(outcome, "          MAY_UPLOAD_OUTCOME: success\n")),
+                (step, step.replace(outcome, "          MAY_UPLOAD_OUTCOME: ${{ steps.other.outcome }}\n")),
+                (step, step.replace("confirm_upload.py --platform " + platform, "dry_run.py --platform " + platform)),
+                (step, step.replace(" --platform " + platform, " --platform " + ("ios" if platform == "android" else "android"))),
+                ("        id: " + step_id + "\n", ""),  # the upload no longer has the id it reads
+                ("        id: " + step_id + "\n", "        id: " + step_id + "_x\n"),
+            )
+            for old, new in mutations:
+                with self.subTest(job=job, new=new[-70:]):
+                    self.fresh()
+                    path = self.root / STORE
+                    current = path.read_text()
+                    at = current.find(old, current.find("  " + job + ":\n"))
+                    self.assertGreaterEqual(at, 0)
+                    path.write_text(current[:at] + new + current[at + len(old):])
+                    self.assertFlagged("store " + job + loud)
+            with self.subTest(job=job, moved="after the report"):
+                self.fresh()
+                path = self.root / STORE
+                current = path.read_text()
+                report_start = current.find("      - name: " + static_check.REPORT, current.find("  " + job + ":\n"))
+                report_end = current.find("      - name: ", report_start + 1)
+                report = current[report_start:report_end]
+                moved = current.replace(step + report, report + step, 1)
+                self.assertNotEqual(moved, current)
+                path.write_text(moved)
+                self.assertFlagged("store " + job + loud)
+        # Held by the guard, it would not run when the iOS upload's guard comes off.
+        self.fresh()
+        self.mutate_nth("        if: " + static_check.CONFIRM_IF + "\n",
+                        "        if: ${{ " + INERT + " && !cancelled() && github.event.inputs.dry_run == 'false' }}\n", 1)
+        self.assertFlagged("store ios-release" + loud)
+        self.assertFlagged("the inert guard appears or is missing somewhere stage 2 does not expect")
+
+    def test_only_the_internal_track_of_may_playground_is_reachable(self):
+        tracks = "tools/may_release/store.py"
+        for new in ('PLAY_UPLOAD_TRACKS = {"playground": "production"}',
+                    'PLAY_UPLOAD_TRACKS = {"playground": "beta"}',
+                    'PLAY_UPLOAD_TRACKS = {"playground": "internal", "production": "internal"}',
+                    'PLAY_UPLOAD_TRACKS = {"production": "internal"}',
+                    'PLAY_UPLOAD_TRACKS = dict(playground="internal")'):
+            with self.subTest(new=new):
+                self.fresh()
+                self.mutate(tracks, 'PLAY_UPLOAD_TRACKS = {"playground": "internal"}', new)
+                self.assertFlagged("store.py: PLAY_UPLOAD_TRACKS is not exactly stage 2's")
+        for old, new in (('TRACK = "internal"', 'TRACK = "production"'),
+                         ('f"{base}/{edit}/tracks/{TRACK}"', 'f"{base}/{edit}/tracks/production"'),
+                         ('        checked_json(session.post(\n            f"{base}/{edit}:commit',
+                          '        session.put(f"{base}/{edit}/tracks/production", json={}, timeout=30)\n'
+                          '        checked_json(session.post(\n            f"{base}/{edit}:commit')):
+            with self.subTest(new=new[:60]):
+                self.fresh()
+                self.mutate("tools/may_release/play_upload.py", old, new)
+                self.assertFlagged("play_upload.py: writes a track other than the Play internal track")
 
     def test_job_has_one_condition(self):
         self.mutate(STORE, "    if: ${{ " + INERT + " && inputs.platform == 'ios' }}\n",
@@ -407,7 +554,7 @@ class StaticCheckTests(unittest.TestCase):
                 self.mutate(STORE, old, new)
                 self.assertFlagged("store admission: does not run exactly the gate, unconditionally")
 
-    def test_stage_1_refuses_dry_run_false_at_admission(self):
+    def test_admission_refuses_dry_run_false_for_held_uploads(self):
         cases = (
             (STORE, ' --dry-run "$MAY_DRY_RUN"\n', "\n",
              "store admission: does not run exactly the gate, unconditionally"),
@@ -417,11 +564,13 @@ class StaticCheckTests(unittest.TestCase):
             (STORE, "          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n        run: python3 -I -S -B tools/may_release/gate.py --action \"$MAY_PLATFORM\"",
              "          MAY_DRY_RUN: 'true'\n        run: python3 -I -S -B tools/may_release/gate.py --action \"$MAY_PLATFORM\"",
              "store admission: does not pass the dispatch's dry_run to the gate"),
-            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"android", "ios"}', 'UPLOADS_HELD = {"ios"}',
+            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = {"android", "ios"}',
              "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held"),
-            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"android", "ios"}', 'UPLOADS_HELD = set(["android", "ios"])',
+            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = set()',
              "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held"),
-            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"android", "ios"}', 'UPLOADS_HELD = {"android", "ios", "web"}',
+            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = set(["ios"])',
+             "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held"),
+            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"ios"}', 'UPLOADS_HELD = {"ios", "web"}',
              "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held"),
         )
         for relative, old, new, expected in cases:
@@ -499,9 +648,13 @@ class StaticCheckTests(unittest.TestCase):
         self.assertLayoutFlagged()
 
     def test_multiline_quoted_id_cannot_hide_an_if(self):
-        # GitHub reads one id "upload if: ... note: end" and an unconditional upload;
-        # the line rules alone would read the guarded if:.
-        self.mutate(STORE, UPLOAD_LINE, '        id: "upload\n' + UPLOAD_LINE + '        note: end"\n')
+        # GitHub reads one id "play_upload if: ... note: end" and an unconditional
+        # upload, which would run on a dry run; the line rules alone would read the if:.
+        self.mutate(STORE, "        id: play_upload\n" + ANDROID_LINE,
+                    '        id: "play_upload\n' + ANDROID_LINE + '        note: end"\n')
+        self.assertLayoutFlagged()
+        self.fresh()
+        self.mutate(STORE, UPLOAD_LINE, '        note: "held\n' + UPLOAD_LINE + '        end"\n')
         self.assertLayoutFlagged()
 
     def test_extra_job_is_refused(self):
@@ -511,7 +664,7 @@ class StaticCheckTests(unittest.TestCase):
                  "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
                  "        run: python3 -I -S -B tools/may_release/play_upload.py --target \"$MAY_TARGET\"\n")
         self.mutate(STORE, "  ios-build:\n", extra + "  ios-build:\n")
-        self.assertFlagged("jobs are not exactly the ones stage 1 pins")
+        self.assertFlagged("jobs are not exactly the ones stage 2 pins")
 
     def test_extra_trigger_is_refused(self):
         for trigger in ("  push:\n", "  pull_request:\n", "  workflow_call:\n"):
@@ -536,7 +689,7 @@ class StaticCheckTests(unittest.TestCase):
                  "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n"
                  "        run: python3 -I -S -B tools/may_release/play_upload.py --target \"$MAY_TARGET\"\n")
         self.mutate(STORE, "  ios-build:\n", extra + "  ios-build:\n")
-        self.assertFlagged("jobs are not exactly the ones stage 1 pins")
+        self.assertFlagged("jobs are not exactly the ones stage 2 pins")
         for trigger in ("  push:\n", "  pull_request:\n", "  workflow_call:\n"):
             with self.subTest(trigger=trigger.strip()):
                 self.fresh()
@@ -567,19 +720,18 @@ class StaticCheckTests(unittest.TestCase):
                 self.assertFlagged("dry_run is not a required boolean input defaulting to true")
 
     def test_dry_run_never_reaches_a_store_upload(self):
-        upload_if = UPLOAD_LINE
         held = "        if: ${{ " + INERT + " && "
-        cases = (
-            (upload_if, ""),
-            (upload_if, held + "github.event.inputs.dry_run != 'true' }}\n"),
-            (upload_if, held + "!inputs.dry_run }}\n"),
-            (upload_if, "        if: ${{ github.event.inputs.dry_run != 'true' }}\n"),
-            (upload_if, "        if: ${{ !inputs.dry_run }}\n"),
-            (upload_if, "        if: always()\n"),
-            ("          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n", ""),
-            ("          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n", "          MAY_DRY_RUN: 'false'\n"),
-        )
-        for job in ("android-release", "ios-release"):
+        for job, upload_if in (("android-release", ANDROID_LINE), ("ios-release", UPLOAD_LINE)):
+            cases = (
+                (upload_if, ""),
+                (upload_if, held + "github.event.inputs.dry_run != 'true' }}\n"),
+                (upload_if, held + "!inputs.dry_run }}\n"),
+                (upload_if, "        if: ${{ github.event.inputs.dry_run != 'true' }}\n"),
+                (upload_if, "        if: ${{ !inputs.dry_run }}\n"),
+                (upload_if, "        if: always()\n"),
+                ("          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n", ""),
+                ("          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n", "          MAY_DRY_RUN: 'false'\n"),
+            )
             for old, new in cases:
                 with self.subTest(job=job, new=new.strip()):
                     self.fresh()

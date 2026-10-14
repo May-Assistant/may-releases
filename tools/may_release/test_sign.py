@@ -1,5 +1,7 @@
 import base64
 import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -243,12 +245,26 @@ class IosUploadTests(unittest.TestCase):
             key_dir = Path(env["API_PRIVATE_KEYS_DIR"])
             captured.update(argv=argv, env=env, keys=sorted(p.name for p in key_dir.iterdir()))
 
-        with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=fake_altool):
+        with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=fake_altool), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
             ios_upload.upload("playground", "a" * 40, "9")
+        self.assertEqual(output.getvalue().splitlines()[3], "  track: TestFlight internal testing only")
         self.assertEqual(captured["keys"], ["AuthKey_23VX669FGY.p8"])
         self.assertFalse(set(captured["env"]) & set(SECRET_NAMES))
         self.assertIn("--upload-app", captured["argv"])
         self.assertFalse((self.work.root / "may-private/asc-keys").exists())
+        # It records the upload for the loud-failure step (confirm_upload.py).
+        record = json.loads((self.work.root / "may-release/upload-record.json").read_text())
+        self.assertEqual(record, {"platform": "ios", "app_id": PLAYGROUND, "build_number": "9",
+                                  "track": "TestFlight internal testing only", "store_id": None,
+                                  "sha256": hashlib.sha256((self.work.root / "may-release/May.ipa").read_bytes()).hexdigest()})
+
+    def test_failed_upload_leaves_no_record(self):
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch("ios_upload.run_private", side_effect=StoreError("Protected native release failed")):
+            with self.assertRaises(StoreError):
+                ios_upload.upload("playground", "a" * 40, "9")
+        self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
 
     def test_mismatched_ipa_or_other_secrets_are_refused_before_upload(self):
         with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private") as runner:
