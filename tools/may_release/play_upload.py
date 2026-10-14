@@ -13,6 +13,10 @@ one. Otherwise, inside one edit, it:
    every other track untouched;
 4. commits with ERROR_IF_IN_REVIEW, so an in-review change is never cancelled.
 
+Dry run: the workflow skips this step unless `dry_run` is false, and this
+script also refuses unless MAY_DRY_RUN is exactly "false", so a real upload is
+always an explicit choice. dry_run.py reports instead.
+
 Any failure deletes the edit. A failed or uncertain commit is never retried
 automatically; inspect Play before retry. The caller must already hold
 Samuel's protected-environment approval.
@@ -28,7 +32,6 @@ host. A 401 fails the run and deletes the edit.
 
 import argparse
 import base64
-import hashlib
 import json
 import os
 import re
@@ -43,7 +46,7 @@ import sys
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import (PLAY_UPLOAD_SECRETS, StoreError, child_env, identity, play_identity,
+from store import (PLAY_UPLOAD_SECRETS, StoreError, child_env, file_sha256, identity, play_identity,
                    require_step_secrets, runner_root, write_private)
 
 SCOPE = "https://www.googleapis.com/auth/androidpublisher"
@@ -53,6 +56,8 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 OPENSSL = "/usr/bin/openssl"
 ROLLED_OUT = ("completed", "inProgress", "halted")
 MAX_VERSION_JUMP = 1000
+# The only track this repository ever writes. dry_run.py reports this value.
+TRACK = "internal"
 
 
 class PlayRefusal(StoreError):
@@ -202,14 +207,6 @@ def check_version(build_number, current):
         raise PlayRefusal("Build number is more than 1000 above the highest Play versionCode.")
 
 
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def delete_edit(session, url):
     try:
         session.delete(url, timeout=30)
@@ -220,6 +217,8 @@ def delete_edit(session, url):
 def upload(target, source_sha, build_number, session=None):
     package = identity("android", target, source_sha, build_number)
     require_step_secrets(PLAY_UPLOAD_SECRETS)
+    if os.environ.get("MAY_DRY_RUN") != "false":
+        raise PlayRefusal("Dry run: no store upload was requested.")
     raw = os.environ.get("MAY_PLAY_JSON", "")
     play_identity(raw, os.environ.get("MAY_PLAY_ACCOUNT", ""))
     bundle = runner_root() / "may-release/signed.aab"
@@ -248,9 +247,9 @@ def upload(target, source_sha, build_number, session=None):
         if str(uploaded.get("sha256", "")).lower() != local_sha256:
             raise StoreError("Google Play returned a different bundle SHA-256")
         checked_json(session.put(
-            f"{base}/{edit}/tracks/internal",
-            json={"track": "internal", "releases": [{"versionCodes": [build_number],
-                                                    "status": "completed"}]}, timeout=30))
+            f"{base}/{edit}/tracks/{TRACK}",
+            json={"track": TRACK, "releases": [{"versionCodes": [build_number],
+                                                "status": "completed"}]}, timeout=30))
         checked_json(session.post(
             f"{base}/{edit}:commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW",
             json={}, timeout=30))

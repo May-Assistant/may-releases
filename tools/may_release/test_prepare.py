@@ -1,11 +1,27 @@
+import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import gate
+import play_upload
 from prepare import PrepareError, exact_sha, fetch, pins, prepare
-from store import StoreError
+import store
+from store import DESIGN_SYSTEM_RECORD, StoreError
+
+DS_URL = "https://github.com/May-Assistant/may-design-system"
+IOS_PIN, ANDROID_PIN = "1" * 40, "2" * 40  # differing, as on may-app main today
+PINS = {"ios": IOS_PIN, "android": ANDROID_PIN}
+
+
+def project_yml(revision=IOS_PIN, url=DS_URL):
+    return "packages:\n  MayDesignSystem:\n    url: " + url + "\n    revision: " + revision + "\n"
+
+
+def lock_file(revision=ANDROID_PIN, url=DS_URL):
+    return "repository=" + url + "\nrevision=" + revision + "\n"
 
 
 class PrepareTests(unittest.TestCase):
@@ -20,8 +36,9 @@ class PrepareTests(unittest.TestCase):
                    "    url: https://github.com/May-Assistant/may-design-system\n"
                    "    revision: " + "a" * 40 + "\n")
         lock = "repository=https://github.com/May-Assistant/may-design-system\nrevision=" + "a" * 40
-        self.assertEqual(pins(project, lock)[0], "a" * 40)
-        with self.assertRaises(PrepareError):
+        self.assertEqual(pins(project, lock)[0], {"ios": "a" * 40, "android": "a" * 40})
+        # Without a store target (the native compile) the two must still match.
+        with self.assertRaises(StoreError):
             pins(project, lock.replace("a" * 40, "b" * 40))
         with self.assertRaises(PrepareError):
             pins(project, lock.replace("May-Assistant", "Somewhere-Else"))
@@ -72,5 +89,149 @@ class PrepareTests(unittest.TestCase):
                 fetching.assert_not_called()
 
 
+
+class PerPlatformPinTests(unittest.TestCase):
+    """Samuel's decision: internal builds check only their own platform's pin; others need a match."""
+
+    def run_prepare(self, platform, target, project=None, lock=None, checked_out=None):
+        """prepare() with git replaced: returns (DS revisions fetched, record, project.yml after)."""
+        fetched = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def fake_fetch(dest, remote, sha, key_text, private, label, main_history=False):
+                dest.mkdir()
+                if label == "app":
+                    (dest / "ios").mkdir()
+                    (dest / "android").mkdir()
+                    (dest / "ios/project.yml").write_text(project if project is not None else project_yml())
+                    (dest / "android/design-system.lock").write_text(lock if lock is not None else lock_file())
+                else:
+                    fetched.append(sha)
+
+            def fake_head(checkout):
+                return checked_out if checked_out is not None else fetched[-1]
+
+            with patch.dict(os.environ, {"RUNNER_TEMP": directory, "MAY_APP_READ_KEY": "k",
+                                         "MAY_DS_READ_KEY": "k"}), \
+                    patch("prepare.fetch", side_effect=fake_fetch), patch("prepare.head_revision", side_effect=fake_head):
+                try:
+                    prepare("a" * 40, platform, target)
+                finally:
+                    record_path = root / "may-private" / DESIGN_SYSTEM_RECORD
+                    self.record = json.loads(record_path.read_text()) if record_path.exists() else None
+                    self.fetched = fetched
+            return fetched, self.record, (root / "may-source/ios/project.yml").read_text()
+
+    def test_internal_android_run_with_mismatched_pins_passes(self):
+        fetched, record, project = self.run_prepare("android", "playground")
+        self.assertEqual(fetched, [ANDROID_PIN])  # its own platform's pin, nothing else
+        self.assertEqual(project, project_yml())  # iOS spec left untouched: it pins another revision
+        self.assertEqual(record, {"platform": "android", "target": "playground", "source_sha": "a" * 40,
+                                  "design_system": {"ios": IOS_PIN, "android": ANDROID_PIN}})
+
+    def test_internal_ios_run_with_mismatched_pins_builds_the_ios_pin(self):
+        fetched, record, project = self.run_prepare("ios", "playground")
+        self.assertEqual(fetched, [IOS_PIN])
+        self.assertIn("  MayDesignSystem:\n    path: ", project)
+        self.assertNotIn(IOS_PIN, project)
+        self.assertEqual(record["design_system"], {"ios": IOS_PIN, "android": ANDROID_PIN})
+
+    def test_internal_run_whose_own_pin_is_wrong_or_untrusted_fails(self):
+        cases = (
+            ("android", dict(lock=lock_file(url="https://github.com/Somewhere-Else/may-design-system"))),
+            ("android", dict(lock=lock_file(revision="2" * 39))),
+            ("android", dict(lock=lock_file(revision="B" * 40))),
+            ("android", dict(lock="repository=" + DS_URL + "\n")),
+            ("ios", dict(project=project_yml(url="https://github.com/Somewhere-Else/may-design-system"))),
+            ("ios", dict(project=project_yml(revision="main"))),
+            ("ios", dict(project="packages:\n  MayDesignSystem:\n    path: ../may-design-system\n")),
+        )
+        for platform, files in cases:
+            with self.subTest(platform=platform, files=files), self.assertRaises(PrepareError):
+                self.run_prepare(platform, "playground", **files)
+            self.assertEqual(self.fetched, [])  # refused before the design system is fetched
+            self.assertIsNone(self.record)
+
+    def test_internal_run_whose_own_pin_is_not_what_is_checked_out_fails(self):
+        for platform in ("android", "ios"):
+            with self.subTest(platform=platform), self.assertRaises(PrepareError):
+                self.run_prepare(platform, "playground", checked_out="3" * 40)
+            self.assertIsNone(self.record)
+
+    def test_ios_pin_must_stay_trusted_even_when_android_is_built(self):
+        # Not compared for an internal Android build, but still checked and recorded.
+        for project in (project_yml(url="https://github.com/Somewhere-Else/may-design-system"),
+                        project_yml(revision="v1.0"), "packages: {}\n"):
+            with self.subTest(project=project), self.assertRaises(PrepareError):
+                self.run_prepare("android", "playground", project=project)
+            self.assertEqual(self.fetched, [])
+
+    def test_production_with_mismatched_pins_fails(self):
+        # The real May app can be promoted by hand from internal testing, so its pins must match.
+        for platform in ("android", "ios"):
+            with self.subTest(platform=platform):
+                with self.assertRaises(StoreError):
+                    store.design_system_pins({"ios": IOS_PIN, "android": ANDROID_PIN}, platform, "production")
+                with self.assertRaises(StoreError):
+                    self.run_prepare(platform, "production")
+                self.assertEqual(self.fetched, [])
+                self.assertIsNone(self.record)
+                fetched, record, _ = self.run_prepare(platform, "production", lock=lock_file(IOS_PIN))
+                self.assertEqual(fetched, [IOS_PIN])
+                self.assertEqual(record["design_system"], {"ios": IOS_PIN, "android": IOS_PIN})
+                # The Playground target next to it may still differ.
+                self.assertEqual(self.run_prepare(platform, "playground")[1]["design_system"], PINS)
+
+    def test_non_internal_target_with_mismatched_pins_fails(self):
+        for platform, target in (("android", "public-beta"), (None, None)):
+            with self.subTest(target=target), self.assertRaises(StoreError):
+                store.design_system_pins({"ios": IOS_PIN, "android": ANDROID_PIN}, platform, target)
+        # The native compile names no target, so it still requires the match.
+        with self.assertRaises(StoreError):
+            self.run_prepare(None, None)
+        self.assertEqual(self.run_prepare(None, None, lock=lock_file(IOS_PIN))[0], [IOS_PIN])
+
+    def test_platform_and_target_are_given_together(self):
+        for platform, target in (("android", None), (None, "playground")):
+            with self.subTest(platform=platform), self.assertRaises(PrepareError):
+                self.run_prepare(platform, target)
+
+    def test_internal_targets_are_one_explicit_list(self):
+        self.assertEqual(store.INTERNAL_TARGETS, {("ios", "playground"), ("android", "playground")})
+        self.assertFalse(store.is_internal("ios", "production"))
+        self.assertFalse(store.is_internal("android", "production"))
+        # Each entry is a real target, uploaded only to internal testing, in an internal environment.
+        for entry in store.INTERNAL_TARGETS:
+            with self.subTest(entry=entry):
+                self.assertIn(entry, store.APP_IDS)
+                self.assertTrue(gate.ENVIRONMENTS[entry].endswith("-internal"))
+        self.assertEqual(play_upload.TRACK, "internal")
+        # Adding an app ID does not make it internal.
+        with patch.dict(store.APP_IDS, {("android", "public"): "io.github.mayassistant.may"}):
+            self.assertFalse(store.is_internal("android", "public"))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class CheckoutIsTests(unittest.TestCase):
+    def test_a_planted_fsmonitor_hook_never_runs(self):
+        # The build can write the design-system checkout's own .git/config (PR #5 re-review).
+        import subprocess
+        import prepare
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, marker = Path(tmp) / "ds", Path(tmp) / "hook-ran"
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(repo)]
+            repo.mkdir()
+            (repo / "tokens.json").write_text("{}")
+            for argv in (["init", "-q"], ["add", "tokens.json"], ["commit", "-q", "-m", "pin"]):
+                subprocess.run(git + argv, check=True, capture_output=True)
+            head = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            hook = Path(tmp) / "hook.sh"
+            hook.write_text("#!/bin/sh\ntouch %s\n" % marker)
+            hook.chmod(0o755)
+            subprocess.run(git + ["config", "core.fsmonitor", str(hook)], check=True)
+            self.assertTrue(prepare.checkout_is(repo, head))
+            self.assertFalse(marker.exists(), "the checkout's fsmonitor hook ran")

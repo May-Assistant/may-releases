@@ -4,6 +4,10 @@ The workflow step that runs this holds only the App Store Connect key and
 issuer: no source read key and no signing material. It re-checks the IPA's
 embedded profile team and bundle ID and its build number before upload.
 TestFlight processing and group assignment need separate readback.
+
+Dry run: the workflow skips this step unless `dry_run` is false, and this
+script also refuses unless MAY_DRY_RUN is exactly "false". dry_run.py reports
+instead.
 """
 
 import argparse
@@ -25,6 +29,8 @@ import verify
 def upload(target, source_sha, build_number):
     app_id = identity("ios", target, source_sha, build_number)
     require_step_secrets(IOS_UPLOAD_SECRETS)
+    if os.environ.get("MAY_DRY_RUN") != "false":
+        raise StoreError("Dry run: no store upload was requested")
     if os.environ.get("MAY_ASC_KEY_ID") != APPLE_KEY_ID:
         raise StoreError("Approved Apple team key ID differs")
     issuer = os.environ.get("MAY_ASC_ISSUER_ID", "")

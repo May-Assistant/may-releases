@@ -2,9 +2,16 @@
 
 No private source, commit metadata, provider output, or credential is printed.
 The build-local design-system path replacement is made only after exact pin checks.
+
+Design-system pins (Samuel's decision, 2026-10-14): a store build checks the
+pin of the platform it builds, which must be well-formed, trusted and exactly
+what is checked out. For an internal target (store.INTERNAL_TARGETS) the iOS and
+Android pins may differ; for any other target, and for the native compile, they
+must match. Both pins are recorded for the sealed handoff on every build.
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -17,7 +24,8 @@ import subprocess
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import SOURCE_READ_SECRETS, StoreError, child_env, require_step_secrets
+from store import (DESIGN_SYSTEM_RECORD, SOURCE_READ_SECRETS, StoreError, child_env, design_system_pins,
+                   require_step_secrets, write_private)
 
 APP = "git@github.com:May-Assistant/may-app.git"
 DS = "git@github.com:May-Assistant/may-design-system.git"
@@ -35,13 +43,45 @@ def exact_sha(value):
     return value
 
 
-def pins(ios_project, android_lock):
+def pins(ios_project, android_lock, platform=None, target=None):
+    """Both design-system pins, each well-formed and trusted; returns (record, iOS spec).
+
+    The record is {"ios": ..., "android": ...}. store.design_system_pins then
+    requires the two to match unless (platform, target) is internal.
+
+    Both pins are checked for form and trust on every build, including the one
+    that is not built or compared. The iOS spec parsed here is the text this
+    script later replaces in project.yml, and the record carries both values
+    into the sealed manifest: drift is only meaningful between two exact
+    revisions of the one trusted repository. A pin that points elsewhere, or
+    at a branch or path, is not drift but a different dependency for the same
+    commit, which will also be built for the other platform.
+    """
     match = re.search(r"(?m)^  MayDesignSystem:\n    url: " + re.escape(DS_URL) +
                       r"\n    revision: ([0-9a-f]{40})$", ios_project)
+    if not match:
+        raise PrepareError("iOS design-system pin is malformed or untrusted")
     lock = dict(line.split("=", 1) for line in android_lock.splitlines() if "=" in line)
-    if not match or lock.get("repository") not in (DS_URL, DS_URL + ".git") or lock.get("revision") != match.group(1):
-        raise PrepareError("iOS and Android design-system pins differ or are untrusted")
-    return match.group(1), match.group(0)
+    if (lock.get("repository") not in (DS_URL, DS_URL + ".git") or
+            not re.fullmatch(r"[0-9a-f]{40}", lock.get("revision") or "")):
+        raise PrepareError("Android design-system pin is malformed or untrusted")
+    record = design_system_pins({"ios": match.group(1), "android": lock["revision"]}, platform, target)
+    return record, match.group(0)
+
+
+def head_revision(checkout):
+    result = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(checkout), "rev-parse", "--verify", "HEAD^{commit}"],
+                            capture_output=True, stdin=subprocess.DEVNULL,
+                            env=child_env(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull))
+    return result.stdout.decode().strip() if not result.returncode else ""
+
+
+def checkout_is(checkout, revision):
+    """Whether checkout is exactly revision, with no change to a tracked file. The build could write
+    the checkout's own config, so no fsmonitor hook from it runs (as integrity.py)."""
+    env = child_env(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    return head_revision(checkout) == revision and not git_status(
+        ["git", "-c", "core.fsmonitor=false", "-C", str(checkout), "diff", "--quiet", "HEAD", "--"], env=env)
 
 
 def private_runner_root():
@@ -106,8 +146,17 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
         raise PrepareError("Private checkout differs from exact commit")
 
 
-def prepare(source_sha):
+def prepare(source_sha, platform=None, target=None):
+    """Fetch the exact app commit and the design system pinned for `platform`.
+
+    With a platform and target (a store build), only that platform's pin is
+    fetched, and for an internal target the other pin may differ. Without them
+    (the native compile), the two pins must match. Both pins are written to
+    may-private/DESIGN_SYSTEM_RECORD for handoff.py to seal.
+    """
     require_step_secrets(SOURCE_READ_SECRETS)
+    if (platform is None) != (target is None):
+        raise PrepareError("Platform and target must be given together")
     root = private_runner_root()
     private = root / "may-private"
     private.mkdir(mode=0o700)
@@ -115,7 +164,8 @@ def prepare(source_sha):
     fetch(source, APP, exact_sha(source_sha), os.environ.get("MAY_APP_READ_KEY", ""),
           private, "app", main_history=True)
     project_path, lock_path = source / "ios/project.yml", source / "android/design-system.lock"
-    revision, old_spec = pins(project_path.read_text(), lock_path.read_text())
+    record, old_spec = pins(project_path.read_text(), lock_path.read_text(), platform, target)
+    revision = record[platform or "ios"]
     ds_checkout = root / "may-design-system"
     fetch(ds_checkout, DS, revision, os.environ.get("MAY_DS_READ_KEY", ""), private, "ds")
     ds_local = source / "android/build-deps/may-design-system"
@@ -125,16 +175,27 @@ def prepare(source_sha):
         raise PrepareError("Design-system build path escapes private source")
     ds_local.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(ds_checkout), str(ds_local))
-    project = project_path.read_text()
-    project_path.write_text(project.replace(old_spec, "  MayDesignSystem:\n    path: " + str(ds_local), 1))
+    if head_revision(ds_local) != revision:
+        raise PrepareError("Design-system checkout is not the built platform's pinned revision")
+    # project.yml is pointed only at a local checkout of its own pinned revision.
+    # An internal Android build whose iOS pin differs leaves it untouched.
+    if revision == record["ios"]:
+        project = project_path.read_text()
+        project_path.write_text(project.replace(old_spec, "  MayDesignSystem:\n    path: " + str(ds_local), 1))
+    write_private(private / DESIGN_SYSTEM_RECORD,
+                  json.dumps({"platform": platform, "target": target, "source_sha": source_sha,
+                              "design_system": record}, sort_keys=True).encode())
     print("Exact private May app and design-system sources prepared on protected runner")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-sha", required=True)
+    # A store build names both; the native compile names neither (pins must match).
+    parser.add_argument("--platform", choices=("ios", "android"))
+    parser.add_argument("--target", choices=("production", "playground"))
     args = parser.parse_args()
     try:
-        prepare(args.source_sha)
+        prepare(args.source_sha, args.platform, args.target)
     except (PrepareError, StoreError, OSError, subprocess.SubprocessError):
         raise SystemExit("Private May source preparation failed; no source or credential was printed") from None
