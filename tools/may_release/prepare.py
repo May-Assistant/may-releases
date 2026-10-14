@@ -70,17 +70,18 @@ def pins(ios_project, android_lock, platform=None, target=None):
 
 
 def head_revision(checkout):
-    result = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--verify", "HEAD^{commit}"],
+    result = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(checkout), "rev-parse", "--verify", "HEAD^{commit}"],
                             capture_output=True, stdin=subprocess.DEVNULL,
                             env=child_env(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull))
     return result.stdout.decode().strip() if not result.returncode else ""
 
 
 def checkout_is(checkout, revision):
-    """Whether checkout is exactly revision, with no change to a tracked file."""
+    """Whether checkout is exactly revision, with no change to a tracked file. The build could write
+    the checkout's own config, so no fsmonitor hook from it runs (as integrity.py)."""
     env = child_env(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
     return head_revision(checkout) == revision and not git_status(
-        ["git", "-C", str(checkout), "diff", "--quiet", "HEAD", "--"], env=env)
+        ["git", "-c", "core.fsmonitor=false", "-C", str(checkout), "diff", "--quiet", "HEAD", "--"], env=env)
 
 
 def private_runner_root():

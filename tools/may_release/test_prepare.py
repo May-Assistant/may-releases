@@ -214,3 +214,24 @@ class PerPlatformPinTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CheckoutIsTests(unittest.TestCase):
+    def test_a_planted_fsmonitor_hook_never_runs(self):
+        # The build can write the design-system checkout's own .git/config (PR #5 re-review).
+        import subprocess
+        import prepare
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, marker = Path(tmp) / "ds", Path(tmp) / "hook-ran"
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(repo)]
+            repo.mkdir()
+            (repo / "tokens.json").write_text("{}")
+            for argv in (["init", "-q"], ["add", "tokens.json"], ["commit", "-q", "-m", "pin"]):
+                subprocess.run(git + argv, check=True, capture_output=True)
+            head = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            hook = Path(tmp) / "hook.sh"
+            hook.write_text("#!/bin/sh\ntouch %s\n" % marker)
+            hook.chmod(0o755)
+            subprocess.run(git + ["config", "core.fsmonitor", str(hook)], check=True)
+            self.assertTrue(prepare.checkout_is(repo, head))
+            self.assertFalse(marker.exists(), "the checkout's fsmonitor hook ran")
