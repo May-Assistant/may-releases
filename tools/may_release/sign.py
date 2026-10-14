@@ -11,7 +11,9 @@ they read by name. Tool output stays in private runner logs.
 
 Android: jarsigner signs the AAB; jarsigner -verify checks every digest, and
 verify.py checks that every entry is covered and that the one signer
-certificate's SHA-256 equals MAY_ANDROID_CERT_SHA256.
+certificate's SHA-256 equals MAY_ANDROID_CERT_SHA256. Before signing, the alias
+and that pin must be the target's own upload key (store.ANDROID_UPLOAD_KEYS), so a
+Playground key can never sign May production, or the reverse.
 
 iOS: a throwaway keychain holds the distribution identity; xcodebuild exports
 an internal-TestFlight-only IPA; verify.py checks the embedded profile's team
@@ -33,8 +35,8 @@ import subprocess
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from store import (ANDROID_SIGNING_SECRETS, APPLE_CERT_SHA1, APPLE_TEAM, IOS_SIGNING_SECRETS,
-                   XCODE_DEVELOPER_DIR, StoreError, child_env, identity, require_step_secrets,
-                   run_private, runner_root, secret_bytes, write_private)
+                   XCODE_DEVELOPER_DIR, StoreError, check_android_upload_key, child_env, identity,
+                   require_step_secrets, run_private, runner_root, secret_bytes, write_private)
 import toolchain
 import verify
 
@@ -65,6 +67,9 @@ def sign_android(target, source_sha, build_number):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", alias):
         raise StoreError("Android key alias metadata is invalid")
     expected = verify.normalize_fingerprint(os.environ.get("MAY_ANDROID_CERT_SHA256", ""))
+    # The environment's alias and certificate pin must be this target's own upload
+    # key (store.ANDROID_UPLOAD_KEYS), so the other app's key never signs this one.
+    check_android_upload_key(target, alias, expected)
     root = runner_root()
     private, out = root / "may-private", root / "may-release"
     unsigned, signed = out / "unsigned.aab", out / "signed.aab"

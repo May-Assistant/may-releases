@@ -11,12 +11,15 @@ from unittest.mock import patch
 
 import confirm_upload
 import play_upload
-from store import SECRET_NAMES, UPLOAD_RECORD, StoreError, write_upload_record
-from test_play_upload import ACCOUNT, BUNDLE, CREDENTIAL, Session
+import sign_only
+from store import SECRET_NAMES, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, UPLOAD_RECORD, StoreError, write_upload_record
+from test_play_upload import (ACCOUNT, BUNDLE, CREDENTIAL, FIXTURE_CERT, OTHER_CERT, PRODUCTION_ACCOUNT, Session,
+                              credential, upload_keys)
 
 HERE = Path(__file__).resolve().parent
 SHA = "a" * 40
 PLAYGROUND = "io.github.mayassistant.may.playground"
+PRODUCTION = "io.github.mayassistant.may"
 NOT_SUCCESS = (None, "", "skipped", "failure", "cancelled", "Success", "success ")
 
 
@@ -35,16 +38,19 @@ class ConfirmUploadTests(unittest.TestCase):
         self.env.stop()
         self.directory.cleanup()
 
-    def upload(self):
+    def upload(self, target="playground"):
         """A real play_upload.upload() against the fake Play session; it writes the record."""
-        with patch.dict(os.environ, {"MAY_PLAY_JSON": CREDENTIAL, "MAY_PLAY_ACCOUNT": ACCOUNT,
-                                     "MAY_DRY_RUN": "false"}), patch("sys.stdout", new_callable=io.StringIO):
-            play_upload.upload("playground", SHA, "9", Session())
+        account = ACCOUNT if target == "playground" else PRODUCTION_ACCOUNT
+        keys = upload_keys() if target == "playground" else upload_keys(playground=OTHER_CERT, production=FIXTURE_CERT)
+        with patch.dict(os.environ, {"MAY_PLAY_JSON": credential(account), "MAY_PLAY_ACCOUNT": account,
+                                     "MAY_DRY_RUN": "false"}), patch("sys.stdout", new_callable=io.StringIO), \
+                patch("store.ANDROID_UPLOAD_KEYS", keys):
+            play_upload.upload(target, SHA, "9", Session())
 
-    def confirm(self, outcome="success", platform="android", build_number="9"):
+    def confirm(self, outcome="success", platform="android", build_number="9", target="playground"):
         env = {} if outcome is None else {"MAY_UPLOAD_OUTCOME": outcome}
         with patch.dict(os.environ, env):
-            return confirm_upload.confirm(platform, "playground", SHA, build_number)
+            return confirm_upload.confirm(platform, target, SHA, build_number)
 
     def test_a_successful_upload_is_confirmed_with_its_report(self):
         self.upload()
@@ -56,6 +62,38 @@ class ConfirmUploadTests(unittest.TestCase):
             "  track: internal",
             "  signed AAB SHA-256: " + hashlib.sha256(BUNDLE).hexdigest(),
             "  Play edit (committed): edit-1"])
+
+    def test_may_production_is_confirmed_exactly_as_playground_is(self):
+        self.upload("production")
+        self.assertEqual(self.confirm(target="production"), [
+            "Store upload made: Google Play accepted and committed:",
+            "  package: " + PRODUCTION,
+            "  versionCode: 9",
+            "  track: internal",
+            "  signed AAB SHA-256: " + hashlib.sha256(BUNDLE).hexdigest(),
+            "  Play edit (committed): edit-1"])
+        # The record is May's: it confirms nothing for May Playground, and the checks are the same.
+        with self.assertRaises(StoreError):
+            self.confirm(target="playground")
+        good = json.loads((self.root / "may-release" / UPLOAD_RECORD).read_text())
+        for change in ({"build_number": "10"}, {"track": "production"}, {"sha256": "0" * 64},
+                       {"app_id": PLAYGROUND}, {"store_id": None}, {"store_id": "edit 1"}):
+            with self.subTest(change=change):
+                (self.root / "may-release" / UPLOAD_RECORD).write_text(json.dumps(dict(good, **change)))
+                with self.assertRaises(StoreError):
+                    self.confirm(target="production")
+        for outcome in NOT_SUCCESS:
+            (self.root / "may-release" / UPLOAD_RECORD).write_text(json.dumps(good))
+            with self.subTest(outcome=outcome), self.assertRaises(StoreError):
+                self.confirm(outcome, target="production")
+
+    def test_a_run_that_published_a_sign_only_bundle_confirms_no_upload(self):
+        self.upload()
+        (self.root / SIGN_ONLY_DIR).mkdir()
+        with self.assertRaises(StoreError) as refused:
+            self.confirm()
+        self.assertEqual(refused.exception.args[0], "This run published a sign-only bundle, which is never an "
+                                                    "upload; nothing was confirmed uploaded")
 
     def test_an_upload_step_that_did_not_succeed_fails_the_job(self):
         self.upload()  # even with a valid record present, the outcome decides first
@@ -121,6 +159,116 @@ class ConfirmUploadTests(unittest.TestCase):
         self.assertTrue(made.stdout.startswith("Requested upload confirmed.\n"))
         self.assertIn("  track: internal\n", made.stdout)
         self.assertIn("  Play edit (committed): edit-1\n", made.stdout)
+
+
+class ConfirmSignOnlyTests(unittest.TestCase):
+    """confirm_upload.py --sign-only: signed, not uploaded, and only if the bundle was published."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        (self.root / "may-release").mkdir()
+        (self.root / "may-release/signed.aab").write_bytes(BUNDLE)
+        self.env = patch.dict(os.environ, {"RUNNER_TEMP": self.directory.name}, clear=True)
+        self.env.start()
+        self.sha = hashlib.sha256(BUNDLE).hexdigest()
+        out = self.root / SIGN_ONLY_DIR
+        out.mkdir()
+        (out / sign_only.SEALED).write_bytes(b"age-encrypted fixture")
+        (out / sign_only.HASH_FILE).write_text(self.sha + "  signed.aab\n")
+        self.record = {"mode": "sign-only", "platform": "android", "app_id": PRODUCTION, "build_number": "9",
+                       "sha256": self.sha, "encrypted_sha256": hashlib.sha256(b"age-encrypted fixture").hexdigest()}
+        self.write(self.record)
+
+    def tearDown(self):
+        self.env.stop()
+        self.directory.cleanup()
+
+    def write(self, record):
+        (self.root / SIGN_ONLY_DIR / SIGN_ONLY_RECORD).write_text(json.dumps(record))
+
+    def confirm(self, outcome="success", target="production"):
+        with patch.dict(os.environ, {} if outcome is None else {"MAY_PUBLISH_OUTCOME": outcome}):
+            return confirm_upload.confirm_signed("android", target, SHA, "9")
+
+    def test_a_published_bundle_is_confirmed_signed_not_uploaded(self):
+        lines = self.confirm()
+        self.assertEqual(lines[:4], [
+            "Signed, not uploaded: nothing was sent to Google Play. Published for one manual Play Console upload:",
+            "  package: " + PRODUCTION, "  versionCode: 9", "  signed AAB SHA-256: " + self.sha])
+        self.assertFalse(any("upload made" in line or "Play edit" in line or "track:" in line for line in lines))
+
+    def test_a_publish_step_that_did_not_succeed_fails_the_job(self):
+        for outcome in NOT_SUCCESS:
+            with self.subTest(outcome=outcome), self.assertRaises(StoreError) as refused:
+                self.confirm(outcome)
+            self.assertEqual(refused.exception.args[0], "sign_only was true, but the signed bundle was not published "
+                             "(the publish step failed, was skipped or was cancelled); nothing is ready for Play Console")
+
+    def test_a_sign_only_run_that_uploaded_fails(self):
+        (self.root / "may-release" / UPLOAD_RECORD).write_text("{}")
+        with self.assertRaises(StoreError) as refused:
+            self.confirm()
+        self.assertEqual(refused.exception.args[0], "A sign-only run left an upload record; it must never upload")
+
+    def test_the_record_must_match_the_signed_bundle_and_the_published_file(self):
+        for change in ({"sha256": "0" * 64}, {"encrypted_sha256": "0" * 64}, {"build_number": "10"},
+                       {"app_id": PLAYGROUND}, {"mode": "upload"}, {"platform": "ios"}, {"extra": "x"}):
+            with self.subTest(change=change):
+                self.write(dict(self.record, **change))
+                with self.assertRaises(StoreError) as refused:
+                    self.confirm()
+                self.assertEqual(refused.exception.args[0],
+                                 "The sign-only record does not match the signed bundle and the published file")
+        self.write(self.record)
+        (self.root / "may-release/signed.aab").write_bytes(BUNDLE + b"changed")
+        with self.assertRaises(StoreError):
+            self.confirm()
+        (self.root / "may-release/signed.aab").write_bytes(BUNDLE)
+        (self.root / SIGN_ONLY_DIR / sign_only.HASH_FILE).write_text("0" * 64 + "  signed.aab\n")
+        with self.assertRaises(StoreError) as refused:
+            self.confirm()
+        self.assertEqual(refused.exception.args[0],
+                         "The sign-only record does not match the signed bundle and the published file")
+        (self.root / SIGN_ONLY_DIR / sign_only.HASH_FILE).write_text(self.sha + "  signed.aab\n")
+        self.write(["not", "a", "record"])
+        with self.assertRaises(StoreError):
+            self.confirm()
+
+    def test_the_published_folder_holds_exactly_its_three_files(self):
+        (self.root / SIGN_ONLY_DIR / "upload.keystore").write_bytes(b"key")
+        with self.assertRaises(StoreError) as refused:
+            self.confirm()
+        self.assertEqual(refused.exception.args[0], "The published sign-only folder holds something other than its three files")
+        (self.root / SIGN_ONLY_DIR / "upload.keystore").unlink()
+        (self.root / SIGN_ONLY_DIR / sign_only.HASH_FILE).unlink()
+        with self.assertRaises(StoreError):
+            self.confirm()
+
+    def test_only_the_android_production_record_is_confirmed(self):
+        with self.assertRaises(StoreError):
+            self.confirm(target="playground")
+        with patch.dict(os.environ, {"MAY_PUBLISH_OUTCOME": "success"}), self.assertRaises(StoreError):
+            confirm_upload.confirm_signed("ios", "production", SHA, "9")
+
+    def test_holds_no_secret(self):
+        for name in SECRET_NAMES:
+            with self.subTest(name=name), patch.dict(os.environ, {name: "present"}), self.assertRaises(StoreError):
+                self.confirm()
+
+    def test_cli_says_signed_not_uploaded(self):
+        argv = [sys.executable, "-I", "-S", "-B", str(HERE / "confirm_upload.py"), "--platform", "android",
+                "--target", "production", "--source-sha", SHA, "--build-number", "9", "--sign-only"]
+        base = {"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": self.directory.name}
+        skipped = subprocess.run(argv, capture_output=True, text=True, cwd=self.directory.name,
+                                 env=dict(base, MAY_PUBLISH_OUTCOME="skipped"))
+        self.assertEqual(skipped.returncode, 1)
+        self.assertTrue(skipped.stderr.startswith("May sign-only check failed: sign_only was true"))
+        made = subprocess.run(argv, capture_output=True, text=True, cwd=self.directory.name,
+                              env=dict(base, MAY_PUBLISH_OUTCOME="success"))
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertTrue(made.stdout.startswith("Signed, not uploaded: confirmed.\n"))
+        self.assertNotIn("Requested upload confirmed", made.stdout)
 
 
 if __name__ == "__main__":

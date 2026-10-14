@@ -15,8 +15,16 @@ import zipfile
 import ios_upload
 import sign
 import signing_fixtures as fx
+import store
 from store import SECRET_NAMES, StoreError
 import verify
+
+COMMITTED_KEYS = store.ANDROID_UPLOAD_KEYS
+
+
+def keys_with(target, cert):
+    """The committed table, with `target`'s certificate pin replaced by a test key's."""
+    return dict(COMMITTED_KEYS, **{target: dict(COMMITTED_KEYS[target], cert=cert)})
 
 PLAYGROUND = "io.github.mayassistant.may.playground"
 HAS_JDK = bool(shutil.which("jarsigner") and shutil.which("keytool"))
@@ -58,19 +66,19 @@ class AndroidSigningTests(unittest.TestCase):
         self.keystore = keys / "upload.p12"
         quiet = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         subprocess.run(["keytool", "-genkeypair", "-keystore", str(self.keystore), "-storetype", "PKCS12",
-                        "-storepass", "fixturepass", "-keypass", "fixturepass", "-alias", "upload",
+                        "-storepass", "fixturepass", "-keypass", "fixturepass", "-alias", "may-playground-upload",
                         "-keyalg", "RSA", "-keysize", "2048", "-validity", "2",
                         "-dname", "CN=May test upload key"], **quiet)
         certificate = keys / "upload.der"
         subprocess.run(["keytool", "-exportcert", "-keystore", str(self.keystore), "-storepass", "fixturepass",
-                        "-alias", "upload", "-file", str(certificate)], **quiet)
+                        "-alias", "may-playground-upload", "-file", str(certificate)], **quiet)
         self.fingerprint = hashlib.sha256(certificate.read_bytes()).hexdigest()
         unsigned_aab(self.work.root / "may-release/unsigned.aab")
         self.env = {"RUNNER_TEMP": str(self.work.root), "PATH": os.environ.get("PATH", ""),
                     "HOME": str(self.work.root / "home"),
                     "MAY_ANDROID_KEYSTORE_BASE64": base64.b64encode(self.keystore.read_bytes()).decode(),
                     "MAY_ANDROID_STORE_PASSWORD": "fixturepass", "MAY_ANDROID_KEY_PASSWORD": "fixturepass",
-                    "MAY_ANDROID_KEY_ALIAS": "upload", "MAY_ANDROID_CERT_SHA256": self.fingerprint}
+                    "MAY_ANDROID_KEY_ALIAS": "may-playground-upload", "MAY_ANDROID_CERT_SHA256": self.fingerprint}
         for name in ("JAVA_HOME",):
             if name in os.environ:
                 self.env[name] = os.environ[name]
@@ -81,7 +89,8 @@ class AndroidSigningTests(unittest.TestCase):
         self.work.directory.cleanup()
 
     def test_signs_verifies_and_removes_keystore(self):
-        with patch.dict(os.environ, self.env, clear=True), patch("sign.jarsigner", return_value=shutil.which("jarsigner")):
+        with patch.dict(os.environ, self.env, clear=True), patch("sign.jarsigner", return_value=shutil.which("jarsigner")), \
+                patch("store.ANDROID_UPLOAD_KEYS", keys_with("playground", self.fingerprint)):
             sign.sign_android("playground", "a" * 40, "9")
         signed = self.work.root / "may-release/signed.aab"
         self.assertEqual(verify.aab_signer_sha256(signed), self.fingerprint)
@@ -90,11 +99,23 @@ class AndroidSigningTests(unittest.TestCase):
 
     def test_wrong_expected_certificate_is_refused_and_bundle_removed(self):
         self.env["MAY_ANDROID_CERT_SHA256"] = "ab" * 32
-        with patch.dict(os.environ, self.env, clear=True), patch("sign.jarsigner", return_value=shutil.which("jarsigner")):
+        with patch.dict(os.environ, self.env, clear=True), patch("sign.jarsigner", return_value=shutil.which("jarsigner")), \
+                patch("store.ANDROID_UPLOAD_KEYS", keys_with("playground", "ab" * 32)):
             with self.assertRaises(StoreError):
                 sign.sign_android("playground", "a" * 40, "9")
         self.assertFalse((self.work.root / "may-release/signed.aab").exists())
         self.assertFalse((self.work.root / "may-private/upload.keystore").exists())
+
+    def test_a_playground_key_never_signs_may_production(self):
+        # The real keystore is Playground's (alias and pin); May production refuses it before jarsigner runs.
+        with patch.dict(os.environ, self.env, clear=True), patch("sign.jarsigner", return_value=shutil.which("jarsigner")), \
+                patch("store.ANDROID_UPLOAD_KEYS", keys_with("playground", self.fingerprint)), \
+                patch("sign.run_private") as runner:
+            with self.assertRaises(StoreError) as refused:
+                sign.sign_android("production", "a" * 40, "9")
+            runner.assert_not_called()
+        self.assertEqual(refused.exception.args[0], "Android key alias is not this target's upload key")
+        self.assertFalse((self.work.root / "may-release/signed.aab").exists())
 
 
 class AndroidSigningIsolationTests(unittest.TestCase):
@@ -107,10 +128,44 @@ class AndroidSigningIsolationTests(unittest.TestCase):
         self.env = {"RUNNER_TEMP": str(self.work.root), "PATH": "/usr/bin",
                     "MAY_ANDROID_KEYSTORE_BASE64": base64.b64encode(b"keystore").decode(),
                     "MAY_ANDROID_STORE_PASSWORD": "store-secret", "MAY_ANDROID_KEY_PASSWORD": "key-secret",
-                    "MAY_ANDROID_KEY_ALIAS": "upload", "MAY_ANDROID_CERT_SHA256": fx.AAB_CERT_SHA256}
+                    "MAY_ANDROID_KEY_ALIAS": "may-playground-upload", "MAY_ANDROID_CERT_SHA256": fx.AAB_CERT_SHA256}
+        self.keys = patch("store.ANDROID_UPLOAD_KEYS",
+                          keys_with("playground", verify.normalize_fingerprint(fx.AAB_CERT_SHA256)))
+        self.keys.start()
+        self.addCleanup(self.keys.stop)
 
     def tearDown(self):
         self.work.directory.cleanup()
+
+    def test_each_target_signs_only_with_its_own_alias_and_certificate_pin(self):
+        production = COMMITTED_KEYS["production"]["cert"]
+        playground_like = COMMITTED_KEYS["playground"]["cert"] + "0" * 48
+        cases = (
+            # (target, alias, MAY_ANDROID_CERT_SHA256, expected refusal)
+            ("production", "may-playground-upload", production, "Android key alias is not this target's upload key"),
+            ("production", "may-upload", playground_like,
+             "MAY_ANDROID_CERT_SHA256 is not this target's upload certificate"),
+            ("production", "may-upload", fx.AAB_CERT_SHA256,
+             "MAY_ANDROID_CERT_SHA256 is not this target's upload certificate"),
+            ("playground", "may-upload", fx.AAB_CERT_SHA256, "Android key alias is not this target's upload key"),
+            ("playground", "may-playground-upload", production,
+             "MAY_ANDROID_CERT_SHA256 is not this target's upload certificate"),
+            ("playground", "upload", fx.AAB_CERT_SHA256, "Android key alias is not this target's upload key"),
+        )
+        for target, alias, cert, message in cases:
+            env = dict(self.env, MAY_ANDROID_KEY_ALIAS=alias, MAY_ANDROID_CERT_SHA256=cert)
+            with self.subTest(target=target, alias=alias, cert=cert), patch.dict(os.environ, env, clear=True), \
+                    patch("sign.run_private") as runner:
+                with self.assertRaises(StoreError) as refused:
+                    sign.sign_android(target, "a" * 40, "9")
+                runner.assert_not_called()
+                self.assertEqual(refused.exception.args[0], message)
+        # The committed production alias and pin pass this check (jarsigner itself is faked here).
+        env = dict(self.env, MAY_ANDROID_KEY_ALIAS="may-upload", MAY_ANDROID_CERT_SHA256=production.upper())
+        with patch.dict(os.environ, env, clear=True), patch("store.ANDROID_UPLOAD_KEYS", COMMITTED_KEYS), \
+                patch("sign.run_private") as runner, patch("sign.verify_signed_aab"):
+            sign.sign_android("production", "a" * 40, "9")
+            self.assertEqual(runner.call_args[0][0][-1], "may-upload")
 
     def test_jarsigner_gets_only_its_password_variables(self):
         captured = {}
@@ -139,7 +194,7 @@ class AndroidSigningIsolationTests(unittest.TestCase):
                 runner.assert_not_called()
 
     def test_key_alias_cannot_be_an_option(self):
-        for alias in ("-J-Dx=y", "-storepass", "", "a" * 65, "up load"):
+        for alias in ("-J-Dx=y", "-storepass", "", "a" * 65, "up load", "upload"):
             with self.subTest(alias=alias), patch.dict(os.environ, dict(self.env, MAY_ANDROID_KEY_ALIAS=alias),
                                                        clear=True), patch("sign.run_private") as runner:
                 with self.assertRaises(StoreError):

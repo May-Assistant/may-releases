@@ -44,15 +44,58 @@ PLAY_ACCOUNT_DOMAIN = "@may-assistant-app.iam.gserviceaccount.com"
 XCODE_DEVELOPER_DIR = "/Applications/Xcode_26.3.app/Contents/Developer"
 # Play's hard limit is 2,100,000,000; stay clear of it.
 MAX_BUILD_NUMBER = 2_000_000_000
-# Stage 2: the Play uploads this repository may make, as target -> the one track
+# Stage 3: the Play uploads this repository may make, as target -> the one track
 # that upload writes. Only "internal" may appear (static_check.py pins this table
 # exactly for the stage), and there is no track input, so no production, beta or
-# alpha track is reachable. The real May app (`production`) is left out on
-# purpose: no dry run has proven its upload, and its internal build can be
-# promoted to production by hand in Play Console, where no control here runs.
-# gate.py refuses dry_run: false for any other target at admission, and
-# play_upload.py refuses it again before any request.
-PLAY_UPLOAD_TRACKS = {"playground": "internal"}
+# alpha track is reachable. Samuel's decision (2026-10-14): the real May app
+# (`production`) may be uploaded to its Play internal track only, after a passing
+# production dry run; promoting a build from internal to production stays a
+# manual step in Play Console, where no control here runs. gate.py refuses
+# dry_run: false for any other target at admission, and play_upload.py refuses it
+# again before any request.
+PLAY_UPLOAD_TRACKS = {"playground": "internal", "production": "internal"}
+# Each Android target's own upload key and Play service account, fixed in reviewed
+# code so that one target's key, certificate or credential can never stand in for
+# the other's (check_android_upload_key, check_android_signer, play_account).
+# alias: the keystore alias sign.py passes to jarsigner (MAY_ANDROID_KEY_ALIAS must
+#   equal it).
+# cert: the upload certificate's SHA-256, lowercase hex. MAY_ANDROID_CERT_SHA256
+#   and the signed bundle's sole signer must equal it. Production's full value is
+#   recorded (may-app docs/engineering/merge-deploy-plan.md, the pinned
+#   may-upload SHA-256). Playground's full value is not recorded in a reviewed
+#   file, so its entry is the recorded prefix of that distinct key, and the full
+#   value stays the environment's MAY_ANDROID_CERT_SHA256, which the signer must
+#   equal exactly. Replace the prefix with the full value once it is recorded.
+# account: the Play service account; MAY_PLAY_ACCOUNT must equal it.
+ANDROID_UPLOAD_KEYS = {
+    "production": {"alias": "may-upload",
+                   "cert": "9e2fe9c8e70421fcbfbbfb4ea8f30942915ecfbd8ffef18989a309fc1e899815",
+                   "account": "may-play-upload@may-assistant-app.iam.gserviceaccount.com"},
+    "playground": {"alias": "may-playground-upload",
+                   "cert": "db087802f802f2a1",
+                   "account": "may-playground-upload@may-assistant-app.iam.gserviceaccount.com"},
+}
+# The lowest build number (versionCode) each store app may use here, mirroring
+# may-app's tools/release/build-number-floors. May production: versionCode 1 was
+# a manual upload and 2 was built for Dots, so this repository starts at 3.
+# gate.py refuses a lower one at admission (dry runs included), and
+# play_upload.py and sign_only.py refuse it again; Play's own check (greater
+# than every versionCode on every track) still applies on upload.
+MIN_BUILD_NUMBERS = {("android", "production"): 3}
+# Sign-only (stage 3): the targets whose release job may publish the signed
+# bundle, encrypted, for one manual Play Console upload instead of uploading it.
+# Only the real May app: its first release must be a Console upload (README,
+# "First production upload").
+SIGN_ONLY_TARGETS = frozenset({("android", "production")})
+# The folder sign_only.py writes and the workflow publishes (3-day artifact):
+# the encrypted signed bundle, its SHA-256 file and SIGN_ONLY_RECORD. Nothing else.
+SIGN_ONLY_DIR = "may-signed"
+SIGN_ONLY_RECORD = "sign-only-record.json"
+# The repository is public, so its Actions artifacts are readable by anyone: the
+# published bundle is encrypted with age to this committed public key
+# (artifact_keys/<name>.age.pub), whose private half only Samuel holds. Admission
+# denies sign_only while it is a placeholder.
+SIGN_ONLY_RECIPIENT = "may-android-console-upload"
 # The only TestFlight destination ios_upload.py's export can reach
 # (testFlightInternalTestingOnly); reported by dry_run.py and confirm_upload.py.
 IOS_TRACK = "TestFlight internal testing only"
@@ -108,6 +151,39 @@ def identity(platform, target, source_sha, build_number):
     return app_id
 
 
+def build_number_floor_ok(platform, target, build_number):
+    """False when the build number is below this store app's floor (MIN_BUILD_NUMBERS)."""
+    return int(build_number) >= MIN_BUILD_NUMBERS.get((platform, target), 1)
+
+
+def android_upload_key(target):
+    key = ANDROID_UPLOAD_KEYS.get(target)
+    if not isinstance(key, dict):
+        raise StoreError("This Android target has no committed upload key")
+    return key
+
+
+def android_cert_matches(target, sha256_hex):
+    """Whether a certificate SHA-256 (64 lowercase hex) is this target's pinned upload certificate."""
+    pin = android_upload_key(target)["cert"]
+    return bool(re.fullmatch(r"[0-9a-f]{64}", sha256_hex or "")) and \
+        bool(re.fullmatch(r"[0-9a-f]{16,64}", pin)) and sha256_hex.startswith(pin)
+
+
+def check_android_upload_key(target, alias, cert_sha256):
+    """Refuse signing material that is not this target's own upload key."""
+    if alias != android_upload_key(target)["alias"]:
+        raise StoreError("Android key alias is not this target's upload key")
+    if not android_cert_matches(target, cert_sha256):
+        raise StoreError("MAY_ANDROID_CERT_SHA256 is not this target's upload certificate")
+
+
+def check_android_signer(target, signer_sha256):
+    """Refuse a signed bundle whose sole signer (verify.aab_signer_sha256) is not this target's key."""
+    if not android_cert_matches(target, signer_sha256):
+        raise StoreError("Signed Android App Bundle is not signed with this target's upload key")
+
+
 def is_internal(platform, target):
     return (platform, target) in INTERNAL_TARGETS
 
@@ -127,6 +203,13 @@ def design_system_pins(record, platform, target):
     if record["ios"] != record["android"] and not is_internal(platform, target):
         raise StoreError("iOS and Android design-system pins differ; only an internal target may differ")
     return {"ios": record["ios"], "android": record["android"]}
+
+
+def play_account(target, configured):
+    """MAY_PLAY_ACCOUNT, refused unless it is exactly this target's committed Play account."""
+    if configured != android_upload_key(target)["account"]:
+        raise StoreError("MAY_PLAY_ACCOUNT is not this target's Play service account")
+    return configured
 
 
 def play_identity(value, expected_account):

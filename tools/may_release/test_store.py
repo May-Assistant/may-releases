@@ -54,7 +54,9 @@ class StoreTests(unittest.TestCase):
     def test_non_object_play_credential_cli_prints_only_the_fixed_message(self):
         with tempfile.TemporaryDirectory() as directory:
             env = {"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": directory,
-                   "MAY_PLAY_JSON": '["private-looking-value"]', "MAY_PLAY_ACCOUNT": ACCOUNT, "MAY_DRY_RUN": "false"}
+                   "MAY_PLAY_JSON": '["private-looking-value"]', "MAY_DRY_RUN": "false",
+                   # May Playground's own account, so the credential itself is what is refused.
+                   "MAY_PLAY_ACCOUNT": "may-playground-upload@may-assistant-app.iam.gserviceaccount.com"}
             result = subprocess.run([sys.executable, "-s", str(HERE / "play_upload.py"), "--target", "playground",
                                      "--source-sha", "a" * 40, "--build-number", "9"],
                                     capture_output=True, text=True, env=env, cwd=directory)

@@ -126,7 +126,7 @@ class GateTests(unittest.TestCase):
             self.assertIn("does not exist", denied.exception.args[0])
             self.assertFalse(os.path.exists(output))
 
-    def test_committed_artifact_keys_are_the_four_distinct_recipients(self):
+    def test_committed_artifact_keys_are_the_four_distinct_recipients_and_the_console_placeholder(self):
         # Provided by Dots from Samuel's Mac on 2026-10-13; private halves never left it.
         expected = {
             "may-ios-internal": "age1rxygmrkqmgaweevxdwpgpwwlgvf9haeulg4qwvv03mv7ml4rhqxsjsxfwl",
@@ -135,8 +135,11 @@ class GateTests(unittest.TestCase):
             "may-android-playground-internal": "age1cv26vadk855hhzs6fljc6wvh3t96r2kklkg8uul62hwfjj5u8v9sex4n5j",
         }
         self.assertEqual({e: gate.artifact_recipient(e) for e in expected}, expected)
+        # Samuel's sign-only Console-upload key: a placeholder until he commits its public half.
+        self.assertEqual(gate.SIGN_ONLY_RECIPIENT, "may-android-console-upload")
+        self.assertIsNone(gate.artifact_recipient(gate.SIGN_ONLY_RECIPIENT))
         self.assertEqual(sorted(p.name for p in gate.ARTIFACT_KEYS.iterdir()),
-                         sorted(e + ".age.pub" for e in expected))
+                         sorted(e + ".age.pub" for e in list(expected) + [gate.SIGN_ONLY_RECIPIENT]))
 
     def test_placeholder_artifact_key_denies_before_any_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -184,17 +187,20 @@ class GateTests(unittest.TestCase):
                     self.assertIsNone(gate.artifact_recipient("x"))
 
 
-    def run_admission(self, dry_run, action="android", target="playground"):
+    def run_admission(self, dry_run, action="android", target="playground", sign_only="false", build="3",
+                      console_key=True):
         """gate.main() as admission runs it, with fixture metadata. Returns (denial, output, requests)."""
         with tempfile.TemporaryDirectory() as directory:
             keys = Path(directory)
             for environment in gate.ENVIRONMENTS.values():
                 (keys / (environment + ".age.pub")).write_text("age1" + "q" * 58 + "\n")
+            (keys / (gate.SIGN_ONLY_RECIPIENT + ".age.pub")).write_text(
+                "age1" + "p" * 58 + "\n" if console_key else "PLACEHOLDER: Samuel's key\n")
             output = os.path.join(directory, "output")
             env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH,
                    "GH_TOKEN": "fixture-token", "GITHUB_OUTPUT": output}
             argv = ["gate.py", "--action", action, "--target", target, "--source-sha", self.sha,
-                    "--build-number", "3", "--dry-run", dry_run]
+                    "--build-number", build, "--dry-run", dry_run, "--sign-only", sign_only]
             requests = []
 
             def fake_json(path, token):
@@ -211,21 +217,43 @@ class GateTests(unittest.TestCase):
             written = Path(output).read_text() if os.path.exists(output) else None
             return denial, written, requests
 
-    HELD = ("Uploads are held for this platform (stage 2 holds iOS); this run did not upload anything. "
+    HELD = ("Uploads are held for this platform (stage 3 holds iOS); this run did not upload anything. "
             "dry_run: false fails here by design; dispatch with dry_run: true")
-    NOT_ADMITTED = ("Stage 2 admits only a May Playground Android upload to the Play internal track; "
+    NOT_ADMITTED = ("Stage 3 admits only an Android May or May Playground upload to the Play internal track; "
                     "this run did not upload anything. Dispatch with dry_run: true")
+    FLOOR = ("Store build number is below this app's floor (May production Android starts at 3: versionCode 1 "
+             "was a manual upload and 2 was built for Dots)")
 
-    def test_stage_2_admits_a_may_playground_android_upload(self):
+    def test_stage_3_admits_a_may_playground_android_upload(self):
         self.assertEqual(gate.UPLOADS_HELD, {"ios"})
         denial, written, requests = self.run_admission("false")
         self.assertIsNone(denial)
         self.assertEqual(written, "environment=may-android-playground-internal\nbuild_environment=may-native-compile\n")
         self.assertTrue(requests)
 
-    def test_stage_2_refuses_every_other_upload_before_anything_else(self):
-        for action, target, expected in (("ios", "playground", self.HELD), ("ios", "production", self.HELD),
-                                         ("android", "production", self.NOT_ADMITTED)):
+    def test_stage_3_admits_a_may_production_android_upload(self):
+        denial, written, requests = self.run_admission("false", "android", "production")
+        self.assertIsNone(denial)
+        self.assertEqual(written, "environment=may-android-internal\nbuild_environment=may-native-compile\n")
+        self.assertEqual(sorted({path.split("/")[1] for path in requests}), ["may-android-internal", "may-native-compile"])
+
+    def test_may_production_android_build_number_floor_is_3_dry_runs_included(self):
+        for dry_run in ("true", "false"):
+            for build in ("1", "2"):
+                with self.subTest(dry_run=dry_run, build=build):
+                    denial, written, requests = self.run_admission(dry_run, "android", "production", build=build)
+                    self.assertEqual(denial, self.FLOOR)
+                    self.assertEqual((written, requests), (None, []))
+            denial, _, _ = self.run_admission(dry_run, "android", "production", build="3")
+            self.assertIsNone(denial)
+        # The rechecks inside protected jobs apply it too; Playground and iOS keep their old rule.
+        with self.assertRaises(GateDenial):
+            validate_run(REPO, MAIN, DISPATCH, self.sha, "android", "2", "production")
+        for action, target in (("android", "playground"), ("ios", "production"), ("ios", "playground")):
+            self.assertTrue(validate_run(REPO, MAIN, DISPATCH, self.sha, action, "2", target))
+
+    def test_stage_3_refuses_every_other_upload_before_anything_else(self):
+        for action, target, expected in (("ios", "playground", self.HELD), ("ios", "production", self.HELD)):
             with self.subTest(action=action, target=target):
                 denial, written, requests = self.run_admission("false", action, target)
                 self.assertEqual(denial, expected)
@@ -238,11 +266,13 @@ class GateTests(unittest.TestCase):
                 self.assertIsNone(written)
 
     def test_admission_refuses_any_track_but_internal(self):
-        for track in ("production", "beta", "alpha", "qa", None):
-            with self.subTest(track=track), patch("gate.PLAY_UPLOAD_TRACKS", {"playground": track}):
-                denial, written, requests = self.run_admission("false")
-                self.assertEqual(denial, self.NOT_ADMITTED)
-                self.assertEqual((written, requests), (None, []))
+        for target in ("playground", "production"):
+            for track in ("production", "beta", "alpha", "qa", None):
+                with self.subTest(target=target, track=track), \
+                        patch("gate.PLAY_UPLOAD_TRACKS", {"playground": track, "production": track}):
+                    denial, written, requests = self.run_admission("false", "android", target)
+                    self.assertEqual(denial, self.NOT_ADMITTED)
+                    self.assertEqual((written, requests), (None, []))
         # The table admission reads is the one play_upload.py writes from.
         self.assertIs(gate.PLAY_UPLOAD_TRACKS, play_upload.PLAY_UPLOAD_TRACKS)
 
@@ -255,9 +285,49 @@ class GateTests(unittest.TestCase):
                     self.assertTrue(written)
                     self.assertTrue(requests)
 
+    def test_sign_only_is_admitted_for_may_production_android_with_dry_run_true(self):
+        denial, written, requests = self.run_admission("true", "android", "production", sign_only="true")
+        self.assertIsNone(denial)
+        self.assertEqual(written, "environment=may-android-internal\nbuild_environment=may-native-compile\n")
+        self.assertTrue(requests)
+
+    def test_sign_only_is_refused_everywhere_else_before_anything(self):
+        cases = (
+            (("true", "android", "playground"), "sign_only is only for the May production Android app (target "
+                                                "production); nothing was signed. Dispatch without sign_only"),
+            (("true", "ios", "production"), "sign_only is only for the May production Android app (target "
+                                            "production); nothing was signed. Dispatch without sign_only"),
+            (("false", "android", "production"), "sign_only never uploads: dispatch it with dry_run: true; "
+                                                 "nothing was signed"),
+        )
+        for (dry_run, action, target), expected in cases:
+            with self.subTest(dry_run=dry_run, action=action, target=target):
+                denial, written, requests = self.run_admission(dry_run, action, target, sign_only="true")
+                self.assertEqual(denial, expected)
+                self.assertEqual((written, requests), (None, []))
+        for value in ("True ", "yes", "1", ""):
+            with self.subTest(value=value):
+                denial, written, _ = self.run_admission("true", "android", "production", sign_only=value)
+                self.assertEqual(denial, "sign_only must be true or false")
+                self.assertIsNone(written)
+        # dry_run missing while sign_only is true fails closed.
+        with self.assertRaises(GateDenial):
+            gate.validate_sign_only("android", "true", None, "production")
+
+    def test_sign_only_waits_for_samuels_console_upload_key(self):
+        denial, written, requests = self.run_admission("true", "android", "production", sign_only="true",
+                                                       console_key=False)
+        self.assertEqual(denial, "The Console-upload public key (artifact_keys/may-android-console-upload.age.pub) is "
+                                 "still a placeholder; Samuel's public key must be committed before sign_only can run")
+        self.assertEqual((written, requests), (None, []))
+        # A plain dry run of the same target does not need it.
+        denial, _, _ = self.run_admission("true", "android", "production", console_key=False)
+        self.assertIsNone(denial)
+
     def test_rechecks_pass_no_dry_run(self):
         gate.validate_dry_run("android", None)  # the in-job rechecks
         gate.validate_dry_run("compile", None)
+        gate.validate_sign_only("android", None, None, "playground")
         with self.assertRaises(GateDenial):
             gate.validate_dry_run("compile", "false")
         with patch("gate.UPLOADS_HELD", set()), self.assertRaises(GateDenial):

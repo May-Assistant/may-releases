@@ -11,7 +11,7 @@ import sys
 
 PATHS = {
     "build": ("may-source", "may-private", "may-design-system", "may-release", "may-handoff"),
-    "release": ("may-private", "may-release", "may-handoff-download"),
+    "release": ("may-private", "may-release", "may-handoff-download", "may-signed"),
 }
 
 if __name__ == "__main__":

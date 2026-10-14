@@ -15,16 +15,41 @@ import urllib.error
 from urllib.parse import parse_qs
 
 import play_upload
-from play_upload import PlayRefusal, PlaySession, PlayStatusError, access_token, upload
+from play_upload import (PlayRefusal, PlaySession, PlayStatusError, access_token, internal_release,
+                         require_commit, require_internal_release, upload)
+import signing_fixtures as fx
+import store
 from store import StoreError
+import verify
 
 HAS_OPENSSL = os.path.exists(play_upload.OPENSSL)
 
-ACCOUNT = "may-play-upload@may-assistant-app.iam.gserviceaccount.com"
-CREDENTIAL = json.dumps({"type": "service_account", "project_id": "may-assistant-app",
-                         "client_email": ACCOUNT, "private_key": "dummy"})
-BUNDLE = b"fixture signed bundle"
+PLAYGROUND_ACCOUNT = "may-playground-upload@may-assistant-app.iam.gserviceaccount.com"
+PRODUCTION_ACCOUNT = "may-play-upload@may-assistant-app.iam.gserviceaccount.com"
+ACCOUNT = PLAYGROUND_ACCOUNT
+
+
+def credential(account):
+    return json.dumps({"type": "service_account", "project_id": "may-assistant-app",
+                       "client_email": account, "private_key": "dummy"})
+
+
+CREDENTIAL = credential(ACCOUNT)
+# A real jarsigner-signed fixture bundle (signing_fixtures.SIGNED_AAB), signed by a
+# throwaway key: Play never sees it. Tests make that key one target's upload key
+# (upload_keys) to show the other target refuses it.
+BUNDLE = fx.SIGNED_AAB
+FIXTURE_CERT = verify.normalize_fingerprint(fx.AAB_CERT_SHA256)
+OTHER_CERT = "0123456789abcdef" * 4
 PLAYGROUND = "io.github.mayassistant.may.playground"
+PRODUCTION = "io.github.mayassistant.may"
+COMMITTED_KEYS = store.ANDROID_UPLOAD_KEYS  # as committed, before any test patches it
+
+
+def upload_keys(playground=FIXTURE_CERT, production=OTHER_CERT):
+    """store.ANDROID_UPLOAD_KEYS with the real aliases and accounts and the given certificate pins."""
+    return {"production": dict(COMMITTED_KEYS["production"], cert=production),
+            "playground": dict(COMMITTED_KEYS["playground"], cert=playground)}
 # Planted in every part of a fake Play error (body, reason, header, URL) and in
 # the bearer token: none of it may reach any output or exception text.
 SECRET = "MAY-PLANTED-SECRET-7f3c9a"
@@ -42,8 +67,9 @@ class Response:
 class Session:
     """Records calls; answers like Play for an app whose first release is live."""
 
-    def __init__(self, tracks=None, uploaded=None, commit_status=200):
+    def __init__(self, tracks=None, uploaded=None, commit_status=200, insert_status=200, put_status=200):
         self.calls = []
+        self.insert_status, self.put_status = insert_status, put_status
         self.tracks = tracks if tracks is not None else [
             {"track": "internal", "releases": [{"versionCodes": ["8"], "status": "completed"}]}]
         self.uploaded = uploaded if uploaded is not None else {
@@ -53,7 +79,7 @@ class Session:
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs.get("json")))
         if url.endswith("/edits"):
-            return Response({"id": "edit-1"})
+            return Response({"id": "edit-1"}, self.insert_status)
         if "bundles?" in url:
             return Response(self.uploaded)
         return Response({"id": "edit-1"}, self.commit_status)
@@ -64,7 +90,7 @@ class Session:
 
     def put(self, url, **kwargs):
         self.calls.append(("PUT", url, kwargs["json"]))
-        return Response({"track": "internal"})
+        return Response({"track": "internal"}, self.put_status)
 
     def delete(self, url, **kwargs):
         self.calls.append(("DELETE", url, None))
@@ -83,11 +109,15 @@ class PlayUploadTests(unittest.TestCase):
         self.env = patch.dict(os.environ, RUNNER_TEMP=self.directory.name, MAY_PLAY_JSON=CREDENTIAL,
                               MAY_PLAY_ACCOUNT=ACCOUNT, MAY_DRY_RUN="false")
         self.env.start()
+        # The fixture bundle's signer is the Playground upload key in these tests.
+        self.keys = patch("store.ANDROID_UPLOAD_KEYS", upload_keys())
+        self.keys.start()
         self.output = patch("sys.stdout", new_callable=io.StringIO)  # the upload report
         self.output.start()
 
     def tearDown(self):
         self.output.stop()
+        self.keys.stop()
         self.env.stop()
         self.directory.cleanup()
 
@@ -113,7 +143,7 @@ class PlayUploadTests(unittest.TestCase):
                 session = Session(tracks=tracks)
                 with self.assertRaises(PlayRefusal) as refused:
                     upload("playground", "a" * 40, "9", session)
-                self.assertEqual(refused.exception.args[0], "First release must be uploaded in Play Console.")
+                self.assertEqual(refused.exception.args[0], FIRST_RELEASE)
                 self.assertEqual(session.methods(), ["POST", "GET", "DELETE"])
 
     def test_version_code_must_exceed_every_track(self):
@@ -169,27 +199,186 @@ class PlayUploadTests(unittest.TestCase):
                     upload("playground", "a" * 40, "9", session)
                 self.assertEqual(session.methods()[-1], "DELETE")
 
-    def test_only_the_internal_track_of_may_playground_is_reachable(self):
+    def test_only_the_internal_track_of_may_and_may_playground_is_reachable(self):
         # The one write is the internal track (test above); nothing else can be chosen.
         self.assertEqual(play_upload.TRACK, "internal")
-        self.assertEqual(play_upload.PLAY_UPLOAD_TRACKS, {"playground": "internal"})
-        # The real May app is refused in stage 2, before any request.
+        self.assertEqual(play_upload.PLAY_UPLOAD_TRACKS, {"playground": "internal", "production": "internal"})
+        # Neither a non-internal track in the table nor a changed TRACK gets past it, for either app.
+        for target in ("playground", "production"):
+            for track in ("production", "beta", "alpha", "qa"):
+                for patched in (patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": track, "production": track}),
+                                patch("play_upload.TRACK", track)):
+                    session = Session()
+                    with self.subTest(target=target, track=track), patched, self.assertRaises(PlayRefusal) as refused:
+                        upload(target, "a" * 40, "9", session)
+                    self.assertEqual(refused.exception.args[0],
+                                     "Only May and May Playground uploads to the Play internal track are allowed.")
+                    self.assertEqual(session.calls, [])
+        with patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": "internal"}), self.assertRaises(PlayRefusal):
+            upload("production", "a" * 40, "9", Session())
+
+    def production(self, production_cert=FIXTURE_CERT, playground_cert=OTHER_CERT, account=PRODUCTION_ACCOUNT):
+        """Environment and key table for a May production upload whose signer is `production_cert`'s key."""
+        return patch.dict(os.environ, MAY_PLAY_ACCOUNT=account, MAY_PLAY_JSON=credential(account)), \
+            patch("store.ANDROID_UPLOAD_KEYS", upload_keys(playground=playground_cert, production=production_cert))
+
+    def test_may_production_uploads_to_its_own_internal_track(self):
+        env, keys = self.production()
+        session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["2"], "status": "completed"}]}],
+                          uploaded={"versionCode": 3, "sha256": hashlib.sha256(BUNDLE).hexdigest()})
+        with env, keys, patch("sys.stdout", new_callable=io.StringIO) as output:
+            upload("production", "a" * 40, "3", session)
+        self.assertEqual(session.methods(), ["POST", "GET", "POST", "PUT", "POST"])
+        # Every request names exactly the May package, never May Playground's.
+        self.assertTrue(all("/" + PRODUCTION + "/edits" in call[1] for call in session.calls))
+        self.assertFalse(any(PLAYGROUND in call[1] for call in session.calls))
+        put = [call for call in session.calls if call[0] == "PUT"]
+        self.assertEqual(len(put), 1)
+        self.assertTrue(put[0][1].endswith("/edits/edit-1/tracks/internal"))
+        self.assertEqual(put[0][2], {"track": "internal", "releases": [{"versionCodes": ["3"], "status": "completed"}]})
+        record = json.loads((Path(self.directory.name) / "may-release/upload-record.json").read_text())
+        self.assertEqual((record["app_id"], record["track"], record["build_number"]), (PRODUCTION, "internal", "3"))
+        self.assertIn("  package: " + PRODUCTION + "\n", output.getvalue())
+
+    def test_a_playground_key_or_account_never_uploads_as_may_production(self):
+        # The fixture key is Playground's upload key; May production's is another.
+        env, keys = self.production(production_cert=OTHER_CERT, playground_cert=FIXTURE_CERT)
         session = Session()
-        with self.assertRaises(PlayRefusal) as refused:
+        with env, keys, self.assertRaises(StoreError) as refused:
             upload("production", "a" * 40, "9", session)
-        self.assertEqual(refused.exception.args[0], "Only May Playground uploads to the Play internal track are allowed.")
+        self.assertEqual(refused.exception.args[0], "Signed Android App Bundle is not signed with this target's upload key")
         self.assertEqual(session.calls, [])
-        # Neither a non-internal track in the table nor a changed TRACK gets past it.
-        for track in ("production", "beta", "alpha", "qa"):
-            for patched in (patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": track}),
-                            patch("play_upload.TRACK", track)):
-                session = Session()
-                with self.subTest(track=track), patched, self.assertRaises(PlayRefusal):
-                    upload("playground", "a" * 40, "9", session)
-                self.assertEqual(session.calls, [])
-        with patch("play_upload.TRACK", "production"), \
-                patch("play_upload.PLAY_UPLOAD_TRACKS", {"playground": "production"}), self.assertRaises(PlayRefusal):
-            upload("playground", "a" * 40, "9", Session())
+        # Nor with the committed production pin: the fixture key is not May's.
+        env, _ = self.production()
+        session = Session()
+        with env, patch("store.ANDROID_UPLOAD_KEYS", COMMITTED_KEYS), self.assertRaises(StoreError):
+            upload("production", "a" * 40, "9", session)
+        self.assertEqual(session.calls, [])
+        # Playground's Play account is refused for May production, before any request.
+        env, keys = self.production(account=PLAYGROUND_ACCOUNT)
+        session = Session()
+        with env, keys, self.assertRaises(StoreError) as refused:
+            upload("production", "a" * 40, "9", session)
+        self.assertEqual(refused.exception.args[0], "MAY_PLAY_ACCOUNT is not this target's Play service account")
+        self.assertEqual(session.calls, [])
+
+    def test_a_may_production_key_or_account_never_uploads_as_playground(self):
+        # The fixture key is now May production's upload key; Playground's is another.
+        session = Session()
+        with patch("store.ANDROID_UPLOAD_KEYS", upload_keys(playground=OTHER_CERT, production=FIXTURE_CERT)), \
+                self.assertRaises(StoreError) as refused:
+            upload("playground", "a" * 40, "9", session)
+        self.assertEqual(refused.exception.args[0], "Signed Android App Bundle is not signed with this target's upload key")
+        self.assertEqual(session.calls, [])
+        session = Session()
+        with patch.dict(os.environ, MAY_PLAY_ACCOUNT=PRODUCTION_ACCOUNT, MAY_PLAY_JSON=credential(PRODUCTION_ACCOUNT)), \
+                self.assertRaises(StoreError) as refused:
+            upload("playground", "a" * 40, "9", session)
+        self.assertEqual(refused.exception.args[0], "MAY_PLAY_ACCOUNT is not this target's Play service account")
+        self.assertEqual(session.calls, [])
+
+    def test_an_unsigned_or_doubly_signed_bundle_is_refused_before_any_request(self):
+        bundle = Path(self.directory.name) / "may-release/signed.aab"
+        for content in (b"not a zip", b""):
+            bundle.write_bytes(content)
+            session = Session()
+            with self.subTest(content=content), self.assertRaises(StoreError):
+                upload("playground", "a" * 40, "9", session)
+            self.assertEqual(session.calls, [])
+
+    def test_may_production_build_number_floor_is_3(self):
+        env, keys = self.production()
+        for number in ("1", "2"):
+            session = Session()
+            with self.subTest(number=number), env, keys, self.assertRaises(PlayRefusal) as refused:
+                upload("production", "a" * 40, number, session)
+            self.assertEqual(refused.exception.args[0], "Build number is below this app's floor (May production starts at 3).")
+            self.assertEqual(session.calls, [])
+        # Playground has no floor here beyond Play's own check.
+        session = Session(tracks=[{"track": "internal", "releases": [{"versionCodes": ["1"], "status": "completed"}]}],
+                          uploaded={"versionCode": 2, "sha256": hashlib.sha256(BUNDLE).hexdigest()})
+        upload("playground", "a" * 40, "2", session)
+        self.assertEqual(session.methods()[-1], "POST")
+
+    def test_only_one_completed_internal_release_of_the_new_build_is_written(self):
+        base = play_upload.API + "/" + PRODUCTION + "/edits/edit-1"
+        url = base + "/tracks/internal"
+        self.assertIsNone(require_internal_release(url, internal_release("9"), "9"))
+        release = {"versionCodes": ["9"], "status": "completed"}
+        cases = {
+            "Only the Play internal track may be written.": [
+                (base + "/tracks/production", {"track": "internal", "releases": [release]}),
+                (base + "/tracks/beta", {"track": "internal", "releases": [release]}),
+                (base + "/internal", {"track": "internal", "releases": [release]}),
+                (url, {"track": "production", "releases": [release]}),
+                (url, ["internal"])],
+            "The internal track write must carry exactly one release.": [
+                (url, {"track": "internal", "releases": [release, release]}),
+                (url, {"track": "internal", "releases": []}),
+                (url, {"track": "internal", "releases": [release], "countryTargeting": {}})],
+            "A Play release may not carry a rollout fraction, country targeting or any other field.": [
+                (url, {"track": "internal", "releases": [dict(release, userFraction=0.1)]}),
+                (url, {"track": "internal", "releases": [dict(release, countryTargeting={"countries": ["US"]})]}),
+                (url, {"track": "internal", "releases": [dict(release, inAppUpdatePriority=5)]}),
+                (url, {"track": "internal", "releases": [dict(release, name="x")]})],
+            "A Play release must be completed; staged, halted and draft releases are refused.": [
+                (url, {"track": "internal", "releases": [dict(release, status=status)]})
+                for status in ("inProgress", "halted", "draft", "statusUnspecified")],
+            "A Play release may carry only the new build; promoting an existing build is refused.": [
+                (url, {"track": "internal", "releases": [dict(release, versionCodes=codes)]})
+                for codes in (["8"], ["8", "9"], [9], [])],
+        }
+        for message, writes in cases.items():
+            for track_url, body in writes:
+                with self.subTest(track_url=track_url, body=body), self.assertRaises(PlayRefusal) as refused:
+                    require_internal_release(track_url, body, "9")
+                self.assertEqual(refused.exception.args[0], message)
+        with patch("play_upload.TRACK", "production"), self.assertRaises(PlayRefusal):
+            require_internal_release(url, internal_release("9"), "9")
+
+    def test_a_changed_track_write_is_refused_before_it_is_sent_and_the_edit_deleted(self):
+        for body in ({"track": "internal", "releases": [{"versionCodes": ["9"], "status": "inProgress",
+                                                          "userFraction": 0.5}]},
+                     {"track": "production", "releases": [{"versionCodes": ["9"], "status": "completed"}]}):
+            session = Session()
+            with self.subTest(body=body), patch("play_upload.internal_release", return_value=body), \
+                    self.assertRaises(PlayRefusal):
+                upload("playground", "a" * 40, "9", session)
+            self.assertEqual(session.methods(), ["POST", "GET", "POST", "DELETE"])
+            self.assertFalse((Path(self.directory.name) / "may-release/upload-record.json").exists())
+
+    def test_the_commit_is_only_error_if_in_review(self):
+        edit = play_upload.API + "/" + PRODUCTION + "/edits/edit-1"
+        self.assertIsNone(require_commit(edit + ":commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW", edit))
+        for url in (edit + ":commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW&changesNotSentForReview=true",
+                    edit + ":commit?changesNotSentForReview=true&changesInReviewBehavior=ERROR_IF_IN_REVIEW",
+                    edit + ":commit?changesNotSentForReview=true",
+                    edit + ":commit?changesInReviewBehavior=CANCEL_IN_REVIEW_AND_SUBMIT",
+                    edit + ":commit",
+                    edit + ":commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW#x",
+                    edit + "-2:commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW",
+                    edit + ":validate?changesInReviewBehavior=ERROR_IF_IN_REVIEW"):
+            with self.subTest(url=url), self.assertRaises(PlayRefusal) as refused:
+                require_commit(url, edit)
+            self.assertEqual(refused.exception.args[0],
+                             "The Play commit must be exactly ERROR_IF_IN_REVIEW; changesNotSentForReview is refused.")
+
+    def test_the_log_names_the_play_request_that_did_not_complete(self):
+        for session, step, hint in ((Session(insert_status=403), "edit insert", True),
+                                    (Session(put_status=400), "internal track update", True),
+                                    (Session(commit_status=400), "commit", False),
+                                    (Session(uploaded={"versionCode": 9, "sha256": "0" * 64}), "bundle upload", False)):
+            with self.subTest(step=step), patch("sys.stderr", new_callable=io.StringIO) as errors, \
+                    self.assertRaises(StoreError):
+                upload("playground", "a" * 40, "9", session)
+            self.assertIn("May Play upload: the request that did not complete was the " + step +
+                          ("; no edit was made.\n" if step == "edit insert" else "; the edit was deleted.\n"),
+                          errors.getvalue())
+            self.assertEqual("cannot make an app's first release" in errors.getvalue(), hint)
+        # A refusal (no release yet, versionCode) names no failed request: its own message says why.
+        with patch("sys.stderr", new_callable=io.StringIO) as errors, self.assertRaises(PlayRefusal):
+            upload("playground", "a" * 40, "9", Session(tracks=[]))
+        self.assertEqual(errors.getvalue(), "")
 
     def test_successful_upload_records_and_reports_what_it_committed(self):
         with patch("sys.stdout", new_callable=io.StringIO) as output:
@@ -274,6 +463,33 @@ class PlayUploadTests(unittest.TestCase):
             with self.assertRaises(StoreError):
                 upload("playground", "a" * 40, "9", session)
         self.assertEqual(session.calls, [])
+
+
+class CommittedUploadKeyTests(unittest.TestCase):
+    """The committed table itself, unpatched."""
+
+    def test_the_committed_upload_keys_are_distinct_per_target(self):
+        keys = store.ANDROID_UPLOAD_KEYS
+        self.assertIs(keys, COMMITTED_KEYS)
+        self.assertEqual(sorted(keys), ["playground", "production"])
+        self.assertEqual(keys["production"], {
+            "alias": "may-upload", "account": PRODUCTION_ACCOUNT,
+            "cert": "9e2fe9c8e70421fcbfbbfb4ea8f30942915ecfbd8ffef18989a309fc1e899815"})
+        self.assertEqual(keys["playground"], {"alias": "may-playground-upload", "account": PLAYGROUND_ACCOUNT,
+                                              "cert": "db087802f802f2a1"})
+        production, playground = keys["production"]["cert"], keys["playground"]["cert"]
+        self.assertFalse(production.startswith(playground) or playground.startswith(production))
+        self.assertTrue(store.android_cert_matches("production", production))
+        self.assertFalse(store.android_cert_matches("playground", production))
+        self.assertFalse(store.android_cert_matches("production", playground + "0" * 48))
+        self.assertTrue(store.android_cert_matches("playground", playground + "0" * 48))
+        self.assertEqual(store.MIN_BUILD_NUMBERS, {("android", "production"): 3})
+
+
+FIRST_RELEASE = ("First release must be uploaded in Play Console: no track of this app has a rolled-out "
+                 "release, and Play's API cannot make an app's first release. Upload the first build by hand "
+                 "(May production: a sign_only run, then one Console upload to internal testing), then dispatch "
+                 "the next build here.")
 
 
 class Reply:

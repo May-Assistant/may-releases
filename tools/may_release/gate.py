@@ -21,13 +21,20 @@ internal-only TestFlight); there is no track input to choose anything else.
 Before any production or public-beta release, Prevent self-review must be on and
 a second reviewer added (README, "Before any non-internal release").
 
-Activation stage 2: admission refuses any dispatch whose dry_run is not true unless
+Activation stage 3: admission refuses any dispatch whose dry_run is not true unless
 it asks for an upload this stage allows: a platform whose upload is not held
 (UPLOADS_HELD) and, for Android, a target store.PLAY_UPLOAD_TRACKS maps to the
-Play `internal` track (stage 2: May Playground only). Any other dry_run: false
+Play `internal` track (stage 3: May and May Playground). Any other dry_run: false
 dispatch fails at once, before any approval, build or secret, rather than
 finishing green without having uploaded anything. (A dispatch that is admitted
 and then does not upload still fails: confirm_upload.py, after the upload step.)
+
+Every store dispatch, dry runs included, must also use a build number at or above
+its app's floor (store.MIN_BUILD_NUMBERS: May production Android starts at 3).
+
+Sign-only (sign_only: true, never the default) is admitted only for May production
+Android (store.SIGN_ONLY_TARGETS), only with dry_run: true (it never uploads), and
+only once the Console-upload public key (store.SIGN_ONLY_RECIPIENT) is committed.
 """
 
 import argparse
@@ -43,7 +50,7 @@ import urllib.request
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import PLAY_UPLOAD_TRACKS
+from store import (PLAY_UPLOAD_TRACKS, SIGN_ONLY_RECIPIENT, SIGN_ONLY_TARGETS, build_number_floor_ok)
 
 CONTROL_REPO = "May-Assistant/may-releases"
 OWNER_ID = 58840187
@@ -56,7 +63,7 @@ ENVIRONMENTS = {
     ("android", "playground"): "may-android-playground-internal",
 }
 MAX_BUILD_NUMBER = 2_000_000_000
-# Stage 2: the store upload step of each platform listed here carries the inert
+# Stage 3: the store upload step of each platform listed here carries the inert
 # guard, so it can never run; static_check.py requires this set to be exactly the
 # platforms whose upload step is held. Stage 1 held both; stage 2 lifted Android.
 UPLOADS_HELD = {"ios"}
@@ -88,6 +95,9 @@ def validate_run(repo, ref, event, sha, action, build_number=None, target="produ
     if action != "compile" and not (re.fullmatch(r"[1-9][0-9]{0,9}", build_number or "")
                                     and int(build_number) <= MAX_BUILD_NUMBER):
         raise GateDenial("Store build number must be a positive integer no greater than 2000000000")
+    if action != "compile" and not build_number_floor_ok(action, target, build_number):
+        raise GateDenial("Store build number is below this app's floor (May production Android starts at 3: "
+                         "versionCode 1 was a manual upload and 2 was built for Dots)")
     return ENVIRONMENTS[key]
 
 
@@ -101,11 +111,29 @@ def validate_dry_run(action, dry_run, target="production"):
     if dry_run == "true":
         return
     if action in UPLOADS_HELD:
-        raise GateDenial("Uploads are held for this platform (stage 2 holds iOS); this run did not upload "
+        raise GateDenial("Uploads are held for this platform (stage 3 holds iOS); this run did not upload "
                          "anything. dry_run: false fails here by design; dispatch with dry_run: true")
     if action != "android" or PLAY_UPLOAD_TRACKS.get(target) != "internal":
-        raise GateDenial("Stage 2 admits only a May Playground Android upload to the Play internal track; "
-                         "this run did not upload anything. Dispatch with dry_run: true")
+        raise GateDenial("Stage 3 admits only an Android May or May Playground upload to the Play internal "
+                         "track; this run did not upload anything. Dispatch with dry_run: true")
+
+
+def validate_sign_only(action, sign_only, dry_run, target="production"):
+    """Admission passes the dispatch's sign_only (a string). The rechecks pass none."""
+    if sign_only is None:
+        return
+    if sign_only not in ("true", "false"):
+        raise GateDenial("sign_only must be true or false")
+    if sign_only == "false":
+        return
+    if (action, target) not in SIGN_ONLY_TARGETS:
+        raise GateDenial("sign_only is only for the May production Android app (target production); "
+                         "nothing was signed. Dispatch without sign_only")
+    if dry_run != "true":
+        raise GateDenial("sign_only never uploads: dispatch it with dry_run: true; nothing was signed")
+    if artifact_recipient(SIGN_ONLY_RECIPIENT) is None:
+        raise GateDenial("The Console-upload public key (artifact_keys/may-android-console-upload.age.pub) is "
+                         "still a placeholder; Samuel's public key must be committed before sign_only can run")
 
 
 def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=None):
@@ -163,11 +191,13 @@ def main():
     parser.add_argument("--build-number")
     parser.add_argument("--target", choices=("production", "playground"), default="production")
     parser.add_argument("--dry-run")
+    parser.add_argument("--sign-only")
     args = parser.parse_args()
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
     validate_dry_run(args.action, args.dry_run, args.target)
+    validate_sign_only(args.action, args.sign_only, args.dry_run, args.target)
     build_env = ENVIRONMENTS["compile"]
     if args.action != "compile" and artifact_recipient(env) is None:
         raise GateDenial("Artifact encryption public key for this target is still a placeholder; "
