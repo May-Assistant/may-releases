@@ -211,11 +211,23 @@ def aab_signer_sha256(path):
 # and android:versionCode. Field numbers used:
 #   XmlNode:      element = 1
 #   XmlElement:   name = 3, attribute = 4 (repeated)
-#   XmlAttribute: namespace_uri = 1, name = 2, value = 3, compiled_item = 6
-#   Item:         prim = 7;  Primitive: int_decimal_value = 6
+#   XmlAttribute: namespace_uri = 1, name = 2, value = 3, source = 4,
+#                 resource_id = 5, compiled_item = 6
+#   Item:         prim = 7, str = 2;  Primitive: int_decimal_value = 6
+# bundletool reads the version code as the first attribute whose resource ID is
+# android:versionCode's (0x0101021b), whatever its name, from its compiled
+# primitive, and the package from the compiled string when there is one. So the
+# identity read here must be the only reading possible: exactly one attribute
+# carries that ID, and it is android:versionCode with exactly one compiled
+# primitive; nothing carries versionCodeMajor's ID or name; `package` has no
+# compiled item or resource ID (aapt2 writes it as a plain string).
 MANIFEST_ENTRY = "base/manifest/AndroidManifest.xml"
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 MAX_MANIFEST_BYTES = 4 << 20
+# A real manifest's message has tens of fields; a pathological one is refused at once.
+MAX_PROTO_FIELDS = 10_000
+VERSION_CODE_ID = 0x0101021B
+VERSION_CODE_MAJOR_ID = 0x01010576
 
 
 def _varint(data, offset):
@@ -255,6 +267,8 @@ def _fields(data):
         else:
             raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
         found.append((number, wire, value))
+        if len(found) > MAX_PROTO_FIELDS:
+            raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
     return found
 
 
@@ -293,15 +307,22 @@ def manifest_identity(data):
             raise VerifyError("Bundle manifest is not a readable aapt2 manifest")
         attribute = _fields(raw)
         namespace, name = _text(attribute, 1), _text(attribute, 2)
-        if (namespace, name) == ("", "package"):
-            packages.append(_text(attribute, 3))
-        elif (namespace, name) == (ANDROID_NS, "versionCodeMajor"):
+        resource_id = _one(attribute, 5, 0, required=False)
+        if resource_id == VERSION_CODE_MAJOR_ID or name == "versionCodeMajor":
             raise VerifyError("Bundle manifest sets versionCodeMajor")
-        elif (namespace, name) == (ANDROID_NS, "versionCode"):
+        if (resource_id == VERSION_CODE_ID) != ((namespace, name) == (ANDROID_NS, "versionCode")):
+            raise VerifyError("Bundle manifest versionCode is not exactly android:versionCode")
+        if (namespace, name) == ("", "package"):
+            if resource_id is not None or _one(attribute, 6, 2, required=False) is not None:
+                raise VerifyError("Bundle manifest package is not a plain string")
+            packages.append(_text(attribute, 3))
+        elif resource_id == VERSION_CODE_ID:
             text = _text(attribute, 3)
-            primitive = _fields(_one(_fields(_one(attribute, 6, 2)), 7, 2))
+            item = _fields(_one(attribute, 6, 2))
+            primitive = _fields(_one(item, 7, 2))
             compiled = _one(primitive, 6, 0)
-            if len(primitive) != 1 or not re.fullmatch(r"[1-9][0-9]{0,9}", text) or int(text) != compiled:
+            if len(item) != 1 or len(primitive) != 1 or not re.fullmatch(r"[1-9][0-9]{0,9}", text) or \
+                    int(text) != compiled:
                 raise VerifyError("Bundle manifest versionCode is malformed")
             versions.append(text)
     if len(packages) != 1 or len(versions) != 1 or not re.fullmatch(r"[A-Za-z][\w]*(\.[A-Za-z][\w]*)+", packages[0]):

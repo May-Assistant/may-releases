@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 import plistlib
 import tempfile
+import time
 import unittest
 import warnings
 import zipfile
@@ -197,9 +198,9 @@ class AabManifestTests(unittest.TestCase):
                 fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
                           fx.version_code("3", compiled=4)),  # string and compiled value disagree
                 fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
-                          fx.attribute(b"versionCode", b"03", ns, 3)),
+                          fx.attribute(b"versionCode", b"03", ns, 3, 0x0101021B)),
                 fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
-                          fx.attribute(b"versionCode", b"0x3", ns, 3)),
+                          fx.attribute(b"versionCode", b"0x3", ns, 3, 0x0101021B)),
             ],
             "Bundle manifest is not a readable aapt2 manifest": [
                 b"", b"fixture manifest", fx.MANIFEST_PRODUCTION_VC3[:40], fx.MANIFEST_PRODUCTION_VC3[:-300],
@@ -208,10 +209,11 @@ class AabManifestTests(unittest.TestCase):
                 fx._field(1, fx._field(3, b"manifest") + fx._field(3, b"manifest") +
                           fx.attribute(b"package", self.PRODUCTION.encode()) + fx.version_code("3")),  # name twice
                 fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
-                          fx.attribute(b"versionCode", b"3", ns)),  # no compiled value
+                          fx.attribute(b"versionCode", b"3", ns, resource_id=0x0101021B)),  # no compiled value
                 fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", self.PRODUCTION.encode()) +
                           fx._field(4, fx._field(1, ns) + fx._field(2, b"versionCode") + fx._field(3, b"3") +
-                                    fx._field(3, b"4") + fx._field(6, fx._field(7, fx._field(6, 3))))),  # value twice
+                                    fx._field(3, b"4") + fx._field(5, 0x0101021B) +
+                                    fx._field(6, fx._field(7, fx._field(6, 3))))),  # value twice
                 b"\x0b\x0c",  # a group
                 b"\x0a\xff\xff\xff\xff\x0f",  # a length past the end
                 fx._field(1, b"\xff" * 11),  # an over-long varint
@@ -221,6 +223,104 @@ class AabManifestTests(unittest.TestCase):
             for manifest in manifests:
                 with self.subTest(message=message[:40], manifest=manifest[:30]):
                     self.refused(manifest, message)
+
+    def crafted(self, *attributes, name_field=None):
+        """A <manifest> element from raw attribute bodies (each an XmlAttribute message)."""
+        name = name_field if name_field is not None else fx._field(3, b"manifest")
+        return fx._field(1, name + b"".join(fx._field(4, body) for body in attributes))
+
+    PACKAGE = fx._field(2, b"package") + fx._field(3, b"io.github.mayassistant.may")
+
+    @staticmethod
+    def version(text=b"3", namespace=fx.ANDROID_NS, name=b"versionCode", resource_id=0x0101021B, item=None):
+        body = (fx._field(1, namespace) if namespace else b"") + fx._field(2, name) + fx._field(3, text)
+        if resource_id is not None:
+            body += fx._field(5, resource_id)
+        return body + fx._field(6, item if item is not None else fx._field(7, fx._field(6, int(text))))
+
+    def test_identity_is_read_the_way_bundletool_reads_it(self):
+        """No manifest may show one identity here and another to bundletool (re-review N1, N2)."""
+        version = self.version
+        # The well-formed crafted manifest is read; each crafted variant below is refused.
+        self.assertEqual(verify.manifest_identity(self.crafted(self.PACKAGE, version())),
+                         ("io.github.mayassistant.may", "3"))
+        cases = {
+            # L1: bundletool prefers the compiled string, so the package may not carry one (nor an ID).
+            "Bundle manifest package is not a plain string": [
+                self.PACKAGE + fx._field(6, fx._field(2, fx._field(1, b"com.evil.app"))),
+                self.PACKAGE + fx._field(5, 0x01010001),
+            ],
+            # L2: another attribute carrying versionCode's ID, before the real one, under another name.
+            # L3: android:versionCode carrying versionName's ID, the real ID under another name.
+            "Bundle manifest versionCode is not exactly android:versionCode": [
+                version(b"2100000000", b"http://x", b"vc"),
+                version(resource_id=0x0101021C),
+                version(resource_id=None),
+                version(namespace=b"", name=b"versionCode"),
+            ],
+            # L4: versionCodeMajor's ID under another name, or its name under any namespace.
+            "Bundle manifest sets versionCodeMajor": [
+                version(b"1", b"http://x", b"major", 0x01010576),
+                version(b"1", b"", b"versionCodeMajor", None),
+            ],
+            # L8: the compiled item must be exactly one primitive: no reference beside it.
+            "Bundle manifest versionCode is malformed": [
+                version(item=fx._field(7, fx._field(6, 3)) + fx._field(1, fx._field(1, 5))),
+                version(item=fx._field(7, fx._field(6, 3) + fx._field(7, 3))),
+            ],
+        }
+        for message, extras in cases.items():
+            for extra in extras:
+                with self.subTest(message=message[:40], extra=extra[:30]):
+                    if message == "Bundle manifest package is not a plain string":
+                        manifest = self.crafted(extra, version())
+                    elif extra.startswith(fx._field(1, fx.ANDROID_NS) + fx._field(2, b"versionCode")):
+                        manifest = self.crafted(self.PACKAGE, extra)  # the only versionCode, malformed
+                    else:
+                        manifest = self.crafted(self.PACKAGE, extra, version())  # before the real one
+                    self.refused(manifest, message)
+        # The reviewer's L2, L3 and L4 exactly as reported, each of which the earlier decoder read as ('…may', '3').
+        exact = {
+            "L2": self.crafted(self.PACKAGE, version(b"2100000000", b"http://x", b"vc"), version()),
+            "L3": self.crafted(self.PACKAGE, version(resource_id=0x0101021C), version(b"7", b"http://x", b"vc")),
+            "L4": self.crafted(self.PACKAGE, version(), version(b"1", b"http://x", b"major", 0x01010576)),
+        }
+        for case, manifest in exact.items():
+            with self.subTest(case=case):
+                try:
+                    verify.manifest_identity(manifest)
+                    raised = None
+                except Exception as error:
+                    raised = error
+                self.assertIsInstance(raised, verify.VerifyError)
+
+    def test_wrong_wire_types_are_refused(self):
+        # N3: a varint where a string or message belongs, and a string where a varint belongs.
+        version = self.version
+        for manifest in (self.crafted(self.PACKAGE, version(), name_field=fx._field(3, 7)),
+                         self.crafted(self.PACKAGE, fx._field(1, fx.ANDROID_NS) + fx._field(2, b"versionCode") +
+                                      fx._field(3, 3) + fx._field(5, 0x0101021B) +
+                                      fx._field(6, fx._field(7, fx._field(6, 3)))),
+                         self.crafted(self.PACKAGE, fx._field(1, fx.ANDROID_NS) + fx._field(2, b"versionCode") +
+                                      fx._field(3, b"3") + fx._field(5, b"\x01\x01\x02\x1b") +
+                                      fx._field(6, fx._field(7, fx._field(6, 3)))),
+                         fx._field(1, fx._field(3, b"manifest") + fx._varint(4 << 3) + fx._varint(5)),
+                         fx._varint(1 << 3) + fx._varint(7)):
+            with self.subTest(manifest=manifest[:30]):
+                self.refused(manifest)
+
+    def test_a_pathological_field_count_is_refused_at_once(self):
+        # N4: 10,001 harmless attributes; refused by the field cap, not after minutes of parsing.
+        filler = fx._field(4, fx._field(2, b"x") + fx._field(3, b"y"))
+        manifest = fx._field(1, fx._field(3, b"manifest") + fx.attribute(b"package", b"io.github.mayassistant.may") +
+                             fx.version_code("3") + filler * 10_001)
+        started = time.monotonic()
+        self.refused(manifest)
+        self.assertLess(time.monotonic() - started, 5)
+        # Below the cap the same attributes are fine.
+        self.assertEqual(verify.manifest_identity(fx._field(1, fx._field(3, b"manifest") + fx.attribute(
+            b"package", b"io.github.mayassistant.may") + fx.version_code("3") + filler * 100)),
+            ("io.github.mayassistant.may", "3"))
 
     def test_a_bundle_without_exactly_one_readable_manifest_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
