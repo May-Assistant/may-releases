@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -251,7 +252,9 @@ class PlayUploadTests(unittest.TestCase):
                                     "".join(traceback.format_exception(raised.exception)))
 
     def test_network_failure_says_no_http_status(self):
-        for failure in (urllib.error.URLError("unreachable " + SECRET), TimeoutError(SECRET), OSError(SECRET)):
+        for failure in (urllib.error.URLError("unreachable " + SECRET), TimeoutError(SECRET), OSError(SECRET),
+                        http.client.BadStatusLine(SECRET), http.client.RemoteDisconnected(SECRET),
+                        http.client.IncompleteRead(SECRET.encode())):
             with self.subTest(failure=type(failure).__name__):
                 message, printed, exit_text = self.run_cli(failure)
                 self.assertEqual(message, "May Play upload stopped: Google Play request was rejected or uncertain "

@@ -284,6 +284,45 @@ class StaticCheckTests(unittest.TestCase):
                 for found in (static_check.message_problems(self.root), static_check.problems(self.root)):
                     self.assertTrue(any(Path(path).name in problem for problem in found), found)
 
+    def test_status_error_is_pinned_whole(self):
+        """PlayStatusError is the one non-literal message: any edit to it, or way round it, is flagged."""
+        init = "    def __init__(self, status):\n"
+        guard = "        if type(status) is int and 100 <= status <= 999:\n"
+        http = '"Google Play request was rejected or uncertain (HTTP " + str(status) + ")")\n'
+        nohttp = '"Google Play request was rejected or uncertain (no HTTP status)")\n'
+        call = "raise PlayStatusError(response.status_code)"
+        opener = "OPENER = urllib.request.build_opener(NoRedirect)\n"
+        leak = 'os.environ.get("MAY_PLAY_JSON", "")'
+        cases = {
+            # The independent review's mutation: the key appended on a 429.
+            "str(extra) on a 429": [(init, init + '        extra = ' + leak + ' if status == 429 else ""\n'),
+                                    (http, http[:-2] + " + str(extra))\n")],
+            "status reassigned": [(init, init + "        status = len(" + leak + ")\n")],
+            "int guard removed": [(guard, "        if True:\n")],
+            "args set in the class": [(nohttp, nohttp + "        self.args = (status,)\n")],
+            "args set at the call site": [(call, "error = PlayStatusError(response.status_code)\n"
+                                                 "        error.args = (response.body,)\n        raise error")],
+            "class attribute replaced": [(opener, opener + "PlayStatusError.__init__ = StoreError.__init__\n")],
+            "str rebound": [(opener, opener + "str = repr\n")],
+            "str redefined": [(opener, opener + "\n\ndef str(value):\n    return " + leak + "\n")],
+            "str imported over": [("import json\n", "import json\nfrom os import environ as str\n")],
+            "type rebound": [(opener, opener + "type = lambda value: int\n")],
+            "builtins patched": [(opener, opener + "import builtins\nbuiltins.str = repr\n")],
+            "globals patched": [(opener, opener + 'globals()["str"] = repr\n')],
+            "StoreError rebound": [(opener, opener + "StoreError = ValueError\n")],
+            "second class": [(opener, opener + "\n\nclass PlayStatusError(StoreError):\n    def __init__(self, status):\n"
+                                               "        super().__init__(\"x\" + str(status))\n")],
+            "class not at top level": [("class PlayStatusError(StoreError):", "if True:\n  class PlayStatusError(StoreError):")],
+            "constructed status": [(call, 'raise PlayStatusError(Response(len(response.body), b"").status_code)')],
+        }
+        for name, mutations in cases.items():
+            with self.subTest(name):
+                self.fresh()
+                for old, new in mutations:
+                    self.mutate("tools/may_release/play_upload.py", old, new)
+                for found in (static_check.message_problems(self.root), static_check.problems(self.root)):
+                    self.assertTrue(any("play_upload.py" in problem for problem in found), found)
+
     def test_compile_workflow_stays_inert(self):
         self.mutate(".github/workflows/native-compile-draft.yml",
                     "if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}",

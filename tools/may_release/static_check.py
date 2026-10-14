@@ -20,13 +20,35 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError"}
-# The one printed error whose message is not a single literal: Play's numeric
-# HTTP status, so that a 403 can be told from a 401 or a 404 in the public log.
-# It is allowed only in play_upload.py, called with exactly one argument,
-# `<response>.status_code`, and its own message is built only from string
-# literals joined by + and str() of a name (the class checks that the name is an
-# int status). No body, header or URL can reach it.
-STATUS_ERRORS = {"PlayStatusError"}
+# The one printed error whose message is not a single literal: it adds Play's
+# numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
+# log. What is enforced (message_problems):
+# - exactly one class of this name exists, at the top level of play_upload.py,
+#   and it parses to exactly STATUS_ERROR_SOURCE's syntax tree (comments and
+#   formatting aside). Any edit to the class fails this check until this copy is
+#   updated in the same reviewed change;
+# - it is called only in play_upload.py, with exactly one argument of the form
+#   `<name>.status_code`;
+# - play_upload.py never rebinds the names the class relies on (PROTECTED_NAMES,
+#   in any binding form) and never refers to FORBIDDEN_NAMES (builtins,
+#   globals(), vars(), setattr, exec, eval, __import__);
+# - no module assigns an exception's `.args`, or any attribute of this class.
+STATUS_ERROR = "PlayStatusError"
+STATUS_ERROR_SOURCE = '''
+class PlayStatusError(StoreError):
+    """A non-2xx Play reply; the message names its numeric HTTP status and nothing else."""
+
+    def __init__(self, status):
+        if type(status) is int and 100 <= status <= 999:
+            super().__init__("Google Play request was rejected or uncertain (HTTP " + str(status) + ")")
+        else:
+            super().__init__("Google Play request was rejected or uncertain (no HTTP status)")
+'''
+# Names play_upload.py may never rebind: the builtins the pinned class calls, the
+# class itself, and its base (bound only by `from store import ... StoreError`).
+PROTECTED_NAMES = {"str", "type", "int", "super", STATUS_ERROR, "StoreError"}
+# Ways round a name check: play_upload.py may not refer to any of these at all.
+FORBIDDEN_NAMES = {"builtins", "__builtins__", "globals", "vars", "setattr", "exec", "eval", "__import__"}
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 UPLOAD_ARTIFACT = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 DOWNLOAD_ARTIFACT = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
@@ -541,14 +563,63 @@ def one_literal(call):
         isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
 
 
-def status_message(node):
-    """String literals joined by +, with str(<name>): the only form a STATUS_ERRORS message takes."""
-    if isinstance(node, ast.Constant):
-        return isinstance(node.value, str)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return status_message(node.left) and status_message(node.right)
-    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str" and \
-        not node.keywords and len(node.args) == 1 and isinstance(node.args[0], ast.Name)
+def bound_names(node):
+    """The names a node binds, in every binding form Python has."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [node.id]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, ast.alias):
+        return [node.asname or node.name.split(".")[0]]
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return [node.name] if node.name else []
+    if isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return list(node.names)
+    return []
+
+
+def status_error_problems(trees):
+    """The pinned PlayStatusError: one class, exactly STATUS_ERROR_SOURCE, nothing rebound under it."""
+    found = []
+    pinned = ast.dump(ast.parse(STATUS_ERROR_SOURCE).body[0])
+    classes = [(path, node) for path, tree in trees.items() for node in ast.walk(tree)
+               if isinstance(node, ast.ClassDef) and node.name == STATUS_ERROR]
+    if len(classes) != 1 or classes[0][0].name != "play_upload.py" or \
+            classes[0][1] not in trees[classes[0][0]].body:
+        found.append(f"play_upload.py: {STATUS_ERROR} must be defined exactly once, at its top level")
+    for path, node in classes:
+        if ast.dump(node) != pinned:
+            found.append(f"{path.name}:{node.lineno}: {STATUS_ERROR} differs from STATUS_ERROR_SOURCE "
+                         "(printed error message is not pinned)")
+    for path, tree in trees.items():
+        if path.name != "play_upload.py":
+            continue
+        for node in ast.walk(tree):
+            for name in bound_names(node):
+                if name in PROTECTED_NAMES and not (
+                        (name == STATUS_ERROR and (path, node) in classes) or
+                        (name == "StoreError" and isinstance(node, ast.alias) and node.asname is None)):
+                    found.append(f"{path.name}:{getattr(node, 'lineno', 0)}: rebinds {name}, "
+                                 f"which the pinned {STATUS_ERROR} relies on")
+            if isinstance(node, ast.ImportFrom) and any(alias.name == "StoreError" for alias in node.names) \
+                    and (node.module != "store" or node.level):
+                found.append(f"{path.name}:{node.lineno}: StoreError must come from store")
+            used = [node.id] if isinstance(node, ast.Name) else \
+                [alias.name.split(".")[0] for alias in node.names] if isinstance(node, (ast.Import, ast.ImportFrom)) \
+                else [node.attr] if isinstance(node, ast.Attribute) else []
+            for name in used:
+                if name in FORBIDDEN_NAMES:
+                    found.append(f"{path.name}:{node.lineno}: uses {name}, a way round the {STATUS_ERROR} pin")
+    for path, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)) and (
+                    node.attr == "args" or (isinstance(node.value, ast.Name) and node.value.id == STATUS_ERROR)):
+                found.append(f"{path.name}:{node.lineno}: printed error message is assigned directly (.args or a class attribute)")
+    return found
 
 
 def message_problems(root):
@@ -557,25 +628,23 @@ def message_problems(root):
              for path in sorted((root / "tools/may_release").glob("*.py")) if not path.name.startswith("test_")}
     printed = printed_error_classes(trees)
     for path, tree in trees.items():
-        status_allowed = path.name == "play_upload.py"
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and called_name(node.func) in printed and not one_literal(node):
-                if not (status_allowed and called_name(node.func) in STATUS_ERRORS and not node.keywords and
-                        len(node.args) == 1 and isinstance(node.args[0], ast.Attribute) and
-                        node.args[0].attr == "status_code"):
+                if not (path.name == "play_upload.py" and isinstance(node.func, ast.Name) and
+                        node.func.id == STATUS_ERROR and not node.keywords and len(node.args) == 1 and
+                        isinstance(node.args[0], ast.Attribute) and node.args[0].attr == "status_code" and
+                        isinstance(node.args[0].value, ast.Name)):
                     found.append(f"{path.name}:{node.lineno}: printed error message is not one string literal")
-            if isinstance(node, ast.ClassDef) and node.name in printed:
-                # A printed error's own constructor sets its message too.
+            if isinstance(node, ast.ClassDef) and node.name in printed and node.name != STATUS_ERROR:
+                # A printed error's own constructor sets its message too. (The status
+                # error's constructor is pinned whole by status_error_problems.)
                 for call in ast.walk(node):
-                    if isinstance(call, ast.Call) and called_name(call.func) == "__init__" and \
-                            not one_literal(call) and not (
-                                status_allowed and node.name in STATUS_ERRORS and not call.keywords and
-                                len(call.args) == 1 and status_message(call.args[0])):
+                    if isinstance(call, ast.Call) and called_name(call.func) == "__init__" and not one_literal(call):
                         found.append(f"{path.name}:{call.lineno}: printed error message is not one string literal")
             if isinstance(node, ast.Raise) and node.exc is not None and not isinstance(node.exc, ast.Call) \
                     and called_name(node.exc) in printed:
                 found.append(f"{path.name}:{node.lineno}: printed error raised without a message")
-    return found
+    return found + status_error_problems(trees)
 
 
 def problems(root=ROOT):

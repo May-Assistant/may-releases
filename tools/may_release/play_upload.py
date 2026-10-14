@@ -50,6 +50,7 @@ host. A 401 fails the run and deletes the edit.
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -82,16 +83,17 @@ class PlayRefusal(StoreError):
     """A deliberate refusal before any change. Its message is a fixed literal."""
 
 
+# Play answered with a non-2xx HTTP status: rejected, or an uncertain outcome.
+# The message is a fixed literal plus the numeric status alone, and only when the
+# status is an int in 100..999 (http.client's own range for a status line);
+# anything else reads "no HTTP status". Only `<response>.status_code` is passed
+# in, and send() discards the error body unread, so no body, header or URL can
+# reach the message. This is the one printed error whose message is not a single
+# literal, so static_check.py pins this whole class (STATUS_ERROR_SOURCE): any
+# edit to it fails the check until that pinned copy is updated in the same
+# reviewed change.
 class PlayStatusError(StoreError):
-    """Play answered with a non-2xx HTTP status: rejected, or an uncertain outcome.
-
-    The message is a fixed literal plus the numeric status alone, and only when
-    the status is an int in 100..999 (http.client's own range for a status
-    line). Anything else reads "no HTTP status". Only Response.status_code is
-    ever passed in, and send() discards the error body unread, so no body,
-    header or URL can reach the message. static_check.py allows this one class
-    a non-literal argument, and only `<response>.status_code`.
-    """
+    """A non-2xx Play reply; the message names its numeric HTTP status and nothing else."""
 
     def __init__(self, status):
         if type(status) is int and 100 <= status <= 999:
@@ -123,7 +125,8 @@ def send(opener, request, timeout):
     except urllib.error.HTTPError as error:
         error.close()
         return Response(error.code, b"")  # Provider error bodies are discarded unread.
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
+        # No usable status (network, timeout, or a malformed or cut-off HTTP reply); nothing is read.
         raise StoreError("Google Play request was rejected or uncertain (no HTTP status)") from None
 
 
