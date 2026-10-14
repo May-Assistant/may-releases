@@ -16,11 +16,11 @@ Google Play accepts only `status: draft` releases through the API until an app's
 | --- | --- |
 | `admission` | active (runs on every dispatch) |
 | `android-build`, `android-release` | active when `platform` is `android` |
-| Android upload step (`play_upload.py`) | **inert**, even with `dry_run: false` |
+| Android upload step (`play_upload.py`) | **inert**; a dispatch with `dry_run: false` is refused at admission |
 | `ios-build`, `ios-release` (and the iOS upload step) | **inert**: `tools/release/ios.sh` does not exist yet |
 | Android dry-run report (`dry_run.py`) | unchanged: runs whenever `dry_run` is not `false` |
 
-`static_check.py` pins exactly this layout (`STAGE`, `STORE_JOB_IF`, `UPLOAD_IF`). A guard that disappears from an iOS job or an upload step fails the check. So does a guard that reappears on `admission` or an Android job: that is flagged as a stage mismatch rather than accepted, so going back to inert is a deliberate, reviewed change to those constants too. [Stage 2](#stage-2-android-uploads) is a separate reviewed change.
+`static_check.py` pins exactly this layout (`STAGE`, `STORE_JOB_IF`, `UPLOAD_IF`), and requires `gate.py`'s `UPLOADS_HELD` to name exactly the platforms whose upload step is held. A guard that disappears from an iOS job or an upload step fails the check. So does a guard that reappears on `admission` or an Android job: that is flagged as a stage mismatch rather than accepted, so going back to inert is a deliberate, reviewed change to those constants too. [Stage 2](#stage-2-android-uploads) is a separate reviewed change.
 
 The [native compile workflow](.github/workflows/native-compile-draft.yml) stays **inert** (`may-compile-disabled-pending-review`), unchanged. The pull-request check runs only dependency-free control tests and static checks with a read-only token.
 
@@ -105,7 +105,8 @@ Within a job, each step receives only its own secrets, and each script refuses t
 - that only the `.age` file is uploaded;
 - the activation stage: exactly which jobs and steps carry the inert guard, that the active Android jobs keep their platform condition, and that the guard appears nowhere else (see [Current state](#current-state));
 - the `dry_run` input (a required boolean defaulting to `true`), that only the store upload and the dry-run report steps are conditional (an `if:` on a step's dash line counts, and a step or job may have only one `if:`), and their exact conditions;
-- that `admission` runs exactly `gate.py`, with no conditional step and no `continue-on-error`, and that only the handoff download may continue on error;
+- that `admission` runs exactly `gate.py`, passing the dispatch's `dry_run` (`--dry-run`), with no conditional step and no `continue-on-error`, and that only the handoff download may continue on error;
+- that `gate.py`'s `UPLOADS_HELD` is exactly the set of platforms whose upload step carries the inert guard;
 - that an unconditional `integrity.py` step comes right before each secret step;
 - that each build job prepares the design system for its own platform and target;
 - that no `setup-java` or `pip install` appears in any workflow.
@@ -138,7 +139,7 @@ Samuel's decision (2026-10-14): relax the design-system pin match for internal b
 - `dry_run.py` reports what would have been uploaded: package or bundle ID, versionCode or build number, track, and the signed artifact's SHA-256. For iOS, it re-verifies the IPA first.
 - Upload steps run only when `github.event.inputs.dry_run == 'false'`. That context holds the boolean as a string, so a missing value never uploads. The comparison ignores case, so any casing of `false` passes it.
 - Each upload script also refuses unless `MAY_DRY_RUN` is exactly `false`.
-- **In stage 1 both upload steps are also held inert**, so no upload runs at all. A stage-1 dispatch with `dry_run: false` builds, seals, opens, signs and verifies, then skips both the upload and the report, and still finishes green. Do not use it; it proves less than a dry run.
+- **In stage 1 both upload steps are also held inert**, so no upload runs at all. A dispatch with `dry_run: false` therefore **fails by design**: admission (`gate.py --dry-run`) refuses it while that platform is in `UPLOADS_HELD`, with `Stage 1: uploads are held; this run did not upload anything.` The run goes red within about a minute, before any approval, build or secret, rather than finishing green without uploading.
 
 ## Artifact key-pair setup
 
@@ -240,6 +241,8 @@ Stage 1 (this change) makes the Android dry run reachable. The dispatch below wo
 | `build_number` | `3` (Playground versionCode 1 was uploaded; versionCode 2 was built for a manual upload) |
 | `dry_run` | `true` |
 
+**`dry_run: false` fails in stage 1 by design.** Admission refuses it before anything else runs: `Stage 1: uploads are held; this run did not upload anything.`
+
 From a terminal:
 
 ```
@@ -270,7 +273,7 @@ It does **not** prove the upload. The Play client has never run against Play. `M
 
 ### Stage 2: Android uploads
 
-After the dry run passes and Samuel gives the go, a reviewed change removes the inert guard from the Android upload step's `if:`, leaving `${{ github.event.inputs.dry_run == 'false' }}`. That is a one-line workflow change; the same change moves `static_check.py` to stage 2 (`STAGE`, and the Android upload's expected condition, which is `DRY_RUN_UPLOAD_IF`) and its tests. The iOS jobs and the iOS upload stay inert until `ios.sh` exists and a macOS rehearsal has passed.
+After the dry run passes and Samuel gives the go, a reviewed change removes the inert guard from the Android upload step's `if:`, leaving `${{ github.event.inputs.dry_run == 'false' }}`. That is a one-line workflow change. The same reviewed change removes `"android"` from `UPLOADS_HELD` in `gate.py` (so admission accepts `dry_run: false` for Android), and moves `static_check.py` to stage 2 (`STAGE`, and the Android upload's expected condition, which is `DRY_RUN_UPLOAD_IF`) with its tests. `static_check.py` refuses the workflow line without the `gate.py` line, and the reverse. The iOS jobs and the iOS upload stay inert until `ios.sh` exists and a macOS rehearsal has passed.
 
 ### Prerequisites that remain
 
@@ -280,6 +283,7 @@ After the dry run passes and Samuel gives the go, a reviewed change removes the 
 - **administrator bypass is off** (`can_admins_bypass: false`);
 - a **custom** deployment branch policy (not "protected branches") with exactly one rule, `main`;
 - exactly **one required-reviewer rule**, whose **sole** reviewer is Samuel (user ID `58840187`);
+- in stage 1, the dispatch's `dry_run` is `true` (admission only; see above);
 - **Prevent self-review is off** (`prevent_self_review: false`). Samuel dispatches and approves his own run; with it on, the gate denies, because the run could never be approved. This is Samuel's decision for internal builds only (see [Self-review](#environments-and-protection)).
 
 Also needed for the dry run, which the gate cannot see:

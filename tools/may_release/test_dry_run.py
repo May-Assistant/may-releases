@@ -70,8 +70,8 @@ class DryRunWorkflowTests(unittest.TestCase):
                     self.assertIn("Decrypt and check the build handoff", ran)
                     self.assertIn(static_check.REPORT, ran)
             with self.subTest(job=job, value="false"):
-                # Stage 1: even dry_run: false never uploads. It signs and verifies,
-                # then skips both the held upload and the report.
+                # Stage 1: admission refuses dry_run: false before these jobs start
+                # (gate.UPLOADS_HELD, test_gate). Even past it, the held upload never runs.
                 ran = steps_that_run(job, "false")
                 self.assertNotIn(upload, ran)
                 self.assertIn(sign, ran)

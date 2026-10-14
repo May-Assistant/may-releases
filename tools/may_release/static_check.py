@@ -88,7 +88,7 @@ RELEASE_COMMAND = re.compile(
     r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|play_upload|ios_upload|dry_run|cleanup|integrity)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
 ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" '
-                  '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
+                  '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN"')
 CONTINUE_ON_ERROR = re.compile(r"(?m)^\s*(-\s+)?continue-on-error:")
 VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
@@ -267,6 +267,10 @@ def store_problems(store):
             any(step_condition(text) is not None for _, text in admission_steps) or \
             CONTINUE_ON_ERROR.search(job_text(store, "admission")):
         found.append("store admission: does not run exactly the gate, unconditionally")
+    # The gate refuses dry_run: false while uploads are held (stage 1), so such a
+    # dispatch fails at admission instead of finishing green without uploading.
+    if "          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n" not in job_text(store, "admission"):
+        found.append("store admission: does not pass the dispatch's dry_run to the gate")
     if not re.search(r"(?m)^" + DRY_RUN_INPUT, store.partition("\njobs:\n")[0]):
         found.append("store-release-draft.yml: dry_run is not a required boolean input defaulting to true")
     for job, (order, expected, actions) in STORE_JOBS.items():
@@ -348,6 +352,26 @@ def store_problems(store):
     return found
 
 
+def held_uploads_problems(root, store):
+    """gate.py's UPLOADS_HELD must name exactly the platforms whose upload step is held."""
+    held = set()
+    for job, name in UPLOADS.items():
+        for step_name, text in job_steps(store, job)[1]:
+            if step_name == name and INERT in (step_condition(text) or ""):
+                held.add(job.split("-")[0])
+    declared = None
+    for node in ast.parse((root / "tools/may_release/gate.py").read_text()).body:
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["UPLOADS_HELD"]:
+            try:
+                declared = ast.literal_eval(node.value)
+            except ValueError:
+                declared = None
+    if not isinstance(declared, set) or declared != held:
+        return [f"gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held, so {STAGE} "
+                "would not refuse dry_run: false at admission"]
+    return []
+
+
 def control_problems(root):
     found = []
     flows = root / ".github/workflows"
@@ -367,7 +391,7 @@ def control_problems(root):
         found.append("native-compile-draft.yml does not recheck after review")
     if "--source-sha '${{ inputs.source_sha }}'" in compile_workflow or "--platform '${{ inputs.platform }}'" in compile_workflow:
         found.append("native-compile-draft.yml interpolates inputs into shell")
-    return found + store_problems(store)
+    return found + store_problems(store) + held_uploads_problems(root, store)
 
 
 def printed_error_classes(trees):

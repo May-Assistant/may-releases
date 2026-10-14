@@ -288,9 +288,12 @@ class StaticCheckTests(unittest.TestCase):
                 self.fresh()
                 self.mutate_nth(UPLOAD_LINE, "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n", nth)
                 found = static_check.problems(self.root)
+                # gate.py's UPLOADS_HELD must follow, or admission would still refuse dry_run: false.
                 self.assertEqual(sorted(found), sorted([
                     "store " + job + ": the upload is not held inert (stage 1)",
-                    "store-release-draft.yml: the inert guard appears or is missing somewhere stage 1 does not expect"]))
+                    "store-release-draft.yml: the inert guard appears or is missing somewhere stage 1 does not expect",
+                    "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held, so stage 1 "
+                    "would not refuse dry_run: false at admission"]))
 
     def test_upload_guard_must_be_exactly_the_stage_1_form(self):
         for new in ("${{ " + INERT + " }}",
@@ -404,6 +407,29 @@ class StaticCheckTests(unittest.TestCase):
                 self.mutate(STORE, old, new)
                 self.assertFlagged("store admission: does not run exactly the gate, unconditionally")
 
+    def test_stage_1_refuses_dry_run_false_at_admission(self):
+        cases = (
+            (STORE, ' --dry-run "$MAY_DRY_RUN"\n', "\n",
+             "store admission: does not run exactly the gate, unconditionally"),
+            (STORE, "          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n        run: python3 -I -S -B tools/may_release/gate.py --action \"$MAY_PLATFORM\"",
+             "        run: python3 -I -S -B tools/may_release/gate.py --action \"$MAY_PLATFORM\"",
+             "store admission: does not pass the dispatch's dry_run to the gate"),
+            (STORE, "          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}\n        run: python3 -I -S -B tools/may_release/gate.py --action \"$MAY_PLATFORM\"",
+             "          MAY_DRY_RUN: 'true'\n        run: python3 -I -S -B tools/may_release/gate.py --action \"$MAY_PLATFORM\"",
+             "store admission: does not pass the dispatch's dry_run to the gate"),
+            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"android", "ios"}', 'UPLOADS_HELD = {"ios"}',
+             "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held"),
+            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"android", "ios"}', 'UPLOADS_HELD = set(["android", "ios"])',
+             "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held"),
+            ("tools/may_release/gate.py", 'UPLOADS_HELD = {"android", "ios"}', 'UPLOADS_HELD = {"android", "ios", "web"}',
+             "gate.py: UPLOADS_HELD is not exactly the platforms whose upload is held"),
+        )
+        for relative, old, new, expected in cases:
+            with self.subTest(new=new.strip()[:50]):
+                self.fresh()
+                self.mutate(relative, old, new)
+                self.assertFlagged(expected)
+
     def test_only_the_handoff_download_may_continue_on_error(self):
         for job, old in (("android-release", "      - name: Check the checkout is exactly its commit before signing\n"),
                          ("ios-build", "      - name: Build unsigned iOS archive without secrets\n")):
@@ -442,10 +468,10 @@ class StaticCheckTests(unittest.TestCase):
             for old, new in cases:
                 with self.subTest(job=job, new=new.strip()):
                     self.fresh()
-                    # The android job comes first in the file; the second occurrence is iOS.
+                    # The first occurrence within the job (admission also passes MAY_DRY_RUN).
                     path = self.root / STORE
                     text = path.read_text()
-                    at = text.find(old) if job == "android-release" else text.find(old, text.find(old) + 1)
+                    at = text.find(old, text.find("  " + job + ":\n"))
                     self.assertGreaterEqual(at, 0)
                     path.write_text(text[:at] + new + text[at + len(old):])
                     found = static_check.problems(self.root)
