@@ -170,9 +170,14 @@ class AabManifestTests(unittest.TestCase):
             for package, number, message in ((self.PLAYGROUND, "3", "Bundle package is not this target's app"),
                                              (self.PRODUCTION, "4", "Bundle versionCode is not the requested build number"),
                                              (self.PRODUCTION, "03", "Bundle versionCode is not the requested build number")):
-                with self.subTest(package=package, number=number), self.assertRaises(verify.VerifyError) as refused:
-                    verify.check_aab_identity(path, package, number)
-                self.assertEqual(refused.exception.args[0], message)
+                with self.subTest(package=package, number=number):
+                    try:
+                        verify.check_aab_identity(path, package, number)
+                        raised = None
+                    except Exception as error:  # an assertion failure, never a test error
+                        raised = error
+                    self.assertIsInstance(raised, verify.VerifyError)
+                    self.assertEqual(raised.args[0], message)
 
     def test_mutated_manifests_are_refused(self):
         ns = fx.ANDROID_NS
