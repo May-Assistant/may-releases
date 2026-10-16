@@ -145,8 +145,13 @@ class StoreTests(unittest.TestCase):
                                            "MAY_POSTHOG_HOST": "https://eu.i.posthog.com"})
         self.assertEqual(env.get("MAY_POSTHOG_ANDROID_KEY"), "phc_Abc-123_x")
         self.assertEqual(env.get("MAY_POSTHOG_HOST"), "https://eu.i.posthog.com")
-        self.assertIn("PostHog crash-report key passed to the Android build", printed)
+        self.assertIn("PostHog crash-report key passed to the Android build; reports go to https://eu.i.posthog.com", printed)
         self.assertNotIn("phc_Abc-123_x", printed)
+
+    def test_an_unset_host_is_posthogs_us_cloud_and_the_line_names_it(self):
+        env, printed = self.android_build({"MAY_POSTHOG_ANDROID_KEY": "phc_Abc"})
+        self.assertEqual(env.get("MAY_POSTHOG_HOST"), "https://us.i.posthog.com")
+        self.assertIn("reports go to https://us.i.posthog.com", printed)
 
     def test_without_the_key_the_build_has_none_and_says_so_once(self):
         for environ in ({}, {"MAY_POSTHOG_ANDROID_KEY": ""}, {"MAY_POSTHOG_HOST": "https://eu.i.posthog.com"}):
@@ -158,7 +163,11 @@ class StoreTests(unittest.TestCase):
 
     def test_a_malformed_key_or_host_is_refused_before_building(self):
         for environ in ({"MAY_POSTHOG_ANDROID_KEY": "phc key\nINJECT"},
-                        {"MAY_POSTHOG_ANDROID_KEY": "phc_ok", "MAY_POSTHOG_HOST": "http://plain.example"},
+                        {"MAY_POSTHOG_ANDROID_KEY": "Abc-123"},
+                        {"MAY_POSTHOG_ANDROID_KEY": "phc_"},
+                        {"MAY_POSTHOG_ANDROID_KEY": "phc_ok", "MAY_POSTHOG_HOST": "https://evil.example"},
+                        {"MAY_POSTHOG_ANDROID_KEY": "phc_ok", "MAY_POSTHOG_HOST": "http://us.i.posthog.com"},
+                        {"MAY_POSTHOG_ANDROID_KEY": "phc_ok", "MAY_POSTHOG_HOST": "https://us.i.posthog.com.evil.example"},
                         {"MAY_POSTHOG_ANDROID_KEY": "phc_ok", "MAY_POSTHOG_HOST": "https://x.example/path"}):
             with self.subTest(environ=environ):
                 runs = []

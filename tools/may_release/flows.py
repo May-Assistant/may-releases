@@ -73,6 +73,7 @@ SYSTEM_IMAGE = "system-images;android-35;google_apis;x86_64"
 SDK_PACKAGES = ("platform-tools", "emulator", "platforms;android-37.0", "build-tools;36.0.0", SYSTEM_IMAGE)
 SDK_INSTALL_ATTEMPTS = 2
 SDK_RETRY_SECONDS = 30
+SDK_INSTALL_SECONDS = 900
 DEVICE = "pixel_7"
 AVD = "may-flows"
 BOOT_SECONDS = 600
@@ -172,8 +173,12 @@ def install_sdk(home, log, env):
     # One retry: a download from Google's SDK repository can fail on a runner before any
     # build (run 38848477790). A second failure is real and fails the run.
     for attempt in range(SDK_INSTALL_ATTEMPTS):
-        if not run_private([manager, "--install", *SDK_PACKAGES], log, env=env, check=False):
-            return
+        try:
+            if not run_private([manager, "--install", *SDK_PACKAGES], log, env=env, check=False,
+                               timeout=SDK_INSTALL_SECONDS):
+                return
+        except subprocess.TimeoutExpired:
+            pass
         if attempt + 1 < SDK_INSTALL_ATTEMPTS:
             sleep(SDK_RETRY_SECONDS)
     raise FlowsError("The Android SDK did not install after one retry; no flow ran")

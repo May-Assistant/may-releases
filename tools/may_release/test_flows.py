@@ -99,10 +99,13 @@ class InstallSdkTest(unittest.TestCase):
     def install(self, outcomes):
         calls, waits = [], []
 
-        def fake_run(argv, log, *, env=None, check=True, **kwargs):
+        def fake_run(argv, log, *, env=None, check=True, timeout=None, **kwargs):
             if "--install" in argv:
-                calls.append(argv)
-                return outcomes[len(calls) - 1]
+                calls.append(timeout)
+                outcome = outcomes[len(calls) - 1]
+                if outcome == "timeout":
+                    raise flows.subprocess.TimeoutExpired(argv, timeout)
+                return outcome
             return 0
 
         with tempfile.TemporaryDirectory() as temp:
@@ -123,6 +126,22 @@ class InstallSdkTest(unittest.TestCase):
 
     def test_a_first_success_does_not_retry(self):
         self.assertEqual(self.install([0]), (1, [], None))
+
+    def test_each_attempt_has_a_timeout_and_a_timed_out_attempt_is_retried(self):
+        self.assertEqual(self.install(["timeout", 0]), (2, [flows.SDK_RETRY_SECONDS], None))
+        calls = []
+        with mock.patch.object(flows, "run_private", side_effect=lambda argv, log, **kw: calls.append(kw.get("timeout")) or 0), \
+                tempfile.TemporaryDirectory() as temp, mock.patch.object(flows.subprocess, "run"):
+            home = Path(temp)
+            (home / "cmdline-tools/latest/bin").mkdir(parents=True)
+            (home / "cmdline-tools/latest/bin/sdkmanager").write_text("")
+            flows.install_sdk(home, home / "log", {})
+        self.assertEqual(calls, [flows.SDK_INSTALL_SECONDS])
+
+    def test_two_timeouts_fail_the_run(self):
+        count, waits, error = self.install(["timeout", "timeout"])
+        self.assertEqual(count, 2)
+        self.assertIsInstance(error, FlowsError)
 
     def test_a_second_failure_fails_the_run(self):
         count, waits, error = self.install([1, 1])

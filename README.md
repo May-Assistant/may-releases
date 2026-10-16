@@ -219,8 +219,9 @@ A reviewed PR replaces the placeholder with exactly that `age1…` line. Unlike 
 ## Secrets and variables per environment
 
 - **`may-native-compile`:** `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (read-only deploy keys for `may-app` and `may-design-system`).
-  - Optional secret `MAY_POSTHOG_ANDROID_KEY`: PostHog's project key for Android crash reports, letters, digits, `_` and `-` only. Only the Android build step receives it; every other step refuses it (`store.SECRET_NAMES`). This one environment builds both May and May Playground, so both apps report to the same PostHog project.
-  - Optional variable `MAY_POSTHOG_HOST`: the project's `https://` ingestion host; PostHog's US cloud when unset.
+  - Optional secret `MAY_POSTHOG_ANDROID_KEY`: PostHog's project key for Android crash reports (`phc_` then letters, digits, `_` and `-`). Only the Android build step receives it; every other step refuses it (`store.SECRET_NAMES`). This one environment builds both May and May Playground, so both apps report to the same PostHog project.
+  - Optional variable `MAY_POSTHOG_HOST`: `https://eu.i.posthog.com` for a project on PostHog's EU cloud; unset means `https://us.i.posthog.com`. `store.py` refuses any other host, and the build step's public line names the host reports will go to.
+  - Who sets them: only Samuel, and only in `may-native-compile`. GitHub resolves a variable or secret from the environment first, then the repository, then the organization, so a repository- or organization-level `MAY_POSTHOG_ANDROID_KEY` or `MAY_POSTHOG_HOST` would otherwise count. Don't create either at those levels. The host allowlist limits what a stray value can do, but a stray key would still send crash reports to another PostHog project.
 - **iOS store environments:**
   - Secrets: `MAY_IOS_CERT_BASE64` and `MAY_IOS_CERT_PASSWORD` (the approved existing distribution certificate), `MAY_IOS_PROFILE_BASE64` (that target's App Store profile), `MAY_ASC_KEY_BASE64`, `MAY_ASC_ISSUER_ID` and `MAY_ARTIFACT_DECRYPT_KEY`.
   - Variable: `MAY_ASC_KEY_ID=23VX669FGY`.

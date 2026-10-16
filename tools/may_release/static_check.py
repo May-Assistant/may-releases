@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|docker://\S+@sha256:[0-9a-f]{64})")
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
-PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError"}
+PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -176,7 +176,7 @@ ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLA
                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN" '
                   '--sign-only "$MAY_SIGN_ONLY"')
 CONTINUE_ON_ERROR = re.compile(r"(?m)^\s*(-\s+)?continue-on-error:")
-VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
+VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID", "MAY_POSTHOG_HOST"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
 
 
@@ -488,6 +488,12 @@ def store_problems(store):
             if ("upload-artifact@" in text or "download-artifact@" in text) and \
                     not re.search(r"(?m)^          name: may-handoff-(android|ios)-\$\{\{ github\.run_attempt \}\}$", text):
                 found.append(f"store {job}: handoff artifact is not bound to this run attempt")
+        # Every job, build and release alike: each secrets.X is bound as X, each vars.X as X (X in VARS),
+        # and nothing else but the declared inputs and constants.
+        if not release:
+            all_secrets = set().union(*expected.values())
+            if not all(release_env_allowed(n, v, all_secrets, job) for n, v in env_entries(job_text(store, job))):
+                found.append(f"store {job}: sets an environment variable it does not declare")
         if release:
             if job in UPLOADS:
                 found += loud_failure_problems(store, job, steps)
