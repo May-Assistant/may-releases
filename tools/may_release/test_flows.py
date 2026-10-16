@@ -39,29 +39,48 @@ class AdmitTest(unittest.TestCase):
 
 
 class ParseTest(unittest.TestCase):
-    def test_reports_pass_fail_and_error_with_only_the_exception_class(self):
+    PKG = "io.github.mayassistant.may.flows."
+
+    def test_reports_each_test_in_fixed_words_only(self):
         text = "\n".join([
-            status("io.github.mayassistant.may.flows.ChatReplyFlow", "reply", 1),
-            status("io.github.mayassistant.may.flows.ChatReplyFlow", "reply", 0),
-            status("io.github.mayassistant.may.flows.TaskDetailFlow", "menu", 1),
-            status("io.github.mayassistant.may.flows.TaskDetailFlow", "menu", -2,
-                   "java.lang.AssertionError: the project menu (secret detail) is inside"),
+            status(self.PKG + "ChatReplyFlow", "maysReplyComesIntoView", 1),
+            status(self.PKG + "ChatReplyFlow", "maysReplyComesIntoView", 0),
+            status(self.PKG + "TaskDetailFlow", "theProjectMenuStaysClear", 1),
+            status(self.PKG + "TaskDetailFlow", "theProjectMenuStaysClear", -2,
+                   "java.lang.AssertionError: the project menu (Book the meeting room) is inside"),
             "\tat org.junit.Assert.fail(Assert.java:89)",
-            status("io.github.mayassistant.may.flows.EmptyStatesFlow", "chats", -1, "weird text: here"),
+            status(self.PKG + "TaskDetailFlow", "theDayPicker", -1,
+                   "io.github.mayassistant.may.core.MayApiException: model_unavailable"),
+            status(self.PKG + "EmptyStatesFlow", "chats", -3),
             "INSTRUMENTATION_CODE: -1",
         ])
         results, completed = parse_instrumentation(text)
         self.assertTrue(completed)
         self.assertEqual(results, [
-            ("io.github.mayassistant.may.flows.ChatReplyFlow#reply", "pass"),
-            ("io.github.mayassistant.may.flows.TaskDetailFlow#menu", "fail (java.lang.AssertionError)"),
-            ("io.github.mayassistant.may.flows.EmptyStatesFlow#chats", "error (unknown)"),
+            ("ChatReplyFlow test 1", "pass"),
+            ("TaskDetailFlow test 1", "fail (assertion)"),
+            ("TaskDetailFlow test 2", "fail (an exception, not an assertion)"),
+            ("EmptyStatesFlow test 1", "ignored"),
         ])
-        self.assertNotIn("secret", repr(results))
 
-    def test_a_crash_is_not_complete_and_odd_names_are_dropped(self):
-        text = status("x y", "t", 0) + "\nINSTRUMENTATION_RESULT: shortMsg=Process crashed.\nINSTRUMENTATION_CODE: 0"
-        self.assertEqual(parse_instrumentation(text), ([], False))
+    def test_nothing_reported_by_the_device_reaches_the_public_lines(self):
+        private = ["maysReplyComesIntoView", "Book the meeting room", "MayApiException", "mayassistant.may.core",
+                   "secretTestName", "com.example.Leak", "Process crashed"]
+        text = "\n".join([
+            status(self.PKG + "ChatReplyFlow", "maysReplyComesIntoView", -2, "java.lang.AssertionError: Book the meeting room"),
+            status(self.PKG + "ChatReplyFlow", "secretTestName", -2, "io.github.mayassistant.may.core.MayApiException: x"),
+            status("com.example.Leak", "secretTestName", 0),
+            "INSTRUMENTATION_STATUS: stream=Book the meeting room",
+            "INSTRUMENTATION_RESULT: shortMsg=Process crashed.",
+            "INSTRUMENTATION_CODE: 0",
+        ])
+        results, completed = parse_instrumentation(text)
+        self.assertFalse(completed)
+        public = "\n".join("May flow " + label + ": " + outcome for label, outcome in results)
+        for word in private:
+            self.assertNotIn(word, public)
+        self.assertEqual([label for label, _ in results],
+                         ["ChatReplyFlow test 1", "ChatReplyFlow test 2", "an unlisted flow test 1"])
 
 
 if __name__ == "__main__":

@@ -7,9 +7,11 @@ flows runs against any app commit: the build before a fix (the broken-build cont
 and the build after it.
 
 This repository is public. Every tool writes to a private runner log that is never
-published. Public output is one fixed line per flow test: its class and method (names
-from may-app's flow sources), and pass, fail with the exception's class name, or
-error. No assertion message, stack trace, screenshot or app output is printed.
+published. Public output is one fixed line per flow test, built only from this file's
+own words: the flow's class name from FLOWS (anything else is "an unlisted flow"), the
+test's number within it, and its outcome from outcome_of. Nothing the app, its tests or
+the instrumentation printed reaches the public log: no method name, exception class,
+assertion message, stack trace, screenshot or app output.
 
 Subcommands, one per workflow step:
   admit    the dispatch is the flows workflow's own, from an allowed branch, with exact SHAs
@@ -31,8 +33,8 @@ import time
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from prepare import APP, PrepareError, exact_sha, fetch
-from store import SOURCE_READ_SECRETS, StoreError, child_env, prepared, require_step_secrets, runner_root
+from prepare import APP, exact_sha, fetch
+from store import SOURCE_READ_SECRETS, child_env, prepared, require_step_secrets, runner_root
 
 CONTROL_REPO = "May-Assistant/may-releases"
 # The may-flows environment admits exactly these branches (no required reviewer;
@@ -62,7 +64,11 @@ APKS = ("android/app/build/outputs/apk/playground/debug/app-playground-debug.apk
         "android/app/build/outputs/apk/androidTest/playground/debug/app-playground-debug-androidTest.apk")
 # am instrument -r status codes (androidx.test InstrumentationResultPrinter).
 STATUS = {0: "pass", -1: "error", -2: "fail", -3: "ignored", -4: "assumption failed"}
-JAVA_NAME = re.compile(r"[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*")
+# A failure is an assertion only when the thrown class is one of these (JUnit's, and
+# what Compose's test APIs throw); anything else, an app class included, is reported
+# as "an exception" without its name.
+ASSERTIONS = {"java.lang.AssertionError", "junit.framework.AssertionFailedError", "org.junit.ComparisonFailure",
+              "junit.framework.ComparisonFailure", "org.junit.internal.ArrayComparisonFailure"}
 
 
 class FlowsError(ValueError):
@@ -149,30 +155,38 @@ def build(source_sha):
             raise FlowsError("The build left no Playground or flow APK")
 
 
+def outcome_of(code, stack):
+    """One of this file's fixed outcome words for an `am instrument` status code."""
+    if code == 0:
+        return "pass"
+    if code in (-1, -2):
+        thrown = stack.split(":", 1)[0].strip()
+        return "fail (assertion)" if thrown in ASSERTIONS else "fail (an exception, not an assertion)"
+    return {-3: "ignored", -4: "assumption failed"}[code]
+
+
+def flow_label(test_class):
+    """The flow's class name if it is one of FLOWS, else a fixed word: never the reported text."""
+    for name in FLOWS.values():
+        if name and test_class == FLOWS_PACKAGE + "." + name:
+            return name
+    return "an unlisted flow"
+
+
 def parse_instrumentation(text):
-    """[(test, outcome)] from `am instrument -r` output; outcome names no message, only an exception class."""
-    results, status = [], {}
-    key = None
+    """[(label, outcome)] from `am instrument -r` output, in this file's own words only."""
+    results, status, counts = [], {}, {}
     for line in text.splitlines():
         if line.startswith("INSTRUMENTATION_STATUS: "):
             key, _, value = line[len("INSTRUMENTATION_STATUS: "):].partition("=")
             status[key] = value
         elif line.startswith("INSTRUMENTATION_STATUS_CODE: "):
             code = line.split(": ", 1)[1].strip()
-            key = None
-            if code.lstrip("-").isdigit() and int(code) in STATUS:
-                name = status.get("class", "") + "#" + status.get("test", "")
-                outcome = STATUS[int(code)]
-                if int(code) in (-1, -2):
-                    thrown = status.get("stack", "").split(":", 1)[0].strip()
-                    outcome += " (" + (thrown if JAVA_NAME.fullmatch(thrown) else "unknown") + ")"
-                if JAVA_NAME.fullmatch(status.get("class", "")) and re.fullmatch(r"\w+", status.get("test", "")):
-                    results.append((name, outcome))
+            if code.lstrip("-").isdigit() and int(code) in STATUS and int(code) != 1:
+                label = flow_label(status.get("class", ""))
+                counts[label] = counts.get(label, 0) + 1
+                results.append((label + " test " + str(counts[label]), outcome_of(int(code), status.get("stack", ""))))
             status = {}
-        elif key == "stack":
-            continue
-        else:
-            key = None
     completed = "INSTRUMENTATION_CODE: -1" in text
     return results, completed
 
@@ -232,7 +246,7 @@ def run(source_sha, flows):
         raise FlowsError("No flow test reported a result")
     if not completed:
         raise FlowsError("The flow run did not finish (the app or its tests stopped part-way)")
-    if any(not outcome.startswith("pass") for _, outcome in results):
+    if any(outcome != "pass" for _, outcome in results):
         raise FlowsError("At least one May flow did not pass")
     print("Every selected May flow passed")
 
@@ -267,5 +281,6 @@ if __name__ == "__main__":
             cleanup()
     except FlowsError as error:
         raise SystemExit("May flows: " + error.args[0]) from None
-    except (PrepareError, StoreError, OSError, subprocess.SubprocessError):
+    except Exception:
+        # Any other failure, whatever its type or message, prints only this.
         raise SystemExit("May flows failed; no private detail was published") from None
