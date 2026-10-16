@@ -63,6 +63,7 @@ FLOWS = {
     "sending-status": "SendingStatusFlow",
     "sign-in": "SignInFlow",
     "plan-your-day": "PlanYourDayFlow",
+    "approvals": "ApprovalsFlow",
 }
 # may-app's android/flows/manifest.txt: one "ClassName count" line per flow class. A run's results must match it
 # exactly for the classes it ran: every listed test reported once, nothing missing, added or unlisted.
