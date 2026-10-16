@@ -1,0 +1,99 @@
+name: May emulator flows (Playground, pass/fail only)
+# Builds May Playground at an exact may-app commit and runs may-app's scripted flows
+# (android/flows, at flows_sha) on an Android emulator on a free public runner.
+# Public output is pass or fail per flow test and nothing else: every tool writes to
+# a private runner log that is never published, and no screenshot is kept.
+# Environment may-flows: no required reviewer, holding read-only deploy keys for
+# may-app and may-design-system (MAY_FLOWS_APP_READ_KEY, MAY_FLOWS_DS_READ_KEY) and no
+# signing, store or handoff secret. Admission accepts this workflow's own dispatch from
+# main only, and checks the environment exists (an `environment:` naming a missing one
+# would auto-create it).
+# Trust: source_sha must be in may-app's main history (prepare.py). The flows' Gradle
+# init script runs on this runner while the job holds the keys, so flows_sha must be
+# in main history too, unless flows_from_branch is true: that admits any may-app
+# commit, for trying flows before they merge (their broken-build controls).
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: May app commit in main history to build and test (40 hex)
+        required: true
+        type: string
+      flows_sha:
+        description: May app commit whose android/flows to run (40 hex; in main history unless flows_from_branch)
+        required: true
+        type: string
+      flows_from_branch:
+        description: Admit a flows_sha outside may-app's main history (flows not yet merged)
+        required: true
+        type: boolean
+        default: false
+      flows:
+        description: Which flows to run
+        required: true
+        type: choice
+        default: all
+        options: [all, chat-reply, task-detail, connections, empty-states]
+permissions:
+  contents: read
+concurrency:
+  group: may-emulator-flows
+  cancel-in-progress: false
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Admit only this workflow's own dispatch from main, into an existing environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_FLOWS_SHA: ${{ inputs.flows_sha }}
+          MAY_FLOWS: ${{ inputs.flows }}
+          MAY_FLOWS_FROM_BRANCH: ${{ github.event.inputs.flows_from_branch }}
+        run: python3 -I -S -B tools/may_release/flows.py admit --source-sha "$MAY_SOURCE_SHA" --flows-sha "$MAY_FLOWS_SHA" --flows "$MAY_FLOWS" --flows-from-branch "$MAY_FLOWS_FROM_BRANCH"
+  flows:
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: may-flows
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+      MAY_FLOWS_SHA: ${{ inputs.flows_sha }}
+      MAY_FLOWS: ${{ inputs.flows }}
+      MAY_FLOWS_FROM_BRANCH: ${{ github.event.inputs.flows_from_branch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned JDK
+        run: python3 -I -S -B tools/may_release/toolchain.py jdk --export
+      - name: Fetch exact private source and pinned design system
+        env:
+          MAY_APP_READ_KEY: ${{ secrets.MAY_FLOWS_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_FLOWS_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"
+      - name: Place the flows over the prepared source
+        env:
+          MAY_APP_READ_KEY: ${{ secrets.MAY_FLOWS_APP_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/flows.py overlay --source-sha "$MAY_SOURCE_SHA" --flows-sha "$MAY_FLOWS_SHA" --flows-from-branch "$MAY_FLOWS_FROM_BRANCH"
+      - name: Build May Playground and its flows without secrets
+        run: python3 -I -S -B tools/may_release/flows.py build --source-sha "$MAY_SOURCE_SHA"
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the flows on an emulator and report pass or fail
+        run: python3 -I -S -B tools/may_release/flows.py run --source-sha "$MAY_SOURCE_SHA" --flows "$MAY_FLOWS"
+      - name: Remove private source, logs and products
+        if: always()
+        run: python3 -I -S -B tools/may_release/flows.py cleanup
