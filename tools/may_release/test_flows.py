@@ -149,6 +149,91 @@ class InstallSdkTest(unittest.TestCase):
         self.assertIsInstance(error, FlowsError)
 
 
+class ManifestTest(unittest.TestCase):
+    def manifest(self, text):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "manifest.txt"
+            if text is not None:
+                path.write_text(text)
+            return flows.read_manifest(path)
+
+    def test_reads_class_counts_and_skips_comments(self):
+        self.assertEqual(self.manifest("# expected\nChatReplyFlow 3\n\nSignInFlow 2\n"), {"ChatReplyFlow": 3, "SignInFlow": 2})
+
+    def test_refuses_a_missing_empty_or_malformed_manifest(self):
+        for text in (None, "", "# only a comment\n", "ChatReplyFlow\n", "ChatReplyFlow 0\n", "ChatReplyFlow -1\n",
+                     "ChatReplyFlow 3 extra\n", "NewFlow 1\n", "ChatReplyFlow 3\nChatReplyFlow 3\n"):
+            with self.subTest(text=text), self.assertRaises(FlowsError):
+                self.manifest(text)
+
+    EXPECTED = {"ChatReplyFlow": 2, "SignInFlow": 1}
+
+    def results(self, *labels):
+        return [(label, "pass") for label in labels]
+
+    def test_exactly_the_manifest_matches(self):
+        self.assertTrue(flows.matches_manifest(self.results("ChatReplyFlow test 1", "ChatReplyFlow test 2", "SignInFlow test 1"),
+                                               self.EXPECTED, "all"))
+        self.assertTrue(flows.matches_manifest(self.results("SignInFlow test 1"), self.EXPECTED, "sign-in"))
+
+    def test_a_missing_extra_or_unlisted_test_does_not(self):
+        for labels, selection in (
+                (("ChatReplyFlow test 1", "SignInFlow test 1"), "all"),                                   # a test missing
+                (("ChatReplyFlow test 1", "ChatReplyFlow test 2"), "all"),                                # a class missing
+                (("ChatReplyFlow test 1", "ChatReplyFlow test 2", "ChatReplyFlow test 3", "SignInFlow test 1"), "all"),
+                (("ChatReplyFlow test 1", "ChatReplyFlow test 2", "SignInFlow test 1", "an unlisted flow test 1"), "all"),
+                (("an unlisted flow test 1",), "sign-in"),
+                (("SignInFlow test 1", "SignInFlow test 2"), "sign-in"),
+                ((), "sign-in"),
+                (("ConnectionsFlow test 1",), "connections")):                                            # not in the manifest
+            with self.subTest(labels=labels, selection=selection):
+                self.assertFalse(flows.matches_manifest(self.results(*labels), self.EXPECTED, selection))
+
+
+class ReportTest(unittest.TestCase):
+    EXPECTED = {"ChatReplyFlow": 1}
+
+    def test_a_run_matching_the_manifest_passes(self):
+        with mock.patch("builtins.print"):
+            flows.report([("ChatReplyFlow test 1", "pass")], True, self.EXPECTED, "all")
+
+    def test_all_passing_but_not_the_manifest_fails(self):
+        for results in ([("ChatReplyFlow test 1", "pass"), ("an unlisted flow test 1", "pass")],
+                        [("ChatReplyFlow test 1", "pass"), ("ChatReplyFlow test 2", "pass")]):
+            with self.subTest(results=results), mock.patch("builtins.print"), self.assertRaises(FlowsError):
+                flows.report(results, True, self.EXPECTED, "all")
+
+
+class NavigationTest(unittest.TestCase):
+    def navigate(self, modes, overlay=0):
+        calls = []
+
+        def fake_run(argv, log, *, env=None, check=True, **kwargs):
+            calls.append((argv[-1], check))
+            if check and overlay:
+                raise FlowsError("A private flows tool failed; diagnostics remain on the runner")
+            return overlay
+
+        answers = iter(modes)
+        with mock.patch.object(flows, "run_private", side_effect=fake_run), \
+                mock.patch.object(flows, "sleep"), \
+                mock.patch.object(flows.time, "monotonic", side_effect=[0, 0, 10, 20, 31, 40, 50, 60]), \
+                mock.patch.object(flows.subprocess, "run",
+                                  side_effect=lambda *a, **k: mock.Mock(stdout=next(answers).encode())):
+            flows.three_button_navigation("adb", Path("log"), {})
+        return calls
+
+    def test_switches_with_check_and_waits_for_three_button(self):
+        calls = self.navigate(["2", "0"])
+        self.assertEqual(calls, [("com.android.internal.systemui.navbar.threebutton", True)])
+
+    def test_a_failed_switch_or_a_mode_that_never_changes_fails(self):
+        with self.assertRaises(FlowsError):
+            self.navigate(["0"], overlay=1)
+        with self.assertRaises(FlowsError):
+            self.navigate(["2", "2", "2", "2", "2", "2"])
+
+
 class ParseTest(unittest.TestCase):
     PKG = "io.github.mayassistant.may.flows."
 

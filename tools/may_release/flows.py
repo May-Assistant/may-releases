@@ -59,7 +59,16 @@ FLOWS = {
     "task-detail": "TaskDetailFlow",
     "connections": "ConnectionsFlow",
     "empty-states": "EmptyStatesFlow",
+    "message-menu": "MessageMenuFlow",
+    "sending-status": "SendingStatusFlow",
+    "sign-in": "SignInFlow",
 }
+# may-app's android/flows/manifest.txt: one "ClassName count" line per flow class. A run's results must match it
+# exactly for the classes it ran: every listed test reported once, nothing missing, added or unlisted.
+MANIFEST = "android/flows/manifest.txt"
+# Three-button navigation (settings secure navigation_mode), so a flow checking clearance has a full bar.
+THREE_BUTTON = "0"
+NAV_SECONDS = 30
 APP_ID = "io.github.mayassistant.may.playground"
 TEST_ID = APP_ID + ".test"
 RUNNER = TEST_ID + "/androidx.test.runner.AndroidJUnitRunner"
@@ -238,10 +247,60 @@ def parse_instrumentation(text):
     return results, completed
 
 
+def read_manifest(path):
+    """{class: count} from android/flows/manifest.txt; every class one of FLOWS', every count a positive number."""
+    try:
+        text = path.read_text()
+    except OSError:
+        raise FlowsError("The flows commit has no android/flows/manifest.txt") from None
+    known, expected = {name for name in FLOWS.values() if name}, {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or parts[0] not in known or parts[0] in expected or not re.fullmatch(r"[1-9][0-9]{0,2}", parts[1]):
+            raise FlowsError("android/flows/manifest.txt is malformed or names a flow this runner does not know")
+        expected[parts[0]] = int(parts[1])
+    if not expected:
+        raise FlowsError("android/flows/manifest.txt lists no flow")
+    return expected
+
+
+def matches_manifest(results, expected, flows):
+    """Whether the run reported exactly the manifest's tests for the selected flows, and no unlisted one."""
+    selection = FLOWS[flows]
+    if selection and selection not in expected:
+        return False
+    wanted = {selection: expected[selection]} if selection else expected
+    counts = {}
+    for label, _ in results:
+        name = label.rpartition(" test ")[0]
+        counts[name] = counts.get(name, 0) + 1
+    # An unlisted flow, or a class the selection didn't ask for, is a key the manifest lacks.
+    return counts == wanted
+
+
+def three_button_navigation(adb, log, env):
+    """Switch the emulator to three-button navigation and confirm it took."""
+    run_private([adb, "shell", "cmd", "overlay", "enable-exclusive", "--category",
+                 "com.android.internal.systemui.navbar.threebutton"], log, env=env)
+    deadline = time.monotonic() + NAV_SECONDS
+    while True:
+        mode = subprocess.run([adb, "shell", "settings", "get", "secure", "navigation_mode"], capture_output=True,
+                              stdin=subprocess.DEVNULL, env=env)
+        if mode.stdout.strip() == THREE_BUTTON.encode():
+            return
+        if time.monotonic() > deadline:
+            raise FlowsError("The emulator did not switch to three-button navigation; no flow ran")
+        sleep(2)
+
+
 def run(source_sha, flows):
     require_step_secrets(())
     root = runner_root()
     source, private = prepared(root, source_sha)
+    expected = read_manifest(source / MANIFEST)
     log = private / "flows-run.log"
     home = sdk()
     env = child_env(ANDROID_AVD_HOME=str(root / "may-avd"), ANDROID_EMULATOR_HOME=str(root / "may-avd"))
@@ -268,8 +327,7 @@ def run(source_sha, flows):
             time.sleep(5)
         for setting in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
             run_private([adb, "shell", "settings", "put", "global", setting, "0"], log, env=env)
-        run_private([adb, "shell", "cmd", "overlay", "enable-exclusive", "--category",
-                     "com.android.internal.systemui.navbar.threebutton"], log, env=env, check=False)
+        three_button_navigation(adb, log, env)
         for apk in APKS:
             run_private([adb, "install", "-r", "-t", str(source / apk)], log, env=env)
         selection = FLOWS[flows]
@@ -286,6 +344,11 @@ def run(source_sha, flows):
             emulator.wait(timeout=60)
         except subprocess.TimeoutExpired:
             emulator.kill()
+    report(results, completed, expected, flows)
+
+
+def report(results, completed, expected, flows):
+    """Prints one line per test, then passes only a finished run whose every test passed and matches the manifest."""
     for name, outcome in results:
         print("May flow " + name + ": " + outcome)
     if not results:
@@ -294,6 +357,8 @@ def run(source_sha, flows):
         raise FlowsError("The flow run did not finish (the app or its tests stopped part-way)")
     if any(outcome != "pass" for _, outcome in results):
         raise FlowsError("At least one May flow did not pass")
+    if not matches_manifest(results, expected, flows):
+        raise FlowsError("The flows that ran differ from android/flows/manifest.txt (a flow or test missing, added or unlisted)")
     print("Every selected May flow passed")
 
 
