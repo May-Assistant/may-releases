@@ -283,8 +283,9 @@ class StaticCheckTests(unittest.TestCase):
         self.assertFlagged("handoff artifact is not bound to this run attempt")
 
     def test_pinned_jdk_is_never_installed_on_macos(self):
-        self.mutate(".github/workflows/native-compile-draft.yml",
-                    "runs-on: ${{ inputs.platform == 'android' && 'ubuntu-24.04' || 'macos-15' }}", "runs-on: macos-15")
+        self.mutate(".github/workflows/native-compile-draft.yml", "      - name: Recheck protection after reviewer approval\n",
+                    "      - name: Install pinned JDK\n        run: python3 tools/may_release/toolchain.py jdk --export\n"
+                    "      - name: Recheck protection after reviewer approval\n")
         self.assertFlagged("native-compile-draft.yml: job native installs the linux-only pinned JDK on macOS")
 
     def test_only_the_encrypted_handoff_is_uploaded(self):
@@ -369,11 +370,21 @@ class StaticCheckTests(unittest.TestCase):
                 for found in (static_check.message_problems(self.root), static_check.problems(self.root)):
                     self.assertTrue(any("play_upload.py" in problem for problem in found), found)
 
-    def test_compile_workflow_stays_inert(self):
-        self.mutate(".github/workflows/native-compile-draft.yml",
-                    "if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}",
-                    "if: ${{ github.event_name == 'workflow_dispatch' }}")
-        self.assertFlagged("native-compile-draft.yml is not inert")
+    def test_compile_workflow_is_exactly_the_ios_playground_compile(self):
+        compile_yml = ".github/workflows/native-compile-draft.yml"
+        changes = {
+            "held inert again": ("    if: ${{ inputs.platform == 'ios' }}\n",
+                                 "    if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}\n"),
+            "android offered": ("        options: [ios]\n", "        options: [ios, android]\n"),
+            "runs on another runner": ("    runs-on: macos-15\n", "    runs-on: macos-14\n"),
+            "pins must match again": ("prepare.py --platform ios --target playground", "prepare.py"),
+            "production scheme too": ("compile.py --platform ios --target playground", "compile.py --platform ios"),
+        }
+        for name, (old, new) in changes.items():
+            with self.subTest(change=name):
+                self.fresh()
+                self.mutate(compile_yml, old, new)
+                self.assertFlagged("native-compile-draft.yml is not the active iOS-only May Playground compile")
 
     def test_stage_3_is_exactly_android_uploads(self):
         store = (ROOT / STORE).read_text()

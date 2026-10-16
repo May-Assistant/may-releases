@@ -630,6 +630,24 @@ def upload_track_problems(root):
     return found
 
 
+# The native compile workflow is active for iOS alone (each build): May Playground, the internal target, so its
+# design-system pin may differ from Android's (store.design_system_pins). These are the lines that make it so.
+COMPILE_IOS_LINES = (
+    "        options: [ios]\n",
+    "    if: ${{ inputs.platform == 'ios' }}\n    runs-on: macos-15\n",
+    "        run: python3 tools/may_release/prepare.py --platform ios --target playground --source-sha \"$MAY_SOURCE_SHA\"\n",
+    "        run: python3 tools/may_release/compile.py --platform ios --target playground\n",
+)
+
+
+def compile_workflow_problems(text):
+    """The native compile is exactly the active iOS-only Playground compile: no inert guard, no other platform."""
+    if "may-compile-disabled-pending-review" in text or not all(text.count(line) == 1 for line in COMPILE_IOS_LINES) \
+            or "toolchain.py jdk" in text or "--platform android" in text:
+        return ["native-compile-draft.yml is not the active iOS-only May Playground compile"]
+    return []
+
+
 def control_problems(root):
     found = []
     flows = root / ".github/workflows"
@@ -638,8 +656,7 @@ def control_problems(root):
     store = (flows / "store-release-draft.yml").read_text()
     if not ("pull_request:" in check and "permissions:\n  contents: read" in check and "secrets." not in check):
         found.append("control-check.yml is not a read-only, no-secret PR check")
-    if compile_workflow.count("if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}") != 2:
-        found.append("native-compile-draft.yml is not inert")
+    found += compile_workflow_problems(compile_workflow)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")
@@ -776,5 +793,5 @@ if __name__ == "__main__":
         sys.exit(1)
     print("May store workflow is at activation stage 3 (Android uploads to the Play internal track for May "
           "and May Playground, May production sign-only in its own job with no Play secret, each checked "
-          "loudly; iOS inert), the native compile workflow is inert, and the no-secret controls are "
+          "loudly; iOS inert), the native compile workflow compiles iOS May Playground only, and the no-secret controls are "
           "structurally present")

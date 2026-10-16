@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 import zipfile
 
-from compile import extract_generator
+from compile import IOS_SCHEMES, extract_generator
 
 
 class CompileTests(unittest.TestCase):
@@ -17,6 +17,12 @@ class CompileTests(unittest.TestCase):
                 output.writestr(info, b"test executable")
             binary = extract_generator(archive, root / "extracted")
             self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+
+
+    def test_the_playground_compile_builds_only_may_playground(self):
+        # The internal target may build at iOS's own design-system pin; the May scheme needs the pins to match.
+        self.assertEqual(IOS_SCHEMES["playground"], ("MayPlayground",))
+        self.assertEqual(IOS_SCHEMES[None], ("May", "MayPlayground"))
 
 
 if __name__ == "__main__":

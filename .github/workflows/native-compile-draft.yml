@@ -1,12 +1,12 @@
-name: May protected native compile (inactive draft)
+name: May iOS compile (MayPlayground, simulator, no signing)
 on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Native platform to compile without signing or upload
+        description: Native platform to compile without signing or upload (iOS only; Android compiles in the flows and store builds)
         required: true
         type: choice
-        options: [ios, android]
+        options: [ios]
       source_sha:
         description: Reviewed 40-character May app commit already on main
         required: true
@@ -18,9 +18,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   admission:
-    # This workflow is intentionally inert until a later reviewed change removes
-    # this guard after the protected environment and scoped keys exist.
-    if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}
+    # Active for iOS (each build, dispatched by the coordinator): May Playground only, the internal target, so it
+    # builds at iOS's own design-system pin (store.design_system_pins); the May scheme waits for the re-pin.
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -38,9 +37,8 @@ jobs:
         run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
   native:
     needs: admission
-    if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}
-    # Android needs nothing from macOS, and the pinned JDK is linux x64 only.
-    runs-on: ${{ inputs.platform == 'android' && 'ubuntu-24.04' || 'macos-15' }}
+    if: ${{ inputs.platform == 'ios' }}
+    runs-on: macos-15
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 90
     permissions:
@@ -55,19 +53,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
         run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
-      - name: Install pinned, checksum-verified JDK 21 for Android
-        if: inputs.platform == 'android'
-        run: python3 tools/may_release/toolchain.py jdk --export
       - name: Fetch exact private app and pinned design system quietly
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
-        run: python3 tools/may_release/prepare.py --source-sha "$MAY_SOURCE_SHA"
+        run: python3 tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"
       - name: Compile without signing or store access
-        env:
-          MAY_PLATFORM: ${{ inputs.platform }}
-        run: python3 tools/may_release/compile.py --platform "$MAY_PLATFORM"
+        run: python3 tools/may_release/compile.py --platform ios --target playground
       - name: Remove private source, logs and products
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"
