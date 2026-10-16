@@ -149,6 +149,115 @@ class InstallSdkTest(unittest.TestCase):
         self.assertIsInstance(error, FlowsError)
 
 
+class ManifestTest(unittest.TestCase):
+    def manifest(self, text):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "manifest.txt"
+            if text is not None:
+                path.write_text(text)
+            return flows.read_manifest(path)
+
+    def test_reads_class_counts_and_skips_comments(self):
+        self.assertEqual(self.manifest("# expected\nChatReplyFlow 3\n\nSignInFlow 2\n"), {"ChatReplyFlow": 3, "SignInFlow": 2})
+
+    def test_reads_a_manifest_with_a_byte_order_mark(self):
+        try:
+            read = self.manifest("\ufeffChatReplyFlow 3\n")
+        except FlowsError as refused:
+            read = refused
+        self.assertEqual(read, {"ChatReplyFlow": 3})
+
+    def test_refuses_a_manifest_over_64_kib(self):
+        with self.assertRaises(FlowsError) as refused:
+            self.manifest("ChatReplyFlow 3\n" + "#" * (64 * 1024))
+        self.assertIn("larger than 64 KiB", str(refused.exception))
+
+    def test_refuses_a_missing_empty_or_malformed_manifest(self):
+        for text in (None, "", "# only a comment\n", "ChatReplyFlow\n", "ChatReplyFlow 0\n", "ChatReplyFlow -1\n",
+                     "ChatReplyFlow 3 extra\n", "NewFlow 1\n", "ChatReplyFlow 3\nChatReplyFlow 3\n"):
+            with self.subTest(text=text), self.assertRaises(FlowsError):
+                self.manifest(text)
+
+    EXPECTED = {"ChatReplyFlow": 2, "SignInFlow": 1}
+
+    def results(self, *labels):
+        return [(label, "pass") for label in labels]
+
+    def test_exactly_the_manifest_matches(self):
+        self.assertIsNone(flows.manifest_difference(
+            self.results("ChatReplyFlow test 1", "ChatReplyFlow test 2", "SignInFlow test 1"), self.EXPECTED, "all"))
+        self.assertIsNone(flows.manifest_difference(self.results("SignInFlow test 1"), self.EXPECTED, "sign-in"))
+
+    def test_a_missing_or_an_extra_test_says_which(self):
+        for labels, selection, difference in (
+                (("ChatReplyFlow test 1", "SignInFlow test 1"), "all", "missing"),                      # a test missing
+                (("ChatReplyFlow test 1", "ChatReplyFlow test 2"), "all", "missing"),                   # a class missing
+                ((), "sign-in", "missing"),
+                (("ConnectionsFlow test 1",), "connections", "missing"),                                # class not listed
+                (("ChatReplyFlow test 1", "ChatReplyFlow test 2", "ChatReplyFlow test 3", "SignInFlow test 1"), "all", "extra"),
+                (("ChatReplyFlow test 1", "ChatReplyFlow test 2", "SignInFlow test 1", "an unlisted flow test 1"), "all", "extra"),
+                (("an unlisted flow test 1",), "sign-in", "extra"),
+                (("SignInFlow test 1", "SignInFlow test 2"), "sign-in", "extra")):
+            with self.subTest(labels=labels, selection=selection):
+                self.assertEqual(flows.manifest_difference(self.results(*labels), self.EXPECTED, selection), difference)
+
+
+class ReportTest(unittest.TestCase):
+    EXPECTED = {"ChatReplyFlow": 1}
+
+    BRANCH = "May flows: flows taken from a branch; this run is not release evidence"
+
+    def printed(self, from_branch):
+        with mock.patch("builtins.print") as printed:
+            flows.report([("ChatReplyFlow test 1", "pass")], True, self.EXPECTED, "all", from_branch)
+        return [c.args[0] for c in printed.call_args_list]
+
+    def test_a_run_matching_the_manifest_passes(self):
+        self.assertEqual(self.printed("false"), ["May flow ChatReplyFlow test 1: pass", "Every selected May flow passed"])
+
+    def test_flows_from_a_branch_say_so_first(self):
+        self.assertEqual(self.printed("true")[0], self.BRANCH)
+        self.assertNotIn(self.BRANCH, self.printed("false"))
+
+    def test_all_passing_but_not_the_manifest_fails_saying_which(self):
+        two = {"ChatReplyFlow": 1, "SignInFlow": 1}
+        for results, expected, says in (
+                ([("ChatReplyFlow test 1", "pass"), ("an unlisted flow test 1", "pass")], self.EXPECTED, "not in android/flows/manifest.txt"),
+                ([], self.EXPECTED, "No flow test reported a result"),
+                ([("ChatReplyFlow test 1", "pass")], two, "missing from the run")):
+            with self.subTest(results=results), mock.patch("builtins.print"), self.assertRaises(FlowsError) as failed:
+                flows.report(results, True, expected, "all", "false")
+            self.assertIn(says, str(failed.exception))
+
+
+class NavigationTest(unittest.TestCase):
+    def navigate(self, modes, overlay=0):
+        calls = []
+
+        def fake_run(argv, log, *, env=None, check=True, **kwargs):
+            calls.append(argv[-1])
+            return overlay
+
+        answers = iter(modes)
+        clock = iter(range(0, 1000, 10))
+        with mock.patch.object(flows, "run_private", side_effect=fake_run), \
+                mock.patch.object(flows, "sleep"), \
+                mock.patch.object(flows.time, "monotonic", side_effect=lambda: next(clock)), \
+                mock.patch.object(flows.subprocess, "run",
+                                  side_effect=lambda *a, **k: mock.Mock(stdout=next(answers).encode())):
+            flows.three_button_navigation("adb", Path("log"), {})
+        return calls
+
+    def test_switches_and_waits_for_three_button(self):
+        self.assertEqual(self.navigate(["2", "0"]), ["com.android.internal.systemui.navbar.threebutton"])
+
+    def test_a_failed_switch_or_a_mode_that_never_changes_fails_saying_so(self):
+        for modes, overlay in ((["0"], 1), (["2"] * 10, 0)):
+            with self.subTest(overlay=overlay), self.assertRaises(FlowsError) as failed:
+                self.navigate(modes, overlay)
+            self.assertIn("did not switch to three-button navigation", str(failed.exception))
+
+
 class ParseTest(unittest.TestCase):
     PKG = "io.github.mayassistant.may.flows."
 
