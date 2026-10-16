@@ -95,6 +95,41 @@ class OverlayTest(unittest.TestCase):
             self.run_overlay("false", {"MAY_APP_READ_KEY": "k", "MAY_DS_READ_KEY": "d"})
 
 
+class InstallSdkTest(unittest.TestCase):
+    def install(self, outcomes):
+        calls, waits = [], []
+
+        def fake_run(argv, log, *, env=None, check=True, **kwargs):
+            if "--install" in argv:
+                calls.append(argv)
+                return outcomes[len(calls) - 1]
+            return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / "cmdline-tools/latest/bin").mkdir(parents=True)
+            (home / "cmdline-tools/latest/bin/sdkmanager").write_text("")
+            with mock.patch.object(flows, "run_private", side_effect=fake_run), \
+                    mock.patch.object(flows, "sleep", side_effect=waits.append), \
+                    mock.patch.object(flows.subprocess, "run"):
+                try:
+                    flows.install_sdk(home, home / "log", {})
+                    return len(calls), waits, None
+                except FlowsError as error:
+                    return len(calls), waits, error
+
+    def test_a_first_install_failure_is_retried_once(self):
+        self.assertEqual(self.install([1, 0]), (2, [flows.SDK_RETRY_SECONDS], None))
+
+    def test_a_first_success_does_not_retry(self):
+        self.assertEqual(self.install([0]), (1, [], None))
+
+    def test_a_second_failure_fails_the_run(self):
+        count, waits, error = self.install([1, 1])
+        self.assertEqual((count, waits), (2, [flows.SDK_RETRY_SECONDS]))
+        self.assertIsInstance(error, FlowsError)
+
+
 class ParseTest(unittest.TestCase):
     PKG = "io.github.mayassistant.may.flows."
 

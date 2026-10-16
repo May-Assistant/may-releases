@@ -131,12 +131,14 @@ PUBLISH_SIGNED_STEP = (
     "          retention-days: 3\n"
     "          compression-level: 0\n")
 READ_KEYS = {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"}
+# The Android build step holds the PostHog crash-report key and nothing else (store.POSTHOG_SECRETS).
+ANDROID_BUILD = "Build unsigned Android App Bundle with only the crash-report key"
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
     "android-build": (
-        ["Install pinned JDK and age", FETCH, "Build unsigned Android App Bundle without secrets",
+        ["Install pinned JDK and age", FETCH, ANDROID_BUILD,
          "Encrypt unsigned bundle to the target's public key"],
-        {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
+        {FETCH: READ_KEYS, ANDROID_BUILD: {"MAY_POSTHOG_ANDROID_KEY"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "android-release": (
         ["Install pinned JDK and age", DECRYPT, "Sign and verify Android App Bundle",
          "Upload update to the internal track only", CONFIRM, REPORT],
