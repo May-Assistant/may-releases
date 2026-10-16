@@ -72,6 +72,31 @@ class StaticCheckTests(unittest.TestCase):
                 self.mutate(STORE, old, new)
                 self.assertFlagged("store android-build: sets an environment variable it does not declare")
 
+    def test_the_crash_report_keys_build_step_runs_only_the_build(self):
+        command = ('        run: python3 -I -S -B tools/may_release/store.py --platform android --target "$MAY_TARGET" '
+                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"\n')
+        for new in ("        run: printenv\n",
+                    command.replace("\n", "; env\n"),
+                    "        run: |\n          printenv\n" + command.replace("        run: ", "          "),
+                    command.replace("store.py", "dry_run.py")):
+            with self.subTest(new=new):
+                self.fresh()
+                self.mutate(STORE, command, new)
+                self.assertFlagged("store android-build: the crash-report key's build step runs something other than the build")
+
+    def test_the_posthog_host_is_read_only_on_the_build_step(self):
+        host = "          MAY_POSTHOG_HOST: ${{ vars.MAY_POSTHOG_HOST }}\n"
+        fetch_env = "          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}\n"
+        job_env = "    env:\n      PYTHONDONTWRITEBYTECODE: '1'\n"   # first: android-build's job-level env
+        for old, new, job in ((fetch_env, fetch_env + host, "android-build"),     # on the fetch step too
+                              (job_env, job_env + "      MAY_POSTHOG_HOST: ${{ vars.MAY_POSTHOG_HOST }}\n", "android-build"),
+                              ("          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n",
+                               "          MAY_PLAY_JSON: ${{ secrets.MAY_PLAY_JSON }}\n" + host, "android-release")):
+            with self.subTest(new=new):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged(f"store {job}: reads the PostHog host outside the crash-report key's build step")
+
     def test_a_flows_error_message_must_be_one_literal(self):
         self.mutate("tools/may_release/flows.py",
                     'raise FlowsError("Unknown flow selection")', 'raise FlowsError("Unknown flow selection: " + str(flows))')
