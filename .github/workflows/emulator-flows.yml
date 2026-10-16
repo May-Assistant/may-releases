@@ -33,7 +33,7 @@ on:
         required: true
         type: choice
         default: all
-        options: [all, chat-reply, task-detail, connections, empty-states, message-menu, sending-status, sign-in]
+        options: [all, chat-reply, task-detail, connections, empty-states, message-menu, sending-status, sign-in, plan-your-day]
 permissions:
   contents: read
 concurrency:

@@ -160,6 +160,17 @@ class ManifestTest(unittest.TestCase):
     def test_reads_class_counts_and_skips_comments(self):
         self.assertEqual(self.manifest("# expected\nChatReplyFlow 3\n\nSignInFlow 2\n"), {"ChatReplyFlow": 3, "SignInFlow": 2})
 
+    def test_reads_may_apps_current_manifest_classes(self):
+        # may-app android/flows/manifest.txt with #180 (build 10's PlanYourDayFlow).
+        text = "".join(f"{name} 1\n" for name in ("ChatReplyFlow", "ConnectionsFlow", "EmptyStatesFlow", "MessageMenuFlow",
+                                                  "PlanYourDayFlow", "SendingStatusFlow", "SignInFlow", "TaskDetailFlow"))
+        try:
+            read = self.manifest(text)
+        except FlowsError as refused:
+            read = refused
+        self.assertEqual(sorted(read) if isinstance(read, dict) else read, sorted(name for name, _ in
+                         (line.split() for line in text.splitlines())))
+
     def test_reads_a_manifest_with_a_byte_order_mark(self):
         try:
             read = self.manifest("\ufeffChatReplyFlow 3\n")
