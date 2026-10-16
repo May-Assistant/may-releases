@@ -8,7 +8,14 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import sys
 import zipfile
+
+# Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
+# after the standard library. A file planted here cannot shadow a stdlib import.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from store import StoreError, require_step_secrets
 
 XCODEGEN_URL = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
 XCODEGEN_SHA256 = "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
@@ -44,6 +51,8 @@ IOS_SCHEMES = {None: ("May", "MayPlayground"), "playground": ("MayPlayground",),
 
 
 def compile_native(platform, target=None):
+    # The compile runs third-party build code (XcodeGen, SwiftPM, Xcode) and holds no secret at all.
+    require_step_secrets(())
     root = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
     source, private = root / "may-source", root / "may-private"
     if not os.environ.get("RUNNER_TEMP") or not source.is_dir() or not private.is_dir():
@@ -94,5 +103,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         compile_native(args.platform, args.target)
-    except (CompileError, OSError, subprocess.SubprocessError, zipfile.BadZipFile):
+    except (CompileError, StoreError, OSError, subprocess.SubprocessError, zipfile.BadZipFile):
         raise SystemExit("Protected May native compile failed; private logs were not published") from None

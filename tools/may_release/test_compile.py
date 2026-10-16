@@ -25,5 +25,21 @@ class CompileTests(unittest.TestCase):
         self.assertEqual(IOS_SCHEMES[None], ("May", "MayPlayground"))
 
 
+    def test_the_compile_refuses_any_secret_in_its_step(self):
+        # Security review of #16, F1: XcodeGen, SwiftPM and Xcode run here; no secret may reach them.
+        import os
+        from unittest import mock
+        from compile import compile_native
+        from store import StoreError
+        for name in ("MAY_APP_READ_KEY", "MAY_ASC_KEY_BASE64"):
+            with self.subTest(secret=name), mock.patch.dict(os.environ, {name: "x"}):
+                try:
+                    compile_native("ios", "playground")
+                    raised = None
+                except Exception as error:  # noqa: BLE001 - which refusal comes first is the point
+                    raised = error
+                self.assertIsInstance(raised, StoreError, "refused for another reason, or not at all")
+
+
 if __name__ == "__main__":
     unittest.main()

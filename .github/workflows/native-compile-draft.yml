@@ -34,7 +34,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
+        run: python3 -I -S -B tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
   native:
     needs: admission
     if: ${{ inputs.platform == 'ios' }}
@@ -52,15 +52,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: python3 tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
+        run: python3 -I -S -B tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"
       - name: Fetch exact private app and pinned design system quietly
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
-        run: python3 tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"
+        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"
       - name: Compile without signing or store access
-        run: python3 tools/may_release/compile.py --platform ios --target playground
+        run: python3 -I -S -B tools/may_release/compile.py --platform ios --target playground
       - name: Remove private source, logs and products
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"

@@ -635,17 +635,54 @@ def upload_track_problems(root):
 COMPILE_IOS_LINES = (
     "        options: [ios]\n",
     "    if: ${{ inputs.platform == 'ios' }}\n    runs-on: macos-15\n",
-    "        run: python3 tools/may_release/prepare.py --platform ios --target playground --source-sha \"$MAY_SOURCE_SHA\"\n",
-    "        run: python3 tools/may_release/compile.py --platform ios --target playground\n",
 )
+GATE_COMPILE = 'python3 -I -S -B tools/may_release/gate.py --action compile --source-sha "$MAY_SOURCE_SHA"'
+PREPARE_IOS = 'python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"'
+COMPILE_IOS = "python3 -I -S -B tools/may_release/compile.py --platform ios --target playground"
+COMPILE_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+                   '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"')
+# Every command the compile workflow may run, each the number of times it does (security review of #16, F1/F2):
+# no other step, so nothing prints the private log or runs anything else.
+COMPILE_RUNS = [GATE_COMPILE, GATE_COMPILE, PREPARE_IOS, COMPILE_IOS, COMPILE_CLEANUP]
+COMPILE_STEP_NAMES = ["Recheck protection after reviewer approval", "Fetch exact private app and pinned design system quietly",
+                      "Compile without signing or store access", "Remove private source, logs and products"]
+COMPILE_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
+COMPILE_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS}
+JOB_PERMISSIONS = "    permissions:\n      contents: read\n      actions: read\n"
 
 
 def compile_workflow_problems(text):
-    """The native compile is exactly the active iOS-only Playground compile: no inert guard, no other platform."""
+    """The native compile is exactly the active iOS-only May Playground compile: dispatch only, read-only, the two
+    source-read keys in the fetch step alone, and nothing run but its four commands."""
+    found = []
     if "may-compile-disabled-pending-review" in text or not all(text.count(line) == 1 for line in COMPILE_IOS_LINES) \
             or "toolchain.py jdk" in text or "--platform android" in text:
-        return ["native-compile-draft.yml is not the active iOS-only May Playground compile"]
-    return []
+        found.append("native-compile-draft.yml is not the active iOS-only May Playground compile")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append("native-compile-draft.yml: top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\non:\n")[2].partition("\npermissions:")[0]) != ["workflow_dispatch"]:
+        found.append("native-compile-draft.yml: is triggered by something other than workflow_dispatch")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "native")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append("native-compile-draft.yml: permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "native"]:
+        found.append("native-compile-draft.yml: jobs are not exactly admission and native")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+run: (.+)$", text)]
+    if runs != COMPILE_RUNS or re.search(r"(?m)^\s+run: *[|>]", text):
+        found.append("native-compile-draft.yml: runs something other than the gate, the fetch, the compile and the cleanup")
+    names = re.findall(r"(?m)^      - name: (.+)$", job_text(text, "native"))
+    cleanup = job_text(text, "native").partition("      - name: Remove private source, logs and products\n")[2]
+    if names != COMPILE_STEP_NAMES or not cleanup.startswith("        if: always()\n"):
+        found.append("native-compile-draft.yml: native's steps are not exactly the recheck, fetch, compile and an always-run cleanup")
+    fetch = job_text(text, "native").partition("      - name: Fetch exact private app and pinned design system quietly\n")[2] \
+        .partition("      - name: ")[0]
+    if secrets_in(text) != set(COMPILE_SECRETS) or any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or any(e not in COMPILE_ENV for e in env_entries(text)) or \
+            re.search(r"(?m)^(    )?env:", text):
+        found.append("native-compile-draft.yml: a secret or env entry other than the fetch step's two source-read keys")
+    return found
 
 
 def control_problems(root):
