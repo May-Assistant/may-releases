@@ -133,6 +133,11 @@ PUBLISH_SIGNED_STEP = (
 READ_KEYS = {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"}
 # The Android build step holds the PostHog crash-report key and nothing else (store.POSTHOG_SECRETS).
 ANDROID_BUILD = "Build unsigned Android App Bundle with only the crash-report key"
+# That step runs exactly this and nothing else (it is the one build step holding a secret past the fetch), and only it
+# may read the PostHog host variable.
+ANDROID_BUILD_COMMAND = ('python3 -I -S -B tools/may_release/store.py --platform android --target "$MAY_TARGET" '
+                         '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
+POSTHOG_HOST_ENV = "MAY_POSTHOG_HOST: ${{ vars.MAY_POSTHOG_HOST }}"
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
     "android-build": (
@@ -447,6 +452,13 @@ def store_problems(store):
                    ' --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA"')
         if not release and [run_commands(text) for name, text in steps if name == FETCH] != [[prepare]]:
             found.append(f"store {job}: does not prepare the design system for its own platform and target")
+        if job == "android-build" and [run_commands(text) for name, text in steps if name == ANDROID_BUILD] != \
+                [[ANDROID_BUILD_COMMAND]]:
+            found.append(f"store {job}: the crash-report key's build step runs something other than the build")
+        # The PostHog host variable: only on android-build's build step (never at job level or on another step).
+        allowed_host = job == "android-build" and [n for n, t in steps if "MAY_POSTHOG_HOST" in t] in ([], [ANDROID_BUILD])
+        if "MAY_POSTHOG_HOST" in job_text(store, job) and not (allowed_host and "MAY_POSTHOG_HOST" not in header):
+            found.append(f"store {job}: reads the PostHog host outside the crash-report key's build step")
         # The dry run must still build, seal, open, sign and verify: only the
         # upload, the loud-failure check and the report are conditional (cleanup
         # always runs).
