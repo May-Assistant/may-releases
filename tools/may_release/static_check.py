@@ -669,13 +669,24 @@ def compile_workflow_problems(text):
         found.append("native-compile-draft.yml: permissions are not exactly read-only (contents, and actions in each job)")
     if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "native"]:
         found.append("native-compile-draft.yml: jobs are not exactly admission and native")
-    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+run: (.+)$", text)]
-    if runs != COMPILE_RUNS or re.search(r"(?m)^\s+run: *[|>]", text):
+    # run: may also sit on a step's dash line (`- run: ...`), unnamed (security review of #16, R1).
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != COMPILE_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
         found.append("native-compile-draft.yml: runs something other than the gate, the fetch, the compile and the cleanup")
-    names = re.findall(r"(?m)^      - name: (.+)$", job_text(text, "native"))
-    cleanup = job_text(text, "native").partition("      - name: Remove private source, logs and products\n")[2]
-    if names != COMPILE_STEP_NAMES or not cleanup.startswith("        if: always()\n"):
+    # Every step, named or not, by the key it starts with: admission is the checkout then the gate; native is the
+    # checkout then its four named steps, the last run always.
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "native")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [name for name, _ in steps["native"]]
+    cleanup = steps["native"][-1][1] if steps["native"] else ""
+    if leading != {"admission": ["uses", "id"], "native": ["uses", "name", "name", "name", "name"]} or \
+            names != [""] + COMPILE_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            [uses_in(chunk) for _, chunk in steps["admission"] + steps["native"]].count([CHECKOUT]) != 2 or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
         found.append("native-compile-draft.yml: native's steps are not exactly the recheck, fetch, compile and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell):", text) or text.count("timeout-minutes:") != 1 or \
+            "    timeout-minutes: 90\n" not in job_text(text, "native"):
+        found.append("native-compile-draft.yml: sets a shell, defaults or a timeout other than native's 90 minutes")
     fetch = job_text(text, "native").partition("      - name: Fetch exact private app and pinned design system quietly\n")[2] \
         .partition("      - name: ")[0]
     if secrets_in(text) != set(COMPILE_SECRETS) or any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS) or \
