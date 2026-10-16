@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|docker://\S+@sha256:[0-9a-f]{64})")
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
-PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError"}
+PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -131,12 +131,19 @@ PUBLISH_SIGNED_STEP = (
     "          retention-days: 3\n"
     "          compression-level: 0\n")
 READ_KEYS = {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"}
+# The Android build step holds the PostHog crash-report key and nothing else (store.POSTHOG_SECRETS).
+ANDROID_BUILD = "Build unsigned Android App Bundle with only the crash-report key"
+# That step runs exactly this and nothing else (it is the one build step holding a secret past the fetch), and only it
+# may read the PostHog host variable.
+ANDROID_BUILD_COMMAND = ('python3 -I -S -B tools/may_release/store.py --platform android --target "$MAY_TARGET" '
+                         '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
+POSTHOG_HOST_ENV = "MAY_POSTHOG_HOST: ${{ vars.MAY_POSTHOG_HOST }}"
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
     "android-build": (
-        ["Install pinned JDK and age", FETCH, "Build unsigned Android App Bundle without secrets",
+        ["Install pinned JDK and age", FETCH, ANDROID_BUILD,
          "Encrypt unsigned bundle to the target's public key"],
-        {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
+        {FETCH: READ_KEYS, ANDROID_BUILD: {"MAY_POSTHOG_ANDROID_KEY"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "android-release": (
         ["Install pinned JDK and age", DECRYPT, "Sign and verify Android App Bundle",
          "Upload update to the internal track only", CONFIRM, REPORT],
@@ -174,7 +181,7 @@ ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLA
                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN" '
                   '--sign-only "$MAY_SIGN_ONLY"')
 CONTINUE_ON_ERROR = re.compile(r"(?m)^\s*(-\s+)?continue-on-error:")
-VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID"}
+VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID", "MAY_POSTHOG_HOST"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
 
 
@@ -445,6 +452,13 @@ def store_problems(store):
                    ' --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA"')
         if not release and [run_commands(text) for name, text in steps if name == FETCH] != [[prepare]]:
             found.append(f"store {job}: does not prepare the design system for its own platform and target")
+        if job == "android-build" and [run_commands(text) for name, text in steps if name == ANDROID_BUILD] != \
+                [[ANDROID_BUILD_COMMAND]]:
+            found.append(f"store {job}: the crash-report key's build step runs something other than the build")
+        # The PostHog host variable: only on android-build's build step (never at job level or on another step).
+        allowed_host = job == "android-build" and [n for n, t in steps if "MAY_POSTHOG_HOST" in t] in ([], [ANDROID_BUILD])
+        if "MAY_POSTHOG_HOST" in job_text(store, job) and not (allowed_host and "MAY_POSTHOG_HOST" not in header):
+            found.append(f"store {job}: reads the PostHog host outside the crash-report key's build step")
         # The dry run must still build, seal, open, sign and verify: only the
         # upload, the loud-failure check and the report are conditional (cleanup
         # always runs).
@@ -486,6 +500,12 @@ def store_problems(store):
             if ("upload-artifact@" in text or "download-artifact@" in text) and \
                     not re.search(r"(?m)^          name: may-handoff-(android|ios)-\$\{\{ github\.run_attempt \}\}$", text):
                 found.append(f"store {job}: handoff artifact is not bound to this run attempt")
+        # Every job, build and release alike: each secrets.X is bound as X, each vars.X as X (X in VARS),
+        # and nothing else but the declared inputs and constants.
+        if not release:
+            all_secrets = set().union(*expected.values())
+            if not all(release_env_allowed(n, v, all_secrets, job) for n, v in env_entries(job_text(store, job))):
+                found.append(f"store {job}: sets an environment variable it does not declare")
         if release:
             if job in UPLOADS:
                 found += loud_failure_problems(store, job, steps)
