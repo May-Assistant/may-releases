@@ -8,7 +8,14 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import sys
 import zipfile
+
+# Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
+# after the standard library. A file planted here cannot shadow a stdlib import.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from store import StoreError, require_step_secrets
 
 XCODEGEN_URL = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
 XCODEGEN_SHA256 = "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
@@ -38,7 +45,14 @@ def extract_generator(archive, generator):
     return binary
 
 
-def compile_native(platform):
+# The iOS schemes each target builds. Playground is internal, so it may build at iOS's own design-system pin
+# (prepare.py --platform ios --target playground); May (production) needs the pins to match.
+IOS_SCHEMES = {None: ("May", "MayPlayground"), "playground": ("MayPlayground",), "production": ("May",)}
+
+
+def compile_native(platform, target=None):
+    # The compile runs third-party build code (XcodeGen, SwiftPM, Xcode) and holds no secret at all.
+    require_step_secrets(())
     root = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
     source, private = root / "may-source", root / "may-private"
     if not os.environ.get("RUNNER_TEMP") or not source.is_dir() or not private.is_dir():
@@ -64,7 +78,7 @@ def compile_native(platform):
         binary = extract_generator(archive, private / "xcodegen")
         env["PATH"] = str(binary.parent) + os.pathsep + env.get("PATH", "")
         run([str(binary), "generate"], log, cwd=source / "ios", env=env)
-        for scheme in ("May", "MayPlayground"):
+        for scheme in IOS_SCHEMES[target]:
             run(["xcodebuild", "-project", str(source / "ios/May.xcodeproj"), "-scheme", scheme,
                  "-configuration", "Release", "-destination", "generic/platform=iOS Simulator",
                  "-derivedDataPath", str(root / "may-derived"),
@@ -85,8 +99,9 @@ def compile_native(platform):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", choices=("ios", "android"), required=True)
+    parser.add_argument("--target", choices=("production", "playground"))
     args = parser.parse_args()
     try:
-        compile_native(args.platform)
-    except (CompileError, OSError, subprocess.SubprocessError, zipfile.BadZipFile):
+        compile_native(args.platform, args.target)
+    except (CompileError, StoreError, OSError, subprocess.SubprocessError, zipfile.BadZipFile):
         raise SystemExit("Protected May native compile failed; private logs were not published") from None

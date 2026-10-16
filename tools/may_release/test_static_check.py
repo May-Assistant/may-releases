@@ -283,8 +283,9 @@ class StaticCheckTests(unittest.TestCase):
         self.assertFlagged("handoff artifact is not bound to this run attempt")
 
     def test_pinned_jdk_is_never_installed_on_macos(self):
-        self.mutate(".github/workflows/native-compile-draft.yml",
-                    "runs-on: ${{ inputs.platform == 'android' && 'ubuntu-24.04' || 'macos-15' }}", "runs-on: macos-15")
+        self.mutate(".github/workflows/native-compile-draft.yml", "      - name: Recheck protection after reviewer approval\n",
+                    "      - name: Install pinned JDK\n        run: python3 tools/may_release/toolchain.py jdk --export\n"
+                    "      - name: Recheck protection after reviewer approval\n")
         self.assertFlagged("native-compile-draft.yml: job native installs the linux-only pinned JDK on macOS")
 
     def test_only_the_encrypted_handoff_is_uploaded(self):
@@ -369,11 +370,62 @@ class StaticCheckTests(unittest.TestCase):
                 for found in (static_check.message_problems(self.root), static_check.problems(self.root)):
                     self.assertTrue(any("play_upload.py" in problem for problem in found), found)
 
-    def test_compile_workflow_stays_inert(self):
-        self.mutate(".github/workflows/native-compile-draft.yml",
-                    "if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}",
-                    "if: ${{ github.event_name == 'workflow_dispatch' }}")
-        self.assertFlagged("native-compile-draft.yml is not inert")
+    def test_compile_workflow_is_exactly_the_ios_playground_compile(self):
+        compile_yml = ".github/workflows/native-compile-draft.yml"
+        shape = "native-compile-draft.yml is not the active iOS-only May Playground compile"
+        runs = "native-compile-draft.yml: runs something other than the gate, the fetch, the compile and the cleanup"
+        changes = {
+            "held inert again": ("    if: ${{ inputs.platform == 'ios' }}\n",
+                                 "    if: ${{ github.event_name == 'may-compile-disabled-pending-review' }}\n", shape),
+            "android offered": ("        options: [ios]\n", "        options: [ios, android]\n", shape),
+            "runs on another runner": ("    runs-on: macos-15\n", "    runs-on: macos-14\n", shape),
+            "pins must match again": ("prepare.py --platform ios --target playground", "prepare.py", runs),
+            "production scheme too": ("compile.py --platform ios --target playground", "compile.py --platform ios", runs),
+        }
+        for name, (old, new, message) in changes.items():
+            with self.subTest(change=name):
+                self.fresh()
+                self.mutate(compile_yml, old, new)
+                self.assertFlagged(message)
+
+    def test_compile_workflow_secrets_permissions_triggers_and_steps_are_pinned(self):
+        # Security review of #16 (F1, F2): each of these went unflagged before.
+        wf = ".github/workflows/native-compile-draft.yml"
+        secret = "native-compile-draft.yml: a secret or env entry other than the fetch step's two source-read keys"
+        perms = "native-compile-draft.yml: permissions are not exactly read-only (contents, and actions in each job)"
+        trigger = "native-compile-draft.yml: is triggered by something other than workflow_dispatch"
+        runs = "native-compile-draft.yml: runs something other than the gate, the fetch, the compile and the cleanup"
+        steps = "native-compile-draft.yml: native's steps are not exactly the recheck, fetch, compile and an always-run cleanup"
+        top = "native-compile-draft.yml: top-level keys are not exactly name, on, permissions, concurrency, jobs"
+        compile_step = "      - name: Compile without signing or store access\n"
+        fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
+        cases = {
+            "a store secret in the compile step": (compile_step, compile_step +
+                "        env:\n          MAY_ASC_KEY_BASE64: ${{ secrets.MAY_ASC_KEY_BASE64 }}\n", secret),
+            "the crash-report key in the fetch step": (fetch_env, fetch_env +
+                "          MAY_POSTHOG_ANDROID_KEY: ${{ secrets.MAY_POSTHOG_ANDROID_KEY }}\n", secret),
+            "a source key rebound under another name": ("          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}\n",
+                "          APP_KEY: ${{ secrets.MAY_APP_READ_KEY }}\n", secret),
+            "a source key bound twice": (compile_step, compile_step +
+                "        env:\n          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n", secret),
+            "a job-level env": ("    timeout-minutes: 90\n", "    timeout-minutes: 90\n    env:\n      CI: '1'\n", secret),
+            "contents: write": ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: write\nconcurrency:", perms),
+            "id-token: write": ("      contents: read\n      actions: read\n    steps:\n      - uses",
+                                "      contents: read\n      actions: read\n      id-token: write\n    steps:\n      - uses", perms),
+            "a pull_request trigger": ("on:\n  workflow_dispatch:\n", "on:\n  pull_request:\n  workflow_dispatch:\n", trigger),
+            "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n", trigger),
+            "the cleanup removed": ("      - name: Remove private source, logs and products\n        if: always()\n", "      - name: Remove private source, logs and products\n", steps),
+            "a step that prints the log": ("      - name: Remove private source, logs and products\n",
+                "      - name: Show log\n        run: cat \"$RUNNER_TEMP/may-private/ios-compile.log\"\n"
+                "      - name: Remove private source, logs and products\n", runs),
+            "python without -I -S -B": ("run: python3 -I -S -B tools/may_release/compile.py", "run: python3 tools/may_release/compile.py", runs),
+            "a top-level env": ("permissions:\n  contents: read\nconcurrency:", "env:\n  CI: '1'\npermissions:\n  contents: read\nconcurrency:", top),
+        }
+        for name, (old, new, message) in cases.items():
+            with self.subTest(change=name):
+                self.fresh()
+                self.mutate(wf, old, new)
+                self.assertFlagged(message)
 
     def test_stage_3_is_exactly_android_uploads(self):
         store = (ROOT / STORE).read_text()
