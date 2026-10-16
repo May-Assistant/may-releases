@@ -397,6 +397,7 @@ class StaticCheckTests(unittest.TestCase):
         runs = "native-compile-draft.yml: runs something other than the gate, the fetch, the compile and the cleanup"
         steps = "native-compile-draft.yml: native's steps are not exactly the recheck, fetch, compile and an always-run cleanup"
         top = "native-compile-draft.yml: top-level keys are not exactly name, on, permissions, concurrency, jobs"
+        shell = "native-compile-draft.yml: sets a shell, defaults or a timeout other than native's 90 minutes"
         compile_step = "      - name: Compile without signing or store access\n"
         fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
         cases = {
@@ -419,6 +420,20 @@ class StaticCheckTests(unittest.TestCase):
                 "      - name: Show log\n        run: cat \"$RUNNER_TEMP/may-private/ios-compile.log\"\n"
                 "      - name: Remove private source, logs and products\n", runs),
             "python without -I -S -B": ("run: python3 -I -S -B tools/may_release/compile.py", "run: python3 tools/may_release/compile.py", runs),
+            # Security review of #16, R1: steps written with the key on the dash line, unnamed.
+            "an unnamed run step": ("      - name: Remove private source, logs and products\n",
+                "      - run: cat \"$RUNNER_TEMP/may-private/ios-compile.log\"\n"
+                "      - name: Remove private source, logs and products\n", runs),
+            "an unnamed uses step": ("      - name: Remove private source, logs and products\n",
+                "      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
+                "      - name: Remove private source, logs and products\n", steps),
+            "an unnamed run step in admission": ("      - id: gate\n", "      - run: env\n      - id: gate\n", runs),
+            "defaults.run.shell": ("permissions:\n  contents: read\nconcurrency:",
+                "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: bash -x {0}\nconcurrency:", shell),
+            "a step shell": ("        run: python3 -I -S -B tools/may_release/compile.py",
+                "        shell: bash -x {0}\n        run: python3 -I -S -B tools/may_release/compile.py", shell),
+            "a longer timeout": ("    timeout-minutes: 90\n", "    timeout-minutes: 600\n", shell),
+            "a timeout on admission": ("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n", shell),
             "a top-level env": ("permissions:\n  contents: read\nconcurrency:", "env:\n  CI: '1'\npermissions:\n  contents: read\nconcurrency:", top),
         }
         for name, (old, new, message) in cases.items():
