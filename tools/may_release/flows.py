@@ -69,6 +69,7 @@ MANIFEST = "android/flows/manifest.txt"
 # Three-button navigation (settings secure navigation_mode), so a flow checking clearance has a full bar.
 THREE_BUTTON = "0"
 NAV_SECONDS = 30
+MANIFEST_BYTES = 64 * 1024
 APP_ID = "io.github.mayassistant.may.playground"
 TEST_ID = APP_ID + ".test"
 RUNNER = TEST_ID + "/androidx.test.runner.AndroidJUnitRunner"
@@ -250,9 +251,11 @@ def parse_instrumentation(text):
 def read_manifest(path):
     """{class: count} from android/flows/manifest.txt; every class one of FLOWS', every count a positive number."""
     try:
-        text = path.read_text()
-    except OSError:
-        raise FlowsError("The flows commit has no android/flows/manifest.txt") from None
+        if path.stat().st_size > MANIFEST_BYTES:
+            raise FlowsError("android/flows/manifest.txt is larger than 64 KiB")
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        raise FlowsError("The flows commit has no readable android/flows/manifest.txt") from None
     known, expected = {name for name in FLOWS.values() if name}, {}
     for line in text.splitlines():
         line = line.strip()
@@ -267,24 +270,27 @@ def read_manifest(path):
     return expected
 
 
-def matches_manifest(results, expected, flows):
-    """Whether the run reported exactly the manifest's tests for the selected flows, and no unlisted one."""
+def manifest_difference(results, expected, flows):
+    """None when the run reported exactly the manifest's tests for the selected flows; else "missing" (a listed test
+    or class did not report) or "extra" (a test or class the manifest does not list, an unlisted flow included)."""
     selection = FLOWS[flows]
     if selection and selection not in expected:
-        return False
+        return "missing"
     wanted = {selection: expected[selection]} if selection else expected
     counts = {}
     for label, _ in results:
         name = label.rpartition(" test ")[0]
         counts[name] = counts.get(name, 0) + 1
-    # An unlisted flow, or a class the selection didn't ask for, is a key the manifest lacks.
-    return counts == wanted
+    if any(name not in wanted or count > wanted[name] for name, count in counts.items()):
+        return "extra"
+    return "missing" if counts != wanted else None
 
 
 def three_button_navigation(adb, log, env):
     """Switch the emulator to three-button navigation and confirm it took."""
-    run_private([adb, "shell", "cmd", "overlay", "enable-exclusive", "--category",
-                 "com.android.internal.systemui.navbar.threebutton"], log, env=env)
+    if run_private([adb, "shell", "cmd", "overlay", "enable-exclusive", "--category",
+                    "com.android.internal.systemui.navbar.threebutton"], log, env=env, check=False):
+        raise FlowsError("The emulator did not switch to three-button navigation; no flow ran")
     deadline = time.monotonic() + NAV_SECONDS
     while True:
         mode = subprocess.run([adb, "shell", "settings", "get", "secure", "navigation_mode"], capture_output=True,
@@ -296,7 +302,7 @@ def three_button_navigation(adb, log, env):
         sleep(2)
 
 
-def run(source_sha, flows):
+def run(source_sha, flows, from_branch):
     require_step_secrets(())
     root = runner_root()
     source, private = prepared(root, source_sha)
@@ -344,11 +350,14 @@ def run(source_sha, flows):
             emulator.wait(timeout=60)
         except subprocess.TimeoutExpired:
             emulator.kill()
-    report(results, completed, expected, flows)
+    report(results, completed, expected, flows, from_branch)
 
 
-def report(results, completed, expected, flows):
-    """Prints one line per test, then passes only a finished run whose every test passed and matches the manifest."""
+def report(results, completed, expected, flows, from_branch):
+    """Prints one line per test, then passes only a finished run whose every test passed and matches the manifest.
+    A run of flows taken from a branch (flows_from_branch) says so first: it is not release evidence."""
+    if from_branch == "true":
+        print("May flows: flows taken from a branch; this run is not release evidence")
     for name, outcome in results:
         print("May flow " + name + ": " + outcome)
     if not results:
@@ -357,8 +366,11 @@ def report(results, completed, expected, flows):
         raise FlowsError("The flow run did not finish (the app or its tests stopped part-way)")
     if any(outcome != "pass" for _, outcome in results):
         raise FlowsError("At least one May flow did not pass")
-    if not matches_manifest(results, expected, flows):
-        raise FlowsError("The flows that ran differ from android/flows/manifest.txt (a flow or test missing, added or unlisted)")
+    difference = manifest_difference(results, expected, flows)
+    if difference == "missing":
+        raise FlowsError("A flow or test in android/flows/manifest.txt is missing from the run")
+    if difference == "extra":
+        raise FlowsError("The run reported a flow or test that is not in android/flows/manifest.txt")
     print("Every selected May flow passed")
 
 
@@ -390,7 +402,7 @@ if __name__ == "__main__":
             build(args.source_sha)
             print("May Playground app and its flows built")
         elif args.command == "run":
-            run(args.source_sha, args.flows)
+            run(args.source_sha, args.flows, args.flows_from_branch)
         else:
             cleanup()
     except FlowsError as error:

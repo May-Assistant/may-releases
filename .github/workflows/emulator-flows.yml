@@ -93,7 +93,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Run the flows on an emulator and report pass or fail
-        run: python3 -I -S -B tools/may_release/flows.py run --source-sha "$MAY_SOURCE_SHA" --flows "$MAY_FLOWS"
+        run: python3 -I -S -B tools/may_release/flows.py run --source-sha "$MAY_SOURCE_SHA" --flows "$MAY_FLOWS" --flows-from-branch "$MAY_FLOWS_FROM_BRANCH"
       - name: Remove private source, logs and products
         if: always()
         run: python3 -I -S -B tools/may_release/flows.py cleanup
