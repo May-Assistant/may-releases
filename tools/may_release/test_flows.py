@@ -4,8 +4,14 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import tempfile
+from pathlib import Path
+from unittest import mock
+
 import flows
-from flows import FlowsError, admit, parse_instrumentation
+from flows import FlowsError, admit, environment_exists, overlay, parse_instrumentation
+from gate import GateDenial
+from store import StoreError
 
 SHA = "a" * 40
 OTHER = "b" * 40
@@ -20,22 +26,73 @@ def status(cls, test, code, stack=None):
 
 
 class AdmitTest(unittest.TestCase):
-    def test_admits_a_dispatch_from_each_allowed_branch(self):
-        for ref in flows.ALLOWED_REFS:
-            admit("May-Assistant/may-releases", ref, "workflow_dispatch", SHA, OTHER, "all")
+    def test_admits_a_dispatch_from_main_with_flows_from_main_or_a_branch(self):
+        for from_branch in ("false", "true"):
+            admit("May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch", SHA, OTHER, "all", from_branch)
+
+    def test_refuses_flows_from_branch_other_than_true_or_false(self):
+        for value in ("", "yes", "True", None):
+            with self.assertRaises(FlowsError):
+                admit("May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch", SHA, OTHER, "all", value)
 
     def test_refuses_another_branch_event_or_repository(self):
-        for repo, ref, event in (("May-Assistant/may-releases", "refs/heads/feature", "workflow_dispatch"),
+        for repo, ref, event in (("May-Assistant/may-releases", "refs/heads/claude/emulator-flows", "workflow_dispatch"),
+                                 ("May-Assistant/may-releases", "refs/heads/feature", "workflow_dispatch"),
                                  ("May-Assistant/may-releases", "refs/heads/main", "push"),
                                  ("someone/may-releases", "refs/heads/main", "workflow_dispatch")):
             with self.assertRaises(FlowsError):
-                admit(repo, ref, event, SHA, OTHER, "all")
+                admit(repo, ref, event, SHA, OTHER, "all", "false")
 
     def test_refuses_inexact_shas_and_unknown_flows(self):
         for source, flows_sha, selection in ((SHA[:7], OTHER, "all"), (SHA, "main", "all"),
                                              (SHA.upper(), OTHER, "all"), (SHA, OTHER, "everything")):
             with self.assertRaises(FlowsError):
-                admit("May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch", source, flows_sha, selection)
+                admit("May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch", source, flows_sha, selection, "false")
+
+
+class EnvironmentTest(unittest.TestCase):
+    def test_passes_when_the_environment_exists(self):
+        asked = []
+        environment_exists("token", get=lambda path, token: asked.append(path) or {"name": "may-flows"})
+        self.assertEqual(asked, ["environments/may-flows"])
+
+    def test_refuses_a_missing_environment_or_token(self):
+        def missing(path, token):
+            raise GateDenial("Protected environment does not exist; it must never be auto-created")
+        with self.assertRaises(FlowsError):
+            environment_exists("token", get=missing)
+        with self.assertRaises(FlowsError):
+            environment_exists("", get=lambda path, token: {})
+
+
+class OverlayTest(unittest.TestCase):
+    def run_overlay(self, from_branch, environ):
+        calls = []
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "may-source/android").mkdir(parents=True)
+            (root / "may-private").mkdir()
+
+            def fake_fetch(dest, remote, sha, key, private, label, main_history=False):
+                calls.append((sha, label, main_history))
+                (dest / "android/flows").mkdir(parents=True)
+                (dest / "android/flows/flows.init.gradle").write_text("// flows")
+
+            with mock.patch.dict(os.environ, environ, clear=True), \
+                    mock.patch.object(flows, "runner_root", return_value=root), \
+                    mock.patch.object(flows, "prepared", return_value=(root / "may-source", root / "may-private")), \
+                    mock.patch.object(flows, "fetch", side_effect=fake_fetch):
+                overlay(SHA, OTHER, from_branch)
+            self.assertTrue((root / "may-source/android/flows/flows.init.gradle").is_file())
+        return calls
+
+    def test_flows_come_from_main_history_unless_from_branch(self):
+        self.assertEqual(self.run_overlay("false", {"MAY_APP_READ_KEY": "k"}), [(OTHER, "flows", True)])
+        self.assertEqual(self.run_overlay("true", {"MAY_APP_READ_KEY": "k"}), [(OTHER, "flows", False)])
+
+    def test_the_overlay_step_refuses_any_other_secret(self):
+        with self.assertRaises(StoreError):
+            self.run_overlay("false", {"MAY_APP_READ_KEY": "k", "MAY_DS_READ_KEY": "d"})
 
 
 class ParseTest(unittest.TestCase):
@@ -62,6 +119,11 @@ class ParseTest(unittest.TestCase):
             ("TaskDetailFlow test 2", "fail (an exception, not an assertion)"),
             ("EmptyStatesFlow test 1", "ignored"),
         ])
+
+    def test_a_malformed_status_code_is_skipped_not_a_crash(self):
+        text = "\n".join([status(self.PKG + "ChatReplyFlow", "a", "--1"), status(self.PKG + "ChatReplyFlow", "a", "- 2"),
+                          status(self.PKG + "ChatReplyFlow", "a", 0), "INSTRUMENTATION_CODE: -1"])
+        self.assertEqual(parse_instrumentation(text), ([("ChatReplyFlow test 1", "pass")], True))
 
     def test_nothing_reported_by_the_device_reaches_the_public_lines(self):
         private = ["maysReplyComesIntoView", "Book the meeting room", "MayApiException", "mayassistant.may.core",

@@ -13,8 +13,17 @@ test's number within it, and its outcome from outcome_of. Nothing the app, its t
 the instrumentation printed reaches the public log: no method name, exception class,
 assertion message, stack trace, screenshot or app output.
 
+A test that is ignored or whose assumption failed fails the run, on purpose: a flow
+that did not check what it is for is not a pass.
+
+Trust: the flows' Gradle init script runs on a runner whose job holds the read-only
+keys, so flows_sha is a trust boundary of its own. By default it must be in may-app's
+main history, like source_sha. flows_from_branch: true admits any may-app commit, for
+trying flows before they merge (their broken-build controls).
+
 Subcommands, one per workflow step:
-  admit    the dispatch is the flows workflow's own, from an allowed branch, with exact SHAs
+  admit    the dispatch is the flows workflow's own, from main, with exact SHAs, and the
+           may-flows environment exists (never auto-created)
   overlay  fetch the flows at --flows-sha and copy them over the prepared source
   build    build the Playground app and its flow APK (no secret in the step)
   run      start the emulator, install, run the selected flows, report
@@ -34,12 +43,14 @@ import time
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from prepare import APP, exact_sha, fetch
-from store import SOURCE_READ_SECRETS, child_env, prepared, require_step_secrets, runner_root
+from gate import GateDenial, get_json
+from store import child_env, prepared, require_step_secrets, runner_root
 
 CONTROL_REPO = "May-Assistant/may-releases"
-# The may-flows environment admits exactly these branches (no required reviewer;
-# read-only deploy keys). Admission refuses any other before a secret is read.
-ALLOWED_REFS = ("refs/heads/main", "refs/heads/claude/emulator-flows")
+# Dispatch from main only. Admission refuses any other ref before a secret is read.
+ALLOWED_REFS = ("refs/heads/main",)
+ENVIRONMENT = "may-flows"
+FLOWS_READ_SECRET = "MAY_APP_READ_KEY"
 FLOWS_PACKAGE = "io.github.mayassistant.may.flows"
 # Which flow classes a dispatch runs. "all" runs the whole package.
 FLOWS = {
@@ -52,6 +63,9 @@ FLOWS = {
 APP_ID = "io.github.mayassistant.may.playground"
 TEST_ID = APP_ID + ".test"
 RUNNER = TEST_ID + "/androidx.test.runner.AndroidJUnitRunner"
+# SDK: platforms;android-37.0 is the app's compileSdk 37, and build-tools 36.0.0 is what
+# its Android Gradle Plugin (9.4.1) builds with (a local build fetched no other). The
+# system image is the emulator's own OS, separate from both.
 # Emulator: API 35 (edge-to-edge is enforced for the app's targetSdk), a phone shape,
 # and three-button navigation, so the navigation bar a flow must stay clear of is a
 # real, full-height one.
@@ -75,7 +89,7 @@ class FlowsError(ValueError):
     pass
 
 
-def admit(repo, ref, event, source_sha, flows_sha, flows):
+def admit(repo, ref, event, source_sha, flows_sha, flows, from_branch):
     if (repo, event) != (CONTROL_REPO, "workflow_dispatch") or ref not in ALLOWED_REFS:
         raise FlowsError("Flows run only by manual dispatch from an allowed branch")
     for sha in (source_sha, flows_sha):
@@ -83,15 +97,30 @@ def admit(repo, ref, event, source_sha, flows_sha, flows):
             raise FlowsError("Source and flows must be exact lowercase commit SHAs")
     if flows not in FLOWS:
         raise FlowsError("Unknown flow selection")
+    if from_branch not in ("true", "false"):
+        raise FlowsError("flows_from_branch must be true or false")
 
 
-def overlay(source_sha, flows_sha):
-    """Fetch may-app at flows_sha with the flows read key, and put its android/flows over the source."""
-    require_step_secrets(SOURCE_READ_SECRETS)
+def environment_exists(token, get=get_json):
+    """The job's environment must already exist: an `environment:` that names a missing one auto-creates it."""
+    if not token:
+        raise FlowsError("GitHub metadata token unavailable")
+    try:
+        get("environments/" + ENVIRONMENT, token)
+    except GateDenial:
+        raise FlowsError("The may-flows environment does not exist or is unavailable") from None
+
+
+def overlay(source_sha, flows_sha, from_branch):
+    """Fetch may-app at flows_sha (in main history unless from_branch) and put its android/flows over the source."""
+    require_step_secrets((FLOWS_READ_SECRET,))
+    if from_branch not in ("true", "false"):
+        raise FlowsError("flows_from_branch must be true or false")
     root = runner_root()
     source, private = prepared(root, source_sha)
     checkout = root / "may-flows-source"
-    fetch(checkout, APP, exact_sha(flows_sha), os.environ.get("MAY_APP_READ_KEY", ""), private, "flows")
+    fetch(checkout, APP, exact_sha(flows_sha), os.environ.get(FLOWS_READ_SECRET, ""), private, "flows",
+          main_history=from_branch != "true")
     flows = checkout / "android/flows"
     if not (flows / "flows.init.gradle").is_file() or flows.is_symlink() or \
             any(p.is_symlink() for p in flows.rglob("*")):
@@ -182,7 +211,7 @@ def parse_instrumentation(text):
             status[key] = value
         elif line.startswith("INSTRUMENTATION_STATUS_CODE: "):
             code = line.split(": ", 1)[1].strip()
-            if code.lstrip("-").isdigit() and int(code) in STATUS and int(code) != 1:
+            if re.fullmatch(r"-?\d+", code) and int(code) in STATUS and int(code) != 1:
                 label = flow_label(status.get("class", ""))
                 counts[label] = counts.get(label, 0) + 1
                 results.append((label + " test " + str(counts[label]), outcome_of(int(code), status.get("stack", ""))))
@@ -208,7 +237,6 @@ def run(source_sha, flows):
         emulator = subprocess.Popen([emulator_bin, "-avd", AVD, "-no-window", "-no-audio", "-no-boot-anim",
                                      "-no-snapshot", "-gpu", "swiftshader_indirect", "-camera-back", "none"],
                                     stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
-    (private / "emulator.pid").write_text(str(emulator.pid))
     try:
         run_private([adb, "wait-for-device"], log, env=env, timeout=BOOT_SECONDS)
         deadline = time.monotonic() + BOOT_SECONDS
@@ -263,14 +291,17 @@ if __name__ == "__main__":
     parser.add_argument("--source-sha", default="")
     parser.add_argument("--flows-sha", default="")
     parser.add_argument("--flows", default="all")
+    parser.add_argument("--flows-from-branch", default="false")
     args = parser.parse_args()
     try:
         if args.command == "admit":
             admit(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
-                  os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.flows_sha, args.flows)
+                  os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.flows_sha, args.flows,
+                  args.flows_from_branch)
+            environment_exists(os.environ.get("GH_TOKEN"))
             print("May flows admitted")
         elif args.command == "overlay":
-            overlay(args.source_sha, args.flows_sha)
+            overlay(args.source_sha, args.flows_sha, args.flows_from_branch)
             print("May flows placed over the prepared source")
         elif args.command == "build":
             build(args.source_sha)
