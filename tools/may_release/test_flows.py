@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import unittest
 
@@ -48,6 +49,17 @@ class AdmitTest(unittest.TestCase):
                                              (SHA.upper(), OTHER, "all"), (SHA, OTHER, "everything")):
             with self.assertRaises(FlowsError):
                 admit("May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch", source, flows_sha, selection, "false")
+
+
+class DispatchChoicesTest(unittest.TestCase):
+    def test_the_workflows_flows_choices_are_exactly_the_flows_admission_knows(self):
+        # A choice admission doesn't know is refused only after a dispatch; a flow without a choice can't be run.
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/emulator-flows.yml").read_text()
+        block = re.search(r"(?m)^      flows:\n((?:        .*\n)+)", workflow)
+        self.assertIsNotNone(block, "emulator-flows.yml has no flows input")
+        options = re.search(r"(?m)^        options: \[(.*)\]$", block.group(1))
+        self.assertIsNotNone(options, "the flows input lists its options on one line")
+        self.assertEqual([o.strip() for o in options.group(1).split(",")], list(flows.FLOWS))
 
 
 class EnvironmentTest(unittest.TestCase):
@@ -161,9 +173,10 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(self.manifest("# expected\nChatReplyFlow 3\n\nSignInFlow 2\n"), {"ChatReplyFlow": 3, "SignInFlow": 2})
 
     def test_reads_may_apps_current_manifest_classes(self):
-        # may-app android/flows/manifest.txt with #180 (build 10's PlanYourDayFlow) and ApprovalsFlow (build 9's crash).
+        # may-app android/flows/manifest.txt with #180 (build 10's PlanYourDayFlow), ApprovalsFlow (build 9's crash) and
+        # OnboardingBFlow (#239, build 11's onboarding B).
         text = "".join(f"{name} 1\n" for name in ("ApprovalsFlow", "ChatReplyFlow", "ConnectionsFlow", "EmptyStatesFlow", "MessageMenuFlow",
-                                                  "PlanYourDayFlow", "SendingStatusFlow", "SignInFlow", "TaskDetailFlow"))
+                                                  "OnboardingBFlow", "PlanYourDayFlow", "SendingStatusFlow", "SignInFlow", "TaskDetailFlow"))
         try:
             read = self.manifest(text)
         except FlowsError as refused:
