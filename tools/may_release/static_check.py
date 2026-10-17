@@ -863,17 +863,78 @@ def ds_compile_workflow_problems(text):
     return found
 
 
-# ds_compile.py runs in this public repository's log: each print() is one literal, or an f-string whose only values are
-# the pull request number, int(total) (the error count) and the pinned Xcode version; nothing writes to stdout or
-# stderr another way, or to a GitHub Actions file.
+# ds_compile.py runs in this public repository's log. These rules are a lint against accidents (a debugging print, a
+# subprocess left writing to the job's log, an exception message built from a path), not a proof that nothing can
+# leak: Python has more ways to write to a descriptor than any list here. Each print() is one literal, or an f-string
+# whose only values are the pull request number, int(total) (the error count) and the pinned Xcode version; print is
+# never aliased or rebound; every subprocess call names where its stdout and stderr go (never inherited); an exit
+# carries a literal, or a literal plus a printed error's own literal message; and the ways round these (sys.stdout,
+# getattr and other dynamic lookups, os.system and friends, descriptor 1 or 2, debuggers, logging) are refused.
 DS_PRINT_VALUES = {"number", "int(total)", "XCODE"}
+# Calls that start a process (as subprocess.<name>, or by these names: compile_ds's injectable `run` defaults to
+# subprocess.run).
+DS_PROCESS_CALLS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+# The only subprocess attributes ds_compile.py may use other than calling it directly.
+DS_SUBPROCESS_NAMES = {"DEVNULL", "STDOUT", "SubprocessError", "TimeoutExpired", "CompletedProcess"}
+DS_DYNAMIC = {"getattr", "setattr", "delattr", "vars", "globals", "locals", "eval", "exec", "compile", "__import__",
+              "breakpoint", "input", "help"}
+DS_OS_CALLS = {"system", "popen", "fdopen", "dup", "dup2", "write", "_exit", "openpty", "forkpty", "startfile"}
+DS_QUIET_MODULES = {"logging", "warnings", "traceback", "faulthandler", "pdb", "pprint", "code", "pty", "cgitb", "ctypes",
+                    "builtins", "io"}
+DS_EXIT_CLASSES = {"GateDenial", "DsCompileError", "StoreError"}
+
+
+def ds_process_streams_ok(call):
+    """capture_output=True, or both stdout= and stderr= given and neither None (a file, DEVNULL or STDOUT)."""
+    keywords = {k.arg: k.value for k in call.keywords if k.arg}
+    if any(k.arg is None for k in call.keywords):
+        return False
+    capture = keywords.get("capture_output")
+    if isinstance(capture, ast.Constant) and capture.value is True:
+        return True
+    return all(name in keywords and not (isinstance(keywords[name], ast.Constant) and keywords[name].value is None)
+               for name in ("stdout", "stderr"))
+
+
+def ds_exit_ok(argument, handlers):
+    """A literal, or "literal" + <name>.args[0] where <name> is bound by an `except` of the printed error classes."""
+    if argument is None or isinstance(argument, ast.Constant) and isinstance(argument.value, (str, int)):
+        return True
+    if isinstance(argument, ast.BinOp) and isinstance(argument.op, ast.Add) and \
+            isinstance(argument.left, ast.Constant) and isinstance(argument.left.value, str):
+        right = argument.right
+        if ast.unparse(right).endswith(".args[0]") and isinstance(right, ast.Subscript) and \
+                isinstance(right.value, ast.Attribute) and isinstance(right.value.value, ast.Name):
+            name = right.value.value.id
+            for handler in handlers:
+                types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+                if handler.name == name and types and all(called_name(t) in DS_EXIT_CLASSES for t in types):
+                    return True
+    return False
 
 
 def ds_compile_print_problems(root):
     path = root / "tools/may_release/ds_compile.py"
     tree = ast.parse(path.read_text())
     found = []
+    parents, handlers = {}, {}
     for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def enclosing_handlers(node):
+        chain = []
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.ExceptHandler):
+                chain.append(node)
+        return chain
+
+    def flag(node, what):
+        found.append(f"ds_compile.py:{getattr(node, 'lineno', 0)}: {what}")
+
+    for node in ast.walk(tree):
+        parent = parents.get(node)
         if isinstance(node, ast.Call) and called_name(node.func) == "print":
             ok = not node.keywords and len(node.args) == 1 and (
                 (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)) or
@@ -882,22 +943,59 @@ def ds_compile_print_problems(root):
                                                     and v.format_spec is None)
                     for v in node.args[0].values)))
             if not ok:
-                found.append(f"ds_compile.py:{node.lineno}: prints something other than a fixed line, the pull request number "
-                             "and the error count")
-        if isinstance(node, ast.Attribute) and node.attr in ("stdout", "stderr", "__stdout__", "__stderr__") and \
+                flag(node, "prints something other than a fixed line, the pull request number and the error count")
+        # print only ever as the callee of a call, never passed, stored or rebound.
+        if isinstance(node, ast.Name) and node.id == "print" and not (isinstance(parent, ast.Call) and parent.func is node) \
+                or "print" in bound_names(node):
+            flag(node, "aliases or rebinds print")
+        if isinstance(node, ast.Call) and called_name(node.func) in DS_PROCESS_CALLS and not ds_process_streams_ok(node):
+            flag(node, "runs a subprocess that may inherit this log (give stdout= and stderr=, or capture_output=True)")
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "subprocess" and \
+                node.attr not in DS_SUBPROCESS_NAMES and not (isinstance(parent, ast.Call) and parent.func is node) and \
+                not (node.attr == "run" and isinstance(parent, ast.arguments) and
+                     any(d is node and a.arg == "run" for a, d in zip(parent.args[len(parent.args) - len(parent.defaults):],
+                                                                      parent.defaults))):
+            flag(node, "references subprocess other than by a direct call")
+        if isinstance(node, ast.ImportFrom) and node.module == "subprocess" and \
+                any(a.name not in DS_SUBPROCESS_NAMES for a in node.names):
+            flag(node, "references subprocess other than by a direct call")
+        exits = None
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            if isinstance(node.exc, ast.Call) and called_name(node.exc.func) == "SystemExit":
+                exits = node.exc.args[0] if node.exc.args else None
+                if node.exc.keywords or len(node.exc.args) > 1:
+                    exits = ast.Name("not-a-literal")
+            elif called_name(node.exc) == "SystemExit" and not isinstance(node.exc, ast.Call):
+                exits = None
+        if isinstance(node, ast.Call) and (ast.unparse(node.func) in ("sys.exit", "exit", "quit")):
+            exits = node.args[0] if node.args else None
+            if node.keywords or len(node.args) > 1:
+                exits = ast.Name("not-a-literal")
+        if exits is not None and not ds_exit_ok(exits, enclosing_handlers(node)):
+            flag(node, "exits with a message that is not a fixed literal")
+        if isinstance(node, ast.Attribute) and node.attr in ("stdout", "stderr", "__stdout__", "__stderr__", "__displayhook__",
+                                                             "displayhook", "excepthook") and \
                 isinstance(node.value, ast.Name) and node.value.id == "sys" or \
-                isinstance(node, ast.alias) and node.name in ("stdout", "stderr") or \
-                isinstance(node, ast.Attribute) and node.attr == "write" and isinstance(node.value, ast.Name) and \
-                node.value.id == "os" or isinstance(node, ast.Constant) and isinstance(node.value, str) and \
-                re.search(r"/dev/(stdout|stderr|tty|fd/[12])", node.value):
-            found.append(f"ds_compile.py:{node.lineno}: writes to stdout or stderr other than by a pinned print")
+                isinstance(node, ast.alias) and node.name in ("stdout", "stderr", "__stdout__", "__stderr__") or \
+                isinstance(node, ast.Constant) and isinstance(node.value, str) and \
+                re.search(r"/dev/(stdout|stderr|tty|fd/|pts)|/proc/self/fd", node.value):
+            flag(node, "writes to stdout or stderr other than by a pinned print")
+        if isinstance(node, ast.Name) and node.id in DS_DYNAMIC and isinstance(node.ctx, ast.Load):
+            flag(node, "uses a dynamic lookup or interpreter hook (getattr, eval, breakpoint and the like)")
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os" and \
+                (node.attr in DS_OS_CALLS or node.attr.startswith(("spawn", "exec", "posix_spawn"))) or \
+                isinstance(node, ast.ImportFrom) and node.module == "os":
+            flag(node, "uses an os call that runs a shell or writes to a descriptor")
+        if isinstance(node, ast.Call) and called_name(node.func) == "open" and node.args and \
+                not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)) and \
+                not isinstance(node.func, ast.Attribute):
+            flag(node, "opens something other than a named file (a descriptor such as 1 or 2)")
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and \
                 re.search(r"GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)|::(error|warning|notice|debug|group)", node.value):
-            found.append(f"ds_compile.py:{node.lineno}: writes a GitHub Actions file or workflow command")
-        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(a.name.split(".")[0] in ("logging", "warnings", "traceback")
-                                                                  for a in node.names) or \
-                isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in ("logging", "warnings", "traceback"):
-            found.append(f"ds_compile.py:{node.lineno}: imports a module that writes to stderr")
+            flag(node, "writes a GitHub Actions file or workflow command")
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(a.name.split(".")[0] in DS_QUIET_MODULES for a in node.names) or \
+                isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in DS_QUIET_MODULES:
+            flag(node, "imports a module that writes to stdout or stderr")
     return found
 
 

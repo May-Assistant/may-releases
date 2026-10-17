@@ -449,6 +449,43 @@ class CompileTests(RunnerCase):
         self.assertEqual(schemes_of("not json"), [])
         self.assertEqual(schemes_of(json.dumps({"workspace": {"schemes": ["-x", 3, "Ok"]}})), ["Ok"])
 
+    def test_a_build_that_times_out_or_will_not_start_is_recorded_as_failed(self):
+        class Breaking(FakeXcode):
+            def __init__(self, failing, error):
+                super().__init__()
+                self.failing, self.error = failing, error
+
+            def __call__(self, argv, **kwargs):
+                if self.failing in argv:
+                    self.calls.append((argv, kwargs))
+                    raise self.error
+                return super().__call__(argv, **kwargs)
+
+        for name, failing, error in (("build times out", "build", subprocess.TimeoutExpired("xcodebuild", 1)),
+                                     ("build will not start", "build", OSError("no such file")),
+                                     ("listing times out", "-list", subprocess.TimeoutExpired("xcodebuild", 1)),
+                                     ("listing will not start", "-list", OSError("no such file"))):
+            with self.subTest(case=name):
+                (self.private / "result.json").unlink(missing_ok=True)
+                _, error, out, _ = self.compile(Breaking(failing, error))
+                self.assertIsNone(error)
+                self.assertEqual(out, "DS Swift compile finished; its output and outcome stay in this runner's private files\n")
+                self.assertEqual(json.loads((self.private / "result.json").read_text())["result"], "failed")
+
+    def test_the_post_then_says_the_build_failed_with_no_located_error(self):
+        def listing_times_out(argv, **kwargs):
+            if argv[1:] == ["-version"]:
+                return subprocess.CompletedProcess(argv, 0, b"Xcode 26.3\n", b"")
+            raise subprocess.TimeoutExpired("xcodebuild", 600)
+        self.compile(listing_times_out)
+        poster = PostCase()
+        poster.root, poster.checkout, poster.private = self.root, self.checkout, self.private
+        poster.pull, poster.calls, poster.pages = ds_pull(), [], {}
+        code, error, out, _ = poster.post()
+        self.assertEqual((code, error), (1, None))
+        self.assertEqual(out, "DS Swift compile failed; 0 errors posted to may-design-system #40\n")
+        self.assertIn("holds no error located in a file of this repository", poster.calls[-1][2]["body"])
+
     def test_refuses_a_key_on_disk_a_secret_in_its_environment_or_another_xcode(self):
         (self.private / "ds.key").write_text("x")
         _, error, _, _ = self.compile(FakeXcode())
@@ -465,7 +502,7 @@ class CompileTests(RunnerCase):
         self.assertFalse((self.private / "result.json").exists())
 
 
-class PostTests(RunnerCase):
+class PostCase(RunnerCase):
     LOG = "\n".join([
         f"{CK}/swift/Sources/A/View.swift:12:5: error: cannot find 'Foo' in scope",
         f"   12 |     let secret = \"{MARKER}\"",
@@ -482,6 +519,8 @@ class PostTests(RunnerCase):
         self.private.mkdir()
         self.pull = ds_pull()
         self.calls = []
+        # Pages of the pull request's existing comments, by page number.
+        self.pages = {}
 
     def write(self, result="failed", log=None):
         (self.private / "result.json").write_text(json.dumps({"result": result}))
@@ -490,6 +529,8 @@ class PostTests(RunnerCase):
 
     def call_api(self, method, path, payload, token, status=201):
         self.calls.append((method, path, payload, token))
+        if method == "GET" and "/comments?" in path:
+            return 200, self.pages.get(int(path.rsplit("=", 1)[1]), [])
         return (200, self.pull) if method == "GET" else (status, {})
 
     def post(self, env=None, call_api=None, head=SHA):
@@ -497,6 +538,8 @@ class PostTests(RunnerCase):
             return self.captured(ds_compile.post, SHA, "40", call_api or self.call_api,
                                  env=env if env is not None else self.environ(MAY_DS_PR_COMMENT_TOKEN=TOKEN))
 
+
+class PostTests(PostCase):
     def test_a_failure_posts_one_comment_of_redacted_errors_and_prints_only_the_count(self):
         self.write()
         code, error, out, err = self.post()
@@ -506,9 +549,10 @@ class PostTests(RunnerCase):
         self.assertEqual(err, "")
         self.assertEqual([(m, p) for m, p, _, _ in self.calls],
                          [("GET", "/repos/May-Assistant/may-design-system/pulls/40"),
+                          ("GET", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=1"),
                           ("POST", "/repos/May-Assistant/may-design-system/issues/40/comments")])
-        body = self.calls[1][2]["body"]
-        self.assertEqual(set(self.calls[1][2]), {"body"})
+        body = self.calls[2][2]["body"]
+        self.assertEqual(set(self.calls[2][2]), {"body"})
         self.assertIn("swift/Sources/A/View.swift:12:5: error: cannot find 'Foo' in scope\n"
                       "swift/Sources/B/B.swift:2:1: error: expected '}'\n", body)
         self.assertNotIn(MARKER, body)
@@ -576,6 +620,61 @@ class PostTests(RunnerCase):
         self.assertEqual(self.calls, [])
 
 
+class CommentDedupeTests(PostCase):
+    def marked(self, sha):
+        return {"body": f"x\n\n<!-- may-ds-swift-compile head={sha} -->\n---"}
+
+    def test_a_head_already_reported_is_not_posted_again(self):
+        for page in (1, 2):
+            with self.subTest(page=page):
+                self.write()
+                self.calls = []
+                self.pages = {1: [{"body": "other"}] * 100, 2: []}
+                self.pages[page] = self.pages[page][:99] + [self.marked(SHA)] if page == 1 else [self.marked(SHA)]
+                code, error, out, err = self.post()
+                self.assertIsNone(error)
+                self.assertEqual(code, 1, "a failed compile still fails the job")
+                self.assertEqual(out, "DS Swift compile result already posted for this head on may-design-system #40; "
+                                      "nothing posted again\n")
+                self.assertNotIn("POST", [m for m, _, _, _ in self.calls])
+                self.assertEqual([p for m, p, _, _ in self.calls if "comments?" in p],
+                                 ["/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=" + str(n) for n in range(1, page + 1)])
+
+    def test_a_pass_already_reported_exits_zero(self):
+        self.write("passed")
+        self.pages = {1: [self.marked(SHA)]}
+        code, error, _, _ = self.post()
+        self.assertEqual((code, error), (0, None))
+        self.assertNotIn("POST", [m for m, _, _, _ in self.calls])
+
+    def test_a_marker_for_another_head_or_a_malformed_comment_does_not_stop_the_post(self):
+        self.write()
+        self.pages = {1: [self.marked(OTHER), {"body": None}, "x", {"body": "may-ds-swift-compile head=" + SHA}]}
+        code, error, _, _ = self.post()
+        self.assertEqual((code, error), (1, None))
+        self.assertEqual([m for m, _, _, _ in self.calls].count("POST"), 1)
+
+    def test_pages_stop_at_a_short_page_and_at_the_cap(self):
+        self.write()
+        self.pages = {n: [{"body": "other"}] * 100 for n in range(1, 30)}
+        self.post()
+        reads = [p for m, p, _, _ in self.calls if "comments?" in p]
+        self.assertEqual(reads, ["/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=" + str(n) for n in range(1, ds_compile.MAX_COMMENT_PAGES + 1)])
+        self.assertEqual([m for m, _, _, _ in self.calls].count("POST"), 1)
+
+    def test_unreadable_comments_post_nothing(self):
+        self.write()
+        def call_api(method, path, payload, token):
+            if "comments?" in path:
+                self.calls.append((method, path, payload, token))
+                return 500, None
+            return self.call_api(method, path, payload, token)
+        _, error, out, _ = self.post(call_api=call_api)
+        self.assertEqual(error.args[0], "The pull request's comments could not be read; nothing was posted")
+        self.assertNotIn("POST", [m for m, _, _, _ in self.calls])
+        self.assertEqual(out, "")
+
+
 class GitHubCallTests(unittest.TestCase):
     """ds_compile.github over a fake urlopen: only the pull request read and its comments endpoint, token as a header."""
 
@@ -588,6 +687,7 @@ class GitHubCallTests(unittest.TestCase):
 
         with patch("urllib.request.urlopen", urlopen):
             self.assertEqual(ds_compile.github("GET", "/repos/May-Assistant/may-design-system/pulls/40", None, TOKEN)[0], 200)
+            self.assertEqual(ds_compile.github("GET", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=10", None, TOKEN)[0], 200)
             self.assertEqual(ds_compile.github("POST", "/repos/May-Assistant/may-design-system/issues/40/comments",
                                                {"body": "b"}, TOKEN)[0], 201)
             for method, path in (("POST", "/repos/May-Assistant/may-app/issues/40/comments"),
@@ -596,11 +696,20 @@ class GitHubCallTests(unittest.TestCase):
                                  ("GET", "/repos/May-Assistant/may-design-system/issues/40/comments"),
                                  ("POST", "/repos/May-Assistant/may-design-system/pulls/40"),
                                  ("POST", "/repos/May-Assistant/may-design-system/issues/40/comments/../../41/comments"),
-                                 ("POST", "/repos/May-Assistant/may-design-system/issues/1/comments?x=1")):
+                                 ("POST", "/repos/May-Assistant/may-design-system/issues/1/comments?x=1"),
+                                 ("POST", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=1"),
+                                 ("GET", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=11"),
+                                 ("GET", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=0"),
+                                 ("GET", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=10&page=1"),
+                                 ("GET", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=1&since=x"),
+                                 ("GET", "/repos/May-Assistant/may-app/issues/40/comments?per_page=100&page=1"),
+                                 ("GET", "/repos/May-Assistant/may-design-system/issues/comments/5"),
+                                 ("DELETE", "/repos/May-Assistant/may-design-system/issues/40/comments")):
                 with self.subTest(method=method, path=path), self.assertRaises(DsCompileError):
                     ds_compile.github(method, path, {"body": "b"}, TOKEN)
         self.assertEqual([(m, u) for m, u, _, _ in seen],
                          [("GET", "https://api.github.com/repos/May-Assistant/may-design-system/pulls/40"),
+                          ("GET", "https://api.github.com/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=10"),
                           ("POST", "https://api.github.com/repos/May-Assistant/may-design-system/issues/40/comments")])
         for _, _, headers, data in seen:
             self.assertEqual(headers["Authorization"], "Bearer " + TOKEN)
@@ -623,7 +732,7 @@ class CommandLineTests(RunnerCase):
 
         def urlopen(request, timeout):
             if request.get_method() == "GET":
-                return FakeResponse(json.dumps(pull).encode())
+                return FakeResponse(json.dumps([] if "/comments?" in request.full_url else pull).encode())
             return FakeResponse(b"{}", 201)
 
         with patch.object(sys, "argv", ["ds_compile.py", "post", "--ds-sha", SHA, "--pr-number", "40"]), \
@@ -723,7 +832,60 @@ class ShapeTests(unittest.TestCase):
         for case, new in cases.items():
             with self.subTest(case=case):
                 self.flagged(tool, anchor, new, message)
-        self.flagged(tool, "import argparse\n", "import argparse\nimport logging\n", "imports a module that writes to stderr")
+        self.flagged(tool, "import argparse\n", "import argparse\nimport logging\n", "imports a module that writes to stdout or stderr")
+
+    # Security review of cad0af0: each way round the print pin it found, and its neighbours, is flagged by its own rule.
+    RULE_CASES = {
+        "aliases or rebinds print": ("    pr = print\n    pr(*errors)\n", "    print = len\n", "    run_quiet(print)\n"),
+        "runs a subprocess that may inherit this log": (
+            '    subprocess.run(["echo", *errors])\n', '    subprocess.run(["echo"], stdout=output)\n',
+            '    subprocess.Popen(["echo"], stdout=None, stderr=None)\n', '    run(["echo"], **options)\n',
+            '    subprocess.check_call(["echo"])\n', '    subprocess.getoutput("echo")\n'),
+        "references subprocess other than by a direct call": ("    launch = subprocess.Popen\n", "    use(subprocess.call)\n"),
+        "exits with a message that is not a fixed literal": (
+            "    raise SystemExit(errors[0])\n", "    sys.exit(str(checkout))\n", '    raise SystemExit("x" + errors[0])\n',
+            "    exit(message)\n", "    raise SystemExit(code=errors)\n"),
+        "writes to stdout or stderr other than by a pinned print": (
+            "    sys.__stdout__.write(errors[0])\n", '    target = "/dev/fd/1"\n', "    sys.displayhook(errors)\n",
+            '    target = "/proc/self/fd/2"\n'),
+        "uses a dynamic lookup or interpreter hook": (
+            '    getattr(sys, "std" + "out").write("x")\n', '    eval("print(1)")\n', "    breakpoint()\n",
+            '    vars(sys)["stdout"]\n', '    __import__("sys")\n'),
+        "uses an os call that runs a shell or writes to a descriptor": (
+            '    os.system("echo x")\n', '    os.popen("echo x")\n', "    os.fdopen(1, \"w\")\n", "    os.dup2(3, 1)\n",
+            "    os.execv(a, b)\n", "    os.spawnl(0, a)\n", "    os._exit(1)\n"),
+        "opens something other than a named file": ("    open(1, \"w\")\n", "    open(2, \"w\")\n", "    open(path_name)\n"),
+        "imports a module that writes to stdout or stderr": (
+            "    import faulthandler\n", "    import pdb\n", "    from traceback import print_exc\n", "    import pprint\n"),
+    }
+
+    def test_each_new_output_rule_flags_its_mutations(self):
+        anchor = '    print("Exact may-design-system commit fetched quietly; the read key and host file are removed")\n'
+        tool = "tools/may_release/ds_compile.py"
+        for message, mutations in self.RULE_CASES.items():
+            for mutation in mutations:
+                with self.subTest(rule=message, mutation=mutation.strip()):
+                    self.flagged(tool, anchor, mutation + anchor, "ds_compile.py:")
+                    found = [p for p in static_check.problems(self.root) if message in p]
+                    self.assertTrue(found, (message, mutation))
+        self.flagged(tool, "import argparse\n", "import argparse\nfrom subprocess import Popen\n",
+                     "references subprocess other than by a direct call")
+        self.flagged(tool, "import argparse\n", "import argparse\nfrom os import system\n", "uses an os call")
+        self.flagged(tool, "import argparse\n", "import argparse\nfrom sys import stdout\n", "writes to stdout or stderr")
+
+    def test_the_allowed_forms_pass(self):
+        # The committed exits, subprocess calls and the injectable run default are accepted.
+        self.assertEqual(static_check.ds_compile_print_problems(static_check.ROOT), [])
+        anchor = '    print("Exact may-design-system commit fetched quietly; the read key and host file are removed")\n'
+        for allowed in ('    subprocess.run(["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n',
+                        '    subprocess.run(["true"], capture_output=True)\n', "    raise SystemExit(1)\n",
+                        '    raise SystemExit("fixed")\n'):
+            with self.subTest(allowed=allowed.strip()):
+                self.tearDown()
+                self.setUp()
+                path = self.root / "tools/may_release/ds_compile.py"
+                path.write_text(path.read_text().replace(anchor, allowed + anchor, 1))
+                self.assertEqual(static_check.ds_compile_print_problems(self.root), [])
 
     def test_its_errors_are_fixed_literals(self):
         self.flagged("tools/may_release/ds_compile.py",

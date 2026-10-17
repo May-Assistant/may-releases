@@ -15,10 +15,11 @@ Steps, one per workflow step, each holding only what it needs:
   has already read the pull request (open, in may-design-system itself, against claude/may-integration or main).
 - compile (no secret in its environment or on disk): the pinned Xcode 26.3 builds the package for the iOS Simulator
   without signing. Every tool writes to a private log; the outcome is recorded in a private file. A failed build
-  does not fail this step: post reports it and then fails the job.
+  (a timeout or a tool that will not start included) does not fail this step: post reports it and then fails the job.
 - post (MAY_DS_PR_COMMENT_TOKEN alone): the private log is reduced to file-located errors inside the checkout,
   repo-relative (diagnostics), and posted as one comment on the pull request (comment_body), after the pull request
-  is read again and is still open at that head. Only the pull request's comments endpoint is ever written.
+  is read again and is still open at that head, and unless a comment already carries this head's marker. Only the
+  pull request's comments endpoint is ever written.
 """
 
 import argparse
@@ -223,22 +224,27 @@ def compile_ds(run=subprocess.run, developer=DEVELOPER):
     if version.returncode or version.stdout.splitlines()[:1] != [b"Xcode " + XCODE.encode()]:
         raise DsCompileError("Pinned Xcode version differs")
     log, listing = private / "compile.log", private / "schemes.json"
-    with log.open("ab") as output, listing.open("wb") as listed:
-        done = run(["xcodebuild", "-list", "-json"], cwd=checkout, env=env, stdout=listed, stderr=output,
-                   stdin=subprocess.DEVNULL, timeout=600)
-    schemes = schemes_of(listing.read_text(errors="replace")) if not done.returncode else []
-    codes = []
+    # From here every failure of the build itself (a non-zero exit, a timeout, a tool that will not start) is recorded
+    # as a failed compile, so the post step still tells the pull request the build failed.
+    schemes, codes = [], []
+    try:
+        with log.open("ab") as output, listing.open("wb") as listed:
+            done = run(["xcodebuild", "-list", "-json"], cwd=checkout, env=env, stdout=listed, stderr=output,
+                       stdin=subprocess.DEVNULL, timeout=600)
+        schemes = schemes_of(listing.read_text(errors="replace")) if not done.returncode else []
+    except (subprocess.SubprocessError, OSError, ValueError):
+        schemes = []
     for scheme in schemes:
-        with log.open("ab") as output:
-            try:
+        try:
+            with log.open("ab") as output:
                 done = run(["xcodebuild", "-scheme", scheme, "-configuration", "Release", "-destination", DESTINATION,
                             "-derivedDataPath", str(root / DERIVED), "-clonedSourcePackagesDirPath", str(root / PACKAGES),
                             "-skipMacroValidation", "-skipPackagePluginValidation", "CODE_SIGNING_ALLOWED=NO", "build"],
                            cwd=checkout, env=env, stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                            timeout=BUILD_SECONDS)
-                codes.append(done.returncode)
-            except subprocess.TimeoutExpired:
-                codes.append(-1)
+            codes.append(done.returncode if isinstance(done.returncode, int) else -1)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            codes.append(-1)
     passed = bool(schemes) and not any(codes)
     result = {"result": "passed" if passed else "failed", "schemes": len(schemes), "codes": codes}
     (private / "result.json").write_text(json.dumps(result))
@@ -247,11 +253,24 @@ def compile_ds(run=subprocess.run, developer=DEVELOPER):
 
 # ---- post ----
 
+_PR = r"/repos/" + re.escape(DS_REPO) + r"/{}/[1-9][0-9]{{0,6}}"
+ALLOWED_CALLS = (("GET", _PR.format("pulls")),
+                 ("GET", _PR.format("issues") + r"/comments\?per_page=100&page=(?:[1-9]|10)"),
+                 ("POST", _PR.format("issues") + r"/comments"))
+# Pages of existing comments read for the marker before posting (100 each).
+MAX_COMMENT_PAGES = 10
+
+
+def already_posted(comments, sha):
+    """Whether a comment in one page of the pull request's comments already carries this head's marker."""
+    marker = f"<!-- {MARKER} head={sha} -->"
+    return any(isinstance(c, dict) and isinstance(c.get("body"), str) and marker in c["body"] for c in comments)
+
+
 def github(method, path, payload, token):
-    """One may-design-system API call: (status, parsed JSON or None). Only the pull request read and its comment post
-    are allowed; nothing from the call is printed."""
-    if not re.fullmatch(r"/repos/" + re.escape(DS_REPO) + r"/(pulls/[1-9][0-9]{0,6}|issues/[1-9][0-9]{0,6}/comments)", path) \
-            or (method, path.split("/")[4]) not in (("GET", "pulls"), ("POST", "issues")):
+    """One may-design-system API call: (status, parsed JSON or None). Only ALLOWED_CALLS are made: the pull request
+    read, a page of its comments, and its comment post. Nothing from the call is printed."""
+    if not any(method == allowed and re.fullmatch(pattern, path) for allowed, pattern in ALLOWED_CALLS):
         raise DsCompileError("Only the design-system pull request and its comments are reachable")
     request = urllib.request.Request(API + path, data=None if payload is None else json.dumps(payload).encode(),
                                      method=method, headers={
@@ -302,6 +321,16 @@ def post(sha, pr, call_api=github):
         validate_ds_pull_request(pull, number, sha)
     except GateDenial:
         raise DsCompileError("The pull request is no longer open at the compiled head; nothing was posted") from None
+    # One comment per head: a re-run (or a second dispatch) for a head already reported posts nothing again.
+    for page in range(1, MAX_COMMENT_PAGES + 1):
+        status, comments = call_api("GET", f"/repos/{DS_REPO}/issues/{number}/comments?per_page=100&page={page}", None, token)
+        if status != 200 or not isinstance(comments, list):
+            raise DsCompileError("The pull request's comments could not be read; nothing was posted")
+        if already_posted(comments, sha):
+            print(f"DS Swift compile result already posted for this head on may-design-system #{number}; nothing posted again")
+            return 0 if passed else 1
+        if len(comments) < 100:
+            break
     status, _ = call_api("POST", f"/repos/{DS_REPO}/issues/{number}/comments", {"body": body}, token)
     if status != 201:
         raise DsCompileError("GitHub did not accept the comment; nothing from the compile is shown here")
@@ -331,7 +360,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        code = main()
+        failed = main()
     except GateDenial as denial:
         raise SystemExit("May DS Swift compile denied: " + denial.args[0]) from None
     except (DsCompileError, StoreError) as error:
@@ -340,4 +369,5 @@ if __name__ == "__main__":
         raise SystemExit("May DS Swift compile stopped; no design-system source, path or credential was printed") from None
     except Exception:
         raise SystemExit("May DS Swift compile stopped; check the may-ds-renders environment, its secrets and the inputs") from None
-    sys.exit(code)
+    if failed:
+        raise SystemExit(1)
