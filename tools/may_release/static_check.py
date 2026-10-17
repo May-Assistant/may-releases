@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|docker://\S+@sha256:[0-9a-f]{64})")
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
-PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError"}
+PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -381,6 +381,10 @@ def workflow_problems(root):
         for step in re.split(r"(?m)^      - ", text)[1:]:
             if re.search(r"uses: actions/checkout@", step) and "persist-credentials: false" not in step:
                 found.append(f"{path.name}: a checkout persists its credentials")
+        # This repository is public: its logs and step summaries are too. Claude Code's full output (every message
+        # and tool result) or its report would put what it read there (may-app-review.yml's review of private code).
+        if re.search(r"(?m)^\s*(show_full_output|display_report):\s*['\"]?[Tt]rue", text):
+            found.append(f"{path.name}: prints Claude's full output or report into this public repository's log")
         if re.search(r"plugin_marketplaces:.*https?://", text):
             found.append(f"{path.name}: plugin marketplace is a moving URL, not a pinned checkout")
         for job in re.findall(r"(?m)^  ([\w-]+):\n", text.partition("\njobs:\n")[2]):
@@ -779,6 +783,84 @@ def compile_pr_workflow_problems(text):
     return found
 
 
+# Claude code review of a may-app pull request (may-app-review.yml, review.py, review_mcp.py). may-app is private and
+# this repository public, so the review's output stays in files (review.py) and the workflow is pinned whole: dispatch
+# with a pull request number only, read-only permissions, admission then the review in the environment admission
+# chose, three pinned checkouts (this repository, the claude-code plugin commit claude-code-review.yml uses), the
+# review token in the fetch and review steps alone, the Claude token in the review step alone, nothing run but
+# review.py's four steps and an always-run cleanup, and no claude-code-action, artifact, summary or carried value.
+REVIEW_GATE = 'python3 -I -S -B tools/may_release/review.py admit --pr-number "$MAY_PR_NUMBER"'
+REVIEW_FETCH = 'python3 -I -S -B tools/may_release/review.py fetch --pr-number "$MAY_PR_NUMBER"'
+REVIEW_INSTALL = "python3 -I -S -B tools/may_release/review.py install"
+REVIEW_RUN = 'python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER"'
+REVIEW_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-review"'
+REVIEW_RUNS = [REVIEW_GATE, REVIEW_FETCH, REVIEW_INSTALL, REVIEW_RUN, REVIEW_CLEANUP]
+REVIEW_STEP_NAMES = ["Check the pull request and fetch its head quietly",
+                     "Install the pinned Claude Code release, checked against its sha512",
+                     "Review and post on the pull request, with nothing from the review in this log",
+                     "Remove private source, transcripts and the review's output"]
+REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN = "MAY_APP_REVIEW_TOKEN", "MAY_REVIEW_CLAUDE_TOKEN"
+REVIEW_PLUGIN_CHECKOUT = ("        with:\n          repository: anthropics/claude-code\n"
+                          "          ref: 0d7f14dd352fa67affd4e172eb1b6f524dbd709e\n          path: .claude-marketplace/claude-code\n"
+                          "          fetch-depth: 1\n          persist-credentials: false\n")
+REVIEW_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
+              (REVIEW_TOKEN, "${{ secrets." + REVIEW_TOKEN + " }}"), (REVIEW_CLAUDE_TOKEN, "${{ secrets." + REVIEW_CLAUDE_TOKEN + " }}")}
+
+
+def review_workflow_problems(text):
+    name = "may-app-review.yml"
+    found = []
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number"] or \
+            not re.search(r"(?m)^        type: string$", trigger):
+        found.append(name + ": is not dispatched with exactly a pr_number")
+    if "\nconcurrency:\n  group: may-app-review\n" not in text:
+        found.append(name + ": does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "review")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + ": permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "review"]:
+        found.append(name + ": jobs are not exactly admission and review")
+    if "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "review"):
+        found.append(name + ": a job runs somewhere other than ubuntu-24.04")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != REVIEW_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + ": runs something other than review.py's admit, fetch, install and review, and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "review")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["review"]]
+    cleanup = steps["review"][-1][1] if steps["review"] else ""
+    plugin = steps["review"][1][1] if len(steps["review"]) > 1 else ""
+    if leading != {"admission": ["uses", "id"], "review": ["uses", "uses", "name", "name", "name", "name"]} or \
+            names != ["", ""] + REVIEW_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT, CHECKOUT] or REVIEW_PLUGIN_CHECKOUT not in plugin:
+        found.append(name + ": review's steps are not exactly the two checkouts (the pinned plugin commit), fetch, install, "
+                     "review and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "")) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 60\n" not in job_text(text, "review"):
+        found.append(name + ": sets a shell, defaults, a condition or a timeout other than review's 60 minutes")
+    job = job_text(text, "review")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or "    needs: admission\n" not in job or \
+            re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + ": review's environment is not the one admission chose, after admission")
+    by_name = dict(steps["review"])
+    fetch, install = by_name.get(REVIEW_STEP_NAMES[0], ""), by_name.get(REVIEW_STEP_NAMES[1], "")
+    run, cleanup = by_name.get(REVIEW_STEP_NAMES[2], ""), by_name.get(REVIEW_STEP_NAMES[3], "")
+    if secrets_in(text) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or text.count("secrets." + REVIEW_TOKEN) != 2 or \
+            text.count("secrets." + REVIEW_CLAUDE_TOKEN) != 1 or secrets_in(fetch) != {REVIEW_TOKEN} or \
+            secrets_in(run) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or "env:" in install or "env:" in cleanup or \
+            any(e not in REVIEW_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + ": a secret or env entry other than the review token in fetch and review and the Claude token in review")
+    if "claude-code-action" in text or "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or \
+            "GITHUB_ENV" in text or "GITHUB_PATH" in text or "${{ inputs." in "\n".join(runs):
+        found.append(name + ": uses claude-code-action, an artifact or a step summary, carries values, or interpolates inputs into shell")
+    return found
+
+
 def control_problems(root):
     found = []
     if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr"}:
@@ -792,6 +874,7 @@ def control_problems(root):
         found.append("control-check.yml is not a read-only, no-secret PR check")
     found += compile_workflow_problems(compile_workflow)
     found += compile_pr_workflow_problems((flows / "native-compile-pr.yml").read_text())
+    found += review_workflow_problems((flows / "may-app-review.yml").read_text())
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

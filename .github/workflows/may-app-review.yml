@@ -1,0 +1,73 @@
+name: Claude code review of a may-app pull request (posted on the pull request, never in this log)
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open, ready-for-review May-Assistant/may-app pull request against main (not from a fork)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: may-app-review
+  cancel-in-progress: false
+jobs:
+  admission:
+    # may-app's own Actions are blocked, so its pull requests are reviewed from here (Samuel, option B). This
+    # repository is public: its logs, summaries and artifacts are public, and may-app is private. So nothing from
+    # may-app (code, diff, file names, transcript or model output) is printed, summarised, uploaded or cached. The
+    # review runs the pinned Claude Code release with all its output in files under $RUNNER_TEMP/may-review, removed
+    # at the end, and this log carries only fixed lines, numbers and logins (review.py). Admission has no environment,
+    # so a missing one is denied on its 404 and never auto-created; it checks the input and may-claude-review's policy.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/review.py admit --pr-number "$MAY_PR_NUMBER"
+  review:
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # The code-review command, from the same pinned commit as claude-code-review.yml (2026-09-29).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anthropics/claude-code
+          ref: 0d7f14dd352fa67affd4e172eb1b6f524dbd709e
+          path: .claude-marketplace/claude-code
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check the pull request and fetch its head quietly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_REVIEW_TOKEN: ${{ secrets.MAY_APP_REVIEW_TOKEN }}
+        run: python3 -I -S -B tools/may_release/review.py fetch --pr-number "$MAY_PR_NUMBER"
+      - name: Install the pinned Claude Code release, checked against its sha512
+        run: python3 -I -S -B tools/may_release/review.py install
+      - name: Review and post on the pull request, with nothing from the review in this log
+        env:
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_REVIEW_TOKEN: ${{ secrets.MAY_APP_REVIEW_TOKEN }}
+          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}
+        run: python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER"
+      - name: Remove private source, transcripts and the review's output
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-review"
