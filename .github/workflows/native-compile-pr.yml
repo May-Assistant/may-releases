@@ -22,7 +22,10 @@ jobs:
     # is denied on its 404 and never auto-created; it checks the inputs and that environment's policy (Samuel, 17 Oct:
     # compile-only runs need no approval, so no required reviewer, main only). The native job's first step then reads
     # the pull request with the token that environment holds: the current head of an open pull request against
-    # may-app main, from may-app itself.
+    # may-app main, from may-app itself. The compile records its outcome privately; the post step alone, holding only
+    # MAY_APP_PR_COMMENT_TOKEN, posts its errors (path:line:col and the compiler's message, never source) as one comment
+    # on that private pull request and then fails the job if the compile failed. This repository is public: nothing
+    # derived from may-app is printed, summarised or uploaded here (compile_pr_errors.py).
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -66,7 +69,13 @@ jobs:
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
       - name: Compile without signing, store access or any credential
-        run: python3 -I -S -B tools/may_release/compile.py --platform ios --target playground
+        run: python3 -I -S -B tools/may_release/compile.py --platform ios --target playground --record-outcome
+      - name: Post the errors on the may-app pull request, never in this log
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}
+        run: python3 -I -S -B tools/may_release/compile_pr_errors.py --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
       - name: Remove private source, logs and products
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"
