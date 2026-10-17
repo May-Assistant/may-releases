@@ -335,7 +335,10 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
         for workflow, old in (("control-check.yml", "      - uses: actions/checkout@"),
                               ("native-compile-pr.yml", "      - uses: actions/checkout@")):
             for new in ("      - uses: actions/cache@0123456789012345678901234567890123456789\n" + old,
-                        "      - uses: actions/setup-python@0123456789012345678901234567890123456789\n        with:\n          cache: pip\n" + old):
+                        "      - uses: actions/setup-python@0123456789012345678901234567890123456789\n        with:\n          cache: pip\n" + old,
+                        # Re-review of #18, L5: a flow-style input, and a third-party cache action with no cache: input.
+                        "      - uses: actions/setup-python@0123456789012345678901234567890123456789\n        with: {cache: pip}\n" + old,
+                        "      - uses: irgaly/xcode-cache@0123456789012345678901234567890123456789\n        with:\n          key: x\n" + old):
                 with self.subTest(workflow=workflow, new=new.split("\n")[0]):
                     self.tearDown()
                     self.setUp()
