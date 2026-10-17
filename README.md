@@ -26,7 +26,7 @@ This repository only performs later updates. It refuses an app whose tracks show
 
 `static_check.py` pins exactly this layout (`STAGE`, `STORE_JOB_IF`, `UPLOAD_IF`, `CONFIRM_IF`, `PLAY_UPLOAD_TRACKS`, and the three sign-only steps, `PUBLISH_SIGNED_STEP` exactly), and requires `gate.py`'s `UPLOADS_HELD` to name exactly the platforms whose upload step is held (stage 3: `{"ios"}`). A guard that disappears from an iOS job or the iOS upload step fails the check. So does a guard that reappears on `admission`, an Android job or the Android upload step: that is flagged as a stage mismatch rather than accepted, so going back to an earlier stage, or to fully inert, is a deliberate, reviewed change to those constants too.
 
-The [pull-request compile workflow](.github/workflows/native-compile-pr.yml) compiles iOS May Playground at the head of an open may-app pull request against `main`, in its own environment `may-native-compile-pr`. It is not usable until Samuel creates that environment and the `MAY_APP_PR_READ_TOKEN` repository secret (see [iOS compile of a pull request head](#ios-compile-of-a-pull-request-head)).
+The [pull-request compile workflow](.github/workflows/native-compile-pr.yml) compiles iOS May Playground at the head of an open may-app pull request against `main`, in its own environment `may-native-compile-pr`. It needs no approval (Samuel, 17 Oct), and it is not usable until Samuel creates that environment and its secrets (see [iOS compile of a pull request head](#ios-compile-of-a-pull-request-head)).
 
 The [native compile workflow](.github/workflows/native-compile-draft.yml) is **active for iOS only**: each build, the coordinator dispatches it to check that **May Playground** compiles. It runs on `macos-15` with the pinned Xcode 26.3 and XcodeGen 2.46.0, makes a simulator Release build with `CODE_SIGNING_ALLOWED=NO`, and has no signing, store call or artifact (see [iOS compile each build](#ios-compile-each-build)). The pull-request check runs only dependency-free control tests and static checks with a read-only token.
 
@@ -221,7 +221,7 @@ A reviewed PR replaces the placeholder with exactly that `age1…` line. Unlike 
 ## Secrets and variables per environment
 
 - **`may-native-compile`:** `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (read-only deploy keys for `may-app` and `may-design-system`).
-- **`may-native-compile-pr`** (proposed; [compile of a pull request head](#ios-compile-of-a-pull-request-head)): `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` only, ideally its own deploy keys. The repository secret `MAY_APP_PR_READ_TOKEN` (may-app pull requests: read) is read only by its gate steps.
+- **`may-native-compile-pr`** (proposed; [compile of a pull request head](#ios-compile-of-a-pull-request-head); no required reviewer, main only): `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (dedicated deploy keys, rotated when someone leaves may-app) and `MAY_APP_PR_READ_TOKEN` (may-app pull requests: read, short-lived). Each is bound in exactly one step.
   - Optional secret `MAY_POSTHOG_ANDROID_KEY`: PostHog's project key for Android crash reports (`phc_` then letters, digits, `_` and `-`). Only the Android build step receives it; every other step refuses it (`store.SECRET_NAMES`). This one environment builds both May and May Playground, so both apps report to the same PostHog project.
   - Optional variable `MAY_POSTHOG_HOST`: `https://eu.i.posthog.com` for a project on PostHog's EU cloud; unset means `https://us.i.posthog.com`. `store.py` refuses any other host, and the build step's public line names the host reports will go to.
   - Who sets them: only Samuel, and only in `may-native-compile`. GitHub resolves a variable or secret from the environment first, then the repository, then the organization, so a repository- or organization-level `MAY_POSTHOG_ANDROID_KEY` or `MAY_POSTHOG_HOST` would otherwise count. Don't create either at those levels. The host allowlist limits what a stray value can do, but a stray key would still send crash reports to another PostHog project.
@@ -390,37 +390,53 @@ gh workflow run native-compile-draft.yml -f platform=ios -f source_sha=<reviewed
 
 `native-compile-pr.yml` gives the iOS lane compile evidence for an **open may-app pull request**, before it merges. It is the same May Playground simulator compile as above. It is a separate workflow, so the release path and `native-compile-draft.yml`, which accept only commits on may-app `main`, are unchanged. It has no signing, no store call and no artifact.
 
+**No approval** (Samuel, 17 Oct, `decisions.md` "Build 11 decisions": compile-only runs on may-releases for open may-app PR heads don't need his approval; signing, TestFlight and store releases keep theirs). The environment's policy is its own (`gate.NO_REVIEWER_ACTIONS`, pinned by `static_check.py` to exactly `{"compile-pr"}`): no other action may run without his review.
+
 ```
 gh workflow run native-compile-pr.yml -f pr_number=<may-app PR number> -f source_sha=<that PR's current head SHA> --repo May-Assistant/may-releases --ref main
 ```
 
-- **What is admitted:** `gate.py --action compile-pr` reads `GET /repos/May-Assistant/may-app/pulls/<number>` with `MAY_APP_PR_READ_TOKEN`. It admits the commit only if all of these hold:
+- **Admission** (`gate.py --action compile-pr`, no environment) checks the dispatch (main only, manual) and the inputs. It also checks that `may-native-compile-pr` exists and has exactly the right policy:
+  - administrator bypass off;
+  - a custom branch policy of exactly `main`;
+  - **no** required-reviewer rule. A reviewer rule is denied, because it would only hang the run.
+
+  A missing environment is denied on its 404 and never auto-created. Admission holds no secret.
+- **The pull request check** (`--check-pull`, the first step on the `may-native-compile-pr` runner, before any pull-request code runs) reads `GET /repos/May-Assistant/may-app/pulls/<number>` with `MAY_APP_PR_READ_TOKEN`, which that environment holds. It admits the commit only if all of these hold:
   - the pull request is **open**;
   - its base is **may-app `main`**;
   - its head is in **may-app itself** (a fork, or a deleted fork, is refused);
   - its head is **exactly** `source_sha`.
 
-  Anything else denies before any environment is read. The same check runs again after Samuel's approval.
-- **What is fetched:** `prepare.py --pr-number` fetches `refs/pull/<number>/head`, requires it to be exactly `source_sha`, and checks out that commit. The design-system pin is checked as for every build.
-- **Where it runs:** in its own environment, **`may-native-compile-pr`**. Admission checks only that environment, never `may-native-compile` or a store environment. That environment holds the two read keys and nothing else. No step references a signing, store or crash-report secret, and `static_check.py` pins this.
-- **Keeping the keys from the pull request's code:** XcodeGen, SwiftPM and `xcodebuild` run the pull request's own build code. So:
-  - `MAY_APP_READ_KEY` and `MAY_DS_READ_KEY` are bound only in the fetch step's own `env` (a step's env does not carry to later steps). The fetch writes each key to a `0600` file, uses it with an allowlisted git environment, and deletes it in a `finally`.
-  - The compile step refuses to start if any `*.key` or `known_hosts` file is left in `may-private`, and refuses any known secret in its own environment (`store.SECRET_NAMES`, which now includes `MAY_APP_PR_READ_TOKEN`).
-  - `static_check.py` pins the workflow's exact steps and commands. It also pins where each secret is bound: the read keys in the fetch step, the PR token in the two gate steps, and no `env` at all on the compile or cleanup. Nothing writes `GITHUB_ENV` or `GITHUB_PATH`.
-- **What this does not stop (residual risk):** GitHub-hosted macOS runners give the job's user passwordless `sudo`. A build script could read the runner process's memory, which holds every secret the job references: the two read keys and the read-only PR token. Same-repo pull request authors can already read may-app. So:
-  - Give `may-native-compile-pr` **its own deploy keys** (separate from `may-native-compile`'s), so they can be revoked on their own.
-  - Use a PR token that can only read may-app pull requests.
+  The public line then names the pull request, its author and the dispatcher (GitHub logins only, otherwise `unknown`), so a run is attributable.
+- **The fetch** (`prepare.py --pr-number`) fetches `refs/pull/<number>/head`, requires it to be exactly `source_sha`, and checks out that commit. The design-system pin is checked as for every build.
+- **The compile** builds `MayPlayground` for the iOS Simulator, Release, `CODE_SIGNING_ALLOWED=NO`.
+- **What the job holds, and why that is enough:** on one GitHub-hosted macOS job, everything the job references is available to the pull request's build code (XcodeGen, SwiftPM and Xcode build phases run it). The runner gives the job's user passwordless `sudo`, and GitHub hands the runner every secret the job references when the job starts. So the design goal is that the job holds **nothing a may-app writer doesn't already have**:
+  - two read-only deploy keys (may-app, may-design-system);
+  - a pull-request read token;
+  - the job's read-only `GITHUB_TOKEN`.
 
-  The next step up is a self-hosted runner, or splitting fetch and build into separate jobs with an encrypted handoff.
+  Only same-repo heads are admitted, so the author already holds that code and those repos. What the steps add is hygiene against accidents, not a boundary against a malicious pull request:
+  - the read keys are bound only in the fetch step's `env`, written to `0600` files and deleted in a `finally`;
+  - the compile refuses to start while any `*.key` or `known_hosts` file is in `may-private`, and refuses any known secret in its environment (`store.SECRET_NAMES`);
+  - `static_check.py` pins each secret to exactly one step, and allows no `env` at all on the compile or cleanup.
+- **Kept that way:**
+  - **Dedicated deploy keys:** `may-native-compile-pr`'s keys are never `may-native-compile`'s, so revoking them never touches the release path. Rotate them whenever someone leaves may-app, because a copied key outlives their GitHub access.
+  - **A short-lived pull-request token:** preferably a GitHub App installation token, otherwise a fine-grained token with an expiry. It covers may-app only, with Pull requests: read and Metadata: read.
+  - **No Actions cache in any workflow:** `static_check.py` refuses `actions/cache` and `cache:` inputs. The runner's own token can write cache entries, and with nothing reading them that reaches nothing.
+- **What reaches the public log:** this repository's tools print only fixed lines, `xcodebuild` writes to a private log that the cleanup deletes, and nothing is uploaded. A pull request's own build code can still write to the run (its step summary, for one). That is its author publishing code they already hold, not something this workflow can stop.
 
-**What Samuel sets up before the first run** (the gate denies on a 404 until then):
-1. **Environment `may-native-compile-pr`**, configured like `may-native-compile`:
-   - Samuel is the sole required reviewer;
-   - administrator bypass is off;
-   - custom branch policy with only `main`.
+**What Samuel sets up before the first run** (admission denies until then). Create **environment `may-native-compile-pr`** with:
+- **no required reviewers**;
+- administrator bypass off (**Allow administrators to bypass** unchecked);
+- **Deployment branches: Selected branches**, with only `main`.
 
-   Its secrets are `MAY_APP_READ_KEY` and `MAY_DS_READ_KEY`, ideally new read-only deploy keys for may-app and may-design-system. Nothing else.
-2. **Repository secret `MAY_APP_PR_READ_TOKEN`**: a fine-grained token or GitHub App installation token for **May-Assistant/may-app only**, with **Pull requests: read** and **Metadata: read**. It must be a repository secret, not an environment one, because admission runs before any environment. This makes it the second repository secret after `CLAUDE_CODE_OAUTH_TOKEN`. Only `native-compile-pr.yml` references it, and `control-check.yml` references no secret.
+Its secrets, and nothing else:
+- `MAY_APP_READ_KEY`: a **new** read-only deploy key on may-app;
+- `MAY_DS_READ_KEY`: a **new** read-only deploy key on may-design-system;
+- `MAY_APP_PR_READ_TOKEN`: may-app only, Pull requests: read and Metadata: read, short-lived (see above).
+
+No repository secret is needed.
 
 ### Prerequisites that remain
 

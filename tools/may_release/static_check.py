@@ -370,6 +370,10 @@ def workflow_problems(root):
             found.append(f"{path.name}: requests deployments permission")
         if "pull_request_target" in text:
             found.append(f"{path.name}: uses pull_request_target")
+        # The runtime token a pull request's build code can read may write cache entries; with no cache consumer
+        # anywhere, that reaches nothing (security review of #18, M1).
+        if re.search(r"(?m)actions/cache[@/]|^\s*(-\s+)?cache(-dependency-path)?:", text):
+            found.append(f"{path.name}: uses an Actions cache")
         if re.search(r"pip3? install|python3? -m pip", text):
             found.append(f"{path.name}: installs Python packages")
         for step in re.split(r"(?m)^      - ", text)[1:]:
@@ -700,12 +704,15 @@ def compile_workflow_problems(text):
 # own environment, admitted only for the current head of an open pull request against may-app main from may-app
 # itself (gate.py --action compile-pr). The pull-request read token is in the two gate steps alone and the source-read
 # keys in the fetch step alone, so the compile (which runs the pull request's own build code) is handed neither.
+# Admission (no environment) checks inputs and the environment's policy; the pull request is read with --check-pull
+# on the environment's runner, where MAY_APP_PR_READ_TOKEN lives (security review of #18, M2).
 GATE_COMPILE_PR = ('python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" '
                    '--pr-number "$MAY_PR_NUMBER"')
+GATE_CHECK_PULL = GATE_COMPILE_PR + " --check-pull"
 PREPARE_IOS_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha '
                   '"$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"')
-COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_COMPILE_PR, PREPARE_IOS_PR, COMPILE_IOS, COMPILE_CLEANUP]
-COMPILE_PR_STEP_NAMES = ["Recheck the pull request head and protection after reviewer approval",
+COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL, PREPARE_IOS_PR, COMPILE_IOS, COMPILE_CLEANUP]
+COMPILE_PR_STEP_NAMES = ["Check the pull request head and environment before fetching",
                          "Fetch the pull request head and pinned design system quietly",
                          "Compile without signing, store access or any credential", "Remove private source, logs and products"]
 PR_READ_SECRET = "MAY_APP_PR_READ_TOKEN"
@@ -756,15 +763,15 @@ def compile_pr_workflow_problems(text):
             "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + ": native's environment is not the one admission chose, after admission")
     by_name = dict(steps["native"])
-    gate_step = steps["admission"][1][1] if len(steps["admission"]) == 2 else ""
     fetch, recheck = by_name.get(COMPILE_PR_STEP_NAMES[1], ""), by_name.get(COMPILE_PR_STEP_NAMES[0], "")
     later = by_name.get(COMPILE_PR_STEP_NAMES[2], "") + by_name.get(COMPILE_PR_STEP_NAMES[3], "")
+    # Each secret is bound exactly once: the PR token in the pull request check, so never in admission too (review of #18, M2).
     if secrets_in(text) != set(COMPILE_SECRETS) | {PR_READ_SECRET} or \
-            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS) or text.count("secrets." + PR_READ_SECRET) != 2 or \
-            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(gate_step) != {PR_READ_SECRET} or \
+            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS + (PR_READ_SECRET,)) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or \
             secrets_in(recheck) != {PR_READ_SECRET} or secrets_in(later) or "env:" in later or \
             any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
-        found.append(name + ": a secret or env entry other than the gates' PR token and the fetch step's two source-read keys")
+        found.append(name + ": a secret or env entry other than the pull request check's PR token and the fetch step's two source-read keys")
     if "GITHUB_ENV" in text or "GITHUB_PATH" in text or "${{ inputs." in "\n".join(runs):
         found.append(name + ": carries values to later steps or interpolates inputs into shell")
     return found
@@ -772,6 +779,9 @@ def compile_pr_workflow_problems(text):
 
 def control_problems(root):
     found = []
+    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr"}:
+        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\"}: only the compile-only pull-request "
+                     "lane may run without Samuel's review")
     flows = root / ".github/workflows"
     check = (flows / "control-check.yml").read_text()
     compile_workflow = (flows / "native-compile-draft.yml").read_text()

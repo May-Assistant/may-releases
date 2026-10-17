@@ -21,12 +21,14 @@ import static_check
 REPO, MAIN, DISPATCH = "May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch"
 SHA, OTHER = "a" * 40, "b" * 40
 PR_WORKFLOW = ".github/workflows/native-compile-pr.yml"
+# may-native-compile-pr as Samuel decided (17 Oct): no required reviewer, admin bypass off, main only.
 ENVIRONMENT = {
     "can_admins_bypass": False,
     "deployment_branch_policy": {"custom_branch_policies": True, "protected_branches": False},
-    "protection_rules": [{"type": "required_reviewers", "prevent_self_review": False, "reviewers": [
-        {"type": "User", "reviewer": {"id": 58840187, "login": "samuelalake"}}]}],
+    "protection_rules": [],
 }
+REVIEWER_RULE = {"type": "required_reviewers", "prevent_self_review": False, "reviewers": [
+    {"type": "User", "reviewer": {"id": 58840187, "login": "samuelalake"}}]}
 POLICIES = {"branch_policies": [{"name": "main"}]}
 
 
@@ -69,9 +71,10 @@ class PullRequestAdmissionTests(unittest.TestCase):
             "no answer": (None, SHA, "unreadable"),
         }
         for name, (value, sha, message) in cases.items():
-            with self.subTest(case=name), self.assertRaises(GateDenial) as caught:
-                validate_pull_request(value, 42, sha)
-            self.assertIn(message, caught.exception.args[0], name)
+            with self.subTest(case=name):
+                with self.assertRaises(GateDenial) as caught:
+                    validate_pull_request(value, 42, sha)
+                self.assertIn(message, caught.exception.args[0], name)
 
     def test_pull_request_number_is_exact(self):
         self.assertEqual(gate.pull_number("42"), 42)
@@ -117,50 +120,90 @@ class AdmissionCommandTests(unittest.TestCase):
             written = output.read_text() if output.exists() else ""
         return denial, seen, written
 
-    def answers(self, pull_value):
+    def answers(self, pull_value, environment=ENVIRONMENT, policies=POLICIES):
         return {"May-Assistant/may-app/pulls/42": pull_value,
-                "May-Assistant/may-releases/environments/may-native-compile-pr": ENVIRONMENT,
-                "May-Assistant/may-releases/environments/may-native-compile-pr/deployment-branch-policies?per_page=100": POLICIES}
+                "May-Assistant/may-releases/environments/may-native-compile-pr": environment,
+                "May-Assistant/may-releases/environments/may-native-compile-pr/deployment-branch-policies?per_page=100": policies}
 
-    def test_admits_a_pull_request_head_in_its_own_environment_only(self):
-        denial, seen, written = self.run_gate(["--action", "compile-pr", "--source-sha", SHA, "--pr-number", "42"],
-                                              self.answers(pull()))
+    ADMIT = ["--action", "compile-pr", "--source-sha", SHA, "--pr-number", "42"]
+    CHECK = ADMIT + ["--check-pull"]
+
+    def test_admission_checks_inputs_and_its_own_environment_with_no_pull_request_token(self):
+        # Admission has no environment, so it never holds the PR token (security review of #18, M2).
+        denial, seen, written = self.run_gate(self.ADMIT, self.answers(pull()), env={"MAY_APP_PR_READ_TOKEN": None})
         self.assertIsNone(denial)
         self.assertEqual(written, "environment=may-native-compile-pr\nbuild_environment=may-native-compile-pr\n")
-        self.assertIn(("https://api.github.com/repos/May-Assistant/may-app/pulls/42", "Bearer pr-token"), seen)
-        # Only the pull-request environment: never may-native-compile or a store environment.
+        self.assertFalse([u for u, _ in seen if "/may-app/" in u], "admission reads no pull request")
         environments = {url.split("/environments/", 1)[1].split("/", 1)[0] for url, _ in seen if "/environments/" in url}
-        self.assertEqual(environments, {"may-native-compile-pr"})
-        # The PR token is used only for may-app; the control token only for may-releases.
+        self.assertEqual(environments, {"may-native-compile-pr"}, "never may-native-compile or a store environment")
+
+    def test_the_pull_request_check_admits_the_head_and_names_who_wrote_and_dispatched_it(self):
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            denial, seen, _ = self.run_gate(self.CHECK, self.answers(pull(user={"login": "dev-one"})),
+                                            env={"GITHUB_TRIGGERING_ACTOR": "coordinator[bot]"})
+        self.assertIsNone(denial)
+        self.assertIn(("https://api.github.com/repos/May-Assistant/may-app/pulls/42", "Bearer pr-token"), seen)
         for url, auth in seen:
             self.assertEqual(auth, "Bearer pr-token" if "/may-app/" in url else "Bearer control-token", url)
+        self.assertEqual(out.getvalue().strip(), "May compile-pr pull request check passed for " + SHA +
+                         " (may-app #42; pull request by dev-one; dispatched by coordinator[bot])")
+        # Anything but a login is never printed.
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            self.run_gate(self.CHECK, self.answers(pull(user={"login": "x\n::error::"})), env={"GITHUB_TRIGGERING_ACTOR": "a b"})
+        self.assertIn("pull request by unknown; dispatched by unknown", out.getvalue())
 
-    def test_refuses_a_commit_that_is_not_the_head_a_closed_pull_or_a_fork_and_writes_no_environment(self):
+    def test_the_pull_request_check_refuses_a_non_head_a_closed_pull_or_a_fork_and_writes_no_environment(self):
         for name, value, sha in (("not the head", pull(), OTHER), ("closed", pull(state="closed"), SHA),
                                  ("fork", pull(head__repo={"full_name": "someone/may-app"}), SHA)):
             with self.subTest(case=name):
-                denial, seen, written = self.run_gate(["--action", "compile-pr", "--source-sha", sha, "--pr-number", "42"],
-                                                      self.answers(value))
+                denial, seen, written = self.run_gate(["--action", "compile-pr", "--source-sha", sha, "--pr-number", "42",
+                                                       "--check-pull"], self.answers(value))
                 self.assertIsNotNone(denial)
                 self.assertEqual(written, "")
                 self.assertFalse([u for u, _ in seen if "/environments/" in u], "denied before any environment read")
 
-    def test_a_missing_pull_request_or_token_denies(self):
-        denial, _, written = self.run_gate(["--action", "compile-pr", "--source-sha", SHA, "--pr-number", "42"],
-                                           {k: v for k, v in self.answers(pull()).items() if "/pulls/" not in k})
+    def test_a_missing_pull_request_or_token_denies_the_check(self):
+        denial, _, written = self.run_gate(self.CHECK, {k: v for k, v in self.answers(pull()).items() if "/pulls/" not in k})
         self.assertIn("does not exist", denial)
         self.assertEqual(written, "")
-        denial, seen, _ = self.run_gate(["--action", "compile-pr", "--source-sha", SHA, "--pr-number", "42"],
-                                        self.answers(pull()), env={"MAY_APP_PR_READ_TOKEN": None})
+        denial, seen, _ = self.run_gate(self.CHECK, self.answers(pull()), env={"MAY_APP_PR_READ_TOKEN": None})
         self.assertEqual(denial, "Pull-request read token unavailable")
         self.assertEqual(seen, [], "nothing is asked without the token")
 
+    def test_the_environment_has_no_reviewer_no_admin_bypass_and_main_only(self):
+        # Samuel, 17 Oct: compile-only runs need no approval. A reviewer rule would only hang the run (review of #18, H1).
+        with_reviewer = dict(ENVIRONMENT, protection_rules=[REVIEWER_RULE])
+        bypass = dict(ENVIRONMENT, can_admins_bypass=True)
+        protected = dict(ENVIRONMENT, deployment_branch_policy={"custom_branch_policies": False, "protected_branches": True})
+        cases = {
+            "a required reviewer": (with_reviewer, POLICIES, "must have no required reviewer"),
+            "administrator bypass": (bypass, POLICIES, "Administrator bypass must be disabled"),
+            "protected branches instead of a policy": (protected, POLICIES, "explicit branch policy"),
+            "another branch allowed": (ENVIRONMENT, {"branch_policies": [{"name": "main"}, {"name": "dev"}]}, "allow only main"),
+        }
+        for name, (environment, policies, message) in cases.items():
+            for args in (self.ADMIT, self.CHECK):
+                with self.subTest(case=name, check="--check-pull" in args):
+                    denial, _, written = self.run_gate(args, self.answers(pull(), environment, policies))
+                    self.assertIsNotNone(denial)
+                    self.assertIn(message, denial)
+                    self.assertEqual(written, "")
+
+    def test_only_compile_pr_runs_without_a_reviewer(self):
+        self.assertEqual(gate.NO_REVIEWER_ACTIONS, {"compile-pr"})
+        # The existing compile still requires Samuel as the sole reviewer.
+        with self.assertRaises(GateDenial):
+            gate.validate_environment(ENVIRONMENT, POLICIES)
+
     def test_the_pull_request_number_comes_with_compile_pr_and_only_then(self):
-        for args in (["--action", "compile-pr", "--source-sha", SHA],
-                     ["--action", "compile", "--source-sha", SHA, "--pr-number", "42"]):
+        for args, message in ((["--action", "compile-pr", "--source-sha", SHA], "given with compile-pr and only then"),
+                              (["--action", "compile", "--source-sha", SHA, "--pr-number", "42"], "given with compile-pr and only then"),
+                              (["--action", "compile", "--source-sha", SHA, "--check-pull"], "Only compile-pr reads a pull request")):
             with self.subTest(args=args):
                 denial, seen, _ = self.run_gate(args, self.answers(pull()))
-                self.assertEqual(denial, "A pull request number is given with compile-pr and only then")
+                self.assertIn(message, denial)
                 self.assertEqual(seen, [])
 
 
@@ -244,7 +287,7 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
 
     def test_each_widening_is_flagged(self):
         name = "native-compile-pr.yml: "
-        secret = name + "a secret or env entry other than the gates' PR token and the fetch step's two source-read keys"
+        secret = name + "a secret or env entry other than the pull request check's PR token and the fetch step's two source-read keys"
         runs = name + "runs something other than the gate, the fetch, the compile and the cleanup"
         compile_step = "      - name: Compile without signing, store access or any credential\n"
         fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
@@ -268,6 +311,10 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
                 name + "is not the iOS-only May Playground compile with no artifact"),
             "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n  workflow_dispatch:\n",
                 name + "is not dispatched with exactly pr_number and source_sha"),
+            "the PR token in admission": ('          GH_TOKEN: ${{ github.token }}\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n          MAY_PR_NUMBER',
+                '          GH_TOKEN: ${{ github.token }}\n          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n'
+                '          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n          MAY_PR_NUMBER', secret),
+            "the check without --check-pull": ('--pr-number "$MAY_PR_NUMBER" --check-pull\n', '--pr-number "$MAY_PR_NUMBER"\n', runs),
             "write permission": ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: write\nconcurrency:",
                 name + "permissions are not exactly read-only"),
         }
@@ -281,6 +328,29 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
                 path.write_text(text.replace(old, new, 1))
                 found = static_check.problems(self.root)
                 self.assertTrue(any(message in problem for problem in found), (case, found))
+
+
+    def test_no_workflow_may_use_an_actions_cache(self):
+        # Security review of #18, M1: the runtime token a pull request's code can read writes cache; nothing reads one.
+        for workflow, old in (("control-check.yml", "      - uses: actions/checkout@"),
+                              ("native-compile-pr.yml", "      - uses: actions/checkout@")):
+            for new in ("      - uses: actions/cache@0123456789012345678901234567890123456789\n" + old,
+                        "      - uses: actions/setup-python@0123456789012345678901234567890123456789\n        with:\n          cache: pip\n" + old):
+                with self.subTest(workflow=workflow, new=new.split("\n")[0]):
+                    self.tearDown()
+                    self.setUp()
+                    path = self.root / ".github/workflows" / workflow
+                    text = path.read_text()
+                    self.assertIn(old, text)
+                    path.write_text(text.replace(old, new, 1))
+                    self.assertTrue(any(workflow + ": uses an Actions cache" in p for p in static_check.problems(self.root)))
+
+    def test_no_other_action_may_join_the_no_reviewer_policy(self):
+        path = self.root / "tools/may_release/gate.py"
+        text = path.read_text()
+        self.assertIn('NO_REVIEWER_ACTIONS = {"compile-pr"}', text)
+        path.write_text(text.replace('NO_REVIEWER_ACTIONS = {"compile-pr"}', 'NO_REVIEWER_ACTIONS = {"compile-pr", "ios"}', 1))
+        self.assertTrue(any("NO_REVIEWER_ACTIONS is not exactly" in p for p in static_check.problems(self.root)))
 
 
 if __name__ == "__main__":

@@ -38,9 +38,16 @@ only once the Console-upload public key (store.SIGN_ONLY_RECIPIENT) is committed
 
 Compile of a pull request head (action compile-pr, native-compile-pr.yml): only a
 may-app commit that is, right now, the head of an open pull request against may-app's
-main, from may-app itself (never a fork), read through the GitHub API with a read-only
-pull-request token (MAY_APP_PR_READ_TOKEN). It builds in its own environment,
-may-native-compile-pr, never a store environment, and is checked again after review.
+main, from may-app itself (never a fork). It builds in its own environment,
+may-native-compile-pr, never a store environment.
+- Samuel's decision (decisions.md, Build 11, 17 Oct): compile-only runs need no approval.
+  So that environment has its own policy (NO_REVIEWER_ACTIONS): administrator bypass off,
+  branch policy exactly main, and no required-reviewer rule at all (one is denied, so a
+  stale rule can never turn the lane into a wait until timeout).
+- Admission (no environment, so a missing one is denied on its 404, never auto-created)
+  checks the inputs and that policy. The pull request itself is read with --check-pull,
+  as the environment job's first step, with MAY_APP_PR_READ_TOKEN held in that
+  environment: main-dispatched runs only, never a repository secret any branch can read.
 """
 
 import argparse
@@ -76,6 +83,10 @@ MAX_BUILD_NUMBER = 2_000_000_000
 # platforms whose upload step is held. Stage 1 held both; stage 2 lifted Android.
 UPLOADS_HELD = {"ios"}
 ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
+# Actions whose environment has no required reviewer (Samuel, 17 Oct: compile-only pull-request runs need no
+# approval). static_check.py pins this to exactly {"compile-pr"}: no signing, store or release action may join it.
+NO_REVIEWER_ACTIONS = {"compile-pr"}
+LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?")
 AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
 
@@ -203,6 +214,25 @@ def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=No
                              "so it can never be approved")
 
 
+def validate_no_reviewer_environment(data, policies):
+    """An environment with no required reviewer (NO_REVIEWER_ACTIONS): administrator bypass off, branch policy
+    exactly main, and no required-reviewer rule (deny one: a reviewer here would only hang the run)."""
+    if data.get("can_admins_bypass") is not False:
+        raise GateDenial("Administrator bypass must be disabled")
+    branch = data.get("deployment_branch_policy") or {}
+    if branch.get("custom_branch_policies") is not True or branch.get("protected_branches") is not False:
+        raise GateDenial("Environment must use explicit branch policy")
+    if sorted(p.get("name") for p in policies.get("branch_policies", [])) != ["main"]:
+        raise GateDenial("Environment must allow only main")
+    if any(r.get("type") == "required_reviewers" for r in data.get("protection_rules", [])):
+        raise GateDenial("The compile-only pull-request environment must have no required reviewer (Samuel, 17 Oct)")
+
+
+def login_or_unknown(value):
+    """A GitHub login for the public admission line, or "unknown": never any other text."""
+    return value if isinstance(value, str) and LOGIN.fullmatch(value) else "unknown"
+
+
 def get_json(path, token):
     request = urllib.request.Request(
         f"https://api.github.com/repos/{CONTROL_REPO}/{path}",
@@ -247,9 +277,13 @@ def main():
     parser.add_argument("--dry-run")
     parser.add_argument("--sign-only")
     parser.add_argument("--pr-number")
+    # compile-pr on its environment's runner, before the fetch: read the pull request itself.
+    parser.add_argument("--check-pull", action="store_true")
     args = parser.parse_args()
     if (args.action == "compile-pr") != (args.pr_number is not None):
         raise GateDenial("A pull request number is given with compile-pr and only then")
+    if args.check_pull and args.action != "compile-pr":
+        raise GateDenial("Only compile-pr reads a pull request")
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
@@ -263,21 +297,34 @@ def main():
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise GateDenial("GitHub metadata token unavailable")
+    author = None
     if args.action == "compile-pr":
         number = pull_number(args.pr_number)
-        pull_token = os.environ.get("MAY_APP_PR_READ_TOKEN")
-        if not pull_token:
-            raise GateDenial("Pull-request read token unavailable")
-        validate_pull_request(get_app_pull(number, pull_token), number, args.source_sha)
+        if args.check_pull:
+            pull_token = os.environ.get("MAY_APP_PR_READ_TOKEN")
+            if not pull_token:
+                raise GateDenial("Pull-request read token unavailable")
+            pull = get_app_pull(number, pull_token)
+            validate_pull_request(pull, number, args.source_sha)
+            author = login_or_unknown((pull.get("user") or {}).get("login"))
     for name in sorted({env, build_env}):
         base = f"environments/{name}"
-        validate_environment(get_json(base, token),
-                             get_json(base + "/deployment-branch-policies?per_page=100", token),
-                             os.environ.get("GITHUB_ACTOR_ID"), os.environ.get("GITHUB_TRIGGERING_ACTOR"))
+        data, policies = get_json(base, token), get_json(base + "/deployment-branch-policies?per_page=100", token)
+        if args.action in NO_REVIEWER_ACTIONS:
+            validate_no_reviewer_environment(data, policies)
+        else:
+            validate_environment(data, policies, os.environ.get("GITHUB_ACTOR_ID"), os.environ.get("GITHUB_TRIGGERING_ACTOR"))
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as stream:
             stream.write(f"environment={env}\nbuild_environment={build_env}\n")
+    if args.action == "compile-pr":
+        # Who wrote and who dispatched it, so a run is attributable from the public log (logins only).
+        dispatcher = login_or_unknown(os.environ.get("GITHUB_TRIGGERING_ACTOR"))
+        checked = f"; pull request by {author}" if author else ""
+        print(f"May compile-pr {'pull request check' if args.check_pull else 'admission'} passed for {args.source_sha} "
+              f"(may-app #{int(args.pr_number)}{checked}; dispatched by {dispatcher})")
+        return
     print(f"May {args.action} admission passed for {args.source_sha}")
 
 
