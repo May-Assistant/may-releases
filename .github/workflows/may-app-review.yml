@@ -6,6 +6,9 @@ on:
         description: Open, ready-for-review May-Assistant/may-app pull request against main (not from a fork)
         required: true
         type: string
+  # Every 15 minutes: the fetch step picks at most one pull request waiting for a review (review.py pick).
+  schedule:
+    - cron: "*/15 * * * *"
 permissions:
   contents: read
 concurrency:
@@ -20,7 +23,7 @@ jobs:
     # at the end, and this log carries only fixed lines, numbers and logins (review.py). The model has no shell, no gh
     # and no token: it reads the pull request as files under /tmp/may-review-view and comments through review_mcp.py.
     # Admission has no environment, so a missing one is denied on its 404 and never auto-created; it checks the input
-    # and may-claude-review's policy.
+    # and may-claude-review's policy (no required reviewer, Samuel, 17 Oct). One run at a time (concurrency).
     runs-on: ubuntu-24.04
     permissions:
       contents: read
