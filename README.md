@@ -460,7 +460,8 @@ gh workflow run may-app-review.yml -f pr_number=<may-app PR number> --repo May-A
   - **Checked against the real CLI (2.1.296, 17 Oct):** a file in the view reads; `/proc/self/environ` is denied; there is no Bash tool; and a CLAUDE.md in the working directory is ignored.
 - **Comments go through `review_mcp.py`**, a local stand-in for the action's comment server under the same tool name, so the command runs unchanged. It:
   - posts only to the checked pull request at the fetched head, and reads the pull request again before each post, posting nothing once it is closed, a draft, retargeted or pushed to;
-  - posts at most 30 comments per run;
+  - posts at most 30 comments per run, counted from its record file, so a restart can't reset the count;
+  - lets nothing make a viewer's browser or GitHub's image proxy fetch from elsewhere. Outside code, raw HTML is escaped, image syntax becomes a plain link, and every link or bare URL whose host isn't github.com is replaced. Code blocks and spans are left as written, so a suggestion's code is intact;
   - refuses any body holding the review token in any spelling (raw, with separators, base64, hex);
   - adds the footer and marker, and redacts token-shaped text.
 

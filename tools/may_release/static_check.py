@@ -905,6 +905,11 @@ def review_tool_problems(root):
     run, command = function_source(tree, "review"), function_source(tree, "claude_command")
     if run is None or command is None or "cwd=view / 'work'" not in ast.unparse(run) or "--add-dir" in ast.unparse(command):
         found.append("review.py: Claude Code runs somewhere other than the view's empty work directory, or with --add-dir")
+    # The token file goes as soon as Claude Code exits, however it exits (re-review of #21, optional).
+    removed = [t for t in ast.walk(run) if isinstance(t, ast.Try) and
+               any("secret.unlink(missing_ok=True)" == ast.unparse(s) for s in t.finalbody)] if run else []
+    if not removed:
+        found.append("review.py: the review's token file is not removed in a finally once Claude Code exits")
     return found
 
 
