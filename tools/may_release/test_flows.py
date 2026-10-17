@@ -161,9 +161,10 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(self.manifest("# expected\nChatReplyFlow 3\n\nSignInFlow 2\n"), {"ChatReplyFlow": 3, "SignInFlow": 2})
 
     def test_reads_may_apps_current_manifest_classes(self):
-        # may-app android/flows/manifest.txt with #180 (build 10's PlanYourDayFlow) and ApprovalsFlow (build 9's crash).
+        # may-app android/flows/manifest.txt with #180 (build 10's PlanYourDayFlow), ApprovalsFlow (build 9's crash) and
+        # OnboardingBFlow (#239, build 11's onboarding B).
         text = "".join(f"{name} 1\n" for name in ("ApprovalsFlow", "ChatReplyFlow", "ConnectionsFlow", "EmptyStatesFlow", "MessageMenuFlow",
-                                                  "PlanYourDayFlow", "SendingStatusFlow", "SignInFlow", "TaskDetailFlow"))
+                                                  "OnboardingBFlow", "PlanYourDayFlow", "SendingStatusFlow", "SignInFlow", "TaskDetailFlow"))
         try:
             read = self.manifest(text)
         except FlowsError as refused:
