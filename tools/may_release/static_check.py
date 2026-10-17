@@ -372,7 +372,9 @@ def workflow_problems(root):
             found.append(f"{path.name}: uses pull_request_target")
         # The runtime token a pull request's build code can read may write cache entries; with no cache consumer
         # anywhere, that reaches nothing (security review of #18, M1).
-        if re.search(r"(?m)actions/cache[@/]|^\s*(-\s+)?cache(-dependency-path)?:", text):
+        # Any action named for a cache (actions/cache, irgaly/xcode-cache, Swatinem/rust-cache, sccache), and a cache
+        # input in block or flow style (`cache: pip`, `with: {cache: pip}`) (re-review of #18, L5).
+        if re.search(r"(?m)uses:\s*\S*cache\S*@|(?:^|[\s{,])cache(-dependency-path)?:", text):
             found.append(f"{path.name}: uses an Actions cache")
         if re.search(r"pip3? install|python3? -m pip", text):
             found.append(f"{path.name}: installs Python packages")
