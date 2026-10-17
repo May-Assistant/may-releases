@@ -28,6 +28,8 @@ This repository only performs later updates. It refuses an app whose tracks show
 
 The [pull-request compile workflow](.github/workflows/native-compile-pr.yml) compiles iOS May Playground at the head of an open may-app pull request against `main`, in its own environment `may-native-compile-pr`. It needs no approval (Samuel, 17 Oct), and it is not usable until Samuel creates that environment and its secrets (see [iOS compile of a pull request head](#ios-compile-of-a-pull-request-head)).
 
+The [design-system Swift compile workflow](.github/workflows/ds-swift-compile.yml) compiles may-design-system's Swift package at the head of an open may-design-system pull request and posts its compile errors on that pull request, never in this log, in its own environment `may-ds-renders`. It needs no approval, and it is not usable until Samuel creates that environment's secrets (see [Design-system Swift compile of a pull request head](#design-system-swift-compile-of-a-pull-request-head)).
+
 The [may-app review workflow](.github/workflows/may-app-review.yml) runs Claude's code review of an open may-app pull request and posts it on that pull request, because may-app's own Actions are blocked. It runs in its own environment `may-claude-review`, and nothing from may-app reaches this public repository's log. It is not usable until Samuel creates that environment and its secrets (see [Claude code review of a may-app pull request](#claude-code-review-of-a-may-app-pull-request)).
 
 The [native compile workflow](.github/workflows/native-compile-draft.yml) is **active for iOS only**: each build, the coordinator dispatches it to check that **May Playground** compiles. It runs on `macos-15` with the pinned Xcode 26.3 and XcodeGen 2.46.0, makes a simulator Release build with `CODE_SIGNING_ALLOWED=NO`, and has no signing, store call or artifact (see [iOS compile each build](#ios-compile-each-build)). The pull-request check runs only dependency-free control tests and static checks with a read-only token.
@@ -393,7 +395,7 @@ gh workflow run native-compile-draft.yml -f platform=ios -f source_sha=<reviewed
 
 `native-compile-pr.yml` gives the iOS lane compile evidence for an **open may-app pull request**, before it merges. It is the same May Playground simulator compile as above. It is a separate workflow, so the release path and `native-compile-draft.yml`, which accept only commits on may-app `main`, are unchanged. It has no signing, no store call and no artifact.
 
-**No approval** (Samuel, 17 Oct, `decisions.md` "Build 11 decisions": compile-only runs on may-releases for open may-app PR heads don't need his approval; signing, TestFlight and store releases keep theirs). The environment's policy is its own (`gate.NO_REVIEWER_ACTIONS`, pinned by `static_check.py` to exactly `{"compile-pr"}`): no other action may run without his review.
+**No approval** (Samuel, 17 Oct, `decisions.md` "Build 11 decisions": compile-only runs on may-releases for open may-app PR heads don't need his approval; signing, TestFlight and store releases keep theirs). The environment's policy is its own (`gate.NO_REVIEWER_ACTIONS`, pinned by `static_check.py` to exactly `{"compile-pr", "ds-compile"}`): no other action may run without his review.
 
 ```
 gh workflow run native-compile-pr.yml -f pr_number=<may-app PR number> -f source_sha=<that PR's current head SHA> --repo May-Assistant/may-releases --ref main
@@ -441,6 +443,29 @@ Its secrets, and nothing else:
 
 No repository secret is needed.
 
+### Design-system Swift compile of a pull request head
+
+`ds-swift-compile.yml` lets the iOS lane see why may-app fails to compile against a may-design-system commit (the app compile keeps its log private). It compiles may-design-system's Swift package alone, at the head of an **open may-design-system pull request** against `claude/may-integration` or `main`, from may-design-system itself, and posts the result as **one comment on that pull request** (Samuel's decision). It has no signing, store call, artifact or approval.
+
+```
+gh workflow run ds-swift-compile.yml -f ds_sha=<that PR's current head SHA> -f ds_pr=<may-design-system PR number> --repo May-Assistant/may-releases --ref main
+```
+
+**This repository is public and may-design-system is private**, so nothing derived from the design system (paths, file or scheme names, compiler messages, logs) reaches this run's log, step summary, artifacts or outputs. The log shows fixed lines, the dispatch's own inputs (commit and pull request number), the dispatcher's login and the number of errors, for example `DS Swift compile failed; 12 errors posted to may-design-system #40`. `static_check.py` pins the workflow whole and every `print` in `ds_compile.py` (a literal, or only the pull request number, the error count and the Xcode version).
+
+- **Admission** (`gate.py --action ds-compile`, no environment) checks the dispatch and inputs, and that `may-ds-renders` exists with administrator bypass off, a custom branch policy of exactly `main`, and **no** required-reviewer rule.
+- **The pull request check** (`--check-pull`, first step on the `may-ds-renders` runner) reads the pull request with `MAY_DS_PR_READ_TOKEN`: open, base `claude/may-integration` or `main` of may-design-system, head in may-design-system itself, head exactly `ds_sha`. It prints nothing read from the pull request.
+- **The fetch** (`ds_compile.py fetch`, `MAY_DS_READ_KEY` alone) fetches `refs/pull/<number>/head` over SSH exactly as `prepare.py` does (a `0600` key file and pinned `known_hosts`, both removed in a `finally`), requires it to be exactly `ds_sha`, and checks it out.
+- **The compile** (`ds_compile.py compile`, no `env` at all) refuses to start while a key or host file is on disk or any known secret is in its environment, checks for Xcode 26.3, and builds the package-wide `*-Package` scheme (otherwise each scheme) for `generic/platform=iOS Simulator`, Release, `CODE_SIGNING_ALLOWED=NO`, with derived data and packages under `$RUNNER_TEMP`. `xcodebuild` gets only `PATH`, `HOME`, the user and locale, `DEVELOPER_DIR` and `TMPDIR` (no GitHub Actions file paths), and all its output goes to a private log. The outcome is recorded in a private file; a failed build does not fail this step.
+- **The post** (`ds_compile.py post`, `MAY_DS_PR_COMMENT_TOKEN` alone, taken out of the environment at once) keeps only `<path>:<line>:<col>: error: <message>` lines whose path is inside the checkout, rewritten repo-relative; warnings, notes, source and caret lines, errors outside the checkout and everything else are dropped. It dedupes them, posts at most 100 and counts the rest, reads the pull request again (still open, same base rules, head still `ds_sha`), and posts one comment on it (`POST /repos/May-Assistant/may-design-system/issues/<number>/comments`, the only write it can make), with the head SHA, this run's URL, a hidden `<!-- may-ds-swift-compile head=<sha> -->` marker and the footer. A passing compile posts that it compiles. A failing compile then fails the job.
+- **The cleanup** always removes `may-ds-source`, `may-ds-private`, `may-ds-derived` and `may-ds-packages` under `$RUNNER_TEMP`.
+- **What the job holds:** as with the pull-request compile above, the design system's own build code (SwiftPM, macros, plugins) runs on a runner that holds every secret the job references. Those are a read-only deploy key and two tokens scoped to may-design-system, which a may-design-system writer already has the equivalent of. The steps add hygiene against accidents, not a boundary against a hostile pull request; in particular a pull request's own build code could still write to the run deliberately.
+
+**What Samuel sets up before the first run** (admission denies until then). Environment **`may-ds-renders`** with no required reviewers, administrator bypass off, and deployment branches **Selected branches: `main`** only. Its secrets:
+- `MAY_DS_READ_KEY`: a read-only deploy key on may-design-system (a new one, not another environment's);
+- `MAY_DS_PR_READ_TOKEN`: may-design-system only, Pull requests: read and Metadata: read, short-lived;
+- `MAY_DS_PR_COMMENT_TOKEN` (**new**): a fine-grained personal access token, may-design-system only, Pull requests: read and write (Metadata: read is always included), with an expiry. Comments appear under its owner's account.
+
 ### Claude code review of a may-app pull request
 
 `may-app-review.yml` runs the pinned code-review command (the same `anthropics/claude-code` commit as `claude-code-review.yml`) on an **open, ready-for-review may-app pull request**, and posts its comments on that pull request: inline comments on the reviewed head, or a "No issues found" summary. Each comment ends with May's attribution footer and a hidden `<!-- may-app-review head=<sha> -->` marker. It exists because may-app's own Actions are blocked by billing (Samuel, option B).
@@ -470,7 +495,7 @@ gh workflow run may-app-review.yml -f pr_number=<may-app PR number> --repo May-A
 
 How a run goes:
 - **Admission** (`review.py admit`, no environment) checks the dispatch (main only, manual), the pull request number (digits only, no leading zero) and `may-claude-review`'s policy: administrator bypass off, a custom branch policy of exactly `main`, and Samuel the sole required reviewer (the store environments' policy, `gate.validate_environment`). A missing environment is denied on its 404, never auto-created.
-- **Samuel approves the run** (the required reviewer). Running without approval, for example a scheduled scan of open pull requests, would need his decision first. `gate.NO_REVIEWER_ACTIONS` stays `{"compile-pr"}`.
+- **Samuel approves the run** (the required reviewer). Running without approval, for example a scheduled scan of open pull requests, would need his decision first. `gate.NO_REVIEWER_ACTIONS` stays `{"compile-pr", "ds-compile"}`.
 - **The fetch** (`review.py fetch`, on the environment's runner) reads the pull request with `MAY_APP_REVIEW_TOKEN`. The pull request must be open, ready for review, against may-app `main` and from may-app itself. It fetches exactly that head into `/tmp/may-review-view/source`. The token goes to git through its environment, never its arguments or config, and git's output is discarded. The review job has `contents: read` alone. Only admission reads the environment's policy (M3).
 - **The review** (`review.py review`) refuses a head that moved since the fetch, writes the pull request's files, then runs the command.
 
