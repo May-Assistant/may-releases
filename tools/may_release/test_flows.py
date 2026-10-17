@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import unittest
 
@@ -48,6 +49,17 @@ class AdmitTest(unittest.TestCase):
                                              (SHA.upper(), OTHER, "all"), (SHA, OTHER, "everything")):
             with self.assertRaises(FlowsError):
                 admit("May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch", source, flows_sha, selection, "false")
+
+
+class DispatchChoicesTest(unittest.TestCase):
+    def test_the_workflows_flows_choices_are_exactly_the_flows_admission_knows(self):
+        # A choice admission doesn't know is refused only after a dispatch; a flow without a choice can't be run.
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/emulator-flows.yml").read_text()
+        block = re.search(r"(?m)^      flows:\n((?:        .*\n)+)", workflow)
+        self.assertIsNotNone(block, "emulator-flows.yml has no flows input")
+        options = re.search(r"(?m)^        options: \[(.*)\]$", block.group(1))
+        self.assertIsNotNone(options, "the flows input lists its options on one line")
+        self.assertEqual([o.strip() for o in options.group(1).split(",")], list(flows.FLOWS))
 
 
 class EnvironmentTest(unittest.TestCase):
