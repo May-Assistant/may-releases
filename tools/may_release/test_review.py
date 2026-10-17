@@ -297,7 +297,7 @@ class ReviewRunTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_review(self, mode, head=SHA, post_status=201, run=DISPATCH, pr="42"):
+    def run_review(self, mode, head=SHA, post_status=201, run=DISPATCH, pr="42", claude_token="sk-ant-oat01-claude"):
         """review.review with the fake CLI; everything this process writes to fds 1 and 2 is captured. Posts (the
         STARTED marker) are recorded in self.posts, with whether Claude Code had run yet."""
         self.posts = []
@@ -307,7 +307,7 @@ class ReviewRunTests(unittest.TestCase):
             return post_status
         (self.root / "mode").write_text(mode)
         env = {**run, "RUNNER_TEMP": self.temp.name, "PATH": os.environ.get("PATH", ""), "MAY_APP_REVIEW_TOKEN": TOKEN,
-               "MAY_REVIEW_CLAUDE_TOKEN": "sk-ant-oat01-claude", "GITHUB_STEP_SUMMARY": "/tmp/summary", "GITHUB_ENV": "/tmp/env",
+               "MAY_REVIEW_CLAUDE_TOKEN": claude_token, "GITHUB_STEP_SUMMARY": "/tmp/summary", "GITHUB_ENV": "/tmp/env",
                "ACTIONS_RUNTIME_TOKEN": "runtime", "ACTIONS_CACHE_URL": "https://cache", "GITHUB_WORKSPACE": self.temp.name + "/ws"}
         error = None
         with tempfile.TemporaryFile() as captured, patch.dict(os.environ, env, clear=True), \
@@ -411,6 +411,22 @@ class ReviewRunTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(self.posts, [("issues/42/comments", TOKEN, {"body": f"May review started at {SHA}"}, False)])
         self.assertNotIn("May review started", printed, "the marker is on the pull request, not in this log")
+
+    def test_a_claude_token_a_header_cant_carry_stops_the_review_before_the_marker_and_names_only_the_secret(self):
+        # 17 Oct, run 39067112651: "API error: invalid_credential_header", turns 1, $0.00, on every run since 05:33.
+        for name, token in (("a zero-width space", "\u200bsk-ant-oat01-claude"), ("a no-break space", "sk-ant-oat01\u00a0claude"),
+                            ("a curly quote", "\u201csk-ant-oat01-claude\u201d"), ("an inner tab", "sk-ant\toat01-claude")):
+            with self.subTest(case=name):
+                printed, error, seen = self.run_review("posted", claude_token=token)
+                self.assertIsInstance(error, GateDenial)
+                self.assertIn("MAY_REVIEW_CLAUDE_TOKEN holds a character", error.args[0])
+                self.assertNotIn("oat01", error.args[0] + printed, "the token's value is never shown")
+                self.assertEqual((self.posts, seen), ([], None), "no marker, and Claude Code never ran")
+
+    def test_spaces_and_newlines_around_the_token_are_left_to_claude_code(self):
+        printed, error, seen = self.run_review("posted", claude_token="sk-ant-oat01-claude\n")
+        self.assertIsNone(error)
+        self.assertIsNotNone(seen)
 
     def test_a_marker_that_cannot_be_posted_stops_the_review_before_claude_code_runs(self):
         printed, error, seen = self.run_review("posted", post_status=403)
