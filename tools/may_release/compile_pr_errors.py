@@ -118,12 +118,17 @@ def post(sha, pr, call_api=github):
         return 0 if passed else 1
     if len(token) < 20:
         raise CompilePrError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")
+    # A sanity check only: the build could have changed the checkout. The pull request's own head, read again below,
+    # is the check that counts.
     if head_revision(checkout) != sha:
         raise CompilePrError("The compiled checkout is not the dispatched commit; nothing was posted")
     errors, total = [], 0
     if not passed:
+        log = private / LOG
+        # The build ran before this step and could leave a link to another file in place of its log: only a regular
+        # file is read (security review of 2cf86ce, #3).
         try:
-            text = (private / LOG).read_text(encoding="utf-8", errors="replace")
+            text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() and not log.is_symlink() else ""
         except OSError:
             text = ""
         errors, total = diagnostics(text, [checkout, checkout.resolve()], exclude=EXCLUDED)

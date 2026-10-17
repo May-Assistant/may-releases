@@ -280,6 +280,20 @@ class PostTests(PostCase):
         self.assertNotIn(TOKEN, body)
         self.assertFalse((self.root / "summary").exists() or (self.root / "output").exists())
 
+    def test_a_log_replaced_by_a_link_is_not_followed(self):
+        # The build runs first and could leave a link to another file (security review of 2cf86ce, #3).
+        self.write()
+        elsewhere = self.root / "elsewhere.txt"
+        elsewhere.write_text(f"{self.checkout}/ios/Secret.swift:1:1: error: {MARKER}")
+        (self.private / tool.LOG).unlink()
+        (self.private / tool.LOG).symlink_to(elsewhere)
+        code, error, out, _ = self.post()
+        self.assertEqual((code, error), (1, None))
+        body = self.calls[-1][2]["body"]
+        self.assertNotIn(MARKER, body)
+        self.assertNotIn("Secret.swift", body)
+        self.assertIn("holds no error located in a file of this repository", body)
+
     def test_a_pass_posts_that_it_compiles(self):
         self.write("passed", log=f"{CK}/ios/A.swift:1:1: error: {MARKER}")
         code, error, out, _ = self.post()
