@@ -82,11 +82,12 @@ def relative(path, roots):
     return None
 
 
-def diagnostics(log_text, roots, limit=MAX_ERRORS):
+def diagnostics(log_text, roots, limit=MAX_ERRORS, exclude=()):
     """(errors, total): the unique compile errors located in a file inside the checkout (roots: its path as the build
     saw it, and its resolved path), each `relative/path:line:col: error: message`, in log order, at most limit of
     them; total counts every unique one. Warnings, notes, remarks, source and caret lines, errors in files outside
-    the checkout (derived data, the SDK, other packages) and every other line are dropped."""
+    the checkout (derived data, the SDK, other packages), errors in a checkout folder named in exclude (repo-relative
+    prefixes ending in '/') and every other line are dropped. Shared with compile_pr_errors.py."""
     seen, ordered = set(), []
     for raw in log_text.split("\n"):
         line = ANSI.sub("", raw.rstrip("\r"))
@@ -96,7 +97,7 @@ def diagnostics(log_text, roots, limit=MAX_ERRORS):
         path, row, column, message = match.groups()
         rel = relative(path, roots)
         message = " ".join(message.split())
-        if rel is None or len(rel) > MAX_PATH or not message:
+        if rel is None or len(rel) > MAX_PATH or not message or rel.startswith(tuple(exclude)):
             continue
         if len(message) > MAX_MESSAGE:
             message = message[:MAX_MESSAGE - 1] + "…"
@@ -261,9 +262,9 @@ ALLOWED_CALLS = (("GET", _PR.format("pulls")),
 MAX_COMMENT_PAGES = 10
 
 
-def already_posted(comments, sha):
+def already_posted(comments, sha, name=MARKER):
     """Whether a comment in one page of the pull request's comments already carries this head's marker."""
-    marker = f"<!-- {MARKER} head={sha} -->"
+    marker = f"<!-- {name} head={sha} -->"
     return any(isinstance(c, dict) and isinstance(c.get("body"), str) and marker in c["body"] for c in comments)
 
 
@@ -272,17 +273,40 @@ def github(method, path, payload, token):
     read, a page of its comments, and its comment post. Nothing from the call is printed."""
     if not any(method == allowed and re.fullmatch(pattern, path) for allowed, pattern in ALLOWED_CALLS):
         raise DsCompileError("Only the design-system pull request and its comments are reachable")
-    request = urllib.request.Request(API + path, data=None if payload is None else json.dumps(payload).encode(),
+    return request(method, path, payload, token)
+
+
+def request(method, path, payload, token):
+    """The HTTP call behind github() and compile_pr_errors.github(), each of which checks its own allowlist first."""
+    call = urllib.request.Request(API + path, data=None if payload is None else json.dumps(payload).encode(),
                                      method=method, headers={
         "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(call, timeout=30) as response:
             return response.status, json.loads(response.read() or b"null")
     except urllib.error.HTTPError as error:
         return error.code, None
     except (urllib.error.URLError, TimeoutError, ValueError):
         return 0, None
+
+
+def post_once(call_api, repo, number, sha, body, token, name=MARKER):
+    """Post body on the pull request unless a comment already carries this head's marker: True when posted, False
+    when it was already there. One comment per head: a re-run (or a second dispatch) for a head already reported
+    posts nothing again. Shared with compile_pr_errors.py; every message is repository-neutral."""
+    for page in range(1, MAX_COMMENT_PAGES + 1):
+        status, comments = call_api("GET", f"/repos/{repo}/issues/{number}/comments?per_page=100&page={page}", None, token)
+        if status != 200 or not isinstance(comments, list):
+            raise DsCompileError("The pull request's comments could not be read; nothing was posted")
+        if already_posted(comments, sha, name):
+            return False
+        if len(comments) < 100:
+            break
+    status, _ = call_api("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body}, token)
+    if status != 201:
+        raise DsCompileError("GitHub did not accept the comment; nothing from the compile is shown here")
+    return True
 
 
 def post(sha, pr, call_api=github):
@@ -321,19 +345,9 @@ def post(sha, pr, call_api=github):
         validate_ds_pull_request(pull, number, sha)
     except GateDenial:
         raise DsCompileError("The pull request is no longer open at the compiled head; nothing was posted") from None
-    # One comment per head: a re-run (or a second dispatch) for a head already reported posts nothing again.
-    for page in range(1, MAX_COMMENT_PAGES + 1):
-        status, comments = call_api("GET", f"/repos/{DS_REPO}/issues/{number}/comments?per_page=100&page={page}", None, token)
-        if status != 200 or not isinstance(comments, list):
-            raise DsCompileError("The pull request's comments could not be read; nothing was posted")
-        if already_posted(comments, sha):
-            print(f"DS Swift compile result already posted for this head on may-design-system #{number}; nothing posted again")
-            return 0 if passed else 1
-        if len(comments) < 100:
-            break
-    status, _ = call_api("POST", f"/repos/{DS_REPO}/issues/{number}/comments", {"body": body}, token)
-    if status != 201:
-        raise DsCompileError("GitHub did not accept the comment; nothing from the compile is shown here")
+    if not post_once(call_api, DS_REPO, number, sha, body, token):
+        print(f"DS Swift compile result already posted for this head on may-design-system #{number}; nothing posted again")
+        return 0 if passed else 1
     if passed:
         print(f"DS Swift compile passed with Xcode {XCODE}; result posted to may-design-system #{number}")
         return 0
