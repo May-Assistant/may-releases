@@ -787,6 +787,8 @@ def compile_pr_workflow_problems(text):
 # this repository public, so the review's output stays in files (review.py) and the workflow is pinned whole: dispatch
 # with a pull request number only, read-only permissions, admission then the review in the environment admission
 # chose, three pinned checkouts (this repository, the claude-code plugin commit claude-code-review.yml uses), the
+# 15-minute schedule as the only other trigger (review.py picks at most one pull request a run; Samuel, 17 Oct), one run
+# at a time and never cancelled, the
 # review token in the fetch and review steps alone, the Claude token in the review step alone, nothing run but
 # review.py's four steps and an always-run cleanup, and no claude-code-action, artifact, summary or carried value.
 REVIEW_GATE = 'python3 -I -S -B tools/may_release/review.py admit --pr-number "$MAY_PR_NUMBER"'
@@ -795,6 +797,7 @@ REVIEW_INSTALL = "python3 -I -S -B tools/may_release/review.py install"
 REVIEW_RUN = 'python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER"'
 REVIEW_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-review" /tmp/may-review-view'
 REVIEW_RUNS = [REVIEW_GATE, REVIEW_FETCH, REVIEW_INSTALL, REVIEW_RUN, REVIEW_CLEANUP]
+REVIEW_SCHEDULE = '  schedule:\n    - cron: "*/15 * * * *"'
 REVIEW_STEP_NAMES = ["Check the pull request and fetch its head quietly",
                      "Install the pinned Claude Code release, checked against its sha512",
                      "Review and post on the pull request, with nothing from the review in this log",
@@ -813,12 +816,12 @@ def review_workflow_problems(text):
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
-    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number"] or \
-            not re.search(r"(?m)^        type: string$", trigger):
-        found.append(name + ": is not dispatched with exactly a pr_number")
-    if "\nconcurrency:\n  group: may-app-review\n" not in text:
-        found.append(name + ": does not run one at a time in its own concurrency group")
+            not re.search(r"(?m)^        type: string$", trigger) or REVIEW_SCHEDULE not in trigger or trigger.count("cron:") != 1:
+        found.append(name + ": is not dispatched with exactly a pr_number, and scheduled every 15 minutes, only")
+    if "\nconcurrency:\n  group: may-app-review\n  cancel-in-progress: false\n" not in text:
+        found.append(name + ": does not run one at a time in its own concurrency group, never cancelling a run")
     # Only admission reads the environment's policy (actions: read); review has contents: read alone (review of #21, M3).
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
             job_text(text, "admission").count(JOB_PERMISSIONS) != 1 or text.count("permissions:") != 3 or \
