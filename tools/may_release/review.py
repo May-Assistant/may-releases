@@ -331,8 +331,8 @@ def mcp_config(number, head, posted, token_file):
 # Claude Code's own words for how a run ended, which it sets and the model cannot, so a startup failure (turns: 1,
 # cost: $0.00) can be told apart without printing any text from the run. Each is shown only as one of the values
 # 2.1.296's own result schema names, and as "other" when it is anything else: the result's subtype, its
-# terminal_reason, and an API error's typed kind (api_error). An API error's HTTP status is shown as a number, and the
-# server's error code (api_error_code, which the CLI copies through only as an identifier) only in that form.
+# terminal_reason, and an API error's typed kind (api_error). An API error's HTTP status is shown as a number. The
+# server's error code (api_error_code) is never read: it is free-form, so nothing shows it can't carry other text.
 SUBTYPES = frozenset({"success", "error_during_execution", "error_max_budget_usd", "error_max_structured_output_retries",
                       "error_max_turns"})
 TERMINAL_REASONS = frozenset({
@@ -348,7 +348,6 @@ API_ERRORS = frozenset({
     "org_disabled_credential", "invalid_credential_header", "model_requires_usage_credits",
     "long_context_credits_required", "consent_unanswered", "no_allowed_fallback", "model_substitution_disabled",
     "field_not_granted", "usage_limit_reached"})
-API_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 
 def outcome(stdout_path):
@@ -366,7 +365,10 @@ def outcome(stdout_path):
     if isinstance(result.get("num_turns"), int) and not isinstance(result.get("num_turns"), bool):
         found["turns"] = result["num_turns"]
     if isinstance(result.get("total_cost_usd"), (int, float)) and not isinstance(result.get("total_cost_usd"), bool):
-        found["cost"] = float(result["total_cost_usd"])
+        try:
+            found["cost"] = float(result["total_cost_usd"])
+        except OverflowError:
+            pass
     if isinstance(result.get("permission_denials"), list):
         found["denied"] = len(result["permission_denials"])
     for key, known in (("subtype", SUBTYPES), ("terminal_reason", TERMINAL_REASONS), ("api_error", API_ERRORS)):
@@ -375,9 +377,6 @@ def outcome(stdout_path):
     status = result.get("api_error_status")
     if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
         found["api_status"] = status
-    if "api_error_code" in result:
-        code = result["api_error_code"]
-        found["api_code"] = code if isinstance(code, str) and API_ERROR_CODE.fullmatch(code) else "other"
     return found
 
 
@@ -426,8 +425,7 @@ def review(pr, cli=None, plugin=None, view=VIEW, get=app_get):
     print(f"Claude Code exited with status {done.returncode}; error: {result.get('is_error', 'unknown')}; "
           f"turns: {result.get('turns', 'unknown')}; cost: {cost}; tool calls denied: {result.get('denied', 'unknown')}; "
           f"subtype: {result.get('subtype', 'unknown')}; ended: {result.get('terminal_reason', 'unknown')}; "
-          f"API error status: {result.get('api_status', 'none')}; API error: {result.get('api_error', 'none')}; "
-          f"API error code: {result.get('api_code', 'none')}")
+          f"API error status: {result.get('api_status', 'none')}; API error: {result.get('api_error', 'none')}")
     print(f"May app review of may-app #{number} at {head}: {counts['inline']} inline and {counts['summary']} "
           f"summary comment(s) posted, {counts['failed']} post(s) failed, {counts['refused']} refused")
     if not counts["started"]:
