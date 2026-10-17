@@ -370,6 +370,10 @@ def workflow_problems(root):
             found.append(f"{path.name}: requests deployments permission")
         if "pull_request_target" in text:
             found.append(f"{path.name}: uses pull_request_target")
+        # The runtime token a pull request's build code can read may write cache entries; with no cache consumer
+        # anywhere, that reaches nothing (security review of #18, M1).
+        if re.search(r"(?m)actions/cache[@/]|^\s*(-\s+)?cache(-dependency-path)?:", text):
+            found.append(f"{path.name}: uses an Actions cache")
         if re.search(r"pip3? install|python3? -m pip", text):
             found.append(f"{path.name}: installs Python packages")
         for step in re.split(r"(?m)^      - ", text)[1:]:
@@ -696,8 +700,88 @@ def compile_workflow_problems(text):
     return found
 
 
+# Compile of an open may-app pull request head (native-compile-pr.yml): the same iOS-only May Playground compile, in its
+# own environment, admitted only for the current head of an open pull request against may-app main from may-app
+# itself (gate.py --action compile-pr). The pull-request read token is in the two gate steps alone and the source-read
+# keys in the fetch step alone, so the compile (which runs the pull request's own build code) is handed neither.
+# Admission (no environment) checks inputs and the environment's policy; the pull request is read with --check-pull
+# on the environment's runner, where MAY_APP_PR_READ_TOKEN lives (security review of #18, M2).
+GATE_COMPILE_PR = ('python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" '
+                   '--pr-number "$MAY_PR_NUMBER"')
+GATE_CHECK_PULL = GATE_COMPILE_PR + " --check-pull"
+PREPARE_IOS_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha '
+                  '"$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"')
+COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL, PREPARE_IOS_PR, COMPILE_IOS, COMPILE_CLEANUP]
+COMPILE_PR_STEP_NAMES = ["Check the pull request head and environment before fetching",
+                         "Fetch the pull request head and pinned design system quietly",
+                         "Compile without signing, store access or any credential", "Remove private source, logs and products"]
+PR_READ_SECRET = "MAY_APP_PR_READ_TOKEN"
+COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
+                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), (PR_READ_SECRET, "${{ secrets." + PR_READ_SECRET + " }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS}
+
+
+def compile_pr_workflow_problems(text):
+    """The pull-request compile is exactly: dispatch with a pull request number and its head, read-only, admission then
+    native in its own environment, the PR token in the gates alone, the source-read keys in the fetch alone, and
+    nothing run but its five commands."""
+    name = "native-compile-pr.yml"
+    found = []
+    if "toolchain.py jdk" in text or "--platform android" in text or "upload-artifact" in text or \
+            "    runs-on: macos-15\n" not in job_text(text, "native") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission"):
+        found.append(name + ": is not the iOS-only May Playground compile with no artifact")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"]:
+        found.append(name + ": is not dispatched with exactly pr_number and source_sha")
+    if "\nconcurrency:\n  group: may-native-compile-pr\n" not in text:
+        found.append(name + ": does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "native")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + ": permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "native"]:
+        found.append(name + ": jobs are not exactly admission and native")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != COMPILE_PR_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + ": runs something other than the gate, the fetch, the compile and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "native")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["native"]]
+    cleanup = steps["native"][-1][1] if steps["native"] else ""
+    if leading != {"admission": ["uses", "id"], "native": ["uses", "name", "name", "name", "name"]} or \
+            names != [""] + COMPILE_PR_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + ": native's steps are not exactly the recheck, fetch, compile and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if):", text.replace("        if: always()\n", "")) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 90\n" not in job_text(text, "native"):
+        found.append(name + ": sets a shell, defaults, a condition or a timeout other than native's 90 minutes")
+    native = job_text(text, "native")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in native or \
+            "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + ": native's environment is not the one admission chose, after admission")
+    by_name = dict(steps["native"])
+    fetch, recheck = by_name.get(COMPILE_PR_STEP_NAMES[1], ""), by_name.get(COMPILE_PR_STEP_NAMES[0], "")
+    later = by_name.get(COMPILE_PR_STEP_NAMES[2], "") + by_name.get(COMPILE_PR_STEP_NAMES[3], "")
+    # Each secret is bound exactly once: the PR token in the pull request check, so never in admission too (review of #18, M2).
+    if secrets_in(text) != set(COMPILE_SECRETS) | {PR_READ_SECRET} or \
+            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS + (PR_READ_SECRET,)) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or \
+            secrets_in(recheck) != {PR_READ_SECRET} or secrets_in(later) or "env:" in later or \
+            any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + ": a secret or env entry other than the pull request check's PR token and the fetch step's two source-read keys")
+    if "GITHUB_ENV" in text or "GITHUB_PATH" in text or "${{ inputs." in "\n".join(runs):
+        found.append(name + ": carries values to later steps or interpolates inputs into shell")
+    return found
+
+
 def control_problems(root):
     found = []
+    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr"}:
+        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\"}: only the compile-only pull-request "
+                     "lane may run without Samuel's review")
     flows = root / ".github/workflows"
     check = (flows / "control-check.yml").read_text()
     compile_workflow = (flows / "native-compile-draft.yml").read_text()
@@ -705,6 +789,7 @@ def control_problems(root):
     if not ("pull_request:" in check and "permissions:\n  contents: read" in check and "secrets." not in check):
         found.append("control-check.yml is not a read-only, no-secret PR check")
     found += compile_workflow_problems(compile_workflow)
+    found += compile_pr_workflow_problems((flows / "native-compile-pr.yml").read_text())
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

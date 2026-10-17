@@ -35,6 +35,19 @@ its app's floor (store.MIN_BUILD_NUMBERS: May production Android starts at 3).
 Sign-only (sign_only: true, never the default) is admitted only for May production
 Android (store.SIGN_ONLY_TARGETS), only with dry_run: true (it never uploads), and
 only once the Console-upload public key (store.SIGN_ONLY_RECIPIENT) is committed.
+
+Compile of a pull request head (action compile-pr, native-compile-pr.yml): only a
+may-app commit that is, right now, the head of an open pull request against may-app's
+main, from may-app itself (never a fork). It builds in its own environment,
+may-native-compile-pr, never a store environment.
+- Samuel's decision (decisions.md, Build 11, 17 Oct): compile-only runs need no approval.
+  So that environment has its own policy (NO_REVIEWER_ACTIONS): administrator bypass off,
+  branch policy exactly main, and no required-reviewer rule at all (one is denied, so a
+  stale rule can never turn the lane into a wait until timeout).
+- Admission (no environment, so a missing one is denied on its 404, never auto-created)
+  checks the inputs and that policy. The pull request itself is read with --check-pull,
+  as the environment job's first step, with MAY_APP_PR_READ_TOKEN held in that
+  environment: main-dispatched runs only, never a repository secret any branch can read.
 """
 
 import argparse
@@ -53,10 +66,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from store import PLAY_UPLOAD_TRACKS, SIGN_ONLY_RECIPIENT, SIGN_ONLY_TARGETS, build_number_floor_ok
 
 CONTROL_REPO = "May-Assistant/may-releases"
+APP_REPO = "May-Assistant/may-app"
 OWNER_ID = 58840187
 # Exact names confirmed from the repository's Actions secrets page, 2026-10-13.
 ENVIRONMENTS = {
     "compile": "may-native-compile",
+    "compile-pr": "may-native-compile-pr",
     ("ios", "production"): "may-ios-internal",
     ("ios", "playground"): "may-ios-playground-internal",
     ("android", "production"): "may-android-internal",
@@ -68,6 +83,10 @@ MAX_BUILD_NUMBER = 2_000_000_000
 # platforms whose upload step is held. Stage 1 held both; stage 2 lifted Android.
 UPLOADS_HELD = {"ios"}
 ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
+# Actions whose environment has no required reviewer (Samuel, 17 Oct: compile-only pull-request runs need no
+# approval). static_check.py pins this to exactly {"compile-pr"}: no signing, store or release action may join it.
+NO_REVIEWER_ACTIONS = {"compile-pr"}
+LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?")
 AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
 
@@ -89,13 +108,15 @@ def validate_run(repo, ref, event, sha, action, build_number=None, target="produ
         raise GateDenial("May control must run by manual dispatch from its main branch")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise GateDenial("Private source must be an exact lowercase commit SHA")
-    key = "compile" if action == "compile" else (action, target)
+    key = action if action in ("compile", "compile-pr") else (action, target)
     if key not in ENVIRONMENTS:
         raise GateDenial("Unknown May control action")
-    if action != "compile" and not (re.fullmatch(r"[1-9][0-9]{0,9}", build_number or "")
+    if action in ("compile", "compile-pr"):
+        return ENVIRONMENTS[key]
+    if not (re.fullmatch(r"[1-9][0-9]{0,9}", build_number or "")
                                     and int(build_number) <= MAX_BUILD_NUMBER):
         raise GateDenial("Store build number must be a positive integer no greater than 2000000000")
-    if action != "compile" and not build_number_floor_ok(action, target, build_number):
+    if not build_number_floor_ok(action, target, build_number):
         raise GateDenial("Store build number is below this app's floor (May production Android starts at 3: "
                          "its first release, versionCode 2, was uploaded by hand on 14 Oct)")
     return ENVIRONMENTS[key]
@@ -140,6 +161,28 @@ def validate_sign_only(action, sign_only, dry_run, target="production"):
                          "is a CI secret; commit a key only Samuel holds")
 
 
+def pull_number(value):
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", value or ""):
+        raise GateDenial("Pull request number must be a positive integer")
+    return int(value)
+
+
+def validate_pull_request(pull, number, sha):
+    """The may-app pull request (GET /repos/May-Assistant/may-app/pulls/{number}) is open, against
+    may-app's main, from may-app itself, and its head is exactly sha. Anything unreadable denies."""
+    if not isinstance(pull, dict) or pull.get("number") != number:
+        raise GateDenial("Pull request metadata is unreadable")
+    if pull.get("state") != "open":
+        raise GateDenial("Pull request is not open")
+    base, head = pull.get("base") or {}, pull.get("head") or {}
+    if base.get("ref") != "main" or (base.get("repo") or {}).get("full_name") != APP_REPO:
+        raise GateDenial("Pull request is not against may-app main")
+    if (head.get("repo") or {}).get("full_name") != APP_REPO:
+        raise GateDenial("Pull request head is not in may-app itself (forks are refused)")
+    if head.get("sha") != sha:
+        raise GateDenial("Source SHA is not the pull request's current head")
+
+
 def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=None):
     if data.get("can_admins_bypass") is not False:
         raise GateDenial("Administrator bypass must be disabled")
@@ -171,6 +214,25 @@ def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=No
                              "so it can never be approved")
 
 
+def validate_no_reviewer_environment(data, policies):
+    """An environment with no required reviewer (NO_REVIEWER_ACTIONS): administrator bypass off, branch policy
+    exactly main, and no required-reviewer rule (deny one: a reviewer here would only hang the run)."""
+    if data.get("can_admins_bypass") is not False:
+        raise GateDenial("Administrator bypass must be disabled")
+    branch = data.get("deployment_branch_policy") or {}
+    if branch.get("custom_branch_policies") is not True or branch.get("protected_branches") is not False:
+        raise GateDenial("Environment must use explicit branch policy")
+    if sorted(p.get("name") for p in policies.get("branch_policies", [])) != ["main"]:
+        raise GateDenial("Environment must allow only main")
+    if any(r.get("type") == "required_reviewers" for r in data.get("protection_rules", [])):
+        raise GateDenial("The compile-only pull-request environment must have no required reviewer (Samuel, 17 Oct)")
+
+
+def login_or_unknown(value):
+    """A GitHub login for the public admission line, or "unknown": never any other text."""
+    return value if isinstance(value, str) and LOGIN.fullmatch(value) else "unknown"
+
+
 def get_json(path, token):
     request = urllib.request.Request(
         f"https://api.github.com/repos/{CONTROL_REPO}/{path}",
@@ -188,36 +250,81 @@ def get_json(path, token):
         raise GateDenial("Protected environment metadata unavailable") from None
 
 
+def get_app_pull(number, token):
+    """One may-app pull request, read with the read-only pull-request token. Bodies are never printed."""
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{APP_REPO}/pulls/{number}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise GateDenial("Pull request does not exist or is not readable with the pull-request token") from None
+        raise GateDenial("Pull request metadata unavailable") from None
+    except (urllib.error.URLError, TimeoutError):
+        raise GateDenial("Pull request metadata unavailable") from None
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=("compile", "ios", "android"), required=True)
+    parser.add_argument("--action", choices=("compile", "compile-pr", "ios", "android"), required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--build-number")
     parser.add_argument("--target", choices=("production", "playground"), default="production")
     parser.add_argument("--dry-run")
     parser.add_argument("--sign-only")
+    parser.add_argument("--pr-number")
+    # compile-pr on its environment's runner, before the fetch: read the pull request itself.
+    parser.add_argument("--check-pull", action="store_true")
     args = parser.parse_args()
+    if (args.action == "compile-pr") != (args.pr_number is not None):
+        raise GateDenial("A pull request number is given with compile-pr and only then")
+    if args.check_pull and args.action != "compile-pr":
+        raise GateDenial("Only compile-pr reads a pull request")
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
     validate_dry_run(args.action, args.dry_run, args.target)
     validate_sign_only(args.action, args.sign_only, args.dry_run, args.target)
-    build_env = ENVIRONMENTS["compile"]
-    if args.action != "compile" and artifact_recipient(env) is None:
+    # A pull-request compile builds in its own environment alone, never may-native-compile or a store one.
+    build_env = env if args.action == "compile-pr" else ENVIRONMENTS["compile"]
+    if args.action not in ("compile", "compile-pr") and artifact_recipient(env) is None:
         raise GateDenial("Artifact encryption public key for this target is still a placeholder; "
                          "the setup lane must commit it first")
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise GateDenial("GitHub metadata token unavailable")
+    author = None
+    if args.action == "compile-pr":
+        number = pull_number(args.pr_number)
+        if args.check_pull:
+            pull_token = os.environ.get("MAY_APP_PR_READ_TOKEN")
+            if not pull_token:
+                raise GateDenial("Pull-request read token unavailable")
+            pull = get_app_pull(number, pull_token)
+            validate_pull_request(pull, number, args.source_sha)
+            author = login_or_unknown((pull.get("user") or {}).get("login"))
     for name in sorted({env, build_env}):
         base = f"environments/{name}"
-        validate_environment(get_json(base, token),
-                             get_json(base + "/deployment-branch-policies?per_page=100", token),
-                             os.environ.get("GITHUB_ACTOR_ID"), os.environ.get("GITHUB_TRIGGERING_ACTOR"))
+        data, policies = get_json(base, token), get_json(base + "/deployment-branch-policies?per_page=100", token)
+        if args.action in NO_REVIEWER_ACTIONS:
+            validate_no_reviewer_environment(data, policies)
+        else:
+            validate_environment(data, policies, os.environ.get("GITHUB_ACTOR_ID"), os.environ.get("GITHUB_TRIGGERING_ACTOR"))
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as stream:
             stream.write(f"environment={env}\nbuild_environment={build_env}\n")
+    if args.action == "compile-pr":
+        # Who wrote and who dispatched it, so a run is attributable from the public log (logins only).
+        dispatcher = login_or_unknown(os.environ.get("GITHUB_TRIGGERING_ACTOR"))
+        checked = f"; pull request by {author}" if author else ""
+        print(f"May compile-pr {'pull request check' if args.check_pull else 'admission'} passed for {args.source_sha} "
+              f"(may-app #{int(args.pr_number)}{checked}; dispatched by {dispatcher})")
+        return
     print(f"May {args.action} admission passed for {args.source_sha}")
 
 

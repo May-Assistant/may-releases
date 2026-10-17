@@ -1,0 +1,72 @@
+name: May iOS compile of a may-app pull request head (MayPlayground, simulator, no signing)
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open May-Assistant/may-app pull request against main (not from a fork)
+        required: true
+        type: string
+      source_sha:
+        description: That pull request's current 40-character head commit
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: may-native-compile-pr
+  cancel-in-progress: false
+jobs:
+  admission:
+    # Compile evidence for an open may-app pull request (the iOS lane): May Playground only, simulator only, in its
+    # own environment, never may-native-compile or a store environment. Admission has no environment, so a missing one
+    # is denied on its 404 and never auto-created; it checks the inputs and that environment's policy (Samuel, 17 Oct:
+    # compile-only runs need no approval, so no required reviewer, main only). The native job's first step then reads
+    # the pull request with the token that environment holds: the current head of an open pull request against
+    # may-app main, from may-app itself.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+  native:
+    needs: admission
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check the pull request head and environment before fetching
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
+      - name: Fetch the pull request head and pinned design system quietly
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+      - name: Compile without signing, store access or any credential
+        run: python3 -I -S -B tools/may_release/compile.py --platform ios --target playground
+      - name: Remove private source, logs and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"

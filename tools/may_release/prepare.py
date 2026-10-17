@@ -8,6 +8,11 @@ pin of the platform it builds, which must be well-formed, trusted and exactly
 what is checked out. For an internal target (store.INTERNAL_TARGETS) the iOS and
 Android pins may differ; for any other target, and for the native compile, they
 must match. Both pins are recorded for the sealed handoff on every build.
+
+A pull-request compile (--pr-number, native-compile-pr.yml) fetches may-app's
+refs/pull/<number>/head instead of main and requires it to be exactly the source
+SHA; gate.py has already checked, through the API, that it is an open pull request
+against main from may-app itself. Nothing else differs.
 """
 
 import argparse
@@ -107,8 +112,17 @@ def git_status(argv, *, env=None):
                           stdin=subprocess.DEVNULL, env=env).returncode
 
 
-def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
+def pull_ref(value):
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", str(value)):
+        raise PrepareError("Pull request number is not exact")
+    return f"refs/pull/{value}/head"
+
+
+def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pull=None):
     exact_sha(sha)
+    if main_history and pull is not None:
+        raise PrepareError("Main history and a pull request head are exclusive")
+    pull_head = pull_ref(pull) if pull is not None else None
     if dest.exists() or not key_text.strip():
         raise PrepareError("Private checkout path or scoped read key is unavailable")
     key, known, log = private / (label + ".key"), private / "known_hosts", private / (label + ".log")
@@ -129,7 +143,8 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
         known.chmod(0o600)
         quiet(["git", "init", "-q", str(dest)], log, env=env)
         quiet(["git", "-C", str(dest), "remote", "add", "origin", remote], log, env=env)
-        ref = "+refs/heads/main:refs/remotes/origin/main" if main_history else sha
+        ref = ("+refs/heads/main:refs/remotes/origin/main" if main_history else
+               "+" + pull_head + ":refs/remotes/origin/pull-head" if pull_head else sha)
         quiet(["git", "-C", str(dest), "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
                "origin", ref], log, env=env)
     finally:
@@ -140,13 +155,21 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False):
     if main_history and git_status(["git", "-C", str(dest), "merge-base", "--is-ancestor", sha,
                                     "refs/remotes/origin/main"], env=env):
         raise PrepareError("May app source SHA is not in main history")
+    if pull_head and head_of(dest, "refs/remotes/origin/pull-head", env) != sha:
+        raise PrepareError("May app source SHA is not the pull request's head")
     quiet(["git", "-C", str(dest), "-c", "advice.detachedHead=false", "checkout", "--quiet",
            "--detach", sha], log, env=env)
     if git_status(["git", "-C", str(dest), "diff", "--quiet", "HEAD", "--"], env=env):
         raise PrepareError("Private checkout differs from exact commit")
 
 
-def prepare(source_sha, platform=None, target=None):
+def head_of(checkout, ref, env):
+    result = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--verify", ref + "^{commit}"],
+                            capture_output=True, stdin=subprocess.DEVNULL, env=env)
+    return result.stdout.decode().strip() if not result.returncode else ""
+
+
+def prepare(source_sha, platform=None, target=None, pull=None):
     """Fetch the exact app commit and the design system pinned for `platform`.
 
     With a platform and target (a store build), only that platform's pin is
@@ -161,8 +184,12 @@ def prepare(source_sha, platform=None, target=None):
     private = root / "may-private"
     private.mkdir(mode=0o700)
     source = root / "may-source"
-    fetch(source, APP, exact_sha(source_sha), os.environ.get("MAY_APP_READ_KEY", ""),
-          private, "app", main_history=True)
+    if pull is None:
+        fetch(source, APP, exact_sha(source_sha), os.environ.get("MAY_APP_READ_KEY", ""),
+              private, "app", main_history=True)
+    else:
+        fetch(source, APP, exact_sha(source_sha), os.environ.get("MAY_APP_READ_KEY", ""),
+              private, "app", pull=pull)
     project_path, lock_path = source / "ios/project.yml", source / "android/design-system.lock"
     record, old_spec = pins(project_path.read_text(), lock_path.read_text(), platform, target)
     revision = record[platform or "ios"]
@@ -194,8 +221,10 @@ if __name__ == "__main__":
     # A store build names both; the native compile names neither (pins must match).
     parser.add_argument("--platform", choices=("ios", "android"))
     parser.add_argument("--target", choices=("production", "playground"))
+    # A pull-request compile names the may-app pull request whose head is --source-sha.
+    parser.add_argument("--pr-number")
     args = parser.parse_args()
     try:
-        prepare(args.source_sha, args.platform, args.target)
+        prepare(args.source_sha, args.platform, args.target, args.pr_number)
     except (PrepareError, StoreError, OSError, subprocess.SubprocessError):
         raise SystemExit("Private May source preparation failed; no source or credential was printed") from None

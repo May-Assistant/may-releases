@@ -50,13 +50,22 @@ def extract_generator(archive, generator):
 IOS_SCHEMES = {None: ("May", "MayPlayground"), "playground": ("MayPlayground",), "production": ("May",)}
 
 
+def credentials_left(private):
+    """Any key or host file the fetch writes: it removes them, and the build (which may run a pull
+    request's own code) must start with none on disk."""
+    return any(path.is_file() and (path.suffix == ".key" or path.name == "known_hosts") for path in private.rglob("*"))
+
+
 def compile_native(platform, target=None):
-    # The compile runs third-party build code (XcodeGen, SwiftPM, Xcode) and holds no secret at all.
+    # The compile runs third-party build code (XcodeGen, SwiftPM, Xcode, and for a pull request its
+    # own build scripts) and holds no secret at all: not in its environment, not on disk.
     require_step_secrets(())
     root = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
     source, private = root / "may-source", root / "may-private"
     if not os.environ.get("RUNNER_TEMP") or not source.is_dir() or not private.is_dir():
         raise CompileError("Exact private source is not prepared")
+    if credentials_left(private):
+        raise CompileError("A read key or host file is still on disk; nothing was compiled")
     stats = os.statvfs(root)
     if stats.f_bavail * stats.f_frsize < 10 * 1024**3:
         raise CompileError("Protected runner has insufficient free space")
