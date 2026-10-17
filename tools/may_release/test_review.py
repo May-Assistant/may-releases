@@ -257,10 +257,17 @@ if mode != "no-server":
     open(posted, "a").write("started\n" + ("inline\ninline\nsummary\nrefused\n" if mode == "posted" else "failed\n" if mode == "failed" else ""))
 print("transcript: " + "PRIVATE-MAY-APP-CONTENT-7f3c", file=sys.stderr)
 ended = {"api": {"subtype": "success", "terminal_reason": "api_error", "api_error_status": 401},
-         "hostile": {"subtype": "PRIVATE-MAY-APP-CONTENT-7f3c", "terminal_reason": "private_" * 5, "api_error_status": "401"},
+         "typed": {"subtype": "success", "terminal_reason": "api_error", "api_error": "usage_limit_reached",
+                   "api_error_code": "weekly_limit"},
+         "huge": {"subtype": "success", "terminal_reason": "completed", "total_cost_usd": 10 ** 400},
+         "hostile": {"subtype": "PRIVATE-MAY-APP-CONTENT-7f3c", "terminal_reason": "leaked", "api_error_status": "401",
+                     "api_error": "private", "api_error_code": "PRIVATE-MAY-APP-CONTENT-7f3c"},
          }.get(mode, {"subtype": "success", "terminal_reason": "completed"})
-print(json.dumps({"type": "result", "is_error": mode in ("error", "api"), "num_turns": 1 if mode == "api" else 31,
-                  "total_cost_usd": 0 if mode == "api" else 1.234, **ended,
+if mode == "deep":
+    print("[" * 200000)
+    sys.exit(0)
+print(json.dumps({"type": "result", "is_error": mode in ("error", "api", "typed"),
+                  "num_turns": 1 if mode in ("api", "typed") else 31, "total_cost_usd": 0 if mode in ("api", "typed") else 1.234, **ended,
                   "permission_denials": [{"tool": "PRIVATE-MAY-APP-CONTENT-7f3c"}], "result": "PRIVATE-MAY-APP-CONTENT-7f3c"}))
 sys.exit(3 if mode == "exit" else 0)
 '''
@@ -325,7 +332,7 @@ class ReviewRunTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertNotIn(MARKER, printed)
         self.assertEqual(printed, "Claude Code exited with status 0; error: False; turns: 31; cost: $1.23; tool calls denied: 1; "
-                                  "subtype: success; ended: completed; API error status: none\n"
+                                  "subtype: success; ended: completed; API error status: none; API error: none\n"
                                   f"May app review of may-app #42 at {SHA}: 2 inline and 1 summary comment(s) posted, 0 post(s) failed, 1 refused\n")
 
     def test_a_startup_failure_shows_how_claude_code_ended_and_nothing_else(self):
@@ -334,14 +341,53 @@ class ReviewRunTests(unittest.TestCase):
         self.assertIsInstance(error, ReviewError)
         self.assertNotIn(MARKER, printed)
         self.assertEqual(printed.splitlines()[0], "Claude Code exited with status 0; error: True; turns: 1; cost: $0.00; "
-                                                  "tool calls denied: 1; subtype: success; ended: api_error; API error status: 401")
+                                                  "tool calls denied: 1; subtype: success; ended: api_error; API error status: 401; "
+                                                  "API error: none")
+
+    def test_an_api_error_without_a_status_shows_its_typed_kind_and_never_the_servers_code(self):
+        # Run 39058057593 (17 Oct): "ended: api_error; API error status: none", with no way to tell which error it was.
+        printed, error, _ = self.run_review("typed")
+        self.assertIsInstance(error, ReviewError)
+        self.assertNotIn(MARKER, printed)
+        self.assertTrue(printed.splitlines()[0].endswith("ended: api_error; API error status: none; API error: usage_limit_reached"),
+                        printed)
+        self.assertNotIn("weekly_limit", printed, "api_error_code is free-form, so it is never shown (review of #23)")
+
+    def test_a_cost_too_large_for_a_float_is_shown_as_unknown(self):
+        printed, error, _ = self.run_review("huge")
+        self.assertIsNone(error)
+        self.assertIn("cost: unknown;", printed)
+
+    def test_a_result_nested_too_deeply_to_read_is_shown_as_unknown(self):
+        printed, error, _ = self.run_review("deep")
+        self.assertIsInstance(error, ReviewError)
+        self.assertIn("error: unknown; turns: unknown", printed)
+
+    def test_reading_a_cost_too_large_for_a_float_leaves_the_cost_out_rather_than_raising(self):
+        path = Path(self.temp.name) / "huge.json"
+        path.write_text(json.dumps({"is_error": False, "num_turns": 2, "total_cost_usd": 10 ** 400}))
+        try:
+            found = review.outcome(path)
+        except OverflowError:
+            found = "raised OverflowError"
+        self.assertEqual(found, {"is_error": False, "turns": 2})
+
+    def test_reading_a_result_nested_too_deeply_gives_nothing_rather_than_raising(self):
+        path = Path(self.temp.name) / "deep.json"
+        path.write_text("[" * 200000)
+        try:
+            found = review.outcome(path)
+        except RecursionError:
+            found = "raised RecursionError"
+        self.assertEqual(found, {})
 
     def test_status_words_that_are_not_the_clis_own_form_are_not_shown(self):
         printed, error, _ = self.run_review("hostile")
         self.assertIsNone(error)
         self.assertNotIn(MARKER, printed)
         self.assertNotIn("private", printed)
-        self.assertIn("subtype: unknown; ended: unknown; API error status: none", printed)
+        self.assertNotIn("leaked", printed)
+        self.assertIn("subtype: other; ended: other; API error status: none; API error: other\n", printed)
 
     def test_a_failed_review_stops_with_a_fixed_line_and_still_shows_nothing(self):
         for mode, message in (("exit", "did not finish cleanly"), ("error", "did not finish cleanly"),
