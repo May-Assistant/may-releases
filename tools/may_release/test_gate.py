@@ -77,8 +77,11 @@ class GateTests(unittest.TestCase):
     def test_exact_environment_names_confirmed_by_setup_lane(self):
         # Confirmed from the repository's Actions secrets page on 2026-10-13. Any
         # rename must be made in the repository settings and here together.
+        # may-native-compile-pr (compile of a may-app pull request head) is proposed, not yet created:
+        # admission denies on its 404 until Samuel creates it.
         self.assertEqual(gate.ENVIRONMENTS, {
             "compile": "may-native-compile",
+            "compile-pr": "may-native-compile-pr",
             ("ios", "production"): "may-ios-internal",
             ("ios", "playground"): "may-ios-playground-internal",
             ("android", "production"): "may-android-internal",

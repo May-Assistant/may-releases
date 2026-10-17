@@ -117,6 +117,8 @@ SECRET_NAMES = (
     "MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID",
     "MAY_ARTIFACT_DECRYPT_KEY",
     "MAY_POSTHOG_ANDROID_KEY",
+    # The repository secret gate.py reads may-app pull requests with (compile-pr); no tool step may hold it.
+    "MAY_APP_PR_READ_TOKEN",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
 # Crash reports (PostHog): the Android build step alone may hold the project key, and
