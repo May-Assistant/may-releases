@@ -414,6 +414,11 @@ def claude_command(cli, number, head, mcp_config, plugin, view, root):
             "--append-system-prompt", APPEND_PROMPT.format(number=number, head=head, pr=view / "pr", source=view / "source")]
 
 
+def header_safe(token):
+    """The token, without the spaces and newlines Claude Code trims, is printable ASCII only."""
+    return all(" " < c <= "~" for c in token.strip())
+
+
 def claude_env(root, claude_token):
     """Only what Claude Code needs: no GitHub token, and no Actions variable (step summary, runtime token).
     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is left unset (review of #21, H1, asked to check it): in 2.1.296 it needs
@@ -515,6 +520,13 @@ def review(pr, cli=None, plugin=None, view=VIEW, get=app_get, post=app_post):
     claude_token = os.environ.get(CLAUDE_TOKEN)
     if not claude_token:
         raise GateDenial("Claude token unavailable (MAY_REVIEW_CLAUDE_TOKEN in may-claude-review)")
+    # Before the marker and before Claude Code: a token with a character an HTTP header can't carry (a zero-width or
+    # no-break space, a curly quote, picked up in copying) ends Claude Code at once as invalid_credential_header, with
+    # turns 1 and $0.00 (17 Oct, run 39067112651). Claude Code trims spaces and newlines itself; anything else outside
+    # printable ASCII is refused here, naming the secret and never its value.
+    if not header_safe(claude_token):
+        raise GateDenial("MAY_REVIEW_CLAUDE_TOKEN holds a character an HTTP header can't carry, often a hidden space "
+                         "from copying; save it again as plain text (claude setup-token)")
     # Before Claude Code runs, so the schedule never picks this head again, whatever the review does.
     if post(f"issues/{number}/comments", review_token, {"body": STARTED.format(head=head)}) != 201:
         raise ReviewError("The review's start could not be marked on the pull request; nothing was reviewed")
