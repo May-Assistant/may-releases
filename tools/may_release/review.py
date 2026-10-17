@@ -328,18 +328,34 @@ def mcp_config(number, head, posted, token_file):
                 "MAY_REVIEW_POSTED": str(posted)}}}}
 
 
-# Claude Code's own words for how a run ended, which it sets and the model cannot: the result's subtype and
-# terminal_reason (e.g. "success", "api_error") and an API error's HTTP status. Shown only in exactly this form,
-# so a startup failure (turns: 1, cost: $0.00) can be told apart without printing any text from the run.
-CLI_WORD = re.compile(r"[a-z_]{1,32}")
+# Claude Code's own words for how a run ended, which it sets and the model cannot, so a startup failure (turns: 1,
+# cost: $0.00) can be told apart without printing any text from the run. Each is shown only as one of the values
+# 2.1.296's own result schema names, and as "other" when it is anything else: the result's subtype, its
+# terminal_reason, and an API error's typed kind (api_error). An API error's HTTP status is shown as a number. The
+# server's error code (api_error_code) is never read: it is free-form, so nothing shows it can't carry other text.
+SUBTYPES = frozenset({"success", "error_during_execution", "error_max_budget_usd", "error_max_structured_output_retries",
+                      "error_max_turns"})
+TERMINAL_REASONS = frozenset({
+    "blocking_limit", "rapid_refill_breaker", "prompt_too_long", "image_error", "model_error", "api_error",
+    "malformed_tool_use_exhausted", "aborted_streaming", "aborted_tools", "stop_hook_prevented", "hook_stopped",
+    "tool_deferred", "max_turns", "background_requested", "completed", "budget_exhausted",
+    "structured_output_retry_exhausted", "tool_deferred_unavailable", "turn_setup_failed"})
+API_ERRORS = frozenset({
+    "max_output_tokens", "dlp_request_denied", "claude_code_version_too_old", "safety_monitor_blocked",
+    "effort_requires_thinking", "advisor_incompatible", "tool_history_mismatch", "autocompact_thrashing", "pdf_too_large",
+    "pdf_password_protected", "media_removed", "no_response", "tls_untrusted_ca", "gateway_content_type",
+    "provider_credentials", "gateway_signin_required", "gateway_session_expired", "api_key_auth_disabled",
+    "org_disabled_credential", "invalid_credential_header", "model_requires_usage_credits",
+    "long_context_credits_required", "consent_unanswered", "no_allowed_fallback", "model_substitution_disabled",
+    "field_not_granted", "usage_limit_reached"})
 
 
 def outcome(stdout_path):
-    """Numbers, booleans and the CLI's own lower-case status words from Claude Code's final JSON result, never its
-    text (result, errors and messages are free text and may hold the review)."""
+    """Numbers, booleans and the CLI's own status words (SUBTYPES, TERMINAL_REASONS, API_ERRORS) from Claude Code's
+    final JSON result, never its text (result, errors and messages are free text and may hold the review)."""
     try:
         result = json.loads(stdout_path.read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(result, dict):
         return {}
@@ -349,12 +365,15 @@ def outcome(stdout_path):
     if isinstance(result.get("num_turns"), int) and not isinstance(result.get("num_turns"), bool):
         found["turns"] = result["num_turns"]
     if isinstance(result.get("total_cost_usd"), (int, float)) and not isinstance(result.get("total_cost_usd"), bool):
-        found["cost"] = float(result["total_cost_usd"])
+        try:
+            found["cost"] = float(result["total_cost_usd"])
+        except OverflowError:
+            pass
     if isinstance(result.get("permission_denials"), list):
         found["denied"] = len(result["permission_denials"])
-    for key in ("subtype", "terminal_reason"):
-        if isinstance(result.get(key), str) and CLI_WORD.fullmatch(result[key]):
-            found[key] = result[key]
+    for key, known in (("subtype", SUBTYPES), ("terminal_reason", TERMINAL_REASONS), ("api_error", API_ERRORS)):
+        if key in result:
+            found[key] = result[key] if isinstance(result[key], str) and result[key] in known else "other"
     status = result.get("api_error_status")
     if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
         found["api_status"] = status
@@ -406,7 +425,7 @@ def review(pr, cli=None, plugin=None, view=VIEW, get=app_get):
     print(f"Claude Code exited with status {done.returncode}; error: {result.get('is_error', 'unknown')}; "
           f"turns: {result.get('turns', 'unknown')}; cost: {cost}; tool calls denied: {result.get('denied', 'unknown')}; "
           f"subtype: {result.get('subtype', 'unknown')}; ended: {result.get('terminal_reason', 'unknown')}; "
-          f"API error status: {result.get('api_status', 'none')}")
+          f"API error status: {result.get('api_status', 'none')}; API error: {result.get('api_error', 'none')}")
     print(f"May app review of may-app #{number} at {head}: {counts['inline']} inline and {counts['summary']} "
           f"summary comment(s) posted, {counts['failed']} post(s) failed, {counts['refused']} refused")
     if not counts["started"]:
