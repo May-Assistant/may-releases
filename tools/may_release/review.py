@@ -328,8 +328,15 @@ def mcp_config(number, head, posted, token_file):
                 "MAY_REVIEW_POSTED": str(posted)}}}}
 
 
+# Claude Code's own words for how a run ended, which it sets and the model cannot: the result's subtype and
+# terminal_reason (e.g. "success", "api_error") and an API error's HTTP status. Shown only in exactly this form,
+# so a startup failure (turns: 1, cost: $0.00) can be told apart without printing any text from the run.
+CLI_WORD = re.compile(r"[a-z_]{1,32}")
+
+
 def outcome(stdout_path):
-    """Numbers and booleans from Claude Code's final JSON result, never its text."""
+    """Numbers, booleans and the CLI's own lower-case status words from Claude Code's final JSON result, never its
+    text (result, errors and messages are free text and may hold the review)."""
     try:
         result = json.loads(stdout_path.read_text())
     except (OSError, ValueError):
@@ -345,6 +352,12 @@ def outcome(stdout_path):
         found["cost"] = float(result["total_cost_usd"])
     if isinstance(result.get("permission_denials"), list):
         found["denied"] = len(result["permission_denials"])
+    for key in ("subtype", "terminal_reason"):
+        if isinstance(result.get(key), str) and CLI_WORD.fullmatch(result[key]):
+            found[key] = result[key]
+    status = result.get("api_error_status")
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        found["api_status"] = status
     return found
 
 
@@ -391,7 +404,9 @@ def review(pr, cli=None, plugin=None, view=VIEW, get=app_get):
     result, counts = outcome(output / "stdout.json"), posted_counts(posted)
     cost = f"${result['cost']:.2f}" if "cost" in result else "unknown"
     print(f"Claude Code exited with status {done.returncode}; error: {result.get('is_error', 'unknown')}; "
-          f"turns: {result.get('turns', 'unknown')}; cost: {cost}; tool calls denied: {result.get('denied', 'unknown')}")
+          f"turns: {result.get('turns', 'unknown')}; cost: {cost}; tool calls denied: {result.get('denied', 'unknown')}; "
+          f"subtype: {result.get('subtype', 'unknown')}; ended: {result.get('terminal_reason', 'unknown')}; "
+          f"API error status: {result.get('api_status', 'none')}")
     print(f"May app review of may-app #{number} at {head}: {counts['inline']} inline and {counts['summary']} "
           f"summary comment(s) posted, {counts['failed']} post(s) failed, {counts['refused']} refused")
     if not counts["started"]:

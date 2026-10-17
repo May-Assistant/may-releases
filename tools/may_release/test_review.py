@@ -238,7 +238,11 @@ mode = open(os.path.join(os.path.dirname(posted), "..", "mode")).read()
 if mode != "no-server":
     open(posted, "a").write("started\n" + ("inline\ninline\nsummary\nrefused\n" if mode == "posted" else "failed\n" if mode == "failed" else ""))
 print("transcript: " + "PRIVATE-MAY-APP-CONTENT-7f3c", file=sys.stderr)
-print(json.dumps({"type": "result", "is_error": mode == "error", "num_turns": 31, "total_cost_usd": 1.234,
+ended = {"api": {"subtype": "success", "terminal_reason": "api_error", "api_error_status": 401},
+         "hostile": {"subtype": "PRIVATE-MAY-APP-CONTENT-7f3c", "terminal_reason": "private_" * 5, "api_error_status": "401"},
+         }.get(mode, {"subtype": "success", "terminal_reason": "completed"})
+print(json.dumps({"type": "result", "is_error": mode in ("error", "api"), "num_turns": 1 if mode == "api" else 31,
+                  "total_cost_usd": 0 if mode == "api" else 1.234, **ended,
                   "permission_denials": [{"tool": "PRIVATE-MAY-APP-CONTENT-7f3c"}], "result": "PRIVATE-MAY-APP-CONTENT-7f3c"}))
 sys.exit(3 if mode == "exit" else 0)
 '''
@@ -294,8 +298,24 @@ class ReviewRunTests(unittest.TestCase):
         printed, error, _ = self.run_review("posted")
         self.assertIsNone(error)
         self.assertNotIn(MARKER, printed)
-        self.assertEqual(printed, "Claude Code exited with status 0; error: False; turns: 31; cost: $1.23; tool calls denied: 1\n"
+        self.assertEqual(printed, "Claude Code exited with status 0; error: False; turns: 31; cost: $1.23; tool calls denied: 1; "
+                                  "subtype: success; ended: completed; API error status: none\n"
                                   f"May app review of may-app #42 at {SHA}: 2 inline and 1 summary comment(s) posted, 0 post(s) failed, 1 refused\n")
+
+    def test_a_startup_failure_shows_how_claude_code_ended_and_nothing_else(self):
+        # may-app #104 (17 Oct): four runs ended "turns: 1; cost: $0.00" with no way to tell why from this log.
+        printed, error, _ = self.run_review("api")
+        self.assertIsInstance(error, ReviewError)
+        self.assertNotIn(MARKER, printed)
+        self.assertEqual(printed.splitlines()[0], "Claude Code exited with status 0; error: True; turns: 1; cost: $0.00; "
+                                                  "tool calls denied: 1; subtype: success; ended: api_error; API error status: 401")
+
+    def test_status_words_that_are_not_the_clis_own_form_are_not_shown(self):
+        printed, error, _ = self.run_review("hostile")
+        self.assertIsNone(error)
+        self.assertNotIn(MARKER, printed)
+        self.assertNotIn("private", printed)
+        self.assertIn("subtype: unknown; ended: unknown; API error status: none", printed)
 
     def test_a_failed_review_stops_with_a_fixed_line_and_still_shows_nothing(self):
         for mode, message in (("exit", "did not finish cleanly"), ("error", "did not finish cleanly"),
