@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[2]
 PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|docker://\S+@sha256:[0-9a-f]{64})")
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
-PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError"}
+PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
+                  "DsCompileError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -783,6 +784,221 @@ def compile_pr_workflow_problems(text):
     return found
 
 
+# Swift compile of a may-design-system pull request head (ds-swift-compile.yml, gate.py --action ds-compile, ds_compile.py).
+# may-design-system is private and this repository public, so the workflow is pinned whole: dispatch with exactly ds_sha
+# and ds_pr, read-only permissions, admission then native in the environment admission chose (may-ds-renders), the
+# design-system pull-request read token in the check alone, the read key in the fetch alone, nothing on the compile,
+# the comment token in the post alone, nothing run but these five commands, and no artifact, step summary or carried
+# value. ds_compile.py prints only fixed lines, the inputs and the error count (ds_compile_print_problems).
+DS_COMPILE = "ds-swift-compile.yml"
+GATE_DS = 'python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
+GATE_DS_CHECK = GATE_DS + " --check-pull"
+DS_FETCH = 'python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
+DS_BUILD = "python3 -I -S -B tools/may_release/ds_compile.py compile"
+DS_POST = 'python3 -I -S -B tools/may_release/ds_compile.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
+DS_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-derived" '
+              '"$RUNNER_TEMP/may-ds-packages"')
+DS_RUNS = [GATE_DS, GATE_DS_CHECK, DS_FETCH, DS_BUILD, DS_POST, DS_CLEANUP]
+DS_STEP_NAMES = ["Check the design-system pull request head and environment before fetching",
+                 "Fetch the exact design-system commit quietly",
+                 "Compile the Swift package without signing or any credential",
+                 "Post the errors on the design-system pull request, never in this log",
+                 "Remove the design-system checkout, logs and products"]
+DS_PR_READ, DS_READ_KEY, DS_COMMENT = "MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_DS_PR_COMMENT_TOKEN"
+DS_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_DS_SHA", "${{ inputs.ds_sha }}"), ("MAY_DS_PR", "${{ inputs.ds_pr }}")} | \
+    {(n, "${{ secrets." + n + " }}") for n in (DS_PR_READ, DS_READ_KEY, DS_COMMENT)}
+
+
+def ds_compile_workflow_problems(text):
+    name = DS_COMPILE + ": "
+    found = []
+    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or \
+            "GITHUB_OUTPUT" in text or "toolchain.py" in text or \
+            "    runs-on: macos-15\n" not in job_text(text, "native") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission"):
+        found.append(name + "publishes an artifact or summary, carries values, or runs somewhere other than its two runners")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["ds_sha", "ds_pr"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly ds_sha and ds_pr")
+    if "\nconcurrency:\n  group: may-ds-swift-compile\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "native")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "native"]:
+        found.append(name + "jobs are not exactly admission and native")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != DS_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the check, the fetch, the compile, the post and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "native")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["native"]]
+    cleanup = steps["native"][-1][1] if steps["native"] else ""
+    if leading != {"admission": ["uses", "id"], "native": ["uses"] + ["name"] * len(DS_STEP_NAMES)} or \
+            names != [""] + DS_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + "native's steps are not exactly the check, fetch, compile, post and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "")) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 60\n" not in job_text(text, "native"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than native's 60 minutes")
+    native = job_text(text, "native")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in native or \
+            "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "native's environment is not the one admission chose, after admission")
+    by_name = dict(steps["native"])
+    check, fetch, build, post, clean = (by_name.get(n, "") for n in DS_STEP_NAMES)
+    # Each secret is bound exactly once, in its own step; the compile and the cleanup have no env at all.
+    if secrets_in(text) != {DS_PR_READ, DS_READ_KEY, DS_COMMENT} or \
+            any(text.count("secrets." + n) != 1 for n in (DS_PR_READ, DS_READ_KEY, DS_COMMENT)) or \
+            secrets_in(check) != {DS_PR_READ} or secrets_in(fetch) != {DS_READ_KEY} or secrets_in(post) != {DS_COMMENT} or \
+            "env:" in build or "env:" in clean or "GH_TOKEN" in fetch + post or \
+            any(e not in DS_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's read token, the fetch's read key and the post's comment token")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    return found
+
+
+# ds_compile.py runs in this public repository's log. These rules are a lint against accidents (a debugging print, a
+# subprocess left writing to the job's log, an exception message built from a path), not a proof that nothing can
+# leak: Python has more ways to write to a descriptor than any list here. Each print() is one literal, or an f-string
+# whose only values are the pull request number, int(total) (the error count) and the pinned Xcode version; print is
+# never aliased or rebound; every subprocess call names where its stdout and stderr go (never inherited); an exit
+# carries a literal, or a literal plus a printed error's own literal message; and the ways round these (sys.stdout,
+# getattr and other dynamic lookups, os.system and friends, descriptor 1 or 2, debuggers, logging) are refused.
+DS_PRINT_VALUES = {"number", "int(total)", "XCODE"}
+# Calls that start a process (as subprocess.<name>, or by these names: compile_ds's injectable `run` defaults to
+# subprocess.run).
+DS_PROCESS_CALLS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+# The only subprocess attributes ds_compile.py may use other than calling it directly.
+DS_SUBPROCESS_NAMES = {"DEVNULL", "STDOUT", "SubprocessError", "TimeoutExpired", "CompletedProcess"}
+DS_DYNAMIC = {"getattr", "setattr", "delattr", "vars", "globals", "locals", "eval", "exec", "compile", "__import__",
+              "breakpoint", "input", "help"}
+DS_OS_CALLS = {"system", "popen", "fdopen", "dup", "dup2", "write", "_exit", "openpty", "forkpty", "startfile"}
+DS_QUIET_MODULES = {"logging", "warnings", "traceback", "faulthandler", "pdb", "pprint", "code", "pty", "cgitb", "ctypes",
+                    "builtins", "io"}
+DS_EXIT_CLASSES = {"GateDenial", "DsCompileError", "StoreError"}
+
+
+def ds_process_streams_ok(call):
+    """capture_output=True, or both stdout= and stderr= given and neither None (a file, DEVNULL or STDOUT)."""
+    keywords = {k.arg: k.value for k in call.keywords if k.arg}
+    if any(k.arg is None for k in call.keywords):
+        return False
+    capture = keywords.get("capture_output")
+    if isinstance(capture, ast.Constant) and capture.value is True:
+        return True
+    return all(name in keywords and not (isinstance(keywords[name], ast.Constant) and keywords[name].value is None)
+               for name in ("stdout", "stderr"))
+
+
+def ds_exit_ok(argument, handlers):
+    """A literal, or "literal" + <name>.args[0] where <name> is bound by an `except` of the printed error classes."""
+    if argument is None or isinstance(argument, ast.Constant) and isinstance(argument.value, (str, int)):
+        return True
+    if isinstance(argument, ast.BinOp) and isinstance(argument.op, ast.Add) and \
+            isinstance(argument.left, ast.Constant) and isinstance(argument.left.value, str):
+        right = argument.right
+        if ast.unparse(right).endswith(".args[0]") and isinstance(right, ast.Subscript) and \
+                isinstance(right.value, ast.Attribute) and isinstance(right.value.value, ast.Name):
+            name = right.value.value.id
+            for handler in handlers:
+                types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+                if handler.name == name and types and all(called_name(t) in DS_EXIT_CLASSES for t in types):
+                    return True
+    return False
+
+
+def ds_compile_print_problems(root):
+    path = root / "tools/may_release/ds_compile.py"
+    tree = ast.parse(path.read_text())
+    found = []
+    parents, handlers = {}, {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def enclosing_handlers(node):
+        chain = []
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.ExceptHandler):
+                chain.append(node)
+        return chain
+
+    def flag(node, what):
+        found.append(f"ds_compile.py:{getattr(node, 'lineno', 0)}: {what}")
+
+    for node in ast.walk(tree):
+        parent = parents.get(node)
+        if isinstance(node, ast.Call) and called_name(node.func) == "print":
+            ok = not node.keywords and len(node.args) == 1 and (
+                (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)) or
+                (isinstance(node.args[0], ast.JoinedStr) and all(
+                    isinstance(v, ast.Constant) or (isinstance(v, ast.FormattedValue) and ast.unparse(v.value) in DS_PRINT_VALUES
+                                                    and v.format_spec is None)
+                    for v in node.args[0].values)))
+            if not ok:
+                flag(node, "prints something other than a fixed line, the pull request number and the error count")
+        # print only ever as the callee of a call, never passed, stored or rebound.
+        if isinstance(node, ast.Name) and node.id == "print" and not (isinstance(parent, ast.Call) and parent.func is node) \
+                or "print" in bound_names(node):
+            flag(node, "aliases or rebinds print")
+        if isinstance(node, ast.Call) and called_name(node.func) in DS_PROCESS_CALLS and not ds_process_streams_ok(node):
+            flag(node, "runs a subprocess that may inherit this log (give stdout= and stderr=, or capture_output=True)")
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "subprocess" and \
+                node.attr not in DS_SUBPROCESS_NAMES and not (isinstance(parent, ast.Call) and parent.func is node) and \
+                not (node.attr == "run" and isinstance(parent, ast.arguments) and
+                     any(d is node and a.arg == "run" for a, d in zip(parent.args[len(parent.args) - len(parent.defaults):],
+                                                                      parent.defaults))):
+            flag(node, "references subprocess other than by a direct call")
+        if isinstance(node, ast.ImportFrom) and node.module == "subprocess" and \
+                any(a.name not in DS_SUBPROCESS_NAMES for a in node.names):
+            flag(node, "references subprocess other than by a direct call")
+        exits = None
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            if isinstance(node.exc, ast.Call) and called_name(node.exc.func) == "SystemExit":
+                exits = node.exc.args[0] if node.exc.args else None
+                if node.exc.keywords or len(node.exc.args) > 1:
+                    exits = ast.Name("not-a-literal")
+            elif called_name(node.exc) == "SystemExit" and not isinstance(node.exc, ast.Call):
+                exits = None
+        if isinstance(node, ast.Call) and (ast.unparse(node.func) in ("sys.exit", "exit", "quit")):
+            exits = node.args[0] if node.args else None
+            if node.keywords or len(node.args) > 1:
+                exits = ast.Name("not-a-literal")
+        if exits is not None and not ds_exit_ok(exits, enclosing_handlers(node)):
+            flag(node, "exits with a message that is not a fixed literal")
+        if isinstance(node, ast.Attribute) and node.attr in ("stdout", "stderr", "__stdout__", "__stderr__", "__displayhook__",
+                                                             "displayhook", "excepthook") and \
+                isinstance(node.value, ast.Name) and node.value.id == "sys" or \
+                isinstance(node, ast.alias) and node.name in ("stdout", "stderr", "__stdout__", "__stderr__") or \
+                isinstance(node, ast.Constant) and isinstance(node.value, str) and \
+                re.search(r"/dev/(stdout|stderr|tty|fd/|pts)|/proc/self/fd", node.value):
+            flag(node, "writes to stdout or stderr other than by a pinned print")
+        if isinstance(node, ast.Name) and node.id in DS_DYNAMIC and isinstance(node.ctx, ast.Load):
+            flag(node, "uses a dynamic lookup or interpreter hook (getattr, eval, breakpoint and the like)")
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os" and \
+                (node.attr in DS_OS_CALLS or node.attr.startswith(("spawn", "exec", "posix_spawn"))) or \
+                isinstance(node, ast.ImportFrom) and node.module == "os":
+            flag(node, "uses an os call that runs a shell or writes to a descriptor")
+        if isinstance(node, ast.Call) and called_name(node.func) == "open" and node.args and \
+                not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)) and \
+                not isinstance(node.func, ast.Attribute):
+            flag(node, "opens something other than a named file (a descriptor such as 1 or 2)")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and \
+                re.search(r"GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)|::(error|warning|notice|debug|group)", node.value):
+            flag(node, "writes a GitHub Actions file or workflow command")
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(a.name.split(".")[0] in DS_QUIET_MODULES for a in node.names) or \
+                isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in DS_QUIET_MODULES:
+            flag(node, "imports a module that writes to stdout or stderr")
+    return found
+
+
 # Claude code review of a may-app pull request (may-app-review.yml, review.py, review_mcp.py). may-app is private and
 # this repository public, so the review's output stays in files (review.py) and the workflow is pinned whole: dispatch
 # with a pull request number only, read-only permissions, admission then the review in the environment admission
@@ -918,9 +1134,9 @@ def review_tool_problems(root):
 
 def control_problems(root):
     found = []
-    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr"}:
-        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\"}: only the compile-only pull-request "
-                     "lane may run without Samuel's review")
+    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr", "ds-compile"}:
+        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\", \"ds-compile\"}: only the two compile-only "
+                     "lanes may run without Samuel's review")
     flows = root / ".github/workflows"
     check = (flows / "control-check.yml").read_text()
     compile_workflow = (flows / "native-compile-draft.yml").read_text()
@@ -931,6 +1147,8 @@ def control_problems(root):
     found += compile_pr_workflow_problems((flows / "native-compile-pr.yml").read_text())
     found += review_workflow_problems((flows / "may-app-review.yml").read_text())
     found += review_tool_problems(root)
+    found += ds_compile_workflow_problems((flows / DS_COMPILE).read_text())
+    found += ds_compile_print_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

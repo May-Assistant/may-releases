@@ -48,6 +48,14 @@ may-native-compile-pr, never a store environment.
   checks the inputs and that policy. The pull request itself is read with --check-pull,
   as the environment job's first step, with MAY_APP_PR_READ_TOKEN held in that
   environment: main-dispatched runs only, never a repository secret any branch can read.
+
+Swift compile of a may-design-system commit (action ds-compile, ds-swift-compile.yml): only a
+may-design-system commit that is, right now, the head of an open pull request in may-design-system
+itself (never a fork) against claude/may-integration or main (DS_BASES). It builds in its own
+environment, may-ds-renders, which also has no required reviewer (Samuel's decision: the compile
+errors go to the lane as a comment on that private pull request; it signs, uploads and releases
+nothing). Admission checks the inputs and that policy; --check-pull, the environment job's first
+step, reads the pull request with MAY_DS_PR_READ_TOKEN, held in that environment.
 """
 
 import argparse
@@ -67,11 +75,15 @@ from store import PLAY_UPLOAD_TRACKS, SIGN_ONLY_RECIPIENT, SIGN_ONLY_TARGETS, bu
 
 CONTROL_REPO = "May-Assistant/may-releases"
 APP_REPO = "May-Assistant/may-app"
+DS_REPO = "May-Assistant/may-design-system"
+# The may-design-system branches a ds-compile pull request may target.
+DS_BASES = ("claude/may-integration", "main")
 OWNER_ID = 58840187
 # Exact names confirmed from the repository's Actions secrets page, 2026-10-13.
 ENVIRONMENTS = {
     "compile": "may-native-compile",
     "compile-pr": "may-native-compile-pr",
+    "ds-compile": "may-ds-renders",
     ("ios", "production"): "may-ios-internal",
     ("ios", "playground"): "may-ios-playground-internal",
     ("android", "production"): "may-android-internal",
@@ -84,8 +96,14 @@ MAX_BUILD_NUMBER = 2_000_000_000
 UPLOADS_HELD = {"ios"}
 ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
 # Actions whose environment has no required reviewer (Samuel, 17 Oct: compile-only pull-request runs need no
-# approval). static_check.py pins this to exactly {"compile-pr"}: no signing, store or release action may join it.
-NO_REVIEWER_ACTIONS = {"compile-pr"}
+# approval), and the design-system Swift compile (Samuel's decision for ds-swift-compile.yml: it compiles and comments
+# on a may-design-system pull request, nothing else). static_check.py pins this to exactly these two: no signing,
+# store or release action may join it.
+NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile"}
+# Actions that take a pull request number (and, with --check-pull, read that pull request).
+PULL_ACTIONS = ("compile-pr", "ds-compile")
+# Actions that build in their own environment alone, with no store or may-native-compile environment.
+OWN_ENVIRONMENT_ACTIONS = ("compile", "compile-pr", "ds-compile")
 LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?")
 AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
@@ -108,10 +126,10 @@ def validate_run(repo, ref, event, sha, action, build_number=None, target="produ
         raise GateDenial("May control must run by manual dispatch from its main branch")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise GateDenial("Private source must be an exact lowercase commit SHA")
-    key = action if action in ("compile", "compile-pr") else (action, target)
+    key = action if action in OWN_ENVIRONMENT_ACTIONS else (action, target)
     if key not in ENVIRONMENTS:
         raise GateDenial("Unknown May control action")
-    if action in ("compile", "compile-pr"):
+    if action in OWN_ENVIRONMENT_ACTIONS:
         return ENVIRONMENTS[key]
     if not (re.fullmatch(r"[1-9][0-9]{0,9}", build_number or "")
                                     and int(build_number) <= MAX_BUILD_NUMBER):
@@ -183,6 +201,22 @@ def validate_pull_request(pull, number, sha):
         raise GateDenial("Source SHA is not the pull request's current head")
 
 
+def validate_ds_pull_request(pull, number, sha):
+    """The may-design-system pull request (GET /repos/May-Assistant/may-design-system/pulls/{number}) is open, against
+    claude/may-integration or main of may-design-system, from may-design-system itself, and its head is exactly sha."""
+    if not isinstance(pull, dict) or pull.get("number") != number:
+        raise GateDenial("Pull request metadata is unreadable")
+    if pull.get("state") != "open":
+        raise GateDenial("Pull request is not open")
+    base, head = pull.get("base") or {}, pull.get("head") or {}
+    if base.get("ref") not in DS_BASES or (base.get("repo") or {}).get("full_name") != DS_REPO:
+        raise GateDenial("Pull request is not against may-design-system claude/may-integration or main")
+    if (head.get("repo") or {}).get("full_name") != DS_REPO:
+        raise GateDenial("Pull request head is not in may-design-system itself (forks are refused)")
+    if head.get("sha") != sha:
+        raise GateDenial("Design-system SHA is not the pull request's current head")
+
+
 def validate_environment(data, policies, dispatcher_id=None, dispatcher_login=None):
     if data.get("can_admins_bypass") is not False:
         raise GateDenial("Administrator bypass must be disabled")
@@ -225,7 +259,7 @@ def validate_no_reviewer_environment(data, policies):
     if sorted(p.get("name") for p in policies.get("branch_policies", [])) != ["main"]:
         raise GateDenial("Environment must allow only main")
     if any(r.get("type") == "required_reviewers" for r in data.get("protection_rules", [])):
-        raise GateDenial("The compile-only pull-request environment must have no required reviewer (Samuel, 17 Oct)")
+        raise GateDenial("A compile-only environment must have no required reviewer (Samuel's decision)")
 
 
 def login_or_unknown(value):
@@ -250,10 +284,13 @@ def get_json(path, token):
         raise GateDenial("Protected environment metadata unavailable") from None
 
 
-def get_app_pull(number, token):
-    """One may-app pull request, read with the read-only pull-request token. Bodies are never printed."""
+def get_app_pull(number, token, repo=APP_REPO):
+    """One may-app (or, for ds-compile, may-design-system) pull request, read with a pull-request token. Bodies are
+    never printed."""
+    if repo not in (APP_REPO, DS_REPO):
+        raise GateDenial("Pull requests are read only from may-app or may-design-system")
     request = urllib.request.Request(
-        f"https://api.github.com/repos/{APP_REPO}/pulls/{number}",
+        f"https://api.github.com/repos/{repo}/pulls/{number}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                  "X-GitHub-Api-Version": "2022-11-28"},
     )
@@ -270,28 +307,28 @@ def get_app_pull(number, token):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=("compile", "compile-pr", "ios", "android"), required=True)
+    parser.add_argument("--action", choices=("compile", "compile-pr", "ds-compile", "ios", "android"), required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--build-number")
     parser.add_argument("--target", choices=("production", "playground"), default="production")
     parser.add_argument("--dry-run")
     parser.add_argument("--sign-only")
     parser.add_argument("--pr-number")
-    # compile-pr on its environment's runner, before the fetch: read the pull request itself.
+    # compile-pr or ds-compile on its environment's runner, before the fetch: read the pull request itself.
     parser.add_argument("--check-pull", action="store_true")
     args = parser.parse_args()
-    if (args.action == "compile-pr") != (args.pr_number is not None):
-        raise GateDenial("A pull request number is given with compile-pr and only then")
-    if args.check_pull and args.action != "compile-pr":
-        raise GateDenial("Only compile-pr reads a pull request")
+    if (args.action in PULL_ACTIONS) != (args.pr_number is not None):
+        raise GateDenial("A pull request number is given with compile-pr or ds-compile and only then")
+    if args.check_pull and args.action not in PULL_ACTIONS:
+        raise GateDenial("Only compile-pr and ds-compile read a pull request")
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
     validate_dry_run(args.action, args.dry_run, args.target)
     validate_sign_only(args.action, args.sign_only, args.dry_run, args.target)
     # A pull-request compile builds in its own environment alone, never may-native-compile or a store one.
-    build_env = env if args.action == "compile-pr" else ENVIRONMENTS["compile"]
-    if args.action not in ("compile", "compile-pr") and artifact_recipient(env) is None:
+    build_env = env if args.action in PULL_ACTIONS else ENVIRONMENTS["compile"]
+    if args.action not in OWN_ENVIRONMENT_ACTIONS and artifact_recipient(env) is None:
         raise GateDenial("Artifact encryption public key for this target is still a placeholder; "
                          "the setup lane must commit it first")
     token = os.environ.get("GH_TOKEN")
@@ -307,6 +344,13 @@ def main():
             pull = get_app_pull(number, pull_token)
             validate_pull_request(pull, number, args.source_sha)
             author = login_or_unknown((pull.get("user") or {}).get("login"))
+    elif args.action == "ds-compile":
+        number = pull_number(args.pr_number)
+        if args.check_pull:
+            pull_token = os.environ.get("MAY_DS_PR_READ_TOKEN")
+            if not pull_token:
+                raise GateDenial("Design-system pull-request read token unavailable")
+            validate_ds_pull_request(get_app_pull(number, pull_token, DS_REPO), number, args.source_sha)
     for name in sorted({env, build_env}):
         base = f"environments/{name}"
         data, policies = get_json(base, token), get_json(base + "/deployment-branch-policies?per_page=100", token)
@@ -324,6 +368,13 @@ def main():
         checked = f"; pull request by {author}" if author else ""
         print(f"May compile-pr {'pull request check' if args.check_pull else 'admission'} passed for {args.source_sha} "
               f"(may-app #{int(args.pr_number)}{checked}; dispatched by {dispatcher})")
+        return
+    if args.action == "ds-compile":
+        # may-design-system is private: only the dispatch's own inputs (commit and number) and the dispatcher are
+        # printed, never the pull request's author, title or anything else read from it.
+        dispatcher = login_or_unknown(os.environ.get("GITHUB_TRIGGERING_ACTOR"))
+        print(f"May ds-compile {'pull request check' if args.check_pull else 'admission'} passed for {args.source_sha} "
+              f"(may-design-system #{int(args.pr_number)}; dispatched by {dispatcher})")
         return
     print(f"May {args.action} admission passed for {args.source_sha}")
 

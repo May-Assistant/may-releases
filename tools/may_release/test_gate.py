@@ -78,10 +78,12 @@ class GateTests(unittest.TestCase):
         # Confirmed from the repository's Actions secrets page on 2026-10-13. Any
         # rename must be made in the repository settings and here together.
         # may-native-compile-pr (compile of a may-app pull request head) is proposed, not yet created:
-        # admission denies on its 404 until Samuel creates it.
+        # admission denies on its 404 until Samuel creates it. may-ds-renders (the design-system Swift compile,
+        # ds-swift-compile.yml) is named by Samuel; admission likewise denies until it exists with its policy.
         self.assertEqual(gate.ENVIRONMENTS, {
             "compile": "may-native-compile",
             "compile-pr": "may-native-compile-pr",
+            "ds-compile": "may-ds-renders",
             ("ios", "production"): "may-ios-internal",
             ("ios", "playground"): "may-ios-playground-internal",
             ("android", "production"): "may-android-internal",

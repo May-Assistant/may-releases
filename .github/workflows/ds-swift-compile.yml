@@ -1,0 +1,78 @@
+name: May design-system Swift compile of a may-design-system pull request head (errors posted on that pull request, never in this log)
+on:
+  workflow_dispatch:
+    inputs:
+      ds_sha:
+        description: The 40-character head commit of that may-design-system pull request
+        required: true
+        type: string
+      ds_pr:
+        description: Open May-Assistant/may-design-system pull request against claude/may-integration or main (not from a fork)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: may-ds-swift-compile
+  cancel-in-progress: false
+jobs:
+  admission:
+    # The iOS lane needs to see why may-app fails to compile against a design-system commit (Samuel's decision): this
+    # compiles may-design-system's Swift package alone and posts its compile errors (path:line:col and the compiler's
+    # message, never source) as one comment on that private pull request. This repository is public: nothing derived
+    # from the design system (paths, messages, file or scheme names, logs) is printed, summarised or uploaded here.
+    # The log carries only fixed lines, the dispatch's inputs and the number of errors (ds_compile.py). Admission has
+    # no environment, so a missing one is denied on its 404 and never auto-created; it checks the inputs and
+    # may-ds-renders' policy (no required reviewer, administrator bypass off, main only).
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_DS_PR: ${{ inputs.ds_pr }}
+        run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+  native:
+    needs: admission
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check the design-system pull request head and environment before fetching
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_DS_PR_READ_TOKEN: ${{ secrets.MAY_DS_PR_READ_TOKEN }}
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_DS_PR: ${{ inputs.ds_pr }}
+        run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR" --check-pull
+      - name: Fetch the exact design-system commit quietly
+        env:
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_DS_PR: ${{ inputs.ds_pr }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Compile the Swift package without signing or any credential
+        run: python3 -I -S -B tools/may_release/ds_compile.py compile
+      - name: Post the errors on the design-system pull request, never in this log
+        env:
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_DS_PR: ${{ inputs.ds_pr }}
+          MAY_DS_PR_COMMENT_TOKEN: ${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Remove the design-system checkout, logs and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-derived" "$RUNNER_TEMP/may-ds-packages"

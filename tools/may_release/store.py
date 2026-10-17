@@ -119,6 +119,9 @@ SECRET_NAMES = (
     "MAY_POSTHOG_ANDROID_KEY",
     # The repository secret gate.py reads may-app pull requests with (compile-pr); no tool step may hold it.
     "MAY_APP_PR_READ_TOKEN",
+    # ds-swift-compile.yml: the may-design-system pull-request read token (gate.py --check-pull alone) and the token
+    # that comments on that pull request (ds_compile.py post alone). No other step may hold either.
+    "MAY_DS_PR_READ_TOKEN", "MAY_DS_PR_COMMENT_TOKEN",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
 # Crash reports (PostHog): the Android build step alone may hold the project key, and
