@@ -17,8 +17,10 @@ jobs:
     # repository is public: its logs, summaries and artifacts are public, and may-app is private. So nothing from
     # may-app (code, diff, file names, transcript or model output) is printed, summarised, uploaded or cached. The
     # review runs the pinned Claude Code release with all its output in files under $RUNNER_TEMP/may-review, removed
-    # at the end, and this log carries only fixed lines, numbers and logins (review.py). Admission has no environment,
-    # so a missing one is denied on its 404 and never auto-created; it checks the input and may-claude-review's policy.
+    # at the end, and this log carries only fixed lines, numbers and logins (review.py). The model has no shell, no gh
+    # and no token: it reads the pull request as files under /tmp/may-review-view and comments through review_mcp.py.
+    # Admission has no environment, so a missing one is denied on its 404 and never auto-created; it checks the input
+    # and may-claude-review's policy.
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -39,9 +41,9 @@ jobs:
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 60
+    # Only admission reads the environment's policy (actions: read); this job needs no API scope of its own.
     permissions:
       contents: read
-      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -56,7 +58,6 @@ jobs:
           persist-credentials: false
       - name: Check the pull request and fetch its head quietly
         env:
-          GH_TOKEN: ${{ github.token }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
           MAY_APP_REVIEW_TOKEN: ${{ secrets.MAY_APP_REVIEW_TOKEN }}
         run: python3 -I -S -B tools/may_release/review.py fetch --pr-number "$MAY_PR_NUMBER"
@@ -70,4 +71,4 @@ jobs:
         run: python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER"
       - name: Remove private source, transcripts and the review's output
         if: always()
-        run: rm -rf -- "$RUNNER_TEMP/may-review"
+        run: rm -rf -- "$RUNNER_TEMP/may-review" /tmp/may-review-view

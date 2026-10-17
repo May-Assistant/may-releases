@@ -793,7 +793,7 @@ REVIEW_GATE = 'python3 -I -S -B tools/may_release/review.py admit --pr-number "$
 REVIEW_FETCH = 'python3 -I -S -B tools/may_release/review.py fetch --pr-number "$MAY_PR_NUMBER"'
 REVIEW_INSTALL = "python3 -I -S -B tools/may_release/review.py install"
 REVIEW_RUN = 'python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER"'
-REVIEW_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-review"'
+REVIEW_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-review" /tmp/may-review-view'
 REVIEW_RUNS = [REVIEW_GATE, REVIEW_FETCH, REVIEW_INSTALL, REVIEW_RUN, REVIEW_CLEANUP]
 REVIEW_STEP_NAMES = ["Check the pull request and fetch its head quietly",
                      "Install the pinned Claude Code release, checked against its sha512",
@@ -819,10 +819,11 @@ def review_workflow_problems(text):
         found.append(name + ": is not dispatched with exactly a pr_number")
     if "\nconcurrency:\n  group: may-app-review\n" not in text:
         found.append(name + ": does not run one at a time in its own concurrency group")
+    # Only admission reads the environment's policy (actions: read); review has contents: read alone (review of #21, M3).
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
-            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "review")] != [1, 1] or \
-            text.count("permissions:") != 3:
-        found.append(name + ": permissions are not exactly read-only (contents, and actions in each job)")
+            job_text(text, "admission").count(JOB_PERMISSIONS) != 1 or text.count("permissions:") != 3 or \
+            not re.search(r"(?m)^    permissions:\n      contents: read\n    steps:\n", job_text(text, "review")):
+        found.append(name + ": permissions are not exactly read-only (contents; actions in admission alone)")
     if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "review"]:
         found.append(name + ": jobs are not exactly admission and review")
     if "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "review"):
@@ -853,11 +854,57 @@ def review_workflow_problems(text):
     if secrets_in(text) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or text.count("secrets." + REVIEW_TOKEN) != 2 or \
             text.count("secrets." + REVIEW_CLAUDE_TOKEN) != 1 or secrets_in(fetch) != {REVIEW_TOKEN} or \
             secrets_in(run) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or "env:" in install or "env:" in cleanup or \
-            any(e not in REVIEW_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+            any(e not in REVIEW_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text) or \
+            "GH_TOKEN" in job:
         found.append(name + ": a secret or env entry other than the review token in fetch and review and the Claude token in review")
     if "claude-code-action" in text or "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or \
             "GITHUB_ENV" in text or "GITHUB_PATH" in text or "${{ inputs." in "\n".join(runs):
         found.append(name + ": uses claude-code-action, an artifact or a step summary, carries values, or interpolates inputs into shell")
+    return found
+
+
+# What the review's model may use (review.py), pinned (security review of #21, H1): the comment tools, subagents and
+# Read of the view alone; no shell, gh, Grep, Glob or web; reads of /proc, /sys and /home (the runner, $RUNNER_TEMP)
+# denied; Claude Code's environment built with no GitHub token; the review token handed to the comment server only
+# as a file path; and the checkout never a working directory or a source of CLAUDE.md.
+REVIEW_VIEW = "/tmp/may-review-view"
+REVIEW_ALLOWED = {"mcp__github_inline_comment__create_inline_comment", "mcp__github_inline_comment__create_summary_comment",
+                  "Agent", "Task", "Read(/" + REVIEW_VIEW + "/**)"}
+REVIEW_MUST_DENY = {"Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Grep", "Glob",
+                    "Read(//proc/**)", "Read(//sys/**)", "Read(//home/**)", "Read(//root/**)", "Read(//etc/**)"}
+
+
+def function_source(tree, name):
+    found = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
+    return found[0] if len(found) == 1 else None
+
+
+def review_tool_problems(root):
+    found = []
+    path = root / "tools/may_release/review.py"
+    allowed, denied = assigned_literal(path, "ALLOWED_TOOLS"), assigned_literal(path, "DENIED_TOOLS")
+    if not isinstance(allowed, str) or set(allowed.split(",")) != REVIEW_ALLOWED or len(allowed.split(",")) != len(REVIEW_ALLOWED):
+        found.append("review.py: ALLOWED_TOOLS is not exactly the comment tools, subagents and Read of the view")
+    if not isinstance(denied, str) or not REVIEW_MUST_DENY <= set(denied.split(",")):
+        found.append("review.py: DENIED_TOOLS does not deny the shell, Grep, Glob, writes, the web and reads of /proc, /sys and /home")
+    tree = ast.parse(path.read_text())
+    view = [node for node in tree.body if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["VIEW"]]
+    if len(view) != 1 or ast.unparse(view[0].value) != f"Path('{REVIEW_VIEW}')":
+        found.append("review.py: VIEW is not " + REVIEW_VIEW)
+    env = function_source(tree, "claude_env")
+    if env is None or [a.arg for a in env.args.args] != ["root", "claude_token"] or \
+            any(isinstance(n, ast.Constant) and isinstance(n.value, str) and ("GH_" in n.value or "GITHUB" in n.value or "MAY_" in n.value)
+                for n in ast.walk(env)) or "CLAUDE_CODE_DISABLE_CLAUDE_MDS" not in ast.unparse(env):
+        found.append("review.py: claude_env takes something besides the Claude token, names a GitHub or May variable, "
+                     "or loads CLAUDE.md files")
+    config = function_source(tree, "mcp_config")
+    if config is None or [a.arg for a in config.args.args] != ["number", "head", "posted", "token_file"] or \
+            any(isinstance(n, ast.Constant) and isinstance(n.value, str) and "TOKEN" in n.value and n.value != "MAY_REVIEW_TOKEN_FILE"
+                for n in ast.walk(config)):
+        found.append("review.py: the comment server is handed something besides the token file's path")
+    run, command = function_source(tree, "review"), function_source(tree, "claude_command")
+    if run is None or command is None or "cwd=view / 'work'" not in ast.unparse(run) or "--add-dir" in ast.unparse(command):
+        found.append("review.py: Claude Code runs somewhere other than the view's empty work directory, or with --add-dir")
     return found
 
 
@@ -875,6 +922,7 @@ def control_problems(root):
     found += compile_workflow_problems(compile_workflow)
     found += compile_pr_workflow_problems((flows / "native-compile-pr.yml").read_text())
     found += review_workflow_problems((flows / "may-app-review.yml").read_text())
+    found += review_tool_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")
