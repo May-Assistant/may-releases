@@ -11,7 +11,8 @@ published. Public output is one fixed line per flow test, built only from this f
 own words: the flow's class name from FLOWS (anything else is "an unlisted flow"), the
 test's number within it, and its outcome from outcome_of. Nothing the app, its tests or
 the instrumentation printed reaches the public log: no method name, exception class,
-assertion message, stack trace, screenshot or app output.
+assertion message, stack trace, screenshot or app output. The one exception is a number: a
+failed assertion's line in the flow's own file, so it can be found in may-app's source.
 
 A test that is ignored or whose assumption failed fails the run, on purpose: a flow
 that did not check what it is for is not a pass.
@@ -253,13 +254,25 @@ def build(source_sha):
             raise FlowsError("The build left no Playground or flow APK")
 
 
-def outcome_of(code, stack):
-    """One of this file's fixed outcome words for an `am instrument` status code."""
+def assertion_line(stack, flow):
+    """The line, in [flow]'s own file, of the innermost stack frame there: digits only, or None."""
+    if not flow:
+        return None
+    # Frames only ("\tat …(File.kt:N)"): the first line is the thrown class and its message, which is never read.
+    found = re.search(r"(?m)^\s+at [\w.$]+\(" + re.escape(flow) + r"\.kt:(\d{1,5})\)$", stack)
+    return int(found.group(1)) if found else None
+
+
+def outcome_of(code, stack, flow=None):
+    """One of this file's fixed outcome words for an `am instrument` status code (and a failed assertion's line in [flow])."""
     if code == 0:
         return "pass"
     if code in (-1, -2):
         thrown = stack.split(":", 1)[0].strip()
-        return "fail (assertion)" if thrown in ASSERTIONS else "fail (an exception, not an assertion)"
+        if thrown not in ASSERTIONS:
+            return "fail (an exception, not an assertion)"
+        line = assertion_line(stack, flow)
+        return "fail (assertion)" if line is None else "fail (assertion, line %d)" % line
     return {-3: "ignored", -4: "assumption failed"}[code]
 
 
@@ -273,18 +286,22 @@ def flow_label(test_class):
 
 def parse_instrumentation(text):
     """[(label, outcome)] from `am instrument -r` output, in this file's own words only."""
-    results, status, counts = [], {}, {}
+    results, status, counts, key = [], {}, {}, None
     for line in text.splitlines():
         if line.startswith("INSTRUMENTATION_STATUS: "):
             key, _, value = line[len("INSTRUMENTATION_STATUS: "):].partition("=")
             status[key] = value
+        elif key == "stack" and not line.startswith("INSTRUMENTATION_"):
+            # The stack's frames follow on lines of their own.
+            status[key] += "\n" + line
         elif line.startswith("INSTRUMENTATION_STATUS_CODE: "):
             code = line.split(": ", 1)[1].strip()
             if re.fullmatch(r"-?\d+", code) and int(code) in STATUS and int(code) != 1:
                 label = flow_label(status.get("class", ""))
                 counts[label] = counts.get(label, 0) + 1
-                results.append((label + " test " + str(counts[label]), outcome_of(int(code), status.get("stack", ""))))
-            status = {}
+                flow = label if label in FLOWS.values() else None
+                results.append((label + " test " + str(counts[label]), outcome_of(int(code), status.get("stack", ""), flow)))
+            status, key = {}, None
     completed = "INSTRUMENTATION_CODE: -1" in text
     return results, completed
 
