@@ -454,8 +454,10 @@ if __name__ == "__main__":
                   args.flows_from_branch)
             runs = queue(args.source_sha, args.flows, args.then)
             environment_exists(os.environ.get("GH_TOKEN"))
-            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-                output.write("runs=" + json.dumps(runs) + "\n")
+            # Run by hand, outside Actions, there's no job output to write: admission still checks every run.
+            if os.environ.get("GITHUB_OUTPUT"):
+                with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                    output.write("runs=" + json.dumps(runs) + "\n")
             print("May flows admitted: %d run%s, one at a time" % (len(runs), "" if len(runs) == 1 else "s"))
         elif args.command == "overlay":
             overlay(args.source_sha, args.flows_sha, args.flows_from_branch)
