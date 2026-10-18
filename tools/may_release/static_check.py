@@ -21,7 +21,7 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
-                  "DsCompileError", "CompilePrError", "RehearsalError"}
+                  "DsCompileError", "CompilePrError", "RehearsalError", "UnitTestsError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -911,6 +911,100 @@ def ios_rehearsal_print_problems(root):
     return quiet_tool_problems(root, REHEARSAL_TOOL, REHEARSAL_PRINT_VALUES, REHEARSAL_EXIT_CLASSES)
 
 
+# May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same
+# admission, pull request check, fetch and environment as native-compile-pr.yml (gate.py --action compile-pr,
+# may-native-compile-pr), so it holds nothing that compile does not: the PR read token in the check alone, the two
+# source-read keys in the fetch alone, and no secret or GitHub token on the suites' step (it runs the pull request's
+# own build and test code) or the cleanup. It is pinned whole: dispatch with exactly pr_number and source_sha,
+# read-only, Linux runners, the pinned JDK installed without carrying a value to later steps (android_unit.py finds it
+# by path), nothing run but its six commands, and no artifact, step summary, comment or carried value. android_unit.py
+# prints only fixed lines, a suite's name and verdict from its own words, and integer counts (android_unit_print_problems).
+UNIT = "android-unit-pr.yml"
+UNIT_JDK = "python3 -I -S -B tools/may_release/toolchain.py jdk"
+PREPARE_ANDROID_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha '
+                      '"$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"')
+UNIT_RUN = 'python3 -I -S -B tools/may_release/android_unit.py --source-sha "$MAY_SOURCE_SHA"'
+UNIT_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+                '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-tools"')
+UNIT_RUNS = [GATE_COMPILE_PR, UNIT_JDK, GATE_CHECK_PULL, PREPARE_ANDROID_PR, UNIT_RUN, UNIT_CLEANUP]
+UNIT_STEP_NAMES = ["Install the pinned, checksum-verified JDK",
+                   "Check the pull request head and environment before fetching",
+                   "Fetch the pull request head and pinned design system quietly",
+                   "Run the unit suites without any credential, printing only pass or fail and counts",
+                   "Remove private source, logs, build outputs and the pinned JDK"]
+UNIT_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}")}
+UNIT_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET,)}
+
+
+def android_unit_workflow_problems(text):
+    name = UNIT + ": "
+    found = []
+    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or \
+            "GITHUB_PATH" in text or "--export" in text or "--platform ios" in text or \
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "unit")] != [1, 1] or \
+            text.count("runs-on:") != 2:
+        found.append(name + "is not the Linux unit-test run with no artifact, step summary or carried value")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly pr_number and source_sha")
+    if "\nconcurrency:\n  group: may-android-unit-pr\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "unit")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "unit"]:
+        found.append(name + "jobs are not exactly admission and unit")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != UNIT_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the JDK install, the check, the fetch, the suites "
+                     "and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "unit")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["unit"]]
+    cleanup = steps["unit"][-1][1] if steps["unit"] else ""
+    if leading != {"admission": ["uses", "id"], "unit": ["uses"] + ["name"] * len(UNIT_STEP_NAMES)} or \
+            names != [""] + UNIT_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + "unit's steps are not exactly the JDK install, check, fetch, suites and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 75\n" not in job_text(text, "unit"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than unit's 75 minutes")
+    job = job_text(text, "unit")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
+            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "unit's environment is not the one admission chose, after admission")
+    by_name = dict(steps["unit"])
+    jdk, check, fetch, suites, clean = (by_name.get(n, "") for n in UNIT_STEP_NAMES)
+    # Each secret bound exactly once: the PR token in the pull request check, the read keys in the fetch. The suites
+    # (the pull request's own build and test code) get the source SHA alone; the JDK install and the cleanup no env.
+    if secrets_in(text) != set(COMPILE_SECRETS) | {PR_READ_SECRET} or \
+            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS + (PR_READ_SECRET,)) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
+            secrets_in(jdk + suites + clean) or "GH_TOKEN" in fetch + suites or "env:" in jdk + clean or \
+            env_entries(suites) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")] or \
+            any(e not in UNIT_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys "
+                     "and the dispatch's inputs")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    return found
+
+
+UNIT_TOOL = "android_unit.py"
+UNIT_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(failed)", "int(skipped)"}
+UNIT_EXIT_CLASSES = {"UnitTestsError", "StoreError"}
+
+
+def android_unit_print_problems(root):
+    return quiet_tool_problems(root, UNIT_TOOL, UNIT_PRINT_VALUES, UNIT_EXIT_CLASSES)
+
+
 # Swift compile of a may-design-system pull request head (ds-swift-compile.yml, gate.py --action ds-compile, ds_compile.py).
 # may-design-system is private and this repository public, so the workflow is pinned whole: dispatch with exactly ds_sha
 # and ds_pr, read-only permissions, admission then native in the environment admission chose (may-ds-renders), the
@@ -1293,6 +1387,8 @@ def control_problems(root):
     found += compile_pr_errors_print_problems(root)
     found += ios_rehearsal_workflow_problems((flows / REHEARSAL).read_text())
     found += ios_rehearsal_print_problems(root)
+    found += android_unit_workflow_problems((flows / UNIT).read_text())
+    found += android_unit_print_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")
