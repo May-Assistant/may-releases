@@ -139,6 +139,14 @@ ANDROID_BUILD = "Build unsigned Android App Bundle with only the crash-report ke
 ANDROID_BUILD_COMMAND = ('python3 -I -S -B tools/may_release/store.py --platform android --target "$MAY_TARGET" '
                          '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
 POSTHOG_HOST_ENV = "MAY_POSTHOG_HOST: ${{ vars.MAY_POSTHOG_HOST }}"
+# The iOS build step likewise holds the iOS PostHog key and nothing else, runs exactly the build, and alone may read
+# the iOS host variable (store.POSTHOG_NAMES).
+IOS_BUILD = "Build unsigned iOS archive with only the crash-report key"
+IOS_BUILD_COMMAND = ('python3 -I -S -B tools/may_release/store.py --platform ios --target "$MAY_TARGET" '
+                     '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
+# build job -> (its crash-report key's build step, the command it runs, its PostHog host variable).
+POSTHOG_BUILD_STEPS = {"android-build": (ANDROID_BUILD, ANDROID_BUILD_COMMAND, "MAY_POSTHOG_HOST"),
+                       "ios-build": (IOS_BUILD, IOS_BUILD_COMMAND, "MAY_POSTHOG_IOS_HOST")}
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
     "android-build": (
@@ -161,9 +169,9 @@ STORE_JOBS = {
                                                 "MAY_ANDROID_KEY_PASSWORD"}},
         {CHECKOUT, DOWNLOAD_ARTIFACT, UPLOAD_ARTIFACT}),
     "ios-build": (
-        ["Install pinned age", FETCH, "Build unsigned iOS archive without secrets",
+        ["Install pinned age", FETCH, IOS_BUILD,
          "Encrypt unsigned archive to the target's public key"],
-        {FETCH: READ_KEYS}, {CHECKOUT, UPLOAD_ARTIFACT}),
+        {FETCH: READ_KEYS, IOS_BUILD: {"MAY_POSTHOG_IOS_KEY"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "ios-release": (
         ["Install pinned age", DECRYPT, "Sign and verify internal-TestFlight IPA",
          "Upload verified IPA for internal TestFlight", CONFIRM, REPORT],
@@ -182,7 +190,8 @@ ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLA
                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN" '
                   '--sign-only "$MAY_SIGN_ONLY"')
 CONTINUE_ON_ERROR = re.compile(r"(?m)^\s*(-\s+)?continue-on-error:")
-VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID", "MAY_POSTHOG_HOST"}
+VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID", "MAY_POSTHOG_HOST",
+        "MAY_POSTHOG_IOS_HOST"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
 
 
@@ -463,13 +472,15 @@ def store_problems(store):
                    ' --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA"')
         if not release and [run_commands(text) for name, text in steps if name == FETCH] != [[prepare]]:
             found.append(f"store {job}: does not prepare the design system for its own platform and target")
-        if job == "android-build" and [run_commands(text) for name, text in steps if name == ANDROID_BUILD] != \
-                [[ANDROID_BUILD_COMMAND]]:
+        if job in POSTHOG_BUILD_STEPS and [run_commands(text) for name, text in steps
+                                           if name == POSTHOG_BUILD_STEPS[job][0]] != [[POSTHOG_BUILD_STEPS[job][1]]]:
             found.append(f"store {job}: the crash-report key's build step runs something other than the build")
-        # The PostHog host variable: only on android-build's build step (never at job level or on another step).
-        allowed_host = job == "android-build" and [n for n, t in steps if "MAY_POSTHOG_HOST" in t] in ([], [ANDROID_BUILD])
-        if "MAY_POSTHOG_HOST" in job_text(store, job) and not (allowed_host and "MAY_POSTHOG_HOST" not in header):
-            found.append(f"store {job}: reads the PostHog host outside the crash-report key's build step")
+        # Each PostHog host variable: only on its own platform's build step (never at job level, on another step or
+        # in another job). Neither name contains the other.
+        for host_job, (step, _, host) in POSTHOG_BUILD_STEPS.items():
+            allowed_host = job == host_job and [n for n, t in steps if host in t] in ([], [step])
+            if host in job_text(store, job) and not (allowed_host and host not in header):
+                found.append(f"store {job}: reads the PostHog host outside the crash-report key's build step")
         # The dry run must still build, seal, open, sign and verify: only the
         # upload, the loud-failure check and the report are conditional (cleanup
         # always runs).

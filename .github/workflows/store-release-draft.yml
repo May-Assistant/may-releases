@@ -342,7 +342,10 @@ jobs:
           MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA"
-      - name: Build unsigned iOS archive without secrets
+      - name: Build unsigned iOS archive with only the crash-report key
+        env:
+          MAY_POSTHOG_IOS_KEY: ${{ secrets.MAY_POSTHOG_IOS_KEY }}
+          MAY_POSTHOG_IOS_HOST: ${{ vars.MAY_POSTHOG_IOS_HOST }}
         run: python3 -I -S -B tools/may_release/store.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Encrypt unsigned archive to the target's public key
         run: python3 -I -S -B tools/may_release/handoff.py seal --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"

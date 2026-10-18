@@ -97,6 +97,76 @@ class StaticCheckTests(unittest.TestCase):
                 self.mutate(STORE, old, new)
                 self.assertFlagged(f"store {job}: reads the PostHog host outside the crash-report key's build step")
 
+    # --- the iOS crash-report key (may-app #449), as Android's ------------------------------------------------
+    IOS_KEY = "          MAY_POSTHOG_IOS_KEY: ${{ secrets.MAY_POSTHOG_IOS_KEY }}\n"
+    IOS_HOST = "          MAY_POSTHOG_IOS_HOST: ${{ vars.MAY_POSTHOG_IOS_HOST }}\n"
+    IOS_COMMAND = ('        run: python3 -I -S -B tools/may_release/store.py --platform ios --target "$MAY_TARGET" '
+                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"\n')
+
+    def test_the_ios_build_step_alone_holds_the_ios_key(self):
+        text = (ROOT / STORE).read_text()
+        self.assertEqual(text.count("secrets.MAY_POSTHOG_IOS_KEY"), 1)
+        self.assertIn("      - name: Build unsigned iOS archive with only the crash-report key\n        env:\n"
+                      + self.IOS_KEY + self.IOS_HOST + self.IOS_COMMAND, text)
+        fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
+        for old, new, nth, job in ((self.IOS_KEY, "", 0, "ios-build"),                     # dropped from the build step
+                                   (fetch_env, fetch_env + self.IOS_KEY, 1, "ios-build"),   # on iOS's fetch step too
+                                   (fetch_env, fetch_env + self.IOS_KEY, 0, "android-build"),
+                                   ("          MAY_POSTHOG_ANDROID_KEY: ${{ secrets.MAY_POSTHOG_ANDROID_KEY }}\n",
+                                    "          MAY_POSTHOG_ANDROID_KEY: ${{ secrets.MAY_POSTHOG_ANDROID_KEY }}\n" + self.IOS_KEY,
+                                    0, "android-build"),
+                                   ("          MAY_IOS_CERT_BASE64: ${{ secrets.MAY_IOS_CERT_BASE64 }}\n",
+                                    "          MAY_IOS_CERT_BASE64: ${{ secrets.MAY_IOS_CERT_BASE64 }}\n" + self.IOS_KEY,
+                                    0, "ios-release")):
+            with self.subTest(new=new, job=job):
+                self.fresh()
+                self.mutate_nth(old, new, nth)
+                self.assertFlagged(f"store {job}: a step holds secrets it does not need")
+
+    def test_the_ios_build_binds_its_key_and_host_under_their_own_names(self):
+        for old, new in ((self.IOS_KEY, "          JAVA_HOME_X: ${{ secrets.MAY_POSTHOG_IOS_KEY }}\n"),
+                         (self.IOS_HOST, "          MAY_POSTHOG_IOS_HOST: ${{ vars.EVIL_HOST }}\n"),
+                         (self.IOS_HOST, "          MAY_POSTHOG_IOS_HOST: https://evil.example\n"),
+                         (self.IOS_HOST, "          MAY_POSTHOG_IOS_HOST: ${{ vars.MAY_POSTHOG_HOST }}\n"),
+                         (self.IOS_HOST, self.IOS_HOST + "          MAY_POSTHOG_KEY: ${{ vars.MAY_POSTHOG_KEY }}\n")):
+            with self.subTest(new=new):
+                self.fresh()
+                self.mutate(STORE, old, new)
+                self.assertFlagged("store ios-build: sets an environment variable it does not declare")
+
+    def test_the_ios_crash_report_keys_build_step_runs_only_the_build(self):
+        for new in ("        run: printenv\n",
+                    self.IOS_COMMAND.replace("\n", "; env\n"),
+                    "        run: |\n          printenv\n" + self.IOS_COMMAND.replace("        run: ", "          "),
+                    self.IOS_COMMAND.replace("--platform ios", "--platform android")):
+            with self.subTest(new=new):
+                self.fresh()
+                self.mutate(STORE, self.IOS_COMMAND, new)
+                self.assertFlagged("store ios-build: the crash-report key's build step runs something other than the build")
+
+    def test_the_ios_posthog_host_is_read_only_on_the_ios_build_step(self):
+        fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
+        job_env = "    env:\n      PYTHONDONTWRITEBYTECODE: '1'\n"
+        android_host = "          MAY_POSTHOG_HOST: ${{ vars.MAY_POSTHOG_HOST }}\n"
+        cases = ((fetch_env, fetch_env + self.IOS_HOST, 1, "ios-build"),           # iOS's fetch step
+                 (android_host, android_host + self.IOS_HOST, 0, "android-build"),  # Android's build step
+                 (self.IOS_HOST, self.IOS_HOST + android_host, 0, "ios-build"),     # Android's host on iOS's step
+                 ("          MAY_IOS_CERT_BASE64: ${{ secrets.MAY_IOS_CERT_BASE64 }}\n",
+                  "          MAY_IOS_CERT_BASE64: ${{ secrets.MAY_IOS_CERT_BASE64 }}\n" + self.IOS_HOST, 0, "ios-release"))
+        for old, new, nth, job in cases:
+            with self.subTest(new=new, job=job):
+                self.fresh()
+                self.mutate_nth(old, new, nth)
+                self.assertFlagged(f"store {job}: reads the PostHog host outside the crash-report key's build step")
+        # At ios-build's job level.
+        text = (self.root / STORE).read_text()
+        at = text.index("  ios-build:\n")
+        at = text.index(job_env, at)
+        self.fresh()
+        (self.root / STORE).write_text(text[:at] + job_env + "      MAY_POSTHOG_IOS_HOST: ${{ vars.MAY_POSTHOG_IOS_HOST }}\n"
+                                       + text[at + len(job_env):])
+        self.assertFlagged("store ios-build: reads the PostHog host outside the crash-report key's build step")
+
     def test_a_flows_error_message_must_be_one_literal(self):
         self.mutate("tools/may_release/flows.py",
                     'raise FlowsError("Unknown flow selection")', 'raise FlowsError("Unknown flow selection: " + str(flows))')
@@ -865,7 +935,7 @@ class StaticCheckTests(unittest.TestCase):
 
     def test_only_the_handoff_download_may_continue_on_error(self):
         for job, old in (("android-release", "      - name: Check the checkout is exactly its commit before signing\n"),
-                         ("ios-build", "      - name: Build unsigned iOS archive without secrets\n")):
+                         ("ios-build", "      - name: Build unsigned iOS archive with only the crash-report key\n")):
             with self.subTest(job=job):
                 self.fresh()
                 self.mutate(STORE, old, old + "        continue-on-error: true\n")
