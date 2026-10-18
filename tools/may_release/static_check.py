@@ -954,7 +954,8 @@ UNIT_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER",
 UNIT_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}"), UNIT_BREAKDOWN_ENV} | \
     {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)}
 UNIT_SECRETS = COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)
-UNIT_RUN_NAME = "\nrun-name: May Android unit suites for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}\non:\n"
+# Quoted: unquoted, YAML reads " #" as the start of a comment and the name stops before the number.
+UNIT_RUN_NAME = "\nrun-name: 'May Android unit suites for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
 
 
 def android_unit_workflow_problems(text):
