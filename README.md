@@ -225,7 +225,7 @@ A reviewed PR replaces the placeholder with exactly that `age1…` line. Unlike 
 ## Secrets and variables per environment
 
 - **`may-native-compile`:** `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (read-only deploy keys for `may-app` and `may-design-system`).
-- **`may-native-compile-pr`** (proposed; [compile of a pull request head](#ios-compile-of-a-pull-request-head); no required reviewer, main only): `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (dedicated deploy keys, rotated when someone leaves may-app) and `MAY_APP_PR_READ_TOKEN` (may-app pull requests: read, short-lived). Each is bound in exactly one step.
+- **`may-native-compile-pr`** (proposed; [compile of a pull request head](#ios-compile-of-a-pull-request-head); no required reviewer, main only): `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (dedicated deploy keys, rotated when someone leaves may-app), `MAY_APP_PR_READ_TOKEN` (may-app pull requests: read, short-lived) and, optionally, `MAY_APP_PR_COMMENT_TOKEN` (may-app pull requests: read and write; [the compile's errors on the pull request](#the-compiles-errors-on-the-pull-request)). Each is bound in exactly one step.
   - Optional secret `MAY_POSTHOG_ANDROID_KEY`: PostHog's project key for Android crash reports (`phc_` then letters, digits, `_` and `-`). Only the Android build step receives it; every other step refuses it (`store.SECRET_NAMES`). This one environment builds both May and May Playground, so both apps report to the same PostHog project.
   - Optional variable `MAY_POSTHOG_HOST`: `https://eu.i.posthog.com` for a project on PostHog's EU cloud; unset means `https://us.i.posthog.com`. `store.py` refuses any other host, and the build step's public line names the host reports will go to.
   - Who sets them: only Samuel, and only in `may-native-compile`. GitHub resolves a variable or secret from the environment first, then the repository, then the organization, so a repository- or organization-level `MAY_POSTHOG_ANDROID_KEY` or `MAY_POSTHOG_HOST` would otherwise count. Don't create either at those levels. The host allowlist limits what a stray value can do, but a stray key would still send crash reports to another PostHog project.
@@ -415,10 +415,12 @@ gh workflow run native-compile-pr.yml -f pr_number=<may-app PR number> -f source
 
   The public line then names the pull request, its author and the dispatcher (GitHub logins only, otherwise `unknown`), so a run is attributable.
 - **The fetch** (`prepare.py --pr-number`) fetches `refs/pull/<number>/head`, requires it to be exactly `source_sha`, and checks out that commit. The design-system pin is checked as for every build.
-- **The compile** builds `MayPlayground` for the iOS Simulator, Release, `CODE_SIGNING_ALLOWED=NO`.
+- **The compile** (`compile.py --record-outcome`, no `env` at all) builds `MayPlayground` for the iOS Simulator, Release, `CODE_SIGNING_ALLOWED=NO`. A failure of the build itself (XcodeGen or `xcodebuild`) is recorded in a private file and does not fail this step, so the post can report it; every check before the build (keys on disk, secrets, Xcode, XcodeGen's hash, free space) still fails here. `native-compile-draft.yml` runs `compile.py` without the flag and is unchanged.
+- **The post** (`compile_pr_errors.py`, `MAY_APP_PR_COMMENT_TOKEN` alone) puts the compile's errors on the pull request; see below. A failed compile then fails the job.
 - **What the job holds, and why that is enough:** on one GitHub-hosted macOS job, everything the job references is available to the pull request's build code (XcodeGen, SwiftPM and Xcode build phases run it). The runner gives the job's user passwordless `sudo`, and GitHub hands the runner every secret the job references when the job starts. So the design goal is that the job holds **nothing a may-app writer doesn't already have**:
   - two read-only deploy keys (may-app, may-design-system);
   - a pull-request read token;
+  - a pull-request comment token (may-app pull requests: read and write), once Samuel adds it;
   - the job's read-only `GITHUB_TOKEN`.
 
   Only same-repo heads are admitted, so the author already holds that code and those repos. What the steps add is hygiene against accidents, not a boundary against a malicious pull request:
@@ -431,6 +433,19 @@ gh workflow run native-compile-pr.yml -f pr_number=<may-app PR number> -f source
   - **No Actions cache in any workflow:** `static_check.py` refuses `actions/cache` and `cache:` inputs. The runner's own token can write cache entries, and with nothing reading them that reaches nothing.
 - **What reaches the public log:** this repository's tools print only fixed lines, `xcodebuild` writes to a private log that the cleanup deletes, and nothing is uploaded. A pull request's own build code can still write to the run (its step summary, for one). That is its author publishing code they already hold, not something this workflow can stop.
 
+#### The compile's errors on the pull request
+
+The compile's log stays private, so on its own a failed run says only that it failed. The post step gives the lane the reason, the same way `ds-swift-compile.yml` does for may-design-system (it reuses `ds_compile.py`'s extraction, redaction, dedupe, cap, fence, marker and comment loop):
+
+- It takes `MAY_APP_PR_COMMENT_TOKEN` out of its environment at once and refuses to run if any other known secret is present. The compile step before it holds no secret, so the pull request's build code never sees this token in its environment.
+- **Without the token** (until Samuel adds it) it posts nothing, prints the one fixed line `May iOS compile: MAY_APP_PR_COMMENT_TOKEN is not set in may-native-compile-pr; no comment posted`, and passes or fails the job with the compile. The workflow works as before.
+- From the private log it keeps only `<path>:<line>:<col>: error: <message>` lines whose path is inside the may-app checkout, rewritten repo-relative. It drops warnings, notes, source and caret lines, and errors outside the checkout (derived data, the SDK, packages). It also drops errors in the design system that `prepare.py` checks out inside it (`android/build-deps/`), which `ds-swift-compile.yml` reports. Token-shaped text becomes `[redacted]`, and a body holding the token in any spelling is refused. It dedupes, posts at most 100 and counts the rest.
+- It checks the checkout is still `source_sha`, then reads the pull request again (open, against may-app `main`, from may-app itself, head still `source_sha`). It reads up to 10 pages of its comments and posts nothing if one already carries `<!-- may-ios-compile-pr head=<sha> -->`. Otherwise it posts **one** comment, with the head SHA, Xcode, the scheme, this run's URL, the marker and the footer. A passing compile posts that it compiles, as ds-compile does.
+- It can reach only `GET /repos/May-Assistant/may-app/pulls/<number>`, `GET …/issues/<number>/comments?per_page=100&page=<1–10>` and `POST …/issues/<number>/comments`. Any other method or path is refused before a request is made.
+- **What reaches the public log:** fixed lines, the pull request number and the number of errors, for example `May iOS compile failed; 12 errors posted to may-app #42`. There is no step summary, output, artifact or cache. `static_check.py` pins the step (its command, its one secret, no `GH_TOKEN`, no condition or `continue-on-error`, a compile with no `env`). It also lints `compile_pr_errors.py` with the same output rules as `ds_compile.py`: each `print` is a literal or carries only the number, the count and the Xcode version, exits are fixed messages, and stdout, descriptors, dynamic lookups and logging are refused.
+- **Residual risk (the same as the compile's):** the build runs the pull request's own code on the same runner before the post. That code cannot read the token from its environment, but with the runner's `sudo` it could change the files the post step later runs (this repository's checkout, Python), or write a fake log or outcome. So treat the token as available to a may-app writer. It is scoped so that this gives them nothing new: may-app only, pull requests read and write, which every may-app writer already has. Hosted runners are discarded after the job. Popping the token clears only Python's copy: code left running by the build could still read it from the post step's process, so rotate it if a may-app writer leaves (security review of 2cf86ce, #1).
+- **What the post's result can and can't prove:** the outcome file and log are written while the pull request's code runs, so a hostile build can make this job pass, post "passed", or leave its log as a link (only a regular file is read). The local checkout's head check is a sanity check for the same reason; the pull request's head, read again over the API, is the check that counts. Don't let a merge rest on this job alone: it shows errors to the author, it doesn't certify code (security review of 2cf86ce, #2, #6).
+
 **What Samuel sets up before the first run** (admission denies until then). Create **environment `may-native-compile-pr`** with:
 - **no required reviewers**;
 - administrator bypass off (**Allow administrators to bypass** unchecked);
@@ -439,7 +454,8 @@ gh workflow run native-compile-pr.yml -f pr_number=<may-app PR number> -f source
 Its secrets, and nothing else:
 - `MAY_APP_READ_KEY`: a **new** read-only deploy key on may-app;
 - `MAY_DS_READ_KEY`: a **new** read-only deploy key on may-design-system;
-- `MAY_APP_PR_READ_TOKEN`: may-app only, Pull requests: read and Metadata: read, short-lived (see above).
+- `MAY_APP_PR_READ_TOKEN`: may-app only, Pull requests: read and Metadata: read, short-lived (see above);
+- `MAY_APP_PR_COMMENT_TOKEN` (**new, optional**; the workflow runs without it and posts nothing): a fine-grained personal access token, resource owner May-Assistant, **only** the may-app repository, **Pull requests: Read and write** (Metadata: read is always included), expiring **15 Nov** like the others. Comments appear under its owner's account.
 
 No repository secret is needed.
 

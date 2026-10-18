@@ -1,10 +1,16 @@
 """No-signing, no-store native compile on a protected cloud runner.
 
 Every tool writes to a private runner log. Public output is a fixed pass/fail line.
+
+With --record-outcome (native-compile-pr.yml alone, iOS alone), a failure of the build itself (XcodeGen or
+xcodebuild exiting non-zero, or not starting) does not fail this step: the outcome is written to a private file
+(OUTCOME) and compile_pr_errors.py, the next step, posts the errors on the may-app pull request and then fails the
+job. Every check before the build (Xcode, XcodeGen's hash, free space, keys on disk, secrets) still fails here.
 """
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -56,10 +62,16 @@ def credentials_left(private):
     return any(path.is_file() and (path.suffix == ".key" or path.name == "known_hosts") for path in private.rglob("*"))
 
 
-def compile_native(platform, target=None):
+# The PR compile's recorded outcome, in may-private: {"result": "passed" | "failed"} (compile_pr_errors.py reads it).
+OUTCOME = "ios-compile-result.json"
+
+
+def compile_native(platform, target=None, record=False):
     # The compile runs third-party build code (XcodeGen, SwiftPM, Xcode, and for a pull request its
     # own build scripts) and holds no secret at all: not in its environment, not on disk.
     require_step_secrets(())
+    if record and platform != "ios":
+        raise CompileError("Only the iOS compile records its outcome")
     root = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
     source, private = root / "may-source", root / "may-private"
     if not os.environ.get("RUNNER_TEMP") or not source.is_dir() or not private.is_dir():
@@ -86,13 +98,25 @@ def compile_native(platform, target=None):
             raise CompileError("Pinned XcodeGen download hash differs")
         binary = extract_generator(archive, private / "xcodegen")
         env["PATH"] = str(binary.parent) + os.pathsep + env.get("PATH", "")
-        run([str(binary), "generate"], log, cwd=source / "ios", env=env)
-        for scheme in IOS_SCHEMES[target]:
-            run(["xcodebuild", "-project", str(source / "ios/May.xcodeproj"), "-scheme", scheme,
-                 "-configuration", "Release", "-destination", "generic/platform=iOS Simulator",
-                 "-derivedDataPath", str(root / "may-derived"),
-                 "-clonedSourcePackagesDirPath", str(root / "may-packages"),
-                 "CODE_SIGNING_ALLOWED=NO", "build"], log, env=env)
+        if record:
+            (private / OUTCOME).unlink(missing_ok=True)
+        try:
+            run([str(binary), "generate"], log, cwd=source / "ios", env=env)
+            for scheme in IOS_SCHEMES[target]:
+                run(["xcodebuild", "-project", str(source / "ios/May.xcodeproj"), "-scheme", scheme,
+                     "-configuration", "Release", "-destination", "generic/platform=iOS Simulator",
+                     "-derivedDataPath", str(root / "may-derived"),
+                     "-clonedSourcePackagesDirPath", str(root / "may-packages"),
+                     "CODE_SIGNING_ALLOWED=NO", "build"], log, env=env)
+            passed = True
+        except (CompileError, OSError, subprocess.SubprocessError):
+            if not record:
+                raise
+            passed = False
+        if record:
+            (private / OUTCOME).write_text(json.dumps({"result": "passed" if passed else "failed"}))
+            print("Protected May iOS compile finished; its outcome and log stay in this runner's private files")
+            return
     elif platform == "android":
         env = os.environ.copy()
         env["GRADLE_USER_HOME"] = str(root / "may-gradle")
@@ -109,8 +133,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", choices=("ios", "android"), required=True)
     parser.add_argument("--target", choices=("production", "playground"))
+    parser.add_argument("--record-outcome", action="store_true")
     args = parser.parse_args()
     try:
-        compile_native(args.platform, args.target)
+        compile_native(args.platform, args.target, args.record_outcome)
     except (CompileError, StoreError, OSError, subprocess.SubprocessError, zipfile.BadZipFile):
         raise SystemExit("Protected May native compile failed; private logs were not published") from None

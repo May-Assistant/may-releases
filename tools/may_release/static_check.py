@@ -21,7 +21,7 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
-                  "DsCompileError"}
+                  "DsCompileError", "CompilePrError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -718,23 +718,31 @@ GATE_COMPILE_PR = ('python3 -I -S -B tools/may_release/gate.py --action compile-
 GATE_CHECK_PULL = GATE_COMPILE_PR + " --check-pull"
 PREPARE_IOS_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha '
                   '"$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"')
-COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL, PREPARE_IOS_PR, COMPILE_IOS, COMPILE_CLEANUP]
+# The compile records its outcome privately (--record-outcome) and the post (compile_pr_errors.py, the comment token
+# alone) puts its errors on the may-app pull request, never in this log (compile_pr_errors_print_problems).
+COMPILE_IOS_PR = COMPILE_IOS + " --record-outcome"
+POST_PR = ('python3 -I -S -B tools/may_release/compile_pr_errors.py --source-sha "$MAY_SOURCE_SHA" '
+           '--pr-number "$MAY_PR_NUMBER"')
+COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL, PREPARE_IOS_PR, COMPILE_IOS_PR, POST_PR, COMPILE_CLEANUP]
 COMPILE_PR_STEP_NAMES = ["Check the pull request head and environment before fetching",
                          "Fetch the pull request head and pinned design system quietly",
-                         "Compile without signing, store access or any credential", "Remove private source, logs and products"]
-PR_READ_SECRET = "MAY_APP_PR_READ_TOKEN"
+                         "Compile without signing, store access or any credential",
+                         "Post the errors on the may-app pull request, never in this log",
+                         "Remove private source, logs and products"]
+PR_READ_SECRET, PR_COMMENT_SECRET = "MAY_APP_PR_READ_TOKEN", "MAY_APP_PR_COMMENT_TOKEN"
 COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), (PR_READ_SECRET, "${{ secrets." + PR_READ_SECRET + " }}")} | \
-    {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS}
+                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)}
 
 
 def compile_pr_workflow_problems(text):
     """The pull-request compile is exactly: dispatch with a pull request number and its head, read-only, admission then
-    native in its own environment, the PR token in the gates alone, the source-read keys in the fetch alone, and
-    nothing run but its five commands."""
+    native in its own environment, the PR token in the gates alone, the source-read keys in the fetch alone, nothing
+    on the compile, the comment token in the post alone, and nothing run but its six commands."""
     name = "native-compile-pr.yml"
     found = []
     if "toolchain.py jdk" in text or "--platform android" in text or "upload-artifact" in text or \
+            "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or \
             "    runs-on: macos-15\n" not in job_text(text, "native") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission"):
         found.append(name + ": is not the iOS-only May Playground compile with no artifact")
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
@@ -753,16 +761,16 @@ def compile_pr_workflow_problems(text):
         found.append(name + ": jobs are not exactly admission and native")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
     if runs != COMPILE_PR_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
-        found.append(name + ": runs something other than the gate, the fetch, the compile and the cleanup")
+        found.append(name + ": runs something other than the gate, the fetch, the compile, the post and the cleanup")
     steps = {job: job_steps(text, job)[1] for job in ("admission", "native")}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
     names = [step for step, _ in steps["native"]]
     cleanup = steps["native"][-1][1] if steps["native"] else ""
-    if leading != {"admission": ["uses", "id"], "native": ["uses", "name", "name", "name", "name"]} or \
+    if leading != {"admission": ["uses", "id"], "native": ["uses"] + ["name"] * len(COMPILE_PR_STEP_NAMES)} or \
             names != [""] + COMPILE_PR_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
             uses_in(text) != [CHECKOUT, CHECKOUT]:
-        found.append(name + ": native's steps are not exactly the recheck, fetch, compile and an always-run cleanup")
-    if re.search(r"(?m)^\s*(defaults|shell|if):", text.replace("        if: always()\n", "")) or \
+        found.append(name + ": native's steps are not exactly the recheck, fetch, compile, post and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
             text.count("timeout-minutes:") != 1 or "    timeout-minutes: 90\n" not in job_text(text, "native"):
         found.append(name + ": sets a shell, defaults, a condition or a timeout other than native's 90 minutes")
     native = job_text(text, "native")
@@ -770,15 +778,17 @@ def compile_pr_workflow_problems(text):
             "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + ": native's environment is not the one admission chose, after admission")
     by_name = dict(steps["native"])
-    fetch, recheck = by_name.get(COMPILE_PR_STEP_NAMES[1], ""), by_name.get(COMPILE_PR_STEP_NAMES[0], "")
-    later = by_name.get(COMPILE_PR_STEP_NAMES[2], "") + by_name.get(COMPILE_PR_STEP_NAMES[3], "")
-    # Each secret is bound exactly once: the PR token in the pull request check, so never in admission too (review of #18, M2).
-    if secrets_in(text) != set(COMPILE_SECRETS) | {PR_READ_SECRET} or \
-            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS + (PR_READ_SECRET,)) or \
-            secrets_in(fetch) != set(COMPILE_SECRETS) or \
-            secrets_in(recheck) != {PR_READ_SECRET} or secrets_in(later) or "env:" in later or \
+    recheck, fetch, build, post, clean = (by_name.get(n, "") for n in COMPILE_PR_STEP_NAMES)
+    later = build + clean
+    # Each secret is bound exactly once: the PR token in the pull request check, so never in admission too (review of
+    # #18, M2); the comment token in the post alone, which runs after the pull request's build code.
+    if secrets_in(text) != set(COMPILE_SECRETS) | {PR_READ_SECRET, PR_COMMENT_SECRET} or \
+            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(post) != {PR_COMMENT_SECRET} or \
+            secrets_in(recheck) != {PR_READ_SECRET} or secrets_in(later) or "env:" in later or "GH_TOKEN" in post or \
             any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
-        found.append(name + ": a secret or env entry other than the pull request check's PR token and the fetch step's two source-read keys")
+        found.append(name + ": a secret or env entry other than the pull request check's PR token, the fetch step's two "
+                     "source-read keys and the post's comment token")
     if "GITHUB_ENV" in text or "GITHUB_PATH" in text or "${{ inputs." in "\n".join(runs):
         found.append(name + ": carries values to later steps or interpolates inputs into shell")
     return found
@@ -882,6 +892,11 @@ DS_OS_CALLS = {"system", "popen", "fdopen", "dup", "dup2", "write", "_exit", "op
 DS_QUIET_MODULES = {"logging", "warnings", "traceback", "faulthandler", "pdb", "pprint", "code", "pty", "cgitb", "ctypes",
                     "builtins", "io"}
 DS_EXIT_CLASSES = {"GateDenial", "DsCompileError", "StoreError"}
+# compile_pr_errors.py (native-compile-pr.yml's post) is held to the same rules: it prints only the pull request
+# number, int(total) and the pinned Xcode version, and exits with its own, ds_compile's or the store's fixed messages.
+COMPILE_PR_ERRORS = "compile_pr_errors.py"
+COMPILE_PR_PRINT_VALUES = {"number", "int(total)", "XCODE"}
+COMPILE_PR_EXIT_CLASSES = {"GateDenial", "CompilePrError", "DsCompileError", "StoreError"}
 
 
 def ds_process_streams_ok(call):
@@ -896,7 +911,7 @@ def ds_process_streams_ok(call):
                for name in ("stdout", "stderr"))
 
 
-def ds_exit_ok(argument, handlers):
+def ds_exit_ok(argument, handlers, classes=DS_EXIT_CLASSES):
     """A literal, or "literal" + <name>.args[0] where <name> is bound by an `except` of the printed error classes."""
     if argument is None or isinstance(argument, ast.Constant) and isinstance(argument.value, (str, int)):
         return True
@@ -908,13 +923,22 @@ def ds_exit_ok(argument, handlers):
             name = right.value.value.id
             for handler in handlers:
                 types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
-                if handler.name == name and types and all(called_name(t) in DS_EXIT_CLASSES for t in types):
+                if handler.name == name and types and all(called_name(t) in classes for t in types):
                     return True
     return False
 
 
 def ds_compile_print_problems(root):
-    path = root / "tools/may_release/ds_compile.py"
+    return quiet_tool_problems(root, "ds_compile.py", DS_PRINT_VALUES, DS_EXIT_CLASSES)
+
+
+def compile_pr_errors_print_problems(root):
+    return quiet_tool_problems(root, COMPILE_PR_ERRORS, COMPILE_PR_PRINT_VALUES, COMPILE_PR_EXIT_CLASSES)
+
+
+def quiet_tool_problems(root, filename, print_values, exit_classes):
+    """The output lint above, for one tool that handles private source in this public log."""
+    path = root / "tools/may_release" / filename
     tree = ast.parse(path.read_text())
     found = []
     parents, handlers = {}, {}
@@ -931,7 +955,7 @@ def ds_compile_print_problems(root):
         return chain
 
     def flag(node, what):
-        found.append(f"ds_compile.py:{getattr(node, 'lineno', 0)}: {what}")
+        found.append(f"{filename}:{getattr(node, 'lineno', 0)}: {what}")
 
     for node in ast.walk(tree):
         parent = parents.get(node)
@@ -939,7 +963,7 @@ def ds_compile_print_problems(root):
             ok = not node.keywords and len(node.args) == 1 and (
                 (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)) or
                 (isinstance(node.args[0], ast.JoinedStr) and all(
-                    isinstance(v, ast.Constant) or (isinstance(v, ast.FormattedValue) and ast.unparse(v.value) in DS_PRINT_VALUES
+                    isinstance(v, ast.Constant) or (isinstance(v, ast.FormattedValue) and ast.unparse(v.value) in print_values
                                                     and v.format_spec is None)
                     for v in node.args[0].values)))
             if not ok:
@@ -971,7 +995,7 @@ def ds_compile_print_problems(root):
             exits = node.args[0] if node.args else None
             if node.keywords or len(node.args) > 1:
                 exits = ast.Name("not-a-literal")
-        if exits is not None and not ds_exit_ok(exits, enclosing_handlers(node)):
+        if exits is not None and not ds_exit_ok(exits, enclosing_handlers(node), exit_classes):
             flag(node, "exits with a message that is not a fixed literal")
         if isinstance(node, ast.Attribute) and node.attr in ("stdout", "stderr", "__stdout__", "__stderr__", "__displayhook__",
                                                              "displayhook", "excepthook") and \
@@ -1149,6 +1173,7 @@ def control_problems(root):
     found += review_tool_problems(root)
     found += ds_compile_workflow_problems((flows / DS_COMPILE).read_text())
     found += ds_compile_print_problems(root)
+    found += compile_pr_errors_print_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

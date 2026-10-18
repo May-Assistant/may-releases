@@ -288,8 +288,8 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
 
     def test_each_widening_is_flagged(self):
         name = "native-compile-pr.yml: "
-        secret = name + "a secret or env entry other than the pull request check's PR token and the fetch step's two source-read keys"
-        runs = name + "runs something other than the gate, the fetch, the compile and the cleanup"
+        secret = name + "a secret or env entry other than the pull request check's PR token, the fetch step's two source-read keys and the post's comment token"
+        runs = name + "runs something other than the gate, the fetch, the compile, the post and the cleanup"
         compile_step = "      - name: Compile without signing, store access or any credential\n"
         fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
         cases = {
