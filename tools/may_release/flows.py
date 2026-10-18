@@ -73,6 +73,12 @@ FLOWS = {
     "report-bug": "ReportBugFlow",
     "files-off": "TaskFilesOffFlow",
     "computer-resting": "ComputerRestingFlow",
+    # Build 13 (may-app android/flows README, flows 18-21): over the real controller and the app's sealed stores, with
+    # core's in-memory FakeBackend as the server.
+    "new-account-confirm": "NewAccountConfirmFlow",
+    "thread-reply-reconnect": "ThreadReplyReconnectFlow",
+    "draft-kill": "DraftKillFlow",
+    "sign-out-queued": "SignOutQueuedFlow",
 }
 # may-app's android/flows/manifest.txt: one "ClassName count" line per flow class. A run's results must match it
 # exactly for the classes it ran: every listed test reported once, nothing missing, added or unlisted.
