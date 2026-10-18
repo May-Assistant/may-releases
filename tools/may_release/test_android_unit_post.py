@@ -176,15 +176,22 @@ class BreakdownTests(Fixture):
         return self.fake(gradle=1, suites={"core": list(reports), "playground": [junit(5)], "production": [junit(2)]})
 
     def test_failing_core_cases_are_located_by_numbers_alone(self):
-        quiet = self.core(junit(3, name="io.x.core.BTest"), failing_report("x", name="io.x.core.ATest"),
-                          failing_report("x", name="io.x.core.CTest", kind="error"))
-        out, error = self.run_breakdown(quiet)
-        self.assertIsNone(error)
-        lines = [line for line in out.splitlines() if "report" in line]
-        self.assertEqual(lines, ["May Android unit suite core: report 1 of 3 by class name, test case 2 of 2 failed",
-                                 "May Android unit suite core: report 3 of 3 by class name, test case 2 of 2 failed"])
+        lines = self.located({"TEST-io.x.core.CTest.xml": junit(3, name="io.x.core.CTest"),
+                              "TEST-io.x.core.ATest.xml": failing_report("x", name="io.x.core.ATest"),
+                              "TEST-io.x.core.BTest.xml": failing_report("x", name="io.x.core.BTest", kind="error")})
+        out = self.out
+        self.assertEqual(lines, ["May Android unit suite core: report 1 of 3 by class name, test case 2 of 2 by name failed",
+                                 "May Android unit suite core: report 2 of 3 by class name, test case 2 of 2 by name failed"])
+        self.assertTrue((self.root / "may-private" / android_unit.OUTCOME).is_file(), "the outcome is written first")
         for private in ("ATest", "CTest", "io.x.core", SECRET_TEXT, "shows the private screen"):
             self.assertNotIn(private, out)
+
+    def test_the_outcome_is_written_before_the_breakdown_runs(self):
+        def broken(source):
+            raise RuntimeError("breakdown failed")
+        with patch.object(android_unit, "core_breakdown", broken), self.assertRaises(RuntimeError):
+            self.run_breakdown(self.core(failing_report("x", name="io.x.core.ATest")))
+        self.assertTrue((self.root / "may-private" / android_unit.OUTCOME).is_file())
 
     def test_it_is_off_unless_asked_and_says_so_when_nothing_failed(self):
         quiet = self.core(failing_report("x", name="io.x.core.ATest"))
@@ -198,12 +205,51 @@ class BreakdownTests(Fixture):
     def test_it_also_runs_without_record_outcome(self):
         out, error = self.run_breakdown(self.core(failing_report("x", name="io.x.core.ATest")), record=False)
         self.assertEqual(error, "At least one May Android unit suite did not pass")
-        self.assertIn("report 1 of 1 by class name, test case 2 of 2 failed", out)
+        self.assertIn("report 1 of 1 by class name, test case 2 of 2 by name failed", out)
 
-    def test_an_unreadable_report_is_left_out_of_the_order(self):
-        quiet = self.core("<!DOCTYPE x><testsuite name='io.x.core.ATest'/>", failing_report("x", name="io.x.core.BTest"))
-        out, _ = self.run_breakdown(quiet)
-        self.assertIn("report 1 of 1 by class name, test case 2 of 2 failed", out)
+    def write_core(self, files):
+        """Core reports under the given file names, as Gradle names them (TEST-<class>.xml)."""
+        folder = self.root / "may-source/android" / android_unit.SUITES["core"][1]
+        folder.mkdir(parents=True, exist_ok=True)
+        for file_name, text in files.items():
+            (folder / file_name).write_text(text)
+
+    def located(self, files):
+        def quiet(argv, log, **_):
+            if argv[0] == "./gradlew":
+                self.write_core(files)
+                for name in ("playground", "production"):
+                    self.reports(**{name: [junit(2)]})
+                return 1
+            return 0
+        self.out, _ = self.run_breakdown(quiet)
+        return [line for line in self.out.splitlines()
+                if line.startswith("May Android unit suite core: ") and ("locate" in line or "by class name" in line or "could not" in line)]
+
+    def test_an_unreadable_report_keeps_its_place_and_is_counted(self):
+        lines = self.located({"TEST-io.x.core.ATest.xml": "<!DOCTYPE x><testsuite name='io.x.core.ATest'/>",
+                              "TEST-io.x.core.BTest.xml": failing_report("x", name="io.x.core.BTest")})
+        self.assertEqual(lines, ["May Android unit suite core: report 2 of 2 by class name, test case 2 of 2 by name failed",
+                                 "May Android unit suite core: 1 of 2 reports could not be read, so their failing test cases are not located"])
+
+    def test_reports_rank_by_file_name_and_cases_by_name_not_run_order(self):
+        # Run order puts the failing case second; by name ("a fails" < "passes") it is first.
+        lines = self.located({"TEST-io.x.core.ZTest.xml": junit(1, name="io.x.core.ZTest"),
+                              "TEST-io.x.core.ATest.xml": failing_report("x", name="io.x.core.ATest", method="a fails")})
+        self.assertEqual(lines, ["May Android unit suite core: report 1 of 2 by class name, test case 1 of 2 by name failed"])
+
+    def test_core_that_did_not_run_and_too_many_reports_say_so(self):
+        out, _ = self.run_breakdown(self.fake(timeout=True))
+        self.assertIn("May Android unit suite core: no report to locate failing test cases in (core did not run)", out)
+        self.write_core({"TEST-a.xml": junit(1), "TEST-b.xml": failing_report("x")})
+        parsed = []
+        with patch.object(android_unit, "MAX_REPORTS", 1), patch.object(android_unit, "parsed_report", parsed.append):
+            result = android_unit.core_breakdown(self.root / "may-source")
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                android_unit.print_breakdown(result)
+        self.assertEqual((result, parsed), (([], 2, 2), []), "no report is parsed past the cap")
+        self.assertEqual(out.getvalue(), "May Android unit suite core: too many reports to locate failing test cases in\n")
 
     def test_at_most_max_breakdown_lines(self):
         quiet = self.core(*[failing_report("x", name=f"io.x.core.T{n:02d}Test") for n in range(5)])

@@ -1009,7 +1009,7 @@ def android_unit_workflow_problems(text):
 
 UNIT_TOOL = "android_unit.py"
 UNIT_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(failed)", "int(skipped)", "int(index)", "int(count)",
-                     "int(case)", "int(cases)"}
+                     "int(case)", "int(cases)", "int(unreadable)"}
 UNIT_EXIT_CLASSES = {"UnitTestsError", "StoreError"}
 
 

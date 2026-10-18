@@ -22,9 +22,11 @@ request and then fails the job. Every check before Gradle (secrets, the pinned J
 committed results) still fails here. The failing tests are never printed.
 
 With --core-breakdown true (the dispatch's core_breakdown input), each failing core test is also located by numbers
-alone: the 1-based index of its report among the core reports sorted by class name, out of how many, and its
-1-based position among that report's test cases. Anyone with the same may-app commit maps them to a class and
-method; no name reaches this log, and none goes into a dispatch input either (those are public too).
+alone: the 1-based index of its report among every core TEST-<class>.xml sorted by file name (readable or not), out of
+how many, and its 1-based position among that report's test cases sorted by name. Both orders come from the
+source: anyone with the same may-app commit lists its test classes and their methods (with any parameterized or
+generated case names, which only a local run's reports show) to map them. No name reaches this log, and none goes
+into a dispatch input either (those are public too).
 """
 
 import argparse
@@ -235,27 +237,46 @@ def parsed_report(report):
 
 
 def core_breakdown(source):
-    """[(index, count, case, cases)] for each failing core test case, at most MAX_BREAKDOWN: index is its report's
-    1-based place among the core reports sorted by class name, out of count; case its 1-based place among that
-    report's test cases, out of cases. An unreadable report is left out of the order, so count says how many were read."""
+    """(found, count, unreadable), or None when core left no report. found holds (index, count, case, cases) for each
+    failing core test case, at most MAX_BREAKDOWN of them. index is its report's 1-based place among every core
+    TEST-*.xml sorted by file name (TEST-<class>.xml, so by class name), readable or not, out of count. case is its
+    1-based place among that report's test cases sorted by name (never run order), out of cases. Unreadable reports
+    keep their place, are counted, and are not looked into. More than MAX_REPORTS reports is refused as one fixed line."""
     folder = source / "android" / SUITES["core"][1]
     if folder.is_symlink() or not folder.is_dir():
-        return []
-    trees = [parsed_report(r) for r in sorted(folder.iterdir()) if r.name.startswith("TEST-") and r.name.endswith(".xml")]
-    trees = sorted((tree for tree in trees if tree is not None), key=lambda tree: tree.get("name") or "")
-    found = []
-    for index, tree in enumerate(trees, 1):
-        cases = list(tree.iter("testcase"))
+        return None
+    reports = sorted(r for r in folder.iterdir() if r.name.startswith("TEST-") and r.name.endswith(".xml"))
+    if not reports:
+        return None
+    if len(reports) > MAX_REPORTS:
+        return [], len(reports), len(reports)
+    found, unreadable = [], 0
+    for index, report in enumerate(reports, 1):
+        tree = parsed_report(report)
+        if tree is None:
+            unreadable += 1
+            continue
+        cases = sorted(tree.iter("testcase"), key=lambda element: element.get("name") or "")
         for case, element in enumerate(cases, 1):
             if any(child.tag in ("failure", "error") for child in element) and len(found) < MAX_BREAKDOWN:
-                found.append((index, len(trees), case, len(cases)))
-    return found
+                found.append((index, len(reports), case, len(cases)))
+    return found, len(reports), unreadable
 
 
-def print_breakdown(found):
+def print_breakdown(result):
+    if result is None:
+        print("May Android unit suite core: no report to locate failing test cases in (core did not run)")
+        return
+    found, count, unreadable = result
+    if count > MAX_REPORTS:
+        print("May Android unit suite core: too many reports to locate failing test cases in")
+        return
     for index, count, case, cases in found:
         print(f"May Android unit suite core: report {int(index)} of {int(count)} by class name, "
-              f"test case {int(case)} of {int(cases)} failed")
+              f"test case {int(case)} of {int(cases)} by name failed")
+    if unreadable:
+        print(f"May Android unit suite core: {int(unreadable)} of {int(count)} reports could not be read, "
+              "so their failing test cases are not located")
     if not found:
         print("May Android unit suite core: no failing test case to locate")
 
@@ -335,9 +356,9 @@ def run_suites(source_sha, record=False, breakdown="false"):
         passed = True
     except UnitTestsError:
         passed = False
+    record_outcome(private, source, results, gradle, passed)
     if breakdown == "true":
         print_breakdown(core_breakdown(source))
-    record_outcome(private, source, results, gradle, passed)
     print("May Android unit suites finished; any failing tests stay in this runner's private files for the next step")
 
 
