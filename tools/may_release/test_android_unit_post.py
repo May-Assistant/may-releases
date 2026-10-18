@@ -160,6 +160,66 @@ class RecordTests(Fixture):
         self.assertEqual((len(failed["failures"]), failed["total"]), (3, 5))
 
 
+class BreakdownTests(Fixture):
+    def run_breakdown(self, quiet, breakdown="true", record=True):
+        out = io.StringIO()
+        with patch.dict(os.environ, self.environ, clear=True), patch("sys.stdout", out), \
+                patch.object(android_unit, "quiet", quiet), patch.object(android_unit, "install_sdk", lambda *a: None), \
+                patch.object(android_unit, "pinned_java_home", lambda: self.jdk):
+            try:
+                android_unit.run_suites(self.sha, record=record, breakdown=breakdown)
+            except android_unit.UnitTestsError as error:
+                return out.getvalue(), error.args[0]
+        return out.getvalue(), None
+
+    def core(self, *reports):
+        return self.fake(gradle=1, suites={"core": list(reports), "playground": [junit(5)], "production": [junit(2)]})
+
+    def test_failing_core_cases_are_located_by_numbers_alone(self):
+        quiet = self.core(junit(3, name="io.x.core.BTest"), failing_report("x", name="io.x.core.ATest"),
+                          failing_report("x", name="io.x.core.CTest", kind="error"))
+        out, error = self.run_breakdown(quiet)
+        self.assertIsNone(error)
+        lines = [line for line in out.splitlines() if "report" in line]
+        self.assertEqual(lines, ["May Android unit suite core: report 1 of 3 by class name, test case 2 of 2 failed",
+                                 "May Android unit suite core: report 3 of 3 by class name, test case 2 of 2 failed"])
+        for private in ("ATest", "CTest", "io.x.core", SECRET_TEXT, "shows the private screen"):
+            self.assertNotIn(private, out)
+
+    def test_it_is_off_unless_asked_and_says_so_when_nothing_failed(self):
+        quiet = self.core(failing_report("x", name="io.x.core.ATest"))
+        out, _ = self.run_breakdown(quiet, breakdown="false")
+        self.assertNotIn("by class name", out)
+        for _, folder in android_unit.SUITES.values():
+            shutil.rmtree(self.root / "may-source/android" / folder, ignore_errors=True)
+        out, _ = self.run_breakdown(self.fake(suites={n: [junit(3)] for n in android_unit.SUITES}))
+        self.assertIn("May Android unit suite core: no failing test case to locate", out)
+
+    def test_it_also_runs_without_record_outcome(self):
+        out, error = self.run_breakdown(self.core(failing_report("x", name="io.x.core.ATest")), record=False)
+        self.assertEqual(error, "At least one May Android unit suite did not pass")
+        self.assertIn("report 1 of 1 by class name, test case 2 of 2 failed", out)
+
+    def test_an_unreadable_report_is_left_out_of_the_order(self):
+        quiet = self.core("<!DOCTYPE x><testsuite name='io.x.core.ATest'/>", failing_report("x", name="io.x.core.BTest"))
+        out, _ = self.run_breakdown(quiet)
+        self.assertIn("report 1 of 1 by class name, test case 2 of 2 failed", out)
+
+    def test_at_most_max_breakdown_lines(self):
+        quiet = self.core(*[failing_report("x", name=f"io.x.core.T{n:02d}Test") for n in range(5)])
+        with patch.object(android_unit, "MAX_BREAKDOWN", 2):
+            out, _ = self.run_breakdown(quiet)
+        self.assertEqual(sum("by class name" in line for line in out.splitlines()), 2)
+
+    def test_anything_but_true_or_false_is_refused_before_any_tool(self):
+        for value in ("", "yes", "True", "io.x.core.ATest"):
+            with self.subTest(value=value):
+                self.calls = []
+                out, error = self.run_breakdown(self.fake(), breakdown=value)
+                self.assertEqual(error, "core_breakdown must be true or false")
+                self.assertEqual(self.calls, [])
+
+
 def recorded(result="failed", failures=None, total=None, gradle="ok", unreadable=0):
     entries = failures if failures is not None else [
         {"suite": "core", "test": PRIVATE + " > shows", "kind": "failure", "message": SECRET_TEXT,
@@ -361,7 +421,7 @@ class WorkflowTests(unittest.TestCase):
         name = "android-unit-pr.yml: "
         secret = name + "a secret or env entry other than"
         runs = name + "runs something other than the gate"
-        suites = "--source-sha \"$MAY_SOURCE_SHA\" --record-outcome\n"
+        suites = "--source-sha \"$MAY_SOURCE_SHA\" --record-outcome --core-breakdown \"$MAY_CORE_BREAKDOWN\"\n"
         post_env = "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
         suites_step = "      - name: Run the unit suites without any credential, printing only pass or fail and counts\n        env:\n"
         cases = {
@@ -373,13 +433,37 @@ class WorkflowTests(unittest.TestCase):
             "the post without the source SHA": ("          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n          MAY_PR_NUMBER: ${{ inputs.pr_number }}\n"
                                                 "          MAY_APP_PR_COMMENT_TOKEN", "          MAY_PR_NUMBER: ${{ inputs.pr_number }}\n"
                                                 "          MAY_APP_PR_COMMENT_TOKEN", secret),
-            "the suites failing the step": (suites, "--source-sha \"$MAY_SOURCE_SHA\"\n", runs),
+            "the suites failing the step": (suites, "--source-sha \"$MAY_SOURCE_SHA\" --core-breakdown \"$MAY_CORE_BREAKDOWN\"\n", runs),
             "no post": ("      - name: Post the failing tests on the may-app pull request, never in this log\n", "      - name: Gone\n",
                         name + "unit's steps are not exactly"),
         }
         for case, (old, new, message) in cases.items():
             with self.subTest(case=case):
                 self.flagged(WORKFLOW, old, new, message, case)
+
+    def test_the_breakdown_input_is_an_optional_boolean_off_by_default_on_the_suites_alone(self):
+        name = "android-unit-pr.yml: "
+        dispatch = name + "is not dispatched with exactly pr_number, source_sha and an optional core_breakdown boolean"
+        secret = name + "a secret or env entry other than"
+        breakdown_env = "          MAY_CORE_BREAKDOWN: ${{ inputs.core_breakdown }}\n"
+        post_env = "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
+        cases = {
+            "a string input (names)": ("        type: boolean\n", "        type: string\n", dispatch),
+            "on by default": ("        default: false\n", "        default: true\n", dispatch),
+            "required": ("        required: false\n        type: boolean\n", "        required: true\n        type: boolean\n", dispatch),
+            "a second input": ("        default: false\n", "        default: false\n      tests:\n        description: x\n"
+                               "        required: false\n        type: string\n", dispatch),
+            "the breakdown on the post": (post_env, post_env + breakdown_env, secret),
+            "the suites without it": (breakdown_env, "", secret),
+        }
+        for case, (old, new, message) in cases.items():
+            with self.subTest(case=case):
+                self.flagged(WORKFLOW, old, new, message, case)
+
+    def test_the_breakdown_prints_numbers_only(self):
+        line = 'print("May Android unit suite core: no failing test case to locate")'
+        self.flagged("tools/may_release/android_unit.py", line, 'print(f"located {tree}")',
+                     "prints something other than a fixed line", "a printed report element")
 
     def test_the_post_tool_prints_only_fixed_lines_the_number_and_the_count(self):
         posted = 'print(f"May Android unit suites failed; {int(total)} failing tests posted to may-app #{number}")'

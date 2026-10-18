@@ -319,8 +319,8 @@ class WorkflowTests(unittest.TestCase):
             "the JDK exported": ("tools/may_release/toolchain.py jdk\n", "tools/may_release/toolchain.py jdk --export\n", shape),
             "an artifact": ("        if: always()\n", "        if: always()\n      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
                             "        with:\n          name: log\n          path: ${{ runner.temp }}/may-private/\n", shape),
-            "a step summary": ('--source-sha "$MAY_SOURCE_SHA" --record-outcome\n',
-                               '--source-sha "$MAY_SOURCE_SHA" --record-outcome >> "$GITHUB_STEP_SUMMARY"\n', shape),
+            "a step summary": ('--core-breakdown "$MAY_CORE_BREAKDOWN"\n',
+                               '--core-breakdown "$MAY_CORE_BREAKDOWN" >> "$GITHUB_STEP_SUMMARY"\n', shape),
             "the log printed": ("      - name: Remove private source",
                                 "      - name: Show\n        run: cat \"$RUNNER_TEMP/may-private/android-unit.log\"\n"
                                 "      - name: Remove private source", runs),
@@ -337,7 +337,7 @@ class WorkflowTests(unittest.TestCase):
             "a store environment": ("    environment: ${{ needs.admission.outputs.environment }}\n",
                                     "    environment: may-android-playground-internal\n", name + "unit's environment is not the one admission chose"),
             "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n  workflow_dispatch:\n",
-                               name + "is not dispatched with exactly pr_number and source_sha"),
+                               name + "is not dispatched with exactly pr_number, source_sha and an optional core_breakdown boolean"),
             "write permission": ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: write\nconcurrency:",
                                  name + "permissions are not exactly read-only"),
             "a shared concurrency group": ("  group: may-android-unit-pr\n", "  group: may-native-compile-pr\n",
