@@ -1,6 +1,6 @@
 name: May Android unit suites at a may-app pull request head (core, Playground, production; pass or fail and counts only)
 # The pull request number and head SHA only (both public in this log already): android_ci_schedule.py reads it to run a
-# head at most once a day.
+# head once.
 run-name: May Android unit suites for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}
 on:
   workflow_dispatch:

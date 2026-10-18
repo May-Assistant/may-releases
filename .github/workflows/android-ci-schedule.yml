@@ -45,11 +45,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: List the unit runs of the last 24 hours, with no may-app credential
+      - name: List the unit runs of the last 30 days, with no may-app credential
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I -S -B tools/may_release/android_ci_schedule.py runs
-      - name: Pick the oldest may-app head touching Android with no run today, with no GitHub token
+      - name: Pick the oldest may-app head touching Android with no run yet, with no GitHub token
         env:
           MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}
         run: python3 -I -S -B tools/may_release/android_ci_schedule.py pick
