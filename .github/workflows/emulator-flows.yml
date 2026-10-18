@@ -33,7 +33,7 @@ on:
         required: true
         type: choice
         default: all
-        options: [all, chat-reply, task-detail, connections, empty-states, message-menu, sending-status, sign-in, plan-your-day, approvals, onboarding-b]
+        options: [all, chat-reply, task-detail, connections, empty-states, message-menu, sending-status, sign-in, plan-your-day, approvals, onboarding-b, take-notes, voice-notes-off, any-time-event, pin, report-bug, files-off, computer-resting]
 permissions:
   contents: read
 concurrency:
