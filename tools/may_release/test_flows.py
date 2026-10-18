@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import flows
-from flows import FlowsError, admit, environment_exists, overlay, parse_instrumentation
+from flows import FlowsError, admit, environment_exists, overlay, parse_instrumentation, queue
 from gate import GateDenial
 from store import StoreError
 
@@ -49,6 +49,47 @@ class AdmitTest(unittest.TestCase):
                                              (SHA.upper(), OTHER, "all"), (SHA, OTHER, "everything")):
             with self.assertRaises(FlowsError):
                 admit("May-Assistant/may-releases", "refs/heads/main", "workflow_dispatch", source, flows_sha, selection, "false")
+
+
+class QueueTest(unittest.TestCase):
+    def test_no_then_is_the_one_run(self):
+        for then in ("", "  ", None):
+            self.assertEqual(queue(SHA, "all", then), [{"source_sha": SHA, "flows": "all"}])
+
+    def test_then_adds_runs_in_order_split_by_spaces_or_commas(self):
+        self.assertEqual(queue(SHA, "draft-kill", "%s:sign-out-queued, %s:all\n%s:pin" % (OTHER, SHA, OTHER)),
+                         [{"source_sha": SHA, "flows": "draft-kill"}, {"source_sha": OTHER, "flows": "sign-out-queued"},
+                          {"source_sha": SHA, "flows": "all"}, {"source_sha": OTHER, "flows": "pin"}])
+
+    def test_each_queued_run_is_held_to_admissions_checks(self):
+        for then in (OTHER, OTHER + ":", OTHER[:7] + ":all", OTHER.upper() + ":all", OTHER + ":everything",
+                     ":all", OTHER + ":all:x", OTHER + ":all$(id)"):
+            with self.assertRaises(FlowsError, msg=then):
+                queue(SHA, "all", then)
+
+    def test_the_first_run_is_checked_too(self):
+        with self.assertRaises(FlowsError):
+            queue(SHA[:7], "all", "")
+
+    def test_at_most_eight_runs(self):
+        self.assertEqual(len(queue(SHA, "all", " ".join([OTHER + ":all"] * 7))), 8)
+        with self.assertRaises(FlowsError):
+            queue(SHA, "all", " ".join([OTHER + ":all"] * 8))
+
+
+class QueueWorkflowTest(unittest.TestCase):
+    def test_the_flows_job_runs_admissions_runs_one_at_a_time(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/emulator-flows.yml").read_text()
+        job = workflow[workflow.index("\n  flows:\n"):]
+        self.assertIn("      max-parallel: 1\n", job)
+        self.assertIn("      fail-fast: false\n", job)
+        self.assertIn("        include: ${{ fromJSON(needs.admission.outputs.runs) }}\n", job)
+        # The source and flows each run builds come from the admitted matrix, never straight from the inputs.
+        self.assertIn("      MAY_SOURCE_SHA: ${{ matrix.source_sha }}\n", job)
+        self.assertIn("      MAY_FLOWS: ${{ matrix.flows }}\n", job)
+        self.assertNotIn("inputs.source_sha", job)
+        self.assertNotIn("inputs.flows }}", job)
+        self.assertNotIn("inputs.then", job)
 
 
 class DispatchChoicesTest(unittest.TestCase):
