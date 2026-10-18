@@ -204,9 +204,10 @@ def prepare(source_sha, platform=None, target=None, pull=None):
     shutil.move(str(ds_checkout), str(ds_local))
     if head_revision(ds_local) != revision:
         raise PrepareError("Design-system checkout is not the built platform's pinned revision")
-    # project.yml is pointed only at a local checkout of its own pinned revision, and only for a build that reads it
-    # (iOS, or the native compile). An Android build leaves it exactly as committed, even when the pins match: may-app's
-    # own tests read its pin (the design-system pin parity test, run by tools/release/android.sh and android-unit-pr.yml).
+    # project.yml is pointed only at a local checkout of its own pinned revision, and only for a build that reads it:
+    # --platform ios (every native compile, rehearsal and iOS store build passes it), or a call with no platform. An
+    # Android build leaves it exactly as committed, even when the pins match: may-app's own tests read its pin (the
+    # design-system pin parity test, run by tools/release/android.sh and android-unit-pr.yml).
     if platform != "android" and revision == record["ios"]:
         project = project_path.read_text()
         project_path.write_text(project.replace(old_spec, "  MayDesignSystem:\n    path: " + str(ds_local), 1))
