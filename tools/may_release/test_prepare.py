@@ -130,6 +130,16 @@ class PerPlatformPinTests(unittest.TestCase):
         self.assertEqual(record, {"platform": "android", "target": "playground", "source_sha": "a" * 40,
                                   "design_system": {"ios": IOS_PIN, "android": ANDROID_PIN}})
 
+    def test_an_android_run_never_rewrites_ios_project_yml_even_when_the_pins_match(self):
+        # may-app's own tests read ios/project.yml's pin (its design-system pin parity test, which
+        # tools/release/android.sh and android-unit-pr.yml run): an Android run must leave it as committed.
+        for target in ("playground", "production"):
+            with self.subTest(target=target):
+                fetched, record, project = self.run_prepare("android", target, lock=lock_file(IOS_PIN))
+                self.assertEqual(fetched, [IOS_PIN])
+                self.assertEqual(project, project_yml())
+                self.assertEqual(record["design_system"], {"ios": IOS_PIN, "android": IOS_PIN})
+
     def test_internal_ios_run_with_mismatched_pins_builds_the_ios_pin(self):
         fetched, record, project = self.run_prepare("ios", "playground")
         self.assertEqual(fetched, [IOS_PIN])
