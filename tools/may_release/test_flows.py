@@ -174,11 +174,13 @@ class ManifestTest(unittest.TestCase):
 
     def test_reads_may_apps_current_manifest_classes(self):
         # may-app android/flows/manifest.txt with #180 (build 10's PlanYourDayFlow), ApprovalsFlow (build 9's crash),
-        # OnboardingBFlow (#239, build 11's onboarding B) and build 12's seven (may-app docs/evidence/build-12).
+        # OnboardingBFlow (#239, build 11's onboarding B), build 12's seven (may-app docs/evidence/build-12) and build 13's
+        # four (may-app android/flows README, flows 18-21).
         text = "".join(f"{name} 1\n" for name in ("AnyTimeEventFlow", "ApprovalsFlow", "ChatReplyFlow", "ComputerRestingFlow", "ConnectionsFlow",
-                                                  "EmptyStatesFlow", "MessageMenuFlow", "OnboardingBFlow", "PinFlow", "PlanYourDayFlow",
-                                                  "ReportBugFlow", "SendingStatusFlow", "SignInFlow", "TakeNotesFlow", "TaskDetailFlow",
-                                                  "TaskFilesOffFlow", "VoiceNotesOffFlow"))
+                                                  "DraftKillFlow", "EmptyStatesFlow", "MessageMenuFlow", "NewAccountConfirmFlow", "OnboardingBFlow",
+                                                  "PinFlow", "PlanYourDayFlow", "ReportBugFlow", "SendingStatusFlow", "SignInFlow",
+                                                  "SignOutQueuedFlow", "TakeNotesFlow", "TaskDetailFlow", "TaskFilesOffFlow",
+                                                  "ThreadReplyReconnectFlow", "VoiceNotesOffFlow"))
         try:
             read = self.manifest(text)
         except FlowsError as refused:
