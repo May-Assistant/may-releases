@@ -140,6 +140,14 @@ class PerPlatformPinTests(unittest.TestCase):
                 self.assertEqual(project, project_yml())
                 self.assertEqual(record["design_system"], {"ios": IOS_PIN, "android": IOS_PIN})
 
+    def test_an_ios_run_still_points_project_yml_at_the_checkout_when_the_pins_match(self):
+        for target in ("playground", "production"):
+            with self.subTest(target=target):
+                fetched, record, project = self.run_prepare("ios", target, lock=lock_file(IOS_PIN))
+                self.assertEqual(fetched, [IOS_PIN])
+                self.assertIn("  MayDesignSystem:\n    path: ", project)
+                self.assertNotIn(IOS_PIN, project)
+
     def test_internal_ios_run_with_mismatched_pins_builds_the_ios_pin(self):
         fetched, record, project = self.run_prepare("ios", "playground")
         self.assertEqual(fetched, [IOS_PIN])
