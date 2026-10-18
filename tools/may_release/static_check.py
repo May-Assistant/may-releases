@@ -21,7 +21,7 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
-                  "DsCompileError", "CompilePrError"}
+                  "DsCompileError", "CompilePrError", "RehearsalError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -794,6 +794,123 @@ def compile_pr_workflow_problems(text):
     return found
 
 
+# Rehearsal of may-app's tools/release/ios.sh archive-unsigned at an open may-app pull request head
+# (ios-archive-rehearsal.yml, ios_rehearsal.py). The same admission, pull request check, fetch and environment as
+# native-compile-pr.yml (gate.py --action compile-pr, may-native-compile-pr), so it holds nothing that compile does not:
+# the PR read token in the check alone, the two source-read keys in the fetch alone, and no secret on any later step
+# (they run, or run after, the pull request's own build code). It is pinned whole: dispatch with exactly pr_number,
+# source_sha, target and build_number, read-only, nothing run but its seven commands, and one upload, exactly the
+# fixed-shape summary file (never the archive, a folder or a glob), with no step summary or carried value. ios_rehearsal.py
+# prints only fixed lines and ios.sh's integer exit status (ios_rehearsal_print_problems).
+REHEARSAL = "ios-archive-rehearsal.yml"
+REHEARSAL_ARGS = ('--target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" '
+                  '--pr-number "$MAY_PR_NUMBER"')
+PREPARE_IOS_REHEARSAL = ('python3 -I -S -B tools/may_release/prepare.py --platform ios --target "$MAY_TARGET" '
+                         '--source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"')
+REHEARSAL_ARCHIVE = "python3 -I -S -B tools/may_release/ios_rehearsal.py archive " + REHEARSAL_ARGS
+REHEARSAL_RECORD = "python3 -I -S -B tools/may_release/ios_rehearsal.py record " + REHEARSAL_ARGS
+REHEARSAL_VERDICT = "python3 -I -S -B tools/may_release/ios_rehearsal.py verdict " + REHEARSAL_ARGS
+REHEARSAL_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+                     '"$RUNNER_TEMP/may-release" "$RUNNER_TEMP/may-rehearsal" "$RUNNER_TEMP"/may-ios-build.*')
+REHEARSAL_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL, PREPARE_IOS_REHEARSAL, REHEARSAL_ARCHIVE, REHEARSAL_RECORD,
+                  REHEARSAL_VERDICT, REHEARSAL_CLEANUP]
+REHEARSAL_PUBLISH = "Publish only the rehearsal summary, never the archive"
+REHEARSAL_STEP_NAMES = ["Check the pull request head and environment before fetching",
+                        "Fetch the pull request head and pinned design system quietly",
+                        "Archive with ios.sh, unsigned, without any credential",
+                        "Check the rehearsal summary before publishing it",
+                        REHEARSAL_PUBLISH,
+                        "Fail unless ios.sh archived and every check passed",
+                        "Remove private source, logs, the archive and the summary"]
+# The publish step, exactly: the one summary file, bound to the run attempt, kept 7 days.
+REHEARSAL_PUBLISH_STEP = (
+    "name: " + REHEARSAL_PUBLISH + "\n"
+    "        uses: " + UPLOAD_ARTIFACT + " # v4\n"
+    "        with:\n"
+    "          name: may-ios-archive-rehearsal-${{ github.run_attempt }}\n"
+    "          path: ${{ runner.temp }}/may-rehearsal/ios-archive-rehearsal.json\n"
+    "          if-no-files-found: error\n"
+    "          retention-days: 7\n")
+REHEARSAL_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
+                    ("MAY_TARGET", "${{ inputs.target }}"), ("MAY_BUILD_NUMBER", "${{ inputs.build_number }}")}
+REHEARSAL_ENV = REHEARSAL_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET,)}
+
+
+def ios_rehearsal_workflow_problems(text):
+    name = REHEARSAL + ": "
+    found = []
+    if "toolchain.py" in text or "--platform android" in text or "GITHUB_STEP_SUMMARY" in text or \
+            "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or \
+            "    runs-on: macos-15\n" not in job_text(text, "rehearsal") or \
+            "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission"):
+        found.append(name + "is not the macOS iOS rehearsal with no step summary or carried value")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "target", "build_number"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "choice", "string"] or \
+            "        options: [playground, production]\n" not in trigger:
+        found.append(name + "is not dispatched with exactly pr_number, source_sha, target and build_number")
+    if "\nconcurrency:\n  group: may-ios-archive-rehearsal\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "rehearsal")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "rehearsal"]:
+        found.append(name + "jobs are not exactly admission and rehearsal")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != REHEARSAL_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the check, the fetch, the archive, the summary check, "
+                     "the verdict and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "rehearsal")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["rehearsal"]]
+    cleanup = steps["rehearsal"][-1][1] if steps["rehearsal"] else ""
+    if leading != {"admission": ["uses", "id"], "rehearsal": ["uses"] + ["name"] * len(REHEARSAL_STEP_NAMES)} or \
+            names != [""] + REHEARSAL_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT]:
+        found.append(name + "rehearsal's steps are not exactly the check, fetch, archive, summary check, publish, "
+                     "verdict and an always-run cleanup")
+    by_name = dict(steps["rehearsal"])
+    check, fetch, build, record, publish, verdict, clean = (by_name.get(n, "") for n in REHEARSAL_STEP_NAMES)
+    # One upload, exactly the summary file: never the archive, the private folder, a folder or a glob.
+    if text.count("upload-artifact") != 1 or publish != REHEARSAL_PUBLISH_STEP:
+        found.append(name + "publishes something other than exactly the rehearsal summary file")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 90\n" not in job_text(text, "rehearsal"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than rehearsal's 90 minutes")
+    job = job_text(text, "rehearsal")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
+            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "rehearsal's environment is not the one admission chose, after admission")
+    # Each secret bound exactly once: the PR token in the pull request check, the read keys in the fetch. The archive
+    # (the pull request's own build code), and every step after it, has no secret and no GH_TOKEN; the cleanup no env.
+    later = build + record + verdict
+    if secrets_in(text) != set(COMPILE_SECRETS) | {PR_READ_SECRET} or \
+            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS + (PR_READ_SECRET,)) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
+            secrets_in(later + publish + clean) or "GH_TOKEN" in fetch + later or "env:" in clean + publish or \
+            any(e not in REHEARSAL_INPUTS for e in env_entries(later)) or \
+            any(e not in REHEARSAL_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys "
+                     "and the dispatch's inputs")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    return found
+
+
+REHEARSAL_TOOL = "ios_rehearsal.py"
+REHEARSAL_PRINT_VALUES = {"int(status)"}
+REHEARSAL_EXIT_CLASSES = {"RehearsalError", "StoreError"}
+
+
+def ios_rehearsal_print_problems(root):
+    return quiet_tool_problems(root, REHEARSAL_TOOL, REHEARSAL_PRINT_VALUES, REHEARSAL_EXIT_CLASSES)
+
+
 # Swift compile of a may-design-system pull request head (ds-swift-compile.yml, gate.py --action ds-compile, ds_compile.py).
 # may-design-system is private and this repository public, so the workflow is pinned whole: dispatch with exactly ds_sha
 # and ds_pr, read-only permissions, admission then native in the environment admission chose (may-ds-renders), the
@@ -1174,6 +1291,8 @@ def control_problems(root):
     found += ds_compile_workflow_problems((flows / DS_COMPILE).read_text())
     found += ds_compile_print_problems(root)
     found += compile_pr_errors_print_problems(root)
+    found += ios_rehearsal_workflow_problems((flows / REHEARSAL).read_text())
+    found += ios_rehearsal_print_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")
