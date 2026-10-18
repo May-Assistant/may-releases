@@ -10,6 +10,11 @@ on:
         description: That pull request's current 40-character head commit
         required: true
         type: string
+      core_breakdown:
+        description: Also locate each failing core test by numbers only (report and test case positions, no names)
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -70,7 +75,8 @@ jobs:
       - name: Run the unit suites without any credential, printing only pass or fail and counts
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: python3 -I -S -B tools/may_release/android_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome
+          MAY_CORE_BREAKDOWN: ${{ inputs.core_breakdown }}
+        run: python3 -I -S -B tools/may_release/android_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome --core-breakdown "$MAY_CORE_BREAKDOWN"
       - name: Post the failing tests on the may-app pull request, never in this log
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}

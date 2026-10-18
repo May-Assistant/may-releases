@@ -924,7 +924,11 @@ UNIT = "android-unit-pr.yml"
 UNIT_JDK = "python3 -I -S -B tools/may_release/toolchain.py jdk"
 PREPARE_ANDROID_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha '
                       '"$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"')
-UNIT_RUN = 'python3 -I -S -B tools/may_release/android_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome'
+UNIT_RUN = ('python3 -I -S -B tools/may_release/android_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome '
+            '--core-breakdown "$MAY_CORE_BREAKDOWN"')
+UNIT_BREAKDOWN_ENV = ("MAY_CORE_BREAKDOWN", "${{ inputs.core_breakdown }}")
+UNIT_BREAKDOWN_INPUT = ("      core_breakdown:\n        description: [^\n]+\n        required: false\n"
+                        "        type: boolean\n        default: false$")
 UNIT_POST = 'python3 -I -S -B tools/may_release/android_unit_post.py --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"'
 UNIT_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
                 '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-tools"')
@@ -936,7 +940,7 @@ UNIT_STEP_NAMES = ["Install the pinned, checksum-verified JDK",
                    "Post the failing tests on the may-app pull request, never in this log",
                    "Remove private source, logs, build outputs and the pinned JDK"]
 UNIT_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}")}
-UNIT_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+UNIT_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}"), UNIT_BREAKDOWN_ENV} | \
     {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)}
 UNIT_SECRETS = COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)
 
@@ -953,9 +957,10 @@ def android_unit_workflow_problems(text):
         found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
-            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
-            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
-        found.append(name + "is not dispatched with exactly pr_number and source_sha")
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "core_breakdown"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean"] or \
+            not re.search(UNIT_BREAKDOWN_INPUT, trigger):
+        found.append(name + "is not dispatched with exactly pr_number, source_sha and an optional core_breakdown boolean")
     if "\nconcurrency:\n  group: may-android-unit-pr\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
@@ -992,7 +997,7 @@ def android_unit_workflow_problems(text):
             secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
             secrets_in(post) != {PR_COMMENT_SECRET} or \
             secrets_in(jdk + suites + clean) or "GH_TOKEN" in fetch + suites + post or "env:" in jdk + clean or \
-            env_entries(suites) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")] or \
+            env_entries(suites) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), UNIT_BREAKDOWN_ENV] or \
             sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
             any(e not in UNIT_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
@@ -1003,7 +1008,8 @@ def android_unit_workflow_problems(text):
 
 
 UNIT_TOOL = "android_unit.py"
-UNIT_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(failed)", "int(skipped)"}
+UNIT_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(failed)", "int(skipped)", "int(index)", "int(count)",
+                     "int(case)", "int(cases)", "int(unreadable)"}
 UNIT_EXIT_CLASSES = {"UnitTestsError", "StoreError"}
 
 
