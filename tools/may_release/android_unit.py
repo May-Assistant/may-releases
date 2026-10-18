@@ -13,20 +13,30 @@ JUnit reports' <testsuite> attributes (never a test name, message or class). The
 reported at least one test, none failed or errored, and Gradle finished.
 
 Test results committed to the pull request are refused before Gradle runs, so a report can only be this run's.
+
+With --record-outcome (android-unit-pr.yml), a suite that fails, errors, ran no test or did not report, and Gradle
+failing or timing out, do not fail this step. The outcome, each suite's counts, and each failing test (its class and
+method, its kind, the first line of its message and the line of the test's own source it failed at, repo-relative)
+go to private files (OUTCOME, FAILURES), and android_unit_post.py, the next step, posts them on the may-app pull
+request and then fails the job. Every check before Gradle (secrets, the pinned JDK, the SDK, fetch-design-system.sh,
+committed results) still fails here. The failing tests are never printed.
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ElementTree
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from review_mcp import TOKEN_SHAPED
 from store import StoreError, child_env, prepared, require_step_secrets, runner_root
 import toolchain
 
@@ -48,6 +58,22 @@ FETCH_DESIGN_SYSTEM = "android/scripts/fetch-design-system.sh"
 REPORT_HEAD_BYTES = 16 * 1024
 MAX_REPORTS = 5000
 COUNTS = ("tests", "failures", "errors", "skipped")
+# --record-outcome's private files, under may-private, for android_unit_post.py.
+OUTCOME, FAILURES = "android-unit-result.json", "android-unit-failures.json"
+# Each suite's Gradle module, for a failing test's source path.
+MODULES = {"core": "android/core", "playground": "android/app", "production": "android/app"}
+# Failing tests recorded (the rest are counted), and the longest name, message and path kept.
+MAX_FAILURES = 100
+MAX_NAME, MAX_MESSAGE = 200, 240
+# A report read whole for its failures; a larger one (or one with a DOCTYPE, which Gradle never writes) is counted as
+# unreadable rather than parsed.
+MAX_REPORT_BYTES = 8 * 1024 * 1024
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+# What is left of an absolute path once the checkout's own prefix is taken off: a runner path, never posted.
+ABSOLUTE = re.compile(r"(?<![\w.:/~-])/(?:[^\s/:;,'\"()<>\[\]]+/)+[^\s/:;,'\"()<>\[\]]*")
+# A stack frame: `at <class>.<method>(<File>.kt:<line>)`.
+FRAME = re.compile(r"\s*at ([\w$.]+)\.([\w$<>-]+)\(([\w$-]+\.(?:kt|java)):([0-9]{1,7})\)")
 
 
 class UnitTestsError(ValueError):
@@ -144,12 +170,102 @@ def suite_result(directory):
     return tests, failed, skipped
 
 
-def run_suites(source_sha):
+def clean(text, roots, limit):
+    """One line of report text as it may be posted on the private pull request: no ANSI or control characters,
+    whitespace collapsed, the checkout's own prefix taken off (repo-relative), any other absolute path replaced,
+    token-shaped strings redacted, and cut to limit characters."""
+    text = " ".join(CONTROL.sub(" ", ANSI.sub("", text or "")).split())
+    for root in roots:
+        text = text.replace(root.rstrip("/") + "/", "")
+    text = TOKEN_SHAPED.sub("[redacted]", ABSOLUTE.sub("[runner path]", text))
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def source_of(source, suite, test_class, file_name):
+    """The failing test's own source file, repo-relative, when exactly one file of that name sits in its package
+    folder under the suite module's src/*/kotlin or src/*/java; else None."""
+    package = test_class.split("$", 1)[0].rpartition(".")[0].replace(".", "/")
+    module = source / MODULES[suite] / "src"
+    if not module.is_dir() or module.is_symlink():
+        return None
+    found = [p for language in ("kotlin", "java") for p in module.glob(f"*/{language}/{package}/{file_name}")
+             if p.is_file() and not p.is_symlink()]
+    if len(found) != 1:
+        return None
+    return found[0].relative_to(source).as_posix()
+
+
+def failure_of(case, problem, source, suite, roots):
+    """{suite, test, kind, message, at} for one failing <testcase>: its first message line, and the first stack frame
+    in the test's own class, as `path:line` (repo-relative) or `File.kt:line` when the file isn't found."""
+    test_class, method = case.get("classname") or "", case.get("name") or ""
+    body = problem.text or ""
+    message = problem.get("message") or next((line for line in body.splitlines() if line.strip()), "")
+    at = None
+    for line in body.splitlines():
+        frame = FRAME.fullmatch(line)
+        if frame and frame.group(1).split("$", 1)[0] == test_class.split("$", 1)[0]:
+            path = source_of(source, suite, test_class, frame.group(3))
+            at = f"{path or frame.group(3)}:{int(frame.group(4))}"
+            break
+    return {"suite": suite, "test": clean(f"{test_class} > {method}", roots, MAX_NAME),
+            "kind": "error" if problem.tag == "error" else "failure",
+            "message": clean(message.splitlines()[0] if message.strip() else "", roots, MAX_MESSAGE),
+            "at": clean(at, roots, MAX_NAME) if at else None}
+
+
+def failing_tests(source, roots):
+    """(failures, total, unreadable): the failing tests of every suite's reports, in report order, at most
+    MAX_FAILURES of them; total counts all; unreadable counts reports too large, linked, or not plain JUnit XML."""
+    failures, total, unreadable = [], 0, 0
+    for suite, (_, directory) in SUITES.items():
+        folder = source / "android" / directory
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        for report in sorted(folder.iterdir()):
+            if not (report.name.startswith("TEST-") and report.name.endswith(".xml")):
+                continue
+            if report.is_symlink() or not report.is_file() or report.stat().st_size > MAX_REPORT_BYTES:
+                unreadable += 1
+                continue
+            text = report.read_text(encoding="utf-8", errors="replace")
+            if "<!DOCTYPE" in text or "<!ENTITY" in text:
+                unreadable += 1
+                continue
+            try:
+                tree = ElementTree.fromstring(text)
+            except ElementTree.ParseError:
+                unreadable += 1
+                continue
+            for case in tree.iter("testcase"):
+                problem = next((child for child in case if child.tag in ("failure", "error")), None)
+                if problem is None:
+                    continue
+                total += 1
+                if len(failures) < MAX_FAILURES:
+                    failures.append(failure_of(case, problem, source, suite, roots))
+    return failures, total, unreadable
+
+
+def record_outcome(private, source, results, gradle, passed):
+    roots = [str(source), str(source.resolve())]
+    failures, total, unreadable = failing_tests(source, roots)
+    (private / FAILURES).write_text(json.dumps({"failures": failures, "total": total, "unreadable": unreadable}))
+    (private / OUTCOME).write_text(json.dumps({
+        "result": "passed" if passed else "failed",
+        "gradle": "timeout" if gradle is None else "failed" if gradle else "ok",
+        "suites": {name: (list(results[name]) if results.get(name) is not None else None) for name in SUITES}}))
+
+
+def run_suites(source_sha, record=False):
     require_step_secrets(())
     root = runner_root()
     source, private = prepared(root, source_sha)
     android = source / "android"
     log = private / "android-unit.log"
+    if record:
+        for name in (OUTCOME, FAILURES):
+            (private / name).unlink(missing_ok=True)
     java_home = pinned_java_home()
     home = sdk_home()
     env = child_env(JAVA_HOME=str(java_home), PATH=str(java_home / "bin") + os.pathsep + os.environ.get("PATH", ""),
@@ -167,7 +283,16 @@ def run_suites(source_sha):
     except subprocess.TimeoutExpired:
         gradle = None
     results = {name: suite_result(android / directory) for name, (_, directory) in SUITES.items()}
-    report(results, gradle)
+    if not record:
+        report(results, gradle)
+        return
+    try:
+        report(results, gradle)
+        passed = True
+    except UnitTestsError:
+        passed = False
+    record_outcome(private, source, results, gradle, passed)
+    print("May Android unit suites finished; any failing tests stay in this runner's private files for the next step")
 
 
 def report(results, gradle):
@@ -194,9 +319,10 @@ def report(results, gradle):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--record-outcome", action="store_true")
     args = parser.parse_args()
     try:
-        run_suites(args.source_sha)
+        run_suites(args.source_sha, args.record_outcome)
     except (UnitTestsError, StoreError) as error:
         raise SystemExit("May Android unit tests: " + error.args[0]) from None
     except Exception:
