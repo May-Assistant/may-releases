@@ -65,6 +65,14 @@ FLOWS = {
     "plan-your-day": "PlanYourDayFlow",
     "approvals": "ApprovalsFlow",
     "onboarding-b": "OnboardingBFlow",
+    # Build 12's sheet (may-app docs/evidence/build-12).
+    "take-notes": "TakeNotesFlow",
+    "voice-notes-off": "VoiceNotesOffFlow",
+    "any-time-event": "AnyTimeEventFlow",
+    "pin": "PinFlow",
+    "report-bug": "ReportBugFlow",
+    "files-off": "TaskFilesOffFlow",
+    "computer-resting": "ComputerRestingFlow",
 }
 # may-app's android/flows/manifest.txt: one "ClassName count" line per flow class. A run's results must match it
 # exactly for the classes it ran: every listed test reported once, nothing missing, added or unlisted.
