@@ -98,8 +98,18 @@ class RecentRunTests(unittest.TestCase):
         busy, tested = recent_runs(TOKEN, NOW, get)
         self.assertFalse(busy)
         self.assertEqual(tested, {(7, SHA), (8, OTHER)})
-        self.assertEqual(seen, ["actions/workflows/android-unit-pr.yml/runs?created=%3E%3D2026-10-17T13%3A00%3A00Z"
+        self.assertEqual(seen, ["actions/workflows/android-unit-pr.yml/runs?created=%3E%3D2026-09-18T13%3A00%3A00Z"
                                 "&per_page=100&page=1"])
+
+    def test_a_head_runs_once_and_a_unit_run_comment_alone_never_runs_it_again(self):
+        # The run's comment refreshes the pull request's updated_at. The head stays tested for 30 days; by then that
+        # comment is more than 14 days old, so the pull request is stale and passed over: no daily re-run.
+        self.assertGreater(tool.WINDOW, tool.STALE)
+        commented = (NOW - datetime.timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        app = FakeApp([pull(3, SHA, updated=commented)], {3: ["android/x"]})
+        self.assertEqual(pick(TOKEN, {(3, SHA)}, app, NOW)[:2], (None, None), "tested 20 days ago")
+        self.assertEqual(pick(TOKEN, set(), app, NOW + datetime.timedelta(days=11))[:2], (None, None),
+                         "out of the window, but stale")
 
     def test_a_queued_or_running_unit_run_makes_the_schedule_wait(self):
         for status in ("queued", "in_progress", "waiting", "requested", "pending"):
@@ -130,7 +140,7 @@ class PickTests(unittest.TestCase):
                       {1: ["android/x"], 2: ["android/x"], 3: ["android/x"], 4: ["backend/x.ts"], 5: ["android/x"], 6: ["android/x"]})
         self.assertEqual(pick(TOKEN, {(3, THIRD)}, app, NOW), (5, OTHER, 2, 1))
         self.assertEqual([p.split("?")[0] for p in app.paths[1:]], ["pulls/4/files", "pulls/5/files"],
-                         "a fork, another base and a head run today have no files read")
+                         "a fork, another base and a head already run have no files read")
 
     def test_a_new_head_on_a_tested_pull_request_is_picked(self):
         app = FakeApp([pull(3, OTHER)], {3: ["android/x"]})
@@ -249,7 +259,7 @@ class StepTests(unittest.TestCase):
         posted, out = self.steps(runs_page(run(9, THIRD)), app)
         self.assertEqual(posted, [(tool.DISPATCH_PATH, TOKEN, {"ref": "main", "inputs": {"pr_number": "4", "source_sha": OTHER}})])
         self.assertEqual(out.splitlines(), [
-            "May Android CI schedule: 1 heads had a unit run in the last 24 hours",
+            "May Android CI schedule: 1 heads had a unit run in the last 30 days",
             f"May Android CI schedule: picked may-app #4 at {OTHER} (2 heads looked at)",
             f"May Android CI schedule: dispatched the unit suites for may-app #4 at {OTHER}"])
         self.assertNotIn(PRIVATE, out)
@@ -312,7 +322,7 @@ class WorkflowTests(unittest.TestCase):
         permissions = name + "permissions are not read-only but for actions: write in pick alone"
         read = "          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n"
         token = "          GH_TOKEN: ${{ github.token }}\n"
-        listed = "      - name: List the unit runs of the last 24 hours, with no may-app credential\n        env:\n"
+        listed = "      - name: List the unit runs of the last 30 days, with no may-app credential\n        env:\n"
         cleanup = "        if: always()\n"
         cases = {
             "GITHUB_TOKEN beside the read token": (read, read + token, secret),

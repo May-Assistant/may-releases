@@ -1,5 +1,5 @@
 """May's Android unit suites on a schedule (android-ci-schedule.yml): every 15 minutes, dispatch android-unit-pr.yml
-for at most one may-app pull request head that touches Android and has not had a unit run in the last 24 hours.
+for at most one may-app pull request head that touches Android and has not had a unit run in the last 30 days.
 
 This adds no new way to build or test anything. It picks a pull request and dispatches the existing, reviewed
 android-unit-pr.yml, whose own admission and pull request check (gate.py --action compile-pr) decide again whether
@@ -9,10 +9,10 @@ The job is split so that no step holds two credentials (static_check.py pins it)
 - admit (no environment): the run is this repository's schedule or a manual dispatch, from main, and
   may-native-compile-pr keeps its policy (administrator bypass off, main only, no required reviewer). A missing
   environment is denied on its 404, never auto-created.
-- runs (GITHUB_TOKEN alone): reads this repository's android-unit-pr runs from the last 24 hours. Their run-name
-  carries the pull request number and head SHA, so a head with a run in that window is skipped (one run a day per
-  head: nothing records a head as done while the comment token is missing, and a passed head is not run twice in a
-  day). When a unit run is queued or running, nothing is dispatched (a second pending run in the same concurrency
+- runs (GITHUB_TOKEN alone): reads this repository's android-unit-pr runs from the last 30 days. Their run-name
+  carries the pull request number and head SHA, so a head with a run in that window is skipped: a head runs once.
+  The window is longer than STALE, so a pull request whose only activity is a unit run's own comment is stale before
+  its head leaves the window, and is not run again. When a unit run is queued or running, nothing is dispatched (a second pending run in the same concurrency
   group would cancel the first).
 - pick (MAY_APP_PR_READ_TOKEN alone, held in may-native-compile-pr): lists may-app's open pull requests against
   main, oldest first, keeps those from a may-app branch (never a fork), and for each head not run in the window
@@ -53,7 +53,7 @@ DISPATCH_PATH = "actions/workflows/android-unit-pr.yml/dispatches"
 # The paths whose change makes a head worth the unit suites (coordinator, 18 Oct).
 PREFIXES = ("android/", "contracts/", "shared/", "gradle/")
 FILES = ("tools/release/android.sh",)
-WINDOW = datetime.timedelta(hours=24)
+WINDOW = datetime.timedelta(days=30)
 # A unit run in any of these is still to finish: the schedule waits for it.
 BUSY = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 # At most this many heads have their files read in one run, so a long queue of non-Android pull requests costs a
@@ -189,7 +189,7 @@ def listing(get, path, token, key=None):
 
 def recent_runs(token, now, get=control_get):
     """(busy, tested): whether a unit run is queued or running, and the (number, sha) of every head that has had a
-    unit run created in the last 24 hours, read from the run name. A name not in RUN_NAME's form counts for nothing."""
+    unit run created in the last 30 days, read from the run name. A name not in RUN_NAME's form counts for nothing."""
     since = (now - WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
     runs = listing(get, RUNS_PATH + "?created=" + urllib.parse.quote(">=" + since), token, "workflow_runs")
     busy, tested = False, set()
@@ -283,7 +283,7 @@ def runs_step(now=None, get=control_get):
     if busy:
         print("May Android CI schedule: a unit run is queued or running; nothing is picked this time")
     else:
-        print(f"May Android CI schedule: {int(count)} heads had a unit run in the last 24 hours")
+        print(f"May Android CI schedule: {int(count)} heads had a unit run in the last 30 days")
 
 
 def pick_step(get=app_get, now=None):

@@ -1063,8 +1063,8 @@ SCHEDULE_TOOL = "android_ci_schedule.py"
 SCHEDULE_CRON = '  schedule:\n    - cron: "*/15 * * * *"\n  workflow_dispatch:\npermissions:'
 SCHEDULE_RUNS = ["python3 -I -S -B tools/may_release/android_ci_schedule.py " + step for step in ("admit", "runs", "pick", "dispatch")] + \
     ['rm -rf -- "$RUNNER_TEMP/may-android-ci"']
-SCHEDULE_STEP_NAMES = ["List the unit runs of the last 24 hours, with no may-app credential",
-                       "Pick the oldest may-app head touching Android with no run today, with no GitHub token",
+SCHEDULE_STEP_NAMES = ["List the unit runs of the last 30 days, with no may-app credential",
+                       "Pick the oldest may-app head touching Android with no run yet, with no GitHub token",
                        "Dispatch the unit suites for the picked head, with no may-app credential",
                        "Remove the carried numbers"]
 SCHEDULE_PICK_PERMISSIONS = "    permissions:\n      contents: read\n      actions: write\n    steps:\n"
