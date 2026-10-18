@@ -38,7 +38,7 @@ on:
         default: all
         options: [all, chat-reply, task-detail, connections, empty-states, message-menu, sending-status, sign-in, plan-your-day, approvals, onboarding-b, take-notes, voice-notes-off, any-time-event, pin, report-bug, files-off, computer-resting, new-account-confirm, thread-reply-reconnect, draft-kill, sign-out-queued]
       then:
-        description: More runs after this one, one at a time, same flows_sha (source_sha:flow, space-separated; at most 7)
+        description: More runs after this one, one at a time, same flows_sha (source_sha:flow, separated by spaces or commas; at most 7)
         required: false
         type: string
         default: ''
