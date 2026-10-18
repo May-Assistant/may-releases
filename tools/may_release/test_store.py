@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import store
-from store import POSTHOG_SECRETS, SECRET_NAMES, StoreError, build, child_env, identity, play_identity
+from store import POSTHOG_NAMES, POSTHOG_SECRETS, SECRET_NAMES, StoreError, build, child_env, identity, play_identity
 
 HERE = Path(__file__).resolve().parent
 ACCOUNT = "may-play-upload@may-assistant-app.iam.gserviceaccount.com"
@@ -98,8 +98,11 @@ class StoreTests(unittest.TestCase):
                 self.assertTrue((root / "may-release" / product).exists())
 
     def test_unsigned_build_refuses_when_any_secret_is_in_its_step(self):
-        # The Android build may hold the PostHog key (its own tests below); iOS refuses every secret.
-        cases = [("android", n) for n in SECRET_NAMES if n not in POSTHOG_SECRETS] + [("ios", n) for n in SECRET_NAMES]
+        # Each build may hold its own platform's PostHog key (their own tests below), and no other secret: not even
+        # the other platform's key.
+        cases = [(p, n) for p in ("android", "ios") for n in SECRET_NAMES if n != POSTHOG_NAMES[p][0]]
+        self.assertIn(("ios", "MAY_POSTHOG_ANDROID_KEY"), cases)
+        self.assertIn(("android", "MAY_POSTHOG_IOS_KEY"), cases)
         for platform, name in cases:
             with self.subTest(platform=platform, name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -111,8 +114,10 @@ class StoreTests(unittest.TestCase):
                         build(platform, "playground", "a" * 40, "9")
                 runner.assert_not_called()
 
-    def android_build(self, environ, runs=None):
-        """Runs the Android build with environ; returns (env given to android.sh, printed text). Appends to runs."""
+    def android_build(self, environ, runs=None, platform="android"):
+        """Runs the Android (or iOS) build with environ; returns (env given to its script, printed text). Appends
+        to runs."""
+        product = "May.xcarchive" if platform == "ios" else "unsigned.aab"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, private = prepared_tree(root)
@@ -122,23 +127,81 @@ class StoreTests(unittest.TestCase):
                 captured.update(env)
                 if runs is not None:
                     runs.append(argv)
-                (Path(env["MAY_ARTIFACT_DIR"]) / "unsigned.aab").write_bytes(b"unsigned")
+                made = Path(env["MAY_ARTIFACT_DIR"]) / product
+                made.mkdir() if platform == "ios" else made.write_bytes(b"unsigned")
 
             printed = io.StringIO()
             with patch.dict(os.environ, {"RUNNER_TEMP": directory, **environ}, clear=True), \
                     patch("store.prepared", return_value=(source, private)), \
                     patch("store.run_private", side_effect=fake_private), \
                     contextlib.redirect_stdout(printed):
-                build("android", "playground", "a" * 40, "9")
+                build(platform, "playground", "a" * 40, "9")
             return captured, printed.getvalue()
 
+    def ios_build(self, environ, runs=None):
+        return self.android_build(environ, runs, platform="ios")
+
     def test_every_other_release_step_refuses_the_posthog_key(self):
-        from store import ANDROID_SIGNING_SECRETS, HANDOFF_SECRETS, PLAY_UPLOAD_SECRETS, SOURCE_READ_SECRETS, \
-            require_step_secrets
-        for allowed in ((), SOURCE_READ_SECRETS, HANDOFF_SECRETS, ANDROID_SIGNING_SECRETS, PLAY_UPLOAD_SECRETS):
-            with self.subTest(allowed=allowed), patch.dict(os.environ, {"MAY_POSTHOG_ANDROID_KEY": "phc_x"}):
-                with self.assertRaises(StoreError):
-                    require_step_secrets(allowed)
+        from store import ANDROID_SIGNING_SECRETS, HANDOFF_SECRETS, IOS_SIGNING_SECRETS, IOS_UPLOAD_SECRETS, \
+            PLAY_UPLOAD_SECRETS, SOURCE_READ_SECRETS, require_step_secrets
+        for key in ("MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_IOS_KEY"):
+            for allowed in ((), SOURCE_READ_SECRETS, HANDOFF_SECRETS, ANDROID_SIGNING_SECRETS, PLAY_UPLOAD_SECRETS,
+                            IOS_SIGNING_SECRETS, IOS_UPLOAD_SECRETS):
+                with self.subTest(key=key, allowed=allowed), patch.dict(os.environ, {key: "phc_x"}):
+                    with self.assertRaises(StoreError):
+                        require_step_secrets(allowed)
+
+    def test_posthog_names_are_one_key_and_one_host_per_platform(self):
+        self.assertEqual(POSTHOG_NAMES, {"android": ("MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_HOST"),
+                                         "ios": ("MAY_POSTHOG_IOS_KEY", "MAY_POSTHOG_IOS_HOST")})
+        self.assertEqual(set(POSTHOG_SECRETS), {"MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_IOS_KEY"})
+        self.assertTrue(set(POSTHOG_SECRETS) <= set(SECRET_NAMES))
+        # The hosts are variables, never secrets.
+        self.assertFalse({"MAY_POSTHOG_HOST", "MAY_POSTHOG_IOS_HOST"} & set(SECRET_NAMES))
+
+    def test_the_posthog_key_and_host_reach_the_ios_build(self):
+        env, printed = self.ios_build({"MAY_POSTHOG_IOS_KEY": "phc_testIos-123_x",
+                                       "MAY_POSTHOG_IOS_HOST": "https://eu.i.posthog.com/"})
+        self.assertEqual(env.get("MAY_POSTHOG_IOS_KEY"), "phc_testIos-123_x")
+        self.assertEqual(env.get("MAY_POSTHOG_IOS_HOST"), "https://eu.i.posthog.com")
+        self.assertIn("PostHog crash-report key passed to the iOS build; reports go to https://eu.i.posthog.com", printed)
+        self.assertNotIn("phc_testIos-123_x", printed)
+        self.assertNotIn("testIos", printed)
+        # Android's names never reach ios.sh, which refuses anything outside its allowlist.
+        self.assertFalse({"MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_HOST"} & set(env))
+
+    def test_an_unset_ios_host_is_posthogs_us_cloud(self):
+        env, printed = self.ios_build({"MAY_POSTHOG_IOS_KEY": "phc_testIos"})
+        self.assertEqual(env.get("MAY_POSTHOG_IOS_HOST"), "https://us.i.posthog.com")
+        self.assertIn("reports go to https://us.i.posthog.com", printed)
+
+    def test_the_ios_build_ignores_androids_host_variable(self):
+        # MAY_POSTHOG_HOST is Android's; the iOS build reads only MAY_POSTHOG_IOS_HOST.
+        env, _ = self.ios_build({"MAY_POSTHOG_IOS_KEY": "phc_testIos", "MAY_POSTHOG_HOST": "https://eu.i.posthog.com"})
+        self.assertEqual(env.get("MAY_POSTHOG_IOS_HOST"), "https://us.i.posthog.com")
+        self.assertNotIn("MAY_POSTHOG_HOST", env)
+
+    def test_without_the_ios_key_the_build_has_none_and_says_so_once(self):
+        for environ in ({}, {"MAY_POSTHOG_IOS_KEY": ""}, {"MAY_POSTHOG_IOS_HOST": "https://eu.i.posthog.com"}):
+            with self.subTest(environ=environ):
+                env, printed = self.ios_build(environ)
+                self.assertFalse({"MAY_POSTHOG_IOS_KEY", "MAY_POSTHOG_IOS_HOST"} & set(env))
+                self.assertEqual(printed.count("No PostHog key in this build environment; this build sends no crash reports"), 1)
+
+    def test_a_malformed_ios_key_or_host_is_refused_before_building_without_naming_it(self):
+        for environ in ({"MAY_POSTHOG_IOS_KEY": "phc key\nINJECT_testLeak"},
+                        {"MAY_POSTHOG_IOS_KEY": "Abc-123_testLeak"},
+                        {"MAY_POSTHOG_IOS_KEY": "phc_"},
+                        {"MAY_POSTHOG_IOS_KEY": "phc_ok", "MAY_POSTHOG_IOS_HOST": "https://evil.example/testLeak"},
+                        {"MAY_POSTHOG_IOS_KEY": "phc_ok", "MAY_POSTHOG_IOS_HOST": "http://us.i.posthog.com"},
+                        {"MAY_POSTHOG_IOS_KEY": "phc_ok", "MAY_POSTHOG_IOS_HOST": "https://us.i.posthog.com.evil.example"}):
+            with self.subTest(environ=environ):
+                runs = []
+                with self.assertRaises(StoreError) as caught:
+                    self.ios_build(environ, runs)
+                self.assertEqual(runs, [])
+                self.assertIn("MAY_POSTHOG_IOS_", caught.exception.args[0])
+                self.assertNotIn("testLeak", caught.exception.args[0])
 
     def test_the_posthog_key_and_host_reach_the_android_build(self):
         env, printed = self.android_build({"MAY_POSTHOG_ANDROID_KEY": "phc_Abc-123_x",

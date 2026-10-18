@@ -116,7 +116,7 @@ SECRET_NAMES = (
     "MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD", "MAY_IOS_PROFILE_BASE64",
     "MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID",
     "MAY_ARTIFACT_DECRYPT_KEY",
-    "MAY_POSTHOG_ANDROID_KEY",
+    "MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_IOS_KEY",
     # The repository secret gate.py reads may-app pull requests with (compile-pr); no tool step may hold it.
     "MAY_APP_PR_READ_TOKEN",
     # ds-swift-compile.yml: the may-design-system pull-request read token (gate.py --check-pull alone) and the token
@@ -127,15 +127,21 @@ SECRET_NAMES = (
     "MAY_APP_PR_COMMENT_TOKEN",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
-# Crash reports (PostHog): the Android build step alone may hold the project key, and
-# hands it to android.sh, where Gradle compiles it into the app (may-app's
-# app/build.gradle.kts reads MAY_POSTHOG_ANDROID_KEY and MAY_POSTHOG_HOST). Every other
-# step refuses it. Without it the app is built with no key and sends no crash report.
-# MAY_POSTHOG_HOST is a variable, not a secret: PostHog's ingestion host for the project.
+# Crash reports (PostHog): each platform's build step alone may hold its project key, and
+# hands it to its build script under the same name: android.sh, where Gradle compiles it
+# into the app (may-app's app/build.gradle.kts reads MAY_POSTHOG_ANDROID_KEY and
+# MAY_POSTHOG_HOST), or ios.sh, which gives it to xcodebuild archive as a build setting the
+# app's Info.plist reads (may-app's tools/release/ios.sh takes MAY_POSTHOG_IOS_KEY and
+# MAY_POSTHOG_IOS_HOST). Every other step refuses both keys, the other platform's build
+# step included. Without its key an app is built with none and sends no crash report.
+# The host is a variable, not a secret: PostHog's ingestion host for the project.
 # GitHub resolves a variable (and a secret) from the environment, then the repository,
 # then the organization, so the host is pinned here: crash reports can only ever go to
 # PostHog's US or EU cloud, whoever sets the variable. Unset means PostHog's US cloud.
-POSTHOG_SECRETS = ("MAY_POSTHOG_ANDROID_KEY",)
+# platform -> (its key secret, its host variable).
+POSTHOG_NAMES = {"android": ("MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_HOST"),
+                 "ios": ("MAY_POSTHOG_IOS_KEY", "MAY_POSTHOG_IOS_HOST")}
+POSTHOG_SECRETS = tuple(key for key, _ in POSTHOG_NAMES.values())
 POSTHOG_KEY = re.compile(r"phc_[A-Za-z0-9_-]+")
 POSTHOG_HOSTS = ("https://us.i.posthog.com", "https://eu.i.posthog.com")
 HANDOFF_SECRETS = ("MAY_ARTIFACT_DECRYPT_KEY",)
@@ -343,24 +349,32 @@ def run_private(argv, cwd, log, env):
         raise StoreError("Protected native release failed; inspect private runner diagnostics")
 
 
-def posthog_env():
-    """The PostHog key and its pinned host for android.sh; {} when the key is absent. Refuses anything else."""
-    key = os.environ.get("MAY_POSTHOG_ANDROID_KEY", "").strip()
-    host = os.environ.get("MAY_POSTHOG_HOST", "").strip().rstrip("/") or POSTHOG_HOSTS[0]
+def posthog_env(platform="android"):
+    """The platform's PostHog key and its pinned host for its build script (POSTHOG_NAMES); {} when the key is
+    absent. Refuses anything else, never naming the value."""
+    key_name, host_name = POSTHOG_NAMES[platform]
+    key = os.environ.get(key_name, "").strip()
+    host = os.environ.get(host_name, "").strip().rstrip("/") or POSTHOG_HOSTS[0]
     if not key:
         return {}
     if not POSTHOG_KEY.fullmatch(key):
+        if platform == "ios":
+            raise StoreError("MAY_POSTHOG_IOS_KEY is not a PostHog project key (phc_ then letters, digits, _ and -)")
         raise StoreError("MAY_POSTHOG_ANDROID_KEY is not a PostHog project key (phc_ then letters, digits, _ and -)")
     if host not in POSTHOG_HOSTS:
+        if platform == "ios":
+            raise StoreError("MAY_POSTHOG_IOS_HOST is not PostHog's US or EU cloud (https://us.i.posthog.com, "
+                             "https://eu.i.posthog.com)")
         raise StoreError("MAY_POSTHOG_HOST is not PostHog's US or EU cloud (https://us.i.posthog.com, "
                          "https://eu.i.posthog.com)")
-    return {"MAY_POSTHOG_ANDROID_KEY": key, "MAY_POSTHOG_HOST": host}
+    return {key_name: key, host_name: host}
 
 
 def build(platform, target, source_sha, build_number):
     app_id = identity(platform, target, source_sha, build_number)
-    require_step_secrets(POSTHOG_SECRETS if platform == "android" else ())
-    crash_reports = posthog_env() if platform == "android" else {}
+    key_name, host_name = POSTHOG_NAMES[platform]
+    require_step_secrets((key_name,))
+    crash_reports = posthog_env(platform)
     root = runner_root()
     source, private = prepared(root, source_sha)
     script_name, command, product = UNSIGNED_BUILDS[platform]
@@ -376,15 +390,18 @@ def build(platform, target, source_sha, build_number):
                     # authenticated dependency fetch must fail closed.
                     MAY_DS_READ_TOKEN="prepared-local-design-system-only")
     if platform == "ios":
-        env.update(MAY_IOS_APP_ID=app_id, MAY_TEAM_ID=APPLE_TEAM, DEVELOPER_DIR=XCODE_DEVELOPER_DIR)
+        env.update(MAY_IOS_APP_ID=app_id, MAY_TEAM_ID=APPLE_TEAM, DEVELOPER_DIR=XCODE_DEVELOPER_DIR, **crash_reports)
     else:
         env.update(MAY_ANDROID_APP_ID=app_id, **crash_reports)
-        if crash_reports:
-            # The host, already checked to be one of POSTHOG_HOSTS, so whoever approves the run sees where
-            # reports go; never the key.
-            print("PostHog crash-report key passed to the Android build; reports go to " + crash_reports["MAY_POSTHOG_HOST"])
+    if crash_reports:
+        # The host, already checked to be one of POSTHOG_HOSTS, so whoever approves the run sees where
+        # reports go; never the key.
+        if platform == "ios":
+            print("PostHog crash-report key passed to the iOS build; reports go to " + crash_reports[host_name])
         else:
-            print("No PostHog key in this build environment; this build sends no crash reports")
+            print("PostHog crash-report key passed to the Android build; reports go to " + crash_reports[host_name])
+    else:
+        print("No PostHog key in this build environment; this build sends no crash reports")
     run_private(["bash", str(script), command], source, private / (platform + "-build.log"), env)
     made = out / product
     if [p.name for p in out.iterdir()] != [product] or made.is_symlink():

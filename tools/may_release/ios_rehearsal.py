@@ -46,9 +46,13 @@ LOG = "ios-rehearsal.log"
 # An archive build (derived data, packages, the archive and its copy) needs room; refuse early rather than fail late.
 MIN_FREE_BYTES = 15 * 1024**3
 RECORD_PREFIX = b"may-release-record: "
-# ios.sh's record, exactly these keys (may-app PR #116). It stays in the private log.
+# ios.sh's record, exactly these keys (may-app PR #116), plus, from ios.sh with PostHog crash reports on, a
+# posthog_key flag (whether MAY_POSTHOG_IOS_KEY was given: never the key). A rehearsal holds no key, so the flag
+# must be false when present. A pull request head from before that flag still records without it. The record
+# stays in the private log.
 IOS_RECORD_KEYS = {"platform", "target", "app_id", "source_sha", "build_number", "version", "team_id_unverified",
                    "design_system", "xcode", "minimum_ios", "package_resolved_sha256", "product", "sha256", "rehearsal"}
+IOS_RECORD_POSTHOG = "posthog_key"
 # Why a rehearsal did not archive: fixed words only, never anything ios.sh printed.
 REASONS = ("archived and checked", "ios.sh exited non-zero", "ios.sh did not start",
            "ios.sh's record is missing or malformed", "ios.sh's record differs from the request",
@@ -107,7 +111,9 @@ def ios_record(log):
         record = json.loads(lines[0][len(RECORD_PREFIX):])
     except ValueError:
         return None
-    return record if isinstance(record, dict) and set(record) == IOS_RECORD_KEYS else None
+    if not isinstance(record, dict) or set(record) not in (IOS_RECORD_KEYS, IOS_RECORD_KEYS | {IOS_RECORD_POSTHOG}):
+        return None
+    return record
 
 
 def record_matches(record, target, app_id, source_sha, build_number, ios_pin):
@@ -115,6 +121,7 @@ def record_matches(record, target, app_id, source_sha, build_number, ios_pin):
                 "build_number": build_number, "team_id_unverified": APPLE_TEAM, "design_system": ios_pin,
                 "xcode": XCODE, "product": PRODUCT, "rehearsal": True}
     return all(record.get(key) == value for key, value in expected.items()) and \
+        record.get(IOS_RECORD_POSTHOG, False) is False and \
         isinstance(record.get("sha256"), str) and bool(re.fullmatch(r"[0-9a-f]{64}", record["sha256"]))
 
 

@@ -44,7 +44,7 @@ Confirmed from the repository's Actions secrets page on 2026-10-13. All secrets 
 
 | Environment | Secrets present |
 | --- | --- |
-| `may-native-compile` | `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`; optional `MAY_POSTHOG_ANDROID_KEY` (and variable `MAY_POSTHOG_HOST`) |
+| `may-native-compile` | `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`; optional `MAY_POSTHOG_ANDROID_KEY` (and variable `MAY_POSTHOG_HOST`) and `MAY_POSTHOG_IOS_KEY` (and variable `MAY_POSTHOG_IOS_HOST`) |
 | `may-android-internal`, `may-android-playground-internal` | `MAY_ANDROID_KEYSTORE_BASE64`, `MAY_ANDROID_KEY_PASSWORD`, `MAY_ANDROID_STORE_PASSWORD`, `MAY_PLAY_JSON`, `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` |
 | `may-ios-internal`, `may-ios-playground-internal` | `MAY_IOS_CERT_BASE64`, `MAY_IOS_CERT_PASSWORD`, `MAY_IOS_PROFILE_BASE64`, `MAY_ASC_KEY_BASE64`, `MAY_ASC_ISSUER_ID`, `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` |
 
@@ -95,9 +95,9 @@ The current code must not be extended to a non-internal track without these.
 
 Each store run is **two jobs on separate fresh VMs**:
 
-1. **`*-build`** (`may-native-compile`, read-only source keys and, for Android, the PostHog crash-report key only):
+1. **`*-build`** (`may-native-compile`, read-only source keys and the platform's own PostHog crash-report key only):
    - fetches the exact private source and the design system pinned for the platform being built (`prepare.py`; see [Design-system pins](#design-system-pins));
-   - runs the private build script for an **unsigned** product (`store.py`). This step runs third-party code: Gradle and its plugins, SwiftPM, and Xcode build phases. On Android it holds one secret, `MAY_POSTHOG_ANDROID_KEY`, which Gradle compiles into the app (it ships inside the APK, as PostHog's project keys are meant to); without it the app is built with no key and sends no crash reports, and the step says so in one fixed line;
+   - runs the private build script for an **unsigned** product (`store.py`). This step runs third-party code: Gradle and its plugins, SwiftPM, and Xcode build phases. On Android it holds one secret, `MAY_POSTHOG_ANDROID_KEY`, which Gradle compiles into the app (it ships inside the APK, as PostHog's project keys are meant to); without it the app is built with no key and sends no crash reports, and the step says so in one fixed line. On iOS it holds `MAY_POSTHOG_IOS_KEY` in the same way: `ios.sh` gives it to `xcodebuild archive` as a build setting the app's Info.plist reads, never prints it (xcodebuild's own echo of its build settings is redacted), and fails the build unless the archived app carries exactly that key;
    - encrypts the product, with a manifest that also records both design-system pins, using [age](https://age-encryption.org) to the target's public key committed in `tools/may_release/artifact_keys/` (`handoff.py seal`);
    - uploads only the encrypted file, as a one-day artifact.
 2. **`*-release`**, or **`android-sign-only`** for a [sign-only](#sign-only) dispatch (the store environment; `needs: [admission, *-build]`):
@@ -229,10 +229,11 @@ A reviewed PR replaces the placeholder with exactly that `age1…` line. Unlike 
 ## Secrets and variables per environment
 
 - **`may-native-compile`:** `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (read-only deploy keys for `may-app` and `may-design-system`).
-- **`may-native-compile-pr`** (proposed; [compile of a pull request head](#ios-compile-of-a-pull-request-head); no required reviewer, main only): `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (dedicated deploy keys, rotated when someone leaves may-app), `MAY_APP_PR_READ_TOKEN` (may-app pull requests: read, short-lived) and, optionally, `MAY_APP_PR_COMMENT_TOKEN` (may-app pull requests: read and write; [the compile's errors on the pull request](#the-compiles-errors-on-the-pull-request)). Each is bound in exactly one step.
   - Optional secret `MAY_POSTHOG_ANDROID_KEY`: PostHog's project key for Android crash reports (`phc_` then letters, digits, `_` and `-`). Only the Android build step receives it; every other step refuses it (`store.SECRET_NAMES`). This one environment builds both May and May Playground, so both apps report to the same PostHog project.
   - Optional variable `MAY_POSTHOG_HOST`: `https://eu.i.posthog.com` for a project on PostHog's EU cloud; unset means `https://us.i.posthog.com`. `store.py` refuses any other host, and the build step's public line names the host reports will go to.
-  - Who sets them: only Samuel, and only in `may-native-compile`. GitHub resolves a variable or secret from the environment first, then the repository, then the organization, so a repository- or organization-level `MAY_POSTHOG_ANDROID_KEY` or `MAY_POSTHOG_HOST` would otherwise count. Don't create either at those levels. The host allowlist limits what a stray value can do, but a stray key would still send crash reports to another PostHog project.
+  - Optional secret `MAY_POSTHOG_IOS_KEY` and variable `MAY_POSTHOG_IOS_HOST`: the same for iOS crash reports (may-app's `tools/release/ios.sh`). Only the iOS build step receives them; every other step refuses the key, the Android build step and the iOS archive rehearsal included, and the Android build never reads the iOS host (nor the iOS build Android's). The iOS key may be a different PostHog project from Android's.
+  - Who sets them: only Samuel, and only in `may-native-compile`, never in `may-native-compile-pr` (no required reviewer; it builds pull request heads). GitHub resolves a variable or secret from the environment first, then the repository, then the organization, so a repository- or organization-level `MAY_POSTHOG_ANDROID_KEY`, `MAY_POSTHOG_HOST`, `MAY_POSTHOG_IOS_KEY` or `MAY_POSTHOG_IOS_HOST` would otherwise count. Don't create any of them at those levels. The host allowlist limits what a stray value can do, but a stray key would still send crash reports to another PostHog project.
+- **`may-native-compile-pr`** (proposed; [compile of a pull request head](#ios-compile-of-a-pull-request-head); no required reviewer, main only): `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` (dedicated deploy keys, rotated when someone leaves may-app), `MAY_APP_PR_READ_TOKEN` (may-app pull requests: read, short-lived) and, optionally, `MAY_APP_PR_COMMENT_TOKEN` (may-app pull requests: read and write; [the compile's errors on the pull request](#the-compiles-errors-on-the-pull-request)). Each is bound in exactly one step.
 - **`may-claude-review`** ([Claude code review of a may-app pull request](#claude-code-review-of-a-may-app-pull-request); no required reviewer, main only): `MAY_APP_REVIEW_TOKEN` (fine-grained, may-app only, expiring; Contents read, Pull requests read and write) in the fetch and review steps, and `MAY_REVIEW_CLAUDE_TOKEN` (a Claude Code OAuth token) in the review step alone.
 - **iOS store environments:**
   - Secrets: `MAY_IOS_CERT_BASE64` and `MAY_IOS_CERT_PASSWORD` (the approved existing distribution certificate), `MAY_IOS_PROFILE_BASE64` (that target's App Store profile), `MAY_ASC_KEY_BASE64`, `MAY_ASC_ISSUER_ID` and `MAY_ARTIFACT_DECRYPT_KEY`.
@@ -589,7 +590,7 @@ No repository secret is needed.
 
 Also needed, which the gate cannot see:
 
-- in `may-native-compile`: `MAY_APP_READ_KEY` and `MAY_DS_READ_KEY` (and, for crash reports, `MAY_POSTHOG_ANDROID_KEY`);
+- in `may-native-compile`: `MAY_APP_READ_KEY` and `MAY_DS_READ_KEY` (and, for crash reports, `MAY_POSTHOG_ANDROID_KEY` and `MAY_POSTHOG_IOS_KEY`);
 - in `may-android-internal`: the secrets `MAY_ARTIFACT_DECRYPT_KEY`, `MAY_ANDROID_KEYSTORE_BASE64` (the `may-upload` keystore), `MAY_ANDROID_STORE_PASSWORD`, `MAY_ANDROID_KEY_PASSWORD` and, for an upload, `MAY_PLAY_JSON` for `may-play-upload@may-assistant-app.iam.gserviceaccount.com`; the variables `MAY_ANDROID_KEY_ALIAS=may-upload`, `MAY_ANDROID_CERT_SHA256` (must equal the committed pin) and `MAY_PLAY_ACCOUNT=may-play-upload@may-assistant-app.iam.gserviceaccount.com`;
 - that service account holds May's "Release apps to testing tracks" permission in Play Console (confirmed 14 Oct, and nothing more: it lacks "Manage testing tracks", so testers are set by hand in Console).
 

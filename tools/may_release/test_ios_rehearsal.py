@@ -197,8 +197,28 @@ class ArchiveTests(RehearsalFixture):
         self.assertEqual(caught.exception.args[0], "Runner has insufficient free space for an archive")
         self.assertEqual(self.seen, [])
 
+    def test_a_record_with_crash_reports_off_archives_as_one_without_the_flag(self):
+        # ios.sh with PostHog crash reports records posthog_key; a rehearsal never holds the key, so it is false.
+        self.archive(self.fake_ios_sh(record_changes={"posthog_key": False}))
+        self.assertEqual((self.summary()["result"], self.summary()["reason"]), ("archived", "archived and checked"))
+        self.assertNotIn("posthog", (self.root / "may-rehearsal/ios-archive-rehearsal.json").read_text())
+
+    def test_a_record_claiming_a_posthog_key_or_naming_one_is_refused(self):
+        for changes, reason in (({"posthog_key": True}, "ios.sh's record differs from the request"),
+                                ({"posthog_key": "false"}, "ios.sh's record differs from the request"),
+                                ({"posthog_key": 0}, "ios.sh's record differs from the request"),
+                                ({"posthog_key": False, "posthog": "phc_testLeak"}, "ios.sh's record is missing or malformed"),
+                                ({"posthog_sha256": "a" * 64}, "ios.sh's record is missing or malformed")):
+            with self.subTest(changes=changes):
+                self.tearDown()
+                self.setUp()
+                self.archive(self.fake_ios_sh(record_changes=changes))
+                self.assertEqual((self.summary()["result"], self.summary()["reason"]), ("failed", reason))
+                self.assertNotIn("phc_testLeak", (self.root / "may-rehearsal/ios-archive-rehearsal.json").read_text())
+
     def test_no_secret_may_be_in_the_archive_step(self):
-        for name in ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY", "MAY_APP_PR_READ_TOKEN", "MAY_ASC_KEY_BASE64"):
+        for name in ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY", "MAY_APP_PR_READ_TOKEN", "MAY_ASC_KEY_BASE64",
+                     "MAY_POSTHOG_IOS_KEY", "MAY_POSTHOG_ANDROID_KEY"):
             with self.subTest(secret=name), self.assertRaises(StoreError):
                 self.archive(self.fake_ios_sh(), environ=dict(self.environ, **{name: "secret"}))
         self.assertEqual(self.seen, [])
