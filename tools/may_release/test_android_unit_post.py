@@ -371,6 +371,26 @@ class PostTests(unittest.TestCase):
         self.assertIn("MAY_APP_PR_COMMENT_TOKEN is not set", out)
         self.assertEqual(self.calls, [])
 
+    def test_the_step_summary_carries_counts_only_with_or_without_the_token(self):
+        for token in (None, TOKEN):
+            with self.subTest(token=bool(token)):
+                summary = self.root / "summary.md"
+                summary.unlink(missing_ok=True)
+                self.write(*recorded(unreadable=2))
+                self.post(self.api(), token=token, extra={"GITHUB_STEP_SUMMARY": str(summary)})
+                self.assertEqual(summary.read_text(), "\n".join([
+                    "### May Android unit suites: failed", "", "| Suite | Tests | Failed | Skipped |", "|---|---|---|---|",
+                    "| core | 2 | 1 | 0 |", "| playground | 5 | 0 | 0 |", "| production | 2 | 0 | 0 |", "",
+                    "1 failing tests and 2 unreadable reports. Which tests failed goes only to the may-app pull request, "
+                    "never here."]) + "\n")
+                self.assertNotIn(PRIVATE, summary.read_text())
+                self.assertNotIn(SECRET_TEXT, summary.read_text())
+
+    def test_a_suite_that_did_not_run_is_summarised_as_such(self):
+        outcome, failed = recorded()
+        outcome["suites"]["production"] = None
+        self.assertIn("| production | did not run | – | – |", tool.summary_lines(outcome, failed))
+
     def test_a_head_already_reported_is_not_posted_again(self):
         code, out = self.post(self.api(comments=[{"body": f"x <!-- may-android-unit-pr head={SHA} -->"}]))
         self.assertEqual(code, 1)
@@ -510,6 +530,21 @@ class WorkflowTests(unittest.TestCase):
         line = 'print("May Android unit suite core: no failing test case to locate")'
         self.flagged("tools/may_release/android_unit.py", line, 'print(f"located {tree}")',
                      "prints something other than a fixed line", "a printed report element")
+
+    def test_the_step_summary_formats_nothing_but_suite_names_and_counts(self):
+        message = "the step summary formats something other than fixed words, suite names and counts"
+        row = 'lines.append(f"| {name} | {int(counts[0])} | {int(counts[1])} | {int(counts[2])} |")'
+        cases = {
+            "a failing test's name": (row, row + "\n    lines += [f\"{failed['failures'][0]['test']}\"]", message),
+            "a raw count": ("{int(counts[0])}", "{counts[0]}", message),
+            "another loop": ("    for name in SUITES:\n", "    for name in failed['failures']:\n", message),
+            "the summary from outside write_summary": ("    write_summary(summary_lines(outcome, failed))\n",
+                                                       "    write_summary(summary_lines(outcome, failed))\n    os.environ.get(\"GITHUB_STEP_SUMMARY\")\n",
+                                                       "writes a GitHub Actions file"),
+        }
+        for case, (old, new, problem) in cases.items():
+            with self.subTest(case=case):
+                self.flagged("tools/may_release/android_unit_post.py", old, new, problem, case)
 
     def test_the_post_tool_prints_only_fixed_lines_the_number_and_the_count(self):
         posted = 'print(f"May Android unit suites failed; {int(total)} failing tests posted to may-app #{number}")'

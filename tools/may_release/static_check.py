@@ -954,6 +954,7 @@ UNIT_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER",
 UNIT_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}"), UNIT_BREAKDOWN_ENV} | \
     {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)}
 UNIT_SECRETS = COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)
+UNIT_RUN_NAME = "\nrun-name: May Android unit suites for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}\non:\n"
 
 
 def android_unit_workflow_problems(text):
@@ -964,8 +965,10 @@ def android_unit_workflow_problems(text):
             [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "unit")] != [1, 1] or \
             text.count("runs-on:") != 2:
         found.append(name + "is not the Linux unit-test run with no artifact, step summary or carried value")
-    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
-        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
+    if UNIT_RUN_NAME not in text or text.count("run-name:") != 1:
+        found.append(name + "run-name is not exactly the pull request number and head SHA (android_ci_schedule.py reads it)")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "core_breakdown"] or \
@@ -1029,9 +1032,122 @@ UNIT_POST_PRINT_VALUES = {"number", "int(total)"}
 UNIT_POST_EXIT_CLASSES = {"GateDenial", "UnitPostError", "CompilePrError", "DsCompileError", "StoreError"}
 
 
+# The post's step summary (android_unit_post.summary_lines): fixed words, the suite's own name and integer counts only.
+UNIT_SUMMARY_VALUES = {"verdict", "name", "int(counts[0])", "int(counts[1])", "int(counts[2])", "int(failed['total'])",
+                       "int(failed['unreadable'])"}
+
+
 def android_unit_print_problems(root):
-    return quiet_tool_problems(root, UNIT_TOOL, UNIT_PRINT_VALUES, UNIT_EXIT_CLASSES) + \
-        quiet_tool_problems(root, UNIT_POST_TOOL, UNIT_POST_PRINT_VALUES, UNIT_POST_EXIT_CLASSES)
+    found = quiet_tool_problems(root, UNIT_TOOL, UNIT_PRINT_VALUES, UNIT_EXIT_CLASSES) + \
+        quiet_tool_problems(root, UNIT_POST_TOOL, UNIT_POST_PRINT_VALUES, UNIT_POST_EXIT_CLASSES,
+                            {"GITHUB_STEP_SUMMARY": "write_summary"})
+    tree = ast.parse((root / "tools/may_release" / UNIT_POST_TOOL).read_text())
+    lines, writer = function_source(tree, "summary_lines"), function_source(tree, "write_summary")
+    values = [ast.unparse(v.value) for n in ast.walk(lines) for v in getattr(n, "values", [])
+              if isinstance(n, ast.JoinedStr) and isinstance(v, ast.FormattedValue)] if lines else None
+    loop = [n for n in ast.walk(lines) if isinstance(n, ast.For)] if lines else []
+    if values is None or not set(values) <= UNIT_SUMMARY_VALUES or \
+            [ast.unparse(n.target) + " in " + ast.unparse(n.iter) for n in loop] != ["name in SUITES"] or \
+            writer is None or [a.arg for a in writer.args.args] != ["lines"]:
+        found.append(UNIT_POST_TOOL + ": the step summary formats something other than fixed words, suite names and counts")
+    return found
+
+
+# The schedule (android-ci-schedule.yml, android_ci_schedule.py) dispatches android-unit-pr.yml for at most one may-app
+# head a run. Pinned whole: the schedule and a bare dispatch as its only triggers, one run at a time, admission with no
+# environment then pick in the environment admission chose, actions: write in pick alone, and no step holding both
+# credentials: GITHUB_TOKEN in runs and dispatch, the PR read token in pick alone, nothing in the cleanup. The tool's
+# one write is control_dispatch, which refuses any path but android-unit-pr.yml's dispatches before it sends anything.
+SCHEDULE = "android-ci-schedule.yml"
+SCHEDULE_TOOL = "android_ci_schedule.py"
+SCHEDULE_CRON = '  schedule:\n    - cron: "*/15 * * * *"\n  workflow_dispatch:\npermissions:'
+SCHEDULE_RUNS = ["python3 -I -S -B tools/may_release/android_ci_schedule.py " + step for step in ("admit", "runs", "pick", "dispatch")] + \
+    ['rm -rf -- "$RUNNER_TEMP/may-android-ci"']
+SCHEDULE_STEP_NAMES = ["List the unit runs of the last 24 hours, with no may-app credential",
+                       "Pick the oldest may-app head touching Android with no run today, with no GitHub token",
+                       "Dispatch the unit suites for the picked head, with no may-app credential",
+                       "Remove the carried numbers"]
+SCHEDULE_PICK_PERMISSIONS = "    permissions:\n      contents: read\n      actions: write\n    steps:\n"
+SCHEDULE_PRINT_VALUES = {"int(count)", "int(looked)", "int(number)", "sha"}
+SCHEDULE_EXIT_CLASSES = {"GateDenial", "ScheduleError"}
+SCHEDULE_DISPATCH = "actions/workflows/android-unit-pr.yml/dispatches"
+
+
+def android_ci_schedule_workflow_problems(text):
+    name = SCHEDULE + ": "
+    found = []
+    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or \
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "pick")] != [1, 1] or \
+            text.count("runs-on:") != 2:
+        found.append(name + "is not the Linux schedule with no artifact, step summary or carried environment")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["schedule", "workflow_dispatch"] or SCHEDULE_CRON not in text or \
+            text.count("cron:") != 1 or re.search(r"(?m)^    (inputs|types|branches):", trigger):
+        found.append(name + "is not scheduled every 15 minutes and dispatched with no input, only")
+    if "\nconcurrency:\n  group: may-android-ci-schedule\n  cancel-in-progress: false\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group, never cancelling a run")
+    writes = re.findall(r"(?m)^\s+[\w-]+:\s*write\b", text)
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or text.count("permissions:") != 3 or \
+            job_text(text, "admission").count(JOB_PERMISSIONS) != 1 or writes != ["      actions: write"] or \
+            SCHEDULE_PICK_PERMISSIONS not in job_text(text, "pick"):
+        found.append(name + "permissions are not read-only but for actions: write in pick alone")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "pick"]:
+        found.append(name + "jobs are not exactly admission and pick")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != SCHEDULE_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than android_ci_schedule.py's admit, runs, pick and dispatch, and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "pick")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["pick"]]
+    cleanup = steps["pick"][-1][1] if steps["pick"] else ""
+    if leading != {"admission": ["uses", "id"], "pick": ["uses"] + ["name"] * len(SCHEDULE_STEP_NAMES)} or \
+            names != [""] + SCHEDULE_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + "pick's steps are not exactly runs, pick, dispatch and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 10\n" not in job_text(text, "pick"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than pick's 10 minutes")
+    job = job_text(text, "pick")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
+            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "pick's environment is not the one admission chose, after admission")
+    by_name = dict(steps["pick"])
+    listed, picked, dispatched, clean = (by_name.get(n, "") for n in SCHEDULE_STEP_NAMES)
+    gate = steps["admission"][1][1] if len(steps["admission"]) > 1 else ""
+    token = [("GH_TOKEN", "${{ github.token }}")]
+    if secrets_in(text) != {PR_READ_SECRET} or text.count("secrets." + PR_READ_SECRET) != 1 or \
+            env_entries(picked) != [(PR_READ_SECRET, "${{ secrets." + PR_READ_SECRET + " }}")] or \
+            env_entries(listed) != token or env_entries(dispatched) != token or env_entries(gate) != token or \
+            "env:" in clean or text.count("github.token") != 3 or re.search(r"(?m)^(    )?env:", text) or \
+            "${{ inputs." in text:
+        found.append(name + "a step holds a credential other than GITHUB_TOKEN in admit, runs and dispatch and the PR "
+                     "read token in pick alone")
+    return found
+
+
+def android_ci_schedule_tool_problems(root):
+    path = root / "tools/may_release" / SCHEDULE_TOOL
+    found = quiet_tool_problems(root, SCHEDULE_TOOL, SCHEDULE_PRINT_VALUES, SCHEDULE_EXIT_CLASSES, {"GITHUB_OUTPUT": "admit"})
+    tree = ast.parse(path.read_text())
+    if assigned_literal(path, "RUN_NAME") != "May Android unit suites for may-app #{number} at {sha}":
+        found.append(SCHEDULE_TOOL + ": RUN_NAME is not android-unit-pr.yml's run-name")
+    if assigned_literal(path, "DISPATCH_PATH") != SCHEDULE_DISPATCH:
+        found.append(SCHEDULE_TOOL + ": DISPATCH_PATH is not android-unit-pr.yml's dispatches endpoint")
+    # Every request that sends a body or names a method is control_dispatch's, which compares its path first.
+    dispatch = function_source(tree, "control_dispatch")
+    senders = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and called_name(n.func) == "Request" and
+               any(k.arg in ("data", "method") for k in n.keywords)]
+    first = dispatch.body[2] if dispatch and len(dispatch.body) > 2 else None
+    if dispatch is None or len(senders) != 1 or senders[0] not in list(ast.walk(dispatch)) or \
+            not isinstance(first, ast.If) or ast.unparse(first.test) != "path != DISPATCH_PATH" or \
+            not isinstance(first.body[0], ast.Raise) or \
+            "f'{API}/repos/{CONTROL_REPO}/{DISPATCH_PATH}'" not in ast.unparse(senders[0]) or \
+            any(isinstance(n, ast.Call) and called_name(n.func) in ("urlopen", "Request") and n not in list(ast.walk(dispatch))
+                and any(k.arg in ("data", "method") for k in n.keywords) for n in ast.walk(tree)):
+        found.append(SCHEDULE_TOOL + ": a request writes somewhere other than control_dispatch's android-unit-pr.yml dispatch")
+    return found
 
 
 # Swift compile of a may-design-system pull request head (ds-swift-compile.yml, gate.py --action ds-compile, ds_compile.py).
@@ -1176,8 +1292,9 @@ def compile_pr_errors_print_problems(root):
     return quiet_tool_problems(root, COMPILE_PR_ERRORS, COMPILE_PR_PRINT_VALUES, COMPILE_PR_EXIT_CLASSES)
 
 
-def quiet_tool_problems(root, filename, print_values, exit_classes):
-    """The output lint above, for one tool that handles private source in this public log."""
+def quiet_tool_problems(root, filename, print_values, exit_classes, files=None):
+    """The output lint above, for one tool that handles private source in this public log. files names, for each
+    GitHub Actions file a tool may write (GITHUB_OUTPUT, GITHUB_STEP_SUMMARY), the one function that may name it."""
     path = root / "tools/may_release" / filename
     tree = ast.parse(path.read_text())
     found = []
@@ -1196,6 +1313,13 @@ def quiet_tool_problems(root, filename, print_values, exit_classes):
 
     def flag(node, what):
         found.append(f"{filename}:{getattr(node, 'lineno', 0)}: {what}")
+
+    def in_function(node, name):
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node.name == name and node in tree.body
+        return False
 
     for node in ast.walk(tree):
         parent = parents.get(node)
@@ -1255,7 +1379,8 @@ def quiet_tool_problems(root, filename, print_values, exit_classes):
                 not isinstance(node.func, ast.Attribute):
             flag(node, "opens something other than a named file (a descriptor such as 1 or 2)")
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and \
-                re.search(r"GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)|::(error|warning|notice|debug|group)", node.value):
+                re.search(r"GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)|::(error|warning|notice|debug|group)", node.value) and \
+                not (node.value in (files or {}) and in_function(node, files[node.value])):
             flag(node, "writes a GitHub Actions file or workflow command")
         if isinstance(node, (ast.Import, ast.ImportFrom)) and any(a.name.split(".")[0] in DS_QUIET_MODULES for a in node.names) or \
                 isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in DS_QUIET_MODULES:
@@ -1418,6 +1543,8 @@ def control_problems(root):
     found += ios_rehearsal_print_problems(root)
     found += android_unit_workflow_problems((flows / UNIT).read_text())
     found += android_unit_print_problems(root)
+    found += android_ci_schedule_workflow_problems((flows / SCHEDULE).read_text())
+    found += android_ci_schedule_tool_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")
