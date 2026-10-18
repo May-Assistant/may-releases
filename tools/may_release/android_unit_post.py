@@ -7,7 +7,7 @@ whose pull request recheck, allowlisted calls, dedupe marker and fence it reuses
 are its logs, step summaries and artifacts; may-app is private. So nothing derived from may-app (a test name, a
 message, a path) is printed, summarised or uploaded here: every line this script prints is fixed, apart from the
 dispatch's own pull request number and the number of failing tests, and every error is a fixed literal
-(static_check.py).
+(static_check.py). The step summary carries each suite's counts and the failing-test total, nothing else.
 
 It runs in its own step, after the suites, holding MAY_APP_PR_COMMENT_TOKEN alone (taken out of the environment at
 once). The comment is posted after the pull request is read again and is still open at the tested head, and unless
@@ -74,6 +74,30 @@ def read_record(private):
     return outcome, failed
 
 
+def summary_lines(outcome, failed):
+    """This run's step summary: each suite's counts and the failing-test total, numbers and fixed words only (this
+    repository is public; static_check.py pins every value formatted here). Written whether or not a comment is
+    posted, so the result is readable here while MAY_APP_PR_COMMENT_TOKEN is not set."""
+    verdict = "passed" if outcome["result"] == "passed" else "failed"
+    lines = [f"### May Android unit suites: {verdict}", "", "| Suite | Tests | Failed | Skipped |", "|---|---|---|---|"]
+    for name in SUITES:
+        counts = outcome["suites"][name]
+        if counts is None:
+            lines.append(f"| {name} | did not run | – | – |")
+        else:
+            lines.append(f"| {name} | {int(counts[0])} | {int(counts[1])} | {int(counts[2])} |")
+    lines += ["", f"{int(failed['total'])} failing tests and {int(failed['unreadable'])} unreadable reports. Which tests "
+              "failed goes only to the may-app pull request, never here."]
+    return lines
+
+
+def write_summary(lines):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with Path(path).open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(lines) + "\n")
+
+
 def comment_body(sha, url, outcome, failed, shown=None):
     """The one comment posted on the pull request. sha is the tested head; url this run, or None."""
     if not SHA.fullmatch(sha or ""):
@@ -135,6 +159,7 @@ def post(sha, pr, call_api=github):
     root = Path(raw).resolve()
     checkout, private = root / SOURCE, root / PRIVATE
     outcome, failed = read_record(private)
+    write_summary(summary_lines(outcome, failed))
     passed = outcome["result"] == "passed"
     total = failed["total"]
     if not token:
