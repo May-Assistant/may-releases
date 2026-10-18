@@ -12,6 +12,9 @@ name: May emulator flows (Playground, pass/fail only)
 # init script runs on this runner while the job holds the keys, so flows_sha must be
 # in main history too, unless flows_from_branch is true: that admits any may-app
 # commit, for trying flows before they merge (their broken-build controls).
+# Queue: `then` adds up to seven more runs ("source_sha:flow", space- or comma-separated) with the same flows_sha,
+# each admitted as the first is. They run one at a time in this one dispatch, as a matrix with max-parallel 1: a second
+# dispatch while one runs would wait in the concurrency group, and a third would cancel it.
 on:
   workflow_dispatch:
     inputs:
@@ -34,6 +37,11 @@ on:
         type: choice
         default: all
         options: [all, chat-reply, task-detail, connections, empty-states, message-menu, sending-status, sign-in, plan-your-day, approvals, onboarding-b, take-notes, voice-notes-off, any-time-event, pin, report-bug, files-off, computer-resting, new-account-confirm, thread-reply-reconnect, draft-kill, sign-out-queued]
+      then:
+        description: More runs after this one, one at a time, same flows_sha (source_sha:flow, space-separated; at most 7)
+        required: false
+        type: string
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -42,6 +50,8 @@ concurrency:
 jobs:
   admission:
     runs-on: ubuntu-24.04
+    outputs:
+      runs: ${{ steps.admit.outputs.runs }}
     permissions:
       contents: read
       actions: read
@@ -50,15 +60,23 @@ jobs:
         with:
           persist-credentials: false
       - name: Admit only this workflow's own dispatch from main, into an existing environment
+        id: admit
         env:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_FLOWS_SHA: ${{ inputs.flows_sha }}
           MAY_FLOWS: ${{ inputs.flows }}
           MAY_FLOWS_FROM_BRANCH: ${{ github.event.inputs.flows_from_branch }}
-        run: python3 -I -S -B tools/may_release/flows.py admit --source-sha "$MAY_SOURCE_SHA" --flows-sha "$MAY_FLOWS_SHA" --flows "$MAY_FLOWS" --flows-from-branch "$MAY_FLOWS_FROM_BRANCH"
+          MAY_THEN: ${{ inputs.then }}
+        run: python3 -I -S -B tools/may_release/flows.py admit --source-sha "$MAY_SOURCE_SHA" --flows-sha "$MAY_FLOWS_SHA" --flows "$MAY_FLOWS" --flows-from-branch "$MAY_FLOWS_FROM_BRANCH" --then "$MAY_THEN"
   flows:
     needs: admission
+    name: flows ${{ matrix.flows }} at ${{ matrix.source_sha }}
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.admission.outputs.runs) }}
     runs-on: ubuntu-24.04
     environment: may-flows
     timeout-minutes: 120
@@ -66,9 +84,9 @@ jobs:
       contents: read
     env:
       PYTHONDONTWRITEBYTECODE: '1'
-      MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+      MAY_SOURCE_SHA: ${{ matrix.source_sha }}
       MAY_FLOWS_SHA: ${{ inputs.flows_sha }}
-      MAY_FLOWS: ${{ inputs.flows }}
+      MAY_FLOWS: ${{ matrix.flows }}
       MAY_FLOWS_FROM_BRANCH: ${{ github.event.inputs.flows_from_branch }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

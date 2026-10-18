@@ -31,6 +31,7 @@ Subcommands, one per workflow step:
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -129,6 +130,30 @@ def admit(repo, ref, event, source_sha, flows_sha, flows, from_branch):
         raise FlowsError("Unknown flow selection")
     if from_branch not in ("true", "false"):
         raise FlowsError("flows_from_branch must be true or false")
+
+
+QUEUE_MAX = 8
+
+
+def queue(source_sha, flows, then):
+    """The runs one dispatch makes, one at a time: its own source and flows, then each `then` entry ("source_sha:flow",
+    separated by spaces or commas), all with the dispatch's flows_sha. Each entry is held to admission's own checks."""
+    runs = [(source_sha, flows)]
+    for entry in re.split(r"[\s,]+", (then or "").strip()):
+        if not entry:
+            continue
+        sha, sep, selection = entry.partition(":")
+        if not sep:
+            raise FlowsError("Each queued run must be source_sha:flow")
+        runs.append((sha, selection))
+    if len(runs) > QUEUE_MAX:
+        raise FlowsError("At most 8 runs per dispatch")
+    for sha, selection in runs:
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise FlowsError("Source and flows must be exact lowercase commit SHAs")
+        if selection not in FLOWS:
+            raise FlowsError("Unknown flow selection")
+    return [{"source_sha": sha, "flows": selection} for sha, selection in runs]
 
 
 def environment_exists(token, get=get_json):
@@ -420,14 +445,18 @@ if __name__ == "__main__":
     parser.add_argument("--flows-sha", default="")
     parser.add_argument("--flows", default="all")
     parser.add_argument("--flows-from-branch", default="false")
+    parser.add_argument("--then", default="")
     args = parser.parse_args()
     try:
         if args.command == "admit":
             admit(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                   os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.flows_sha, args.flows,
                   args.flows_from_branch)
+            runs = queue(args.source_sha, args.flows, args.then)
             environment_exists(os.environ.get("GH_TOKEN"))
-            print("May flows admitted")
+            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                output.write("runs=" + json.dumps(runs) + "\n")
+            print("May flows admitted: %d run%s, one at a time" % (len(runs), "" if len(runs) == 1 else "s"))
         elif args.command == "overlay":
             overlay(args.source_sha, args.flows_sha, args.flows_from_branch)
             print("May flows placed over the prepared source")
