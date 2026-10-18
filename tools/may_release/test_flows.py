@@ -311,6 +311,28 @@ class ParseTest(unittest.TestCase):
             ("EmptyStatesFlow test 1", "ignored"),
         ])
 
+    def test_a_failed_assertion_says_its_line_in_the_flows_own_file(self):
+        frames = "\n".join(["\tat org.junit.Assert.fail(Assert.java:89)",
+                            "\tat org.junit.Assert.assertTrue(Assert.java:42)",
+                            "\tat " + self.PKG + "FlowSupportKt.within(FlowSupport.kt:82)",
+                            "\tat " + self.PKG + "DraftKillFlow.draftSurvives(DraftKillFlow.kt:52)",
+                            "\tat " + self.PKG + "DraftKillFlow.c_sending_clears_it_for_good(DraftKillFlow.kt:63)"])
+        text = "\n".join([
+            status(self.PKG + "DraftKillFlow", "a", -2, "java.lang.AssertionError: the draft is back\n" + frames),
+            # A message that looks like a frame is never read; with no frame in the flow's file, no line.
+            status(self.PKG + "DraftKillFlow", "b", -2, "java.lang.AssertionError: x (DraftKillFlow.kt:99)\n\tat org.junit.Assert.fail(Assert.java:89)"),
+            # An exception says no line, nor does a flow that isn't listed.
+            status(self.PKG + "DraftKillFlow", "c", -2, "java.lang.IllegalStateException: y\n" + frames),
+            status("com.example.Leak", "d", -2, "java.lang.AssertionError: z\n\tat com.example.Leak.d(Leak.kt:7)"),
+            "INSTRUMENTATION_CODE: -1",
+        ])
+        results, _ = parse_instrumentation(text)
+        self.assertEqual([outcome for _, outcome in results], [
+            "fail (assertion, line 52)", "fail (assertion)", "fail (an exception, not an assertion)", "fail (assertion)"])
+        public = "\n".join("May flow " + label + ": " + outcome for label, outcome in results)
+        for word in ("the draft is back", "draftSurvives", "FlowSupport", "Assert.java", "99", "Leak.kt", "IllegalState"):
+            self.assertNotIn(word, public)
+
     def test_a_malformed_status_code_is_skipped_not_a_crash(self):
         text = "\n".join([status(self.PKG + "ChatReplyFlow", "a", "--1"), status(self.PKG + "ChatReplyFlow", "a", "- 2"),
                           status(self.PKG + "ChatReplyFlow", "a", 0), "INSTRUMENTATION_CODE: -1"])
