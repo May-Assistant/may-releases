@@ -26,8 +26,8 @@ NOW = datetime.datetime(2026, 10, 18, 13, 0, tzinfo=datetime.timezone.utc)
 RUN = {"GITHUB_REPOSITORY": "May-Assistant/may-releases", "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "schedule"}
 
 
-def pull(number, sha, head_repo="May-Assistant/may-app", base="main"):
-    return {"number": number, "state": "open", "title": PRIVATE, "head": {"sha": sha, "ref": PRIVATE, "repo": {"full_name": head_repo}},
+def pull(number, sha, head_repo="May-Assistant/may-app", base="main", updated="2026-10-18T12:00:00Z"):
+    return {"number": number, "state": "open", "title": PRIVATE, "updated_at": updated, "head": {"sha": sha, "ref": PRIVATE, "repo": {"full_name": head_repo}},
             "base": {"ref": base, "repo": {"full_name": "May-Assistant/may-app"}}}
 
 
@@ -128,28 +128,35 @@ class PickTests(unittest.TestCase):
         app = FakeApp([pull(1, SHA, head_repo="someone/may-app"), pull(2, OTHER, base="claude/x"), pull(3, THIRD),
                        pull(4, SHA), pull(5, OTHER), pull(6, THIRD)],
                       {1: ["android/x"], 2: ["android/x"], 3: ["android/x"], 4: ["backend/x.ts"], 5: ["android/x"], 6: ["android/x"]})
-        self.assertEqual(pick(TOKEN, {(3, THIRD)}, app), (5, OTHER, 2, 1))
+        self.assertEqual(pick(TOKEN, {(3, THIRD)}, app, NOW), (5, OTHER, 2, 1))
         self.assertEqual([p.split("?")[0] for p in app.paths[1:]], ["pulls/4/files", "pulls/5/files"],
                          "a fork, another base and a head run today have no files read")
 
     def test_a_new_head_on_a_tested_pull_request_is_picked(self):
         app = FakeApp([pull(3, OTHER)], {3: ["android/x"]})
-        self.assertEqual(pick(TOKEN, {(3, SHA)}, app)[:2], (3, OTHER))
+        self.assertEqual(pick(TOKEN, {(3, SHA)}, app, NOW)[:2], (3, OTHER))
 
     def test_unreadable_files_pass_the_pull_request_over_and_nothing_found_picks_nothing(self):
         app = FakeApp([pull(3, SHA), pull(4, OTHER)], {4: ["docs/x.md"]})
-        self.assertEqual(pick(TOKEN, set(), app), (None, None, 2, 0))
+        self.assertEqual(pick(TOKEN, set(), app, NOW), (None, None, 2, 0))
 
     def test_at_most_forty_heads_have_their_files_read_in_one_run(self):
         app = FakeApp([pull(n, SHA) for n in range(1, 60)], {n: ["docs/x.md"] for n in range(1, 60)} | {59: ["android/x"]})
-        self.assertEqual(pick(TOKEN, set(), app), (None, None, 40, 0))
+        self.assertEqual(pick(TOKEN, set(), app, NOW), (None, None, 40, 0))
         self.assertEqual(len(app.paths), 41)
+
+    def test_a_pull_request_not_updated_in_fourteen_days_is_passed_over_without_a_read(self):
+        app = FakeApp([pull(1, SHA, updated="2026-07-01T09:00:00Z"), pull(2, SHA, updated="2026-10-04T12:59:59Z"),
+                       pull(3, SHA, updated=None), pull(4, SHA, updated="18 Oct"), pull(5, OTHER, updated="2026-10-04T13:00:00Z")],
+                      {n: ["android/x"] for n in range(1, 6)})
+        self.assertEqual(pick(TOKEN, set(), app, NOW), (5, OTHER, 1, 1))
+        self.assertEqual([p.split("?")[0] for p in app.paths[1:]], ["pulls/5/files"])
 
     def test_malformed_candidates_are_skipped(self):
         bad = [None, {"number": True, "head": {"sha": SHA}}, {**pull(2, SHA), "state": "closed"}, pull(3, "A" * 40),
                {**pull(4, SHA), "head": None}, {**pull(5, SHA), "number": "5"}]
         app = FakeApp(bad + [pull(6, SHA)], {n: ["android/x"] for n in range(1, 7)})
-        self.assertEqual(pick(TOKEN, set(), app)[:2], (6, SHA))
+        self.assertEqual(pick(TOKEN, set(), app, NOW)[:2], (6, SHA))
 
 
 class WriteTests(unittest.TestCase):
@@ -231,7 +238,7 @@ class StepTests(unittest.TestCase):
             tool.runs_step(NOW, runs)
             with patch.dict(os.environ, {"MAY_APP_PR_READ_TOKEN": TOKEN}):
                 del os.environ["GH_TOKEN"]
-                tool.pick_step(app)
+                tool.pick_step(app, NOW)
                 self.assertFalse("MAY_APP_PR_READ_TOKEN" in os.environ, "the read token leaves the environment at once")
                 os.environ["GH_TOKEN"] = TOKEN
             tool.dispatch_step(post)

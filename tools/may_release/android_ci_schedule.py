@@ -59,6 +59,9 @@ BUSY = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 # At most this many heads have their files read in one run, so a long queue of non-Android pull requests costs a
 # bounded number of reads; the rest are looked at on a later run.
 MAX_LOOKED = 40
+# A pull request not updated for this long is passed over, so months-old drafts never take the 40 reads from newer
+# Android work (coordinator, 18 Oct). Any push or comment updates it, and a unit run's comment does too.
+STALE = datetime.timedelta(days=14)
 PAGES = 30
 SHA = re.compile(r"[0-9a-f]{40}")
 NUMBER = re.compile(r"[1-9][0-9]{0,6}")
@@ -215,12 +218,23 @@ def touches(files):
     return False
 
 
-def pick(token, tested, get=app_get):
-    """(number, sha, looked, android): the oldest open may-app pull request against main from a may-app branch whose
-    head has had no unit run in the window and touches the paths, or None for number and sha; looked counts the heads
+def updated_since(candidate, since):
+    """The pull request was updated at or after since; an unreadable updated_at counts as stale."""
+    value = candidate.get("updated_at")
+    try:
+        updated = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    return updated >= since
+
+
+def pick(token, tested, get=app_get, now=None):
+    """(number, sha, looked, android): the oldest open may-app pull request against main from a may-app branch,
+    updated in the last 14 days, whose head has had no unit run in the window and touches the paths, or None for number and sha; looked counts the heads
     whose files were read, android those that touch the paths. A pull request whose files can't be read, or that has
     more than 3000, is passed over, not the run stopped. Nothing read here is printed."""
     looked = android = 0
+    since = (now or datetime.datetime.now(datetime.timezone.utc)) - STALE
     for candidate in listing(get, "pulls?state=open&base=main&sort=created&direction=asc", token):
         if not isinstance(candidate, dict):
             continue
@@ -230,7 +244,8 @@ def pick(token, tested, get=app_get):
                 not isinstance(sha, str) or not SHA.fullmatch(sha) or candidate.get("state") != "open" or \
                 not isinstance(base, dict) or base.get("ref") != "main" or \
                 (base.get("repo") or {}).get("full_name") != APP_REPO or \
-                (head.get("repo") or {}).get("full_name") != APP_REPO or (number, sha) in tested:
+                (head.get("repo") or {}).get("full_name") != APP_REPO or (number, sha) in tested or \
+                not updated_since(candidate, since):
             continue
         if looked == MAX_LOOKED:
             break
@@ -271,7 +286,7 @@ def runs_step(now=None, get=control_get):
         print(f"May Android CI schedule: {int(count)} heads had a unit run in the last 24 hours")
 
 
-def pick_step(get=app_get):
+def pick_step(get=app_get, now=None):
     check_run()
     # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
     token = os.environ.pop(READ_TOKEN, "")
@@ -284,7 +299,7 @@ def pick_step(get=app_get):
         print("May Android CI schedule: a unit run is queued or running; nothing picked")
         return
     tested = {(n, s) for n, s in (e for e in runs["tested"] if isinstance(e, list) and len(e) == 2)}
-    number, sha, looked, android = pick(token, tested, get)
+    number, sha, looked, android = pick(token, tested, get, now)
     if number is None:
         print(f"May Android CI schedule: no head to run ({int(looked)} heads looked at, none touching Android)")
         return
