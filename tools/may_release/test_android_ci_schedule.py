@@ -365,10 +365,12 @@ class WorkflowTests(unittest.TestCase):
 
     def test_the_unit_run_name_is_the_number_and_head_the_schedule_reads(self):
         message = "android-unit-pr.yml: run-name is not exactly the pull request number and head SHA"
-        line = "run-name: May Android unit suites for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}\n"
+        line = "run-name: 'May Android unit suites for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\n"
         for case, new in {"no run-name": "", "the head first": line.replace("#${{ inputs.pr_number }} at ${{ inputs.source_sha }}",
                                                                             "#${{ inputs.source_sha }} at ${{ inputs.pr_number }}"),
-                          "a may-app value": line.replace("\n", " ${{ github.event.inputs.title }}\n")}.items():
+                          "a may-app value": line.replace("'\n", " ${{ github.event.inputs.title }}'\n"),
+                          # YAML reads an unquoted " #" as a comment: every run would be named only up to the number.
+                          "unquoted": line.replace("'", "")}.items():
             with self.subTest(case=case):
                 self.flagged(UNIT, line, new, message if new else "top-level keys", case)
         self.flagged(TOOL, 'RUN_NAME = "May Android unit suites for may-app #{number} at {sha}"',
