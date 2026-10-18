@@ -73,8 +73,7 @@ FLOWS = {
     "report-bug": "ReportBugFlow",
     "files-off": "TaskFilesOffFlow",
     "computer-resting": "ComputerRestingFlow",
-    # Build 13 (may-app android/flows README, flows 18-21): over the real controller and the app's sealed stores, with
-    # core's in-memory FakeBackend as the server.
+    # Build 13 (may-app android/flows README, flows 18-21).
     "new-account-confirm": "NewAccountConfirmFlow",
     "thread-reply-reconnect": "ThreadReplyReconnectFlow",
     "draft-kill": "DraftKillFlow",
