@@ -301,7 +301,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_each_widening_is_flagged(self):
         name = "android-unit-pr.yml: "
-        secret = name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys and the dispatch's inputs"
+        secret = name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, the post's comment token and the dispatch's inputs"
         runs = name + "runs something other than the gate"
         shape = name + "is not the Linux unit-test run"
         suites_step = "      - name: Run the unit suites without any credential, printing only pass or fail and counts\n        env:\n"
@@ -319,8 +319,8 @@ class WorkflowTests(unittest.TestCase):
             "the JDK exported": ("tools/may_release/toolchain.py jdk\n", "tools/may_release/toolchain.py jdk --export\n", shape),
             "an artifact": ("        if: always()\n", "        if: always()\n      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
                             "        with:\n          name: log\n          path: ${{ runner.temp }}/may-private/\n", shape),
-            "a step summary": ('--source-sha "$MAY_SOURCE_SHA"\n      - name: Remove',
-                               '--source-sha "$MAY_SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"\n      - name: Remove', shape),
+            "a step summary": ('--source-sha "$MAY_SOURCE_SHA" --record-outcome\n',
+                               '--source-sha "$MAY_SOURCE_SHA" --record-outcome >> "$GITHUB_STEP_SUMMARY"\n', shape),
             "the log printed": ("      - name: Remove private source",
                                 "      - name: Show\n        run: cat \"$RUNNER_TEMP/may-private/android-unit.log\"\n"
                                 "      - name: Remove private source", runs),
