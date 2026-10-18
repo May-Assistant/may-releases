@@ -13,6 +13,9 @@ import store
 from store import POSTHOG_NAMES, POSTHOG_SECRETS, SECRET_NAMES, StoreError, build, child_env, identity, play_identity
 
 HERE = Path(__file__).resolve().parent
+# How these tests run a tool as a child: no user site, and no bytecode written beside the tools (-B), as the
+# workflows run them.
+CHILD = [sys.executable, "-s", "-B"]
 ACCOUNT = "may-play-upload@may-assistant-app.iam.gserviceaccount.com"
 CREDENTIAL = json.dumps({"type": "service_account", "project_id": "may-assistant-app",
                          "client_email": ACCOUNT, "private_key": "dummy"})
@@ -59,13 +62,25 @@ class StoreTests(unittest.TestCase):
                    "MAY_PLAY_JSON": '["private-looking-value"]', "MAY_DRY_RUN": "false",
                    # May Playground's own account, so the credential itself is what is refused.
                    "MAY_PLAY_ACCOUNT": "may-playground-upload@may-assistant-app.iam.gserviceaccount.com"}
-            result = subprocess.run([sys.executable, "-s", str(HERE / "play_upload.py"), "--target", "playground",
+            result = subprocess.run([*CHILD, str(HERE / "play_upload.py"), "--target", "playground",
                                      "--source-sha", "a" * 40, "--build-number", "9"],
                                     capture_output=True, text=True, env=env, cwd=directory)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr.strip(), "May Play upload stopped: Protected May Play credential is not a "
                                                 "JSON object; inspect the store before any retry")
+
+    def test_a_child_tool_writes_no_bytecode_beside_the_tools(self):
+        # play_upload.py imports store and verify; under -B neither import leaves a __pycache__ in the tool folder.
+        with tempfile.TemporaryDirectory() as directory:
+            copy = Path(directory) / "may_release"
+            copy.mkdir()
+            for name in ("play_upload.py", "store.py", "verify.py", "cleanup.py"):
+                (copy / name).write_text((HERE / name).read_text())
+            for script, args in (("play_upload.py", ["--help"]), ("cleanup.py", ["release"])):
+                subprocess.run([*CHILD, str(copy / script), *args], capture_output=True,
+                               env={"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": directory}, cwd=directory)
+            self.assertEqual(sorted(p.name for p in copy.iterdir()), ["cleanup.py", "play_upload.py", "store.py", "verify.py"])
 
     def test_child_env_is_an_allowlist(self):
         with patch.dict(os.environ, {"PATH": "/bin", "JAVA_HOME_21_X64": "/jdk", "SOME_TOKEN": "x",
@@ -259,7 +274,7 @@ class StoreTests(unittest.TestCase):
             for name in ("may-private", "may-release", "may-handoff-download", "may-tools", "_work"):
                 (root / name).mkdir()
                 (root / name / "f").write_text("x")
-            result = subprocess.run([sys.executable, "-s", str(HERE / "cleanup.py"), "release"],
+            result = subprocess.run([*CHILD, str(HERE / "cleanup.py"), "release"],
                                     env={"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": directory},
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0)
