@@ -21,10 +21,12 @@ internal-only TestFlight); there is no track input to choose anything else.
 Before any production or public-beta release, Prevent self-review must be on and
 a second reviewer added (README, "Before any non-internal release").
 
-Activation stage 3: admission refuses any dispatch whose dry_run is not true unless
+Activation stage 4: admission refuses any dispatch whose dry_run is not true unless
 it asks for an upload this stage allows: a platform whose upload is not held
 (UPLOADS_HELD) and, for Android, a target store.PLAY_UPLOAD_TRACKS maps to the
-Play `internal` track (stage 3: May and May Playground). Any other dry_run: false
+Play `internal` track (May and May Playground), or, for iOS, a target in
+TESTFLIGHT_TARGETS (May and May Playground; ios_upload.py exports for internal
+TestFlight only). Any other dry_run: false
 dispatch fails at once, before any approval, build or secret, rather than
 finishing green without having uploaded anything. (A dispatch that is admitted
 and then does not upload still fails: confirm_upload.py, after the upload step.)
@@ -90,10 +92,13 @@ ENVIRONMENTS = {
     ("android", "playground"): "may-android-playground-internal",
 }
 MAX_BUILD_NUMBER = 2_000_000_000
-# Stage 3: the store upload step of each platform listed here carries the inert
-# guard, so it can never run; static_check.py requires this set to be exactly the
-# platforms whose upload step is held. Stage 1 held both; stage 2 lifted Android.
-UPLOADS_HELD = {"ios"}
+# The store upload step of each platform listed here carries the inert guard, so
+# it can never run; static_check.py requires this set to be exactly the platforms
+# whose upload step is held. Stage 1 held both; stage 2 lifted Android; stage 4
+# lifted iOS (Samuel's go, 19 Oct).
+UPLOADS_HELD = set()
+# Stage 4: the iOS targets admitted to upload, each to internal TestFlight only.
+TESTFLIGHT_TARGETS = {"playground", "production"}
 ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
 # Actions whose environment has no required reviewer (Samuel, 17 Oct: compile-only pull-request runs need no
 # approval), and the design-system Swift compile (Samuel's decision for ds-swift-compile.yml: it compiles and comments
@@ -150,11 +155,14 @@ def validate_dry_run(action, dry_run, target="production"):
     if dry_run == "true":
         return
     if action in UPLOADS_HELD:
-        raise GateDenial("Uploads are held for this platform (stage 3 holds iOS); this run did not upload "
-                         "anything. dry_run: false fails here by design; dispatch with dry_run: true")
-    if action != "android" or PLAY_UPLOAD_TRACKS.get(target) != "internal":
-        raise GateDenial("Stage 3 admits only an Android May or May Playground upload to the Play internal "
-                         "track; this run did not upload anything. Dispatch with dry_run: true")
+        raise GateDenial("Uploads are held for this platform; this run did not upload anything. "
+                         "dry_run: false fails here by design; dispatch with dry_run: true")
+    if action == "android" and PLAY_UPLOAD_TRACKS.get(target) == "internal":
+        return
+    if action == "ios" and target in TESTFLIGHT_TARGETS:
+        return
+    raise GateDenial("Stage 4 admits only a May or May Playground upload to the Play internal track or to "
+                     "internal TestFlight; this run did not upload anything. Dispatch with dry_run: true")
 
 
 def validate_sign_only(action, sign_only, dry_run, target="production"):

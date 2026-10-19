@@ -180,16 +180,16 @@ class DryRunWorkflowTests(unittest.TestCase):
                          static_check.CONFIRM_SIGNED_IF)
         self.assertTrue(runs(static_check.CONFIRM_SIGNED_IF, "true", failed=True, sign_only_input="true"))
 
-    def test_stage_3_uploads_android_only_when_dry_run_is_false(self):
-        for value in ("false", "FALSE"):
-            with self.subTest(value=value):
-                result, outcomes = run_job("android-release", value)
-                self.assertEqual(result, "success")
-                self.assertEqual(outcomes["Upload update to the internal track only"], "success")
-                self.assertEqual(outcomes[static_check.CONFIRM], "success")
-                self.assertEqual(outcomes[static_check.REPORT], "skipped")
-        # The iOS upload is still held: even inside its (inert) job, it never runs.
-        self.assertEqual(run_job("ios-release", "false")[1]["Upload verified IPA for internal TestFlight"], "skipped")
+    def test_stage_4_uploads_android_and_ios_when_dry_run_is_false(self):
+        for job, upload in (("android-release", "Upload update to the internal track only"),
+                            ("ios-release", "Upload verified IPA for internal TestFlight")):
+            for value in ("false", "FALSE"):
+                with self.subTest(job=job, value=value):
+                    result, outcomes = run_job(job, value)
+                    self.assertEqual(result, "success")
+                    self.assertEqual(outcomes[upload], "success")
+                    self.assertEqual(outcomes[static_check.CONFIRM], "success")
+                    self.assertEqual(outcomes[static_check.REPORT], "skipped")
 
     def test_dry_run_false_never_ends_green_without_uploading(self):
         # Android: the upload ran and failed, or an earlier step failed so it was skipped.
@@ -198,18 +198,25 @@ class DryRunWorkflowTests(unittest.TestCase):
                 result, outcomes = run_job("android-release", "false", upload_outcome)
                 self.assertEqual(result, "failure")
                 self.assertEqual(outcomes.get(static_check.CONFIRM), "failure")
-        # iOS: the upload is still held (skipped), so if the job ever ran with
-        # dry_run: false, the loud-failure step fails it rather than going green.
-        result, outcomes = run_job("ios-release", "false")
-        self.assertEqual(result, "failure")
-        self.assertEqual(outcomes.get("Upload verified IPA for internal TestFlight"), "skipped")
-        self.assertEqual(outcomes.get(static_check.CONFIRM), "failure")
-        # Android with its guard put back: the skipped upload must not go green either.
-        held = STORE.read_text().replace("        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n",
-                                         "        if: " + static_check.HELD_UPLOAD_IF + "\n", 1)
-        result, outcomes = run_job("android-release", "false", workflow=held)
-        self.assertEqual(result, "failure")
-        self.assertEqual(outcomes.get("Upload update to the internal track only"), "skipped")
+        # iOS the same: a failed upload, or one skipped after an earlier failure, fails the job.
+        for upload_outcome in ("failure", "skipped"):
+            with self.subTest(job="ios-release", upload_outcome=upload_outcome):
+                result, outcomes = run_job("ios-release", "false", upload_outcome)
+                self.assertEqual(result, "failure")
+                self.assertEqual(outcomes.get(static_check.CONFIRM), "failure")
+        # Either upload with its guard put back: the skipped upload must not go green either.
+        for job, upload, nth in (("android-release", "Upload update to the internal track only", 0),
+                                 ("ios-release", "Upload verified IPA for internal TestFlight", 1)):
+            with self.subTest(job=job, held=True):
+                text = STORE.read_text()
+                line = "        if: " + static_check.DRY_RUN_UPLOAD_IF + "\n"
+                at = -1
+                for _ in range(nth + 1):
+                    at = text.find(line, at + 1)
+                held = text[:at] + "        if: " + static_check.HELD_UPLOAD_IF + "\n" + text[at + len(line):]
+                result, outcomes = run_job(job, "false", workflow=held)
+                self.assertEqual(result, "failure")
+                self.assertEqual(outcomes.get(upload), "skipped")
 
 
 class DryRunReportTests(unittest.TestCase):

@@ -222,19 +222,26 @@ class GateTests(unittest.TestCase):
             written = Path(output).read_text() if os.path.exists(output) else None
             return denial, written, requests
 
-    HELD = ("Uploads are held for this platform (stage 3 holds iOS); this run did not upload anything. "
+    HELD = ("Uploads are held for this platform; this run did not upload anything. "
             "dry_run: false fails here by design; dispatch with dry_run: true")
-    NOT_ADMITTED = ("Stage 3 admits only an Android May or May Playground upload to the Play internal track; "
-                    "this run did not upload anything. Dispatch with dry_run: true")
+    NOT_ADMITTED = ("Stage 4 admits only a May or May Playground upload to the Play internal track or to internal "
+                    "TestFlight; this run did not upload anything. Dispatch with dry_run: true")
     FLOOR = ("Store build number is below this app's floor (May production Android starts at 3: its first "
              "release, versionCode 2, was uploaded by hand on 14 Oct)")
 
-    def test_stage_3_admits_a_may_playground_android_upload(self):
-        self.assertEqual(gate.UPLOADS_HELD, {"ios"})
+    def test_stage_4_admits_android_internal_and_ios_testflight_uploads(self):
+        self.assertEqual(gate.UPLOADS_HELD, set())
+        self.assertEqual(gate.TESTFLIGHT_TARGETS, {"playground", "production"})
         denial, written, requests = self.run_admission("false")
         self.assertIsNone(denial)
         self.assertEqual(written, "environment=may-android-playground-internal\nbuild_environment=may-native-compile\n")
         self.assertTrue(requests)
+        for target, environment in (("playground", "may-ios-playground-internal"), ("production", "may-ios-internal")):
+            with self.subTest(target=target):
+                denial, written, requests = self.run_admission("false", "ios", target)
+                self.assertIsNone(denial)
+                self.assertEqual(written, "environment=" + environment + "\nbuild_environment=may-native-compile\n")
+                self.assertTrue(requests)
 
     def test_stage_3_admits_a_may_production_android_upload(self):
         denial, written, requests = self.run_admission("false", "android", "production")
@@ -257,10 +264,13 @@ class GateTests(unittest.TestCase):
         for action, target in (("android", "playground"), ("ios", "production"), ("ios", "playground")):
             self.assertTrue(validate_run(REPO, MAIN, DISPATCH, self.sha, action, "2", target))
 
-    def test_stage_3_refuses_every_other_upload_before_anything_else(self):
-        for action, target, expected in (("ios", "playground", self.HELD), ("ios", "production", self.HELD)):
-            with self.subTest(action=action, target=target):
-                denial, written, requests = self.run_admission("false", action, target)
+    def test_stage_4_refuses_every_other_upload_before_anything_else(self):
+        # A held platform, or an iOS target outside TESTFLIGHT_TARGETS, is refused before anything else.
+        for held, targets, expected in (({"ios"}, {"playground", "production"}, self.HELD),
+                                        (set(), set(), self.NOT_ADMITTED), (set(), {"production"}, self.NOT_ADMITTED)):
+            with self.subTest(held=held, targets=targets), patch("gate.UPLOADS_HELD", held), \
+                    patch("gate.TESTFLIGHT_TARGETS", targets):
+                denial, written, requests = self.run_admission("false", "ios", "playground")
                 self.assertEqual(denial, expected)
                 self.assertIsNone(written)  # no environment output, so no later job can start
                 self.assertEqual(requests, [])  # refused before any metadata request
@@ -341,8 +351,11 @@ class GateTests(unittest.TestCase):
         gate.validate_sign_only("android", None, None, "playground")
         with self.assertRaises(GateDenial):
             gate.validate_dry_run("compile", "false")
-        with patch("gate.UPLOADS_HELD", set()), self.assertRaises(GateDenial):
-            gate.validate_dry_run("ios", "false", "playground")  # unheld later: still needs its own rule
+        gate.validate_dry_run("ios", "false", "playground")
+        with patch("gate.TESTFLIGHT_TARGETS", set()), self.assertRaises(GateDenial):
+            gate.validate_dry_run("ios", "false", "playground")  # an unheld platform still needs its own rule
+        with self.assertRaises(GateDenial):
+            gate.validate_dry_run("ios", "false", "staging")
 
 
 if __name__ == "__main__":
