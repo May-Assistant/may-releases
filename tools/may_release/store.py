@@ -106,6 +106,8 @@ IOS_TRACK = "TestFlight internal testing only"
 # Written under may-release by play_upload.py or ios_upload.py once an upload has
 # succeeded; confirm_upload.py requires it whenever dry_run is false.
 UPLOAD_RECORD = "upload-record.json"
+# An App Store Connect build upload ID, as ios_upload.py records it and confirm_upload.py requires it.
+ASC_UPLOAD_ID = re.compile(r"[A-Za-z0-9-]{1,100}")
 
 # Every secret any May release step can hold. Each step names the subset it may
 # see; a step that finds any other one present refuses to run.
@@ -272,8 +274,8 @@ def upload_report(record):
             "  build number (CFBundleVersion): " + record["build_number"],
             "  track: " + record["track"],
             "  signed IPA SHA-256: " + record["sha256"],
-            "  upload ID: not reported (the upload tool's output stays in the private log); "
-            "verify processing in App Store Connect"]
+            "  App Store Connect build upload: " + record["store_id"] +
+            " (read back from App Store Connect; TestFlight processing and testers are checked there)"]
 
 
 def write_upload_record(platform, app_id, build_number, track, sha256, store_id=None):

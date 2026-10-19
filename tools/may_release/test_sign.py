@@ -40,7 +40,7 @@ def fixture_ipa(path, build="9"):
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("Payload/May.app/embedded.mobileprovision", fx.PROFILE_BER)
         archive.writestr("Payload/May.app/Info.plist", plistlib.dumps(
-            {"CFBundleIdentifier": PLAYGROUND, "CFBundleVersion": build}))
+            {"CFBundleIdentifier": PLAYGROUND, "CFBundleVersion": build, "CFBundleShortVersionString": "1.0"}))
 
 
 class Workspace:
@@ -303,11 +303,35 @@ class IosUploadTests(unittest.TestCase):
         def fake_altool(argv, cwd, log, env):
             key_dir = Path(env["API_PRIVATE_KEYS_DIR"])
             captured.update(argv=argv, env=env, keys=sorted(p.name for p in key_dir.iterdir()))
+            log.write_text("No errors uploading '" + argv[4] + "'.\nDelivery UUID: 0a1b2c3d-1111-2222-3333-444455556666\n")
+
+        def fake_token(key_path, issuer):
+            captured.update(token_key=key_path.name, token_key_present=key_path.is_file(), issuer=issuer)
+            return "token"
+
+        def fake_get(token, url):
+            captured.update(url=url)
+            return 200, {"data": [{"id": "upload-1", "attributes": {
+                "cfBundleVersion": "9", "cfBundleShortVersionString": "1.0", "platform": "IOS",
+                "createdDate": "2099-01-01T00:00:00Z", "state": {"state": "PROCESSING"}}}]}
 
         with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=fake_altool), \
+                patch("ios_upload.asc_token", side_effect=fake_token), \
                 patch("sys.stdout", new_callable=io.StringIO) as output:
-            ios_upload.upload("playground", "a" * 40, "9")
-        self.assertEqual(output.getvalue().splitlines()[3], "  track: TestFlight internal testing only")
+            ios_upload.upload("playground", "a" * 40, "9", get=fake_get, sleep=lambda _: None)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[1], "  delivery UUID: 0a1b2c3d-1111-2222-3333-444455556666")
+        self.assertNotIn(str(self.work.root), output.getvalue())
+        self.assertEqual(lines[0], "altool output (scrubbed; the full log stays private and is deleted at cleanup):")
+        self.assertEqual(lines[4], "App Store Connect build upload upload-1 is PROCESSING for build 9")
+        self.assertEqual(lines[8], "  track: TestFlight internal testing only")
+        self.assertEqual(lines[-1], "  App Store Connect build upload: upload-1 (read back from App Store Connect; "
+                                    "TestFlight processing and testers are checked there)")
+        # The token is signed from the same key, while it is still on disk; the readback asks for May Playground.
+        self.assertEqual((captured["token_key"], captured["token_key_present"]), ("AuthKey_23VX669FGY.p8", True))
+        self.assertEqual(captured["issuer"], self.env["MAY_ASC_ISSUER_ID"])
+        self.assertTrue(captured["url"].startswith("https://api.appstoreconnect.apple.com/v1/apps/6822072535/"
+                                                   "buildUploads?filter%5BcfBundleVersion%5D=9&"))
         self.assertEqual(captured["keys"], ["AuthKey_23VX669FGY.p8"])
         self.assertFalse(set(captured["env"]) & set(SECRET_NAMES))
         self.assertIn("--upload-app", captured["argv"])
@@ -315,15 +339,52 @@ class IosUploadTests(unittest.TestCase):
         # It records the upload for the loud-failure step (confirm_upload.py).
         record = json.loads((self.work.root / "may-release/upload-record.json").read_text())
         self.assertEqual(record, {"platform": "ios", "app_id": PLAYGROUND, "build_number": "9",
-                                  "track": "TestFlight internal testing only", "store_id": None,
+                                  "track": "TestFlight internal testing only", "store_id": "upload-1",
                                   "sha256": hashlib.sha256((self.work.root / "may-release/May.ipa").read_bytes()).hexdigest()})
 
     def test_failed_upload_leaves_no_record(self):
+        def failed_altool(argv, cwd, log, env):
+            log.write_text("*** Error: Error uploading '" + argv[4] + "'. ITMS-90062\n")
+            raise StoreError("Protected native release failed")
+
         with patch.dict(os.environ, self.env, clear=True), \
-                patch("ios_upload.run_private", side_effect=StoreError("Protected native release failed")):
+                patch("ios_upload.run_private", side_effect=failed_altool), \
+                patch("ios_upload.asc_token") as token, patch("sys.stdout", new_callable=io.StringIO) as output:
             with self.assertRaises(StoreError):
                 ios_upload.upload("playground", "a" * 40, "9")
+            token.assert_not_called()
         self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
+        # The scrubbed excerpt is printed even when altool fails, before cleanup removes its log.
+        self.assertEqual(output.getvalue().splitlines()[1:], ["  delivery UUID: none",
+                                                              "  lines naming an error: 1; naming a warning: 0",
+                                                              "  codes: ITMS-90062"])
+        self.assertFalse((self.work.root / "may-private/asc-keys").exists())
+
+    def test_altool_exit_zero_without_a_build_upload_fails_and_leaves_no_record(self):
+        """Run 39192306300: altool exited 0, and App Store Connect had no build upload."""
+        clock = iter(range(0, 10000, 30))
+        with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private"), \
+                patch("ios_upload.asc_token", return_value="token"), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(StoreError) as refused:
+                ios_upload.upload("playground", "a" * 40, "9", get=lambda token, url: (200, {"data": []}),
+                                  sleep=lambda _: None, clock=lambda: next(clock))
+        self.assertIn("before the timeout", refused.exception.args[0])
+        self.assertEqual(output.getvalue().splitlines()[-1], "altool finished, so the upload may be in App Store "
+                                                             "Connect; check there before retrying")
+        self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
+        self.assertFalse((self.work.root / "may-private/asc-keys").exists())
+
+    def test_unsigned_token_after_altool_says_the_upload_may_be_there(self):
+        with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private"), \
+                patch("ios_upload.OPENSSL", "/nonexistent/openssl"), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(StoreError) as refused:
+                ios_upload.upload("playground", "a" * 40, "9", get=lambda token, url: self.fail("no readback"))
+        self.assertEqual(refused.exception.args[0], "App Store Connect token could not be signed")
+        self.assertEqual(output.getvalue().splitlines()[-1], "altool finished, so the upload may be in App Store "
+                                                             "Connect; check there before retrying")
+        self.assertFalse((self.work.root / "may-private/asc-keys").exists())
 
     def test_mismatched_ipa_or_other_secrets_are_refused_before_upload(self):
         with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private") as runner:

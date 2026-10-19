@@ -10,7 +10,8 @@ with dry_run: false can never end green without uploading. It refuses unless:
 2. that step left its upload record (store.UPLOAD_RECORD) for exactly this
    platform, app, build number and track, and for the SHA-256 of the signed
    artifact still on this runner. For Android the record must also name the
-   committed Play edit.
+   committed Play edit; for iOS, the App Store Connect build upload that
+   ios_upload.py read back (an altool exit status alone is never an upload).
 
 It then prints the upload report. It holds no secret and makes no network call.
 
@@ -40,7 +41,7 @@ import sys
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import (IOS_TRACK, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, UPLOAD_RECORD, StoreError, file_sha256, identity,
+from store import (ASC_UPLOAD_ID, IOS_TRACK, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, UPLOAD_RECORD, StoreError, file_sha256, identity,
                    require_step_secrets, runner_root, upload_report)
 import play_upload
 import sign_only
@@ -75,8 +76,8 @@ def confirm(platform, target, source_sha, build_number):
     store_id = record["store_id"]
     if platform == "android" and not (isinstance(store_id, str) and EDIT_ID.fullmatch(store_id)):
         raise StoreError("The upload record names no committed Play edit; the upload is not confirmed")
-    if platform == "ios" and store_id is not None:
-        raise StoreError("The upload record does not match this run; the upload is not confirmed")
+    if platform == "ios" and not (isinstance(store_id, str) and ASC_UPLOAD_ID.fullmatch(store_id)):
+        raise StoreError("The upload record names no App Store Connect build upload; the upload is not confirmed")
     return upload_report(record)
 
 
