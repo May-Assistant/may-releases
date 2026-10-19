@@ -130,9 +130,10 @@ jobs:
           MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 -I -S -B tools/may_release/prepare.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA"
-      - name: Build unsigned Android App Bundle with only the crash-report key
+      - name: Build unsigned Android App Bundle with only the crash-report key and Firebase config
         env:
           MAY_POSTHOG_ANDROID_KEY: ${{ secrets.MAY_POSTHOG_ANDROID_KEY }}
+          MAY_GOOGLE_SERVICES_JSON: ${{ secrets.MAY_GOOGLE_SERVICES_JSON }}
           MAY_POSTHOG_HOST: ${{ vars.MAY_POSTHOG_HOST }}
         run: python3 -I -S -B tools/may_release/store.py --platform android --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Encrypt unsigned bundle to the target's public key

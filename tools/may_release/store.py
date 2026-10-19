@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 APP_IDS = {
@@ -119,6 +120,7 @@ SECRET_NAMES = (
     "MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID",
     "MAY_ARTIFACT_DECRYPT_KEY",
     "MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_IOS_KEY",
+    "MAY_GOOGLE_SERVICES_JSON",
     # The repository secret gate.py reads may-app pull requests with (compile-pr); no tool step may hold it.
     "MAY_APP_PR_READ_TOKEN",
     # ds-swift-compile.yml: the may-design-system pull-request read token (gate.py --check-pull alone) and the token
@@ -146,6 +148,15 @@ POSTHOG_NAMES = {"android": ("MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_HOST"),
 POSTHOG_SECRETS = tuple(key for key, _ in POSTHOG_NAMES.values())
 POSTHOG_KEY = re.compile(r"phc_[A-Za-z0-9_-]+")
 POSTHOG_HOSTS = ("https://us.i.posthog.com", "https://eu.i.posthog.com")
+# Push (FCM): the Android build step alone may hold MAY_GOOGLE_SERVICES_JSON, the base64 of the Firebase project's
+# google-services.json. build() checks it is a JSON object with an Android client for the target's package, writes
+# it 0600 under may-private/firebase (inside the runner's temp folder, never in the checkout: android.sh refuses an
+# untracked file there), hands the build script only its path as MAY_GOOGLE_SERVICES_FILE, and deletes it once the
+# build ends (cleanup.py removes may-private too). Nothing of it is printed. Every other step refuses it, the iOS
+# build step included. Without it the app is built with no Firebase config. may-app's Android build reads
+# MAY_GOOGLE_SERVICES_FILE once its FCM work lands; until then the file is unused.
+GOOGLE_SERVICES_SECRET = "MAY_GOOGLE_SERVICES_JSON"
+GOOGLE_SERVICES_MAX_BYTES = 256 * 1024
 HANDOFF_SECRETS = ("MAY_ARTIFACT_DECRYPT_KEY",)
 ANDROID_SIGNING_SECRETS = ("MAY_ANDROID_KEYSTORE_BASE64", "MAY_ANDROID_STORE_PASSWORD",
                            "MAY_ANDROID_KEY_PASSWORD")
@@ -372,10 +383,35 @@ def posthog_env(platform="android"):
     return {key_name: key, host_name: host}
 
 
+def google_services(app_id):
+    """The checked google-services.json bytes from MAY_GOOGLE_SERVICES_JSON, or None when it is absent. Refuses
+    anything that is not a JSON object with an Android client for app_id, never naming the value."""
+    if not os.environ.get(GOOGLE_SERVICES_SECRET, "").strip():
+        return None
+    try:
+        data = base64.b64decode(os.environ[GOOGLE_SERVICES_SECRET].strip(), validate=True)
+        config = json.loads(data.decode("utf-8")) if 0 < len(data) <= GOOGLE_SERVICES_MAX_BYTES else None
+    except (binascii.Error, ValueError):
+        config = None
+    if not isinstance(config, dict) or not isinstance(config.get("project_info"), dict) or \
+            not isinstance(config["project_info"].get("project_id"), str) or not isinstance(config.get("client"), list):
+        raise StoreError("MAY_GOOGLE_SERVICES_JSON is not the base64 of a google-services.json object")
+    packages = set()
+    for client in config["client"]:
+        info = client.get("client_info") if isinstance(client, dict) else None
+        android = info.get("android_client_info") if isinstance(info, dict) else None
+        if isinstance(android, dict):
+            packages.add(android.get("package_name"))
+    if app_id not in packages:
+        raise StoreError("MAY_GOOGLE_SERVICES_JSON has no Android client for this target's package")
+    return data
+
+
 def build(platform, target, source_sha, build_number):
     app_id = identity(platform, target, source_sha, build_number)
     key_name, host_name = POSTHOG_NAMES[platform]
-    require_step_secrets((key_name,))
+    require_step_secrets((key_name, GOOGLE_SERVICES_SECRET) if platform == "android" else (key_name,))
+    firebase_config = google_services(app_id) if platform == "android" else None
     crash_reports = posthog_env(platform)
     root = runner_root()
     source, private = prepared(root, source_sha)
@@ -404,7 +440,19 @@ def build(platform, target, source_sha, build_number):
             print("PostHog crash-report key passed to the Android build; reports go to " + crash_reports[host_name])
     else:
         print("No PostHog key in this build environment; this build sends no crash reports")
-    run_private(["bash", str(script), command], source, private / (platform + "-build.log"), env)
+    firebase = private / "firebase"
+    if firebase_config is not None:
+        firebase.mkdir(mode=0o700)
+        write_private(firebase / "google-services.json", firebase_config)
+        env.update(MAY_GOOGLE_SERVICES_FILE=str(firebase / "google-services.json"))
+        print("Firebase config checked for " + app_id + " and passed to the Android build as a private file")
+    elif platform == "android":
+        print("No Firebase config in this build environment; this build has no push (FCM) config")
+    try:
+        run_private(["bash", str(script), command], source, private / (platform + "-build.log"), env)
+    finally:
+        if firebase_config is not None:
+            shutil.rmtree(firebase, ignore_errors=True)
     made = out / product
     if [p.name for p in out.iterdir()] != [product] or made.is_symlink():
         raise StoreError("Unsigned build must leave exactly its one expected product")
