@@ -130,17 +130,33 @@ class ConfirmUploadTests(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.confirm()
 
-    def test_ios_record_has_no_store_id_and_its_own_track(self):
+    def test_ios_record_names_its_build_upload_and_its_own_track(self):
         ipa = self.root / "may-release/May.ipa"
         ipa.write_bytes(b"fixture ipa")
         write_upload_record("ios", PLAYGROUND, "9", "TestFlight internal testing only",
-                            hashlib.sha256(b"fixture ipa").hexdigest())
+                            hashlib.sha256(b"fixture ipa").hexdigest(), "upload-1")
         lines = self.confirm(platform="ios")
         self.assertEqual(lines[1:4], ["  bundle: " + PLAYGROUND, "  build number (CFBundleVersion): 9",
                                       "  track: TestFlight internal testing only"])
+        self.assertTrue(lines[5].startswith("  App Store Connect build upload: upload-1 "))
         for outcome in ("skipped", None):
             with self.subTest(outcome=outcome), self.assertRaises(StoreError):
                 self.confirm(outcome, platform="ios")
+
+    def test_ios_record_without_a_build_upload_is_refused(self):
+        """An altool exit status alone (no App Store Connect build upload read back) is never an upload."""
+        ipa = self.root / "may-release/May.ipa"
+        ipa.write_bytes(b"fixture ipa")
+        for store_id in (None, "", "upload 1", "../x", 7, "a" * 101):
+            with self.subTest(store_id=store_id):
+                (self.root / "may-release" / UPLOAD_RECORD).write_text(json.dumps(
+                    {"platform": "ios", "app_id": PLAYGROUND, "build_number": "9",
+                     "track": "TestFlight internal testing only",
+                     "sha256": hashlib.sha256(b"fixture ipa").hexdigest(), "store_id": store_id}))
+                with self.assertRaises(StoreError) as refused:
+                    self.confirm(platform="ios")
+                self.assertEqual(refused.exception.args[0], "The upload record names no App Store Connect build "
+                                                            "upload; the upload is not confirmed")
 
     def test_holds_no_secret(self):
         self.upload()

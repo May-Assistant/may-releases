@@ -272,8 +272,8 @@ def upload_report(record):
             "  build number (CFBundleVersion): " + record["build_number"],
             "  track: " + record["track"],
             "  signed IPA SHA-256: " + record["sha256"],
-            "  upload ID: not reported (the upload tool's output stays in the private log); "
-            "verify processing in App Store Connect"]
+            "  App Store Connect build upload: " + record["store_id"] +
+            " (read back from App Store Connect; TestFlight processing and testers are checked there)"]
 
 
 def write_upload_record(platform, app_id, build_number, track, sha256, store_id=None):
