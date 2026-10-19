@@ -41,9 +41,8 @@ import sys
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import (IOS_TRACK, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, UPLOAD_RECORD, StoreError, file_sha256, identity,
+from store import (ASC_UPLOAD_ID, IOS_TRACK, SIGN_ONLY_DIR, SIGN_ONLY_RECORD, UPLOAD_RECORD, StoreError, file_sha256, identity,
                    require_step_secrets, runner_root, upload_report)
-import ios_upload
 import play_upload
 import sign_only
 
@@ -77,7 +76,7 @@ def confirm(platform, target, source_sha, build_number):
     store_id = record["store_id"]
     if platform == "android" and not (isinstance(store_id, str) and EDIT_ID.fullmatch(store_id)):
         raise StoreError("The upload record names no committed Play edit; the upload is not confirmed")
-    if platform == "ios" and not (isinstance(store_id, str) and ios_upload.UPLOAD_ID.fullmatch(store_id)):
+    if platform == "ios" and not (isinstance(store_id, str) and ASC_UPLOAD_ID.fullmatch(store_id)):
         raise StoreError("The upload record names no App Store Connect build upload; the upload is not confirmed")
     return upload_report(record)
 

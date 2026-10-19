@@ -9,9 +9,12 @@ altool's exit status is not proof of an upload: run 39192306300 exited 0 and
 left no build upload in App Store Connect. So, after altool, this script signs
 one App Store Connect API token (ES256, by /usr/bin/openssl, from the same key)
 and polls `GET /v1/apps/{id}/buildUploads` for this CFBundleVersion, every
-POLL_SECONDS for up to POLL_TIMEOUT. The step fails unless a build upload for
-this build number, created after this step started, appears in a state other
-than FAILED (PROCESSING or COMPLETE; AWAITING_UPLOAD keeps polling). It prints
+POLL_SECONDS for up to POLL_TIMEOUT. Of the iOS build uploads for this
+CFBundleVersion and the IPA's CFBundleShortVersionString created after this step
+started, the newest decides: the step fails unless it is PROCESSING or COMPLETE
+(FAILED fails at once; AWAITING_UPLOAD keeps polling). Any failure after altool
+finished says the upload may be in App Store Connect, and a timeout also names
+any fields it could not read (names only). It prints
 that build upload's ID and state and records the ID as the upload's store_id,
 which confirm_upload.py requires. Only GETs are sent, only to ASC_API, with
 redirects refused; Apple's error bodies are discarded unread.
@@ -39,6 +42,7 @@ import datetime
 import http.client
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -47,12 +51,13 @@ import urllib.error
 from urllib.parse import quote, urlencode
 import urllib.request
 import sys
+import zipfile
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from store import (APPLE_KEY_ID, APPLE_TEAM, IOS_TRACK, IOS_UPLOAD_SECRETS, XCODE_DEVELOPER_DIR, StoreError,
+from store import (APPLE_KEY_ID, ASC_UPLOAD_ID, APPLE_TEAM, IOS_TRACK, IOS_UPLOAD_SECRETS, XCODE_DEVELOPER_DIR, StoreError,
                    child_env, file_sha256, identity, require_step_secrets, run_private, runner_root,
                    secret_bytes, write_private, write_upload_record)
 import verify
@@ -62,13 +67,15 @@ ASC_API = "https://api.appstoreconnect.apple.com/v1/"
 ASC_APP_IDS = {"production": "6821782401", "playground": "6822072535"}
 OPENSSL = "/usr/bin/openssl"
 POLL_SECONDS, POLL_TIMEOUT = 30, 900
-TOKEN_LIFETIME = 1200  # Apple's maximum: 20 minutes, which outlasts the poll.
+TOKEN_LIFETIME = 1140  # Under Apple's 20-minute maximum, with a minute's margin; it outlasts the poll.
 CLOCK_SKEW = 300  # A build upload created this long before the step started still counts as this one.
 UPLOAD_STATES = {"AWAITING_UPLOAD", "PROCESSING", "FAILED", "COMPLETE"}
 ACCEPTED_STATES = {"PROCESSING", "COMPLETE"}
-UPLOAD_ID = re.compile(r"[A-Za-z0-9-]{1,100}")
+SHORT_VERSION = re.compile(r"\d{1,9}(\.\d{1,9}){0,2}")
 UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
-CODE_TOKENS = re.compile(r"ITMS-\d{4,6}|(?<![\w.-])-\d{3,6}\b|\b[A-Z][A-Z_.]{2,79}\b")
+# Only code-shaped tokens: ITMS-NNNNN, a negative numeric code, or upper-case words joined by _ or . (such as
+# ENTITY_ERROR.ATTRIBUTE.INVALID). A bare upper-case run (which could be a fragment of an ID) never matches.
+CODE_TOKENS = re.compile(r"ITMS-\d{4,6}|(?<![\w.-])-\d{3,6}\b|\b[A-Z]{2,30}(?:[_.][A-Z]{2,30}){1,5}\b")
 MAX_CODES = 20
 
 
@@ -110,9 +117,12 @@ def asc_token(key_path, issuer, now=None):
     header = {"alg": "ES256", "kid": APPLE_KEY_ID, "typ": "JWT"}
     claims = {"iss": issuer, "iat": issued, "exp": issued + TOKEN_LIFETIME, "aud": "appstoreconnect-v1"}
     signing_input = b64url(json.dumps(header).encode()) + b"." + b64url(json.dumps(claims).encode())
-    result = subprocess.run([OPENSSL, "dgst", "-sha256", "-sign", str(key_path)], input=signing_input,
-                            capture_output=True, env=child_env())
-    if result.returncode or not result.stdout:
+    try:
+        result = subprocess.run([OPENSSL, "dgst", "-sha256", "-sign", str(key_path)], input=signing_input,
+                                capture_output=True, env=child_env())
+    except OSError:
+        result = None
+    if result is None or result.returncode or not result.stdout:
         raise StoreError("App Store Connect token could not be signed")
     return (signing_input + b"." + b64url(der_to_jose(result.stdout))).decode()
 
@@ -155,35 +165,48 @@ def created_at(item):
     return moment.timestamp() if moment.tzinfo else None
 
 
-def matching_upload(items, build_number, started):
-    """This run's build upload in a listing: this CFBundleVersion, created since the step started, newest
-    first. Returns (id, state) or None."""
+def matching_upload(items, build_number, short_version, started, unreadable):
+    """This run's build upload in a listing: iOS, this CFBundleVersion and CFBundleShortVersionString, created
+    since the step started. The newest such upload decides, so a newer FAILED beats an older PROCESSING.
+    Returns (id, state) or None. The names of fields that could not be read are added to `unreadable`."""
     found = []
     for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("attributes"), dict):
-            raise StoreError("App Store Connect build upload list was invalid")
+        attributes = item.get("attributes") if isinstance(item, dict) else None
+        if not isinstance(attributes, dict):
+            unreadable.add("attributes")
+            continue
+        version = attributes.get("cfBundleVersion")
+        if not isinstance(version, str):
+            unreadable.add("cfBundleVersion")
+        if version != build_number:
+            continue
         when = created_at(item)
-        if item["attributes"].get("cfBundleVersion") != build_number or when is None or when < started - CLOCK_SKEW:
+        if when is None:
+            unreadable.add("createdDate")
+        checks = (("platform", attributes.get("platform"), "IOS"),
+                  ("cfBundleShortVersionString", attributes.get("cfBundleShortVersionString"), short_version))
+        for name, value, _ in checks:
+            if not isinstance(value, str):
+                unreadable.add(name)
+        if when is None or when < started - CLOCK_SKEW or any(value != expected for _, value, expected in checks):
             continue
         upload_id, state = item.get("id"), upload_state(item)
-        if not (isinstance(upload_id, str) and UPLOAD_ID.fullmatch(upload_id)) or state is None:
-            raise StoreError("App Store Connect build upload record was invalid")
-        found.append((when, upload_id, state))
-    if not found:
-        return None
-    # Any accepted upload counts; otherwise the newest decides (FAILED fails, AWAITING_UPLOAD waits).
-    found.sort(reverse=True)
-    accepted = [entry for entry in found if entry[2] in ACCEPTED_STATES]
-    _, upload_id, state = (accepted or found)[0]
-    return upload_id, state
+        valid_id = isinstance(upload_id, str) and ASC_UPLOAD_ID.fullmatch(upload_id)
+        if not valid_id:
+            unreadable.add("id")
+        if state is None:
+            unreadable.add("state")
+        if valid_id and state is not None:
+            found.append((when, upload_id, state))
+    return max(found)[1:] if found else None
 
 
-def await_build_upload(token, asc_app_id, build_number, started, get=asc_get, sleep=time.sleep,
+def await_build_upload(token, asc_app_id, build_number, short_version, started, get=asc_get, sleep=time.sleep,
                        clock=time.monotonic):
     """Poll App Store Connect until this build upload exists and is not FAILED. Returns (id, state)."""
     url = ASC_API + "apps/" + quote(asc_app_id, safe="") + "/buildUploads?" + urlencode(
         {"filter[cfBundleVersion]": build_number, "limit": "200"})
-    deadline = clock() + POLL_TIMEOUT
+    deadline, unreadable = clock() + POLL_TIMEOUT, set()
     while True:
         status, body = get(token, url)
         if status in (401, 403):
@@ -194,7 +217,7 @@ def await_build_upload(token, asc_app_id, build_number, started, get=asc_get, sl
             items = body.get("data") if isinstance(body, dict) else None
             if not isinstance(items, list):
                 raise StoreError("App Store Connect build upload list was invalid")
-            match = matching_upload(items, build_number, started)
+            match = matching_upload(items, build_number, short_version, started, unreadable)
             if match and match[1] == "FAILED":
                 raise StoreError("App Store Connect build upload FAILED; the build was not accepted")
             if match and match[1] in ACCEPTED_STATES:
@@ -203,6 +226,9 @@ def await_build_upload(token, asc_app_id, build_number, started, get=asc_get, sl
             raise StoreError("App Store Connect build upload readback was rejected")
         # Not there yet, still AWAITING_UPLOAD, or a transient reply (no reply, 429, 5xx): poll again.
         if clock() + POLL_SECONDS > deadline:
+            if unreadable:
+                # Field names only (a fixed set this script reads), never their values.
+                print("App Store Connect build upload fields that could not be read: " + ", ".join(sorted(unreadable)))
             raise StoreError("No accepted App Store Connect build upload for this build number appeared "
                              "before the timeout; altool's exit status is not an upload")
         sleep(POLL_SECONDS)
@@ -215,16 +241,29 @@ def altool_excerpt(log):
     except OSError:
         return ["altool output: none recorded"]
     lines = text.splitlines()
-    errors = [line for line in lines if re.search(r"(?i)\berror", line)]
+    errors = [line for line in lines if re.search(r"(?i)(?<!no )\berror", line)]  # not "No errors uploading."
     warnings = [line for line in lines if re.search(r"(?i)\bwarning", line)]
     uuid = re.search(r"(?i)delivery\s*uuid\W{0,5}([0-9A-Fa-f-]{36})", text)
-    codes = sorted({code for line in errors + warnings for code in CODE_TOKENS.findall(line)
-                    if code not in ("ERROR", "WARNING")})
+    codes = sorted({code for line in errors + warnings for code in CODE_TOKENS.findall(line)})
     return ["altool output (scrubbed; the full log stays private and is deleted at cleanup):",
             "  delivery UUID: " + (uuid.group(1) if uuid and UUID.fullmatch(uuid.group(1)) else "none"),
             "  lines naming an error: " + str(len(errors)) + "; naming a warning: " + str(len(warnings)),
             "  codes: " + (", ".join(codes[:MAX_CODES]) if codes else "none") +
             (" (" + str(len(codes) - MAX_CODES) + " more)" if len(codes) > MAX_CODES else "")]
+
+
+def ipa_short_version(ipa):
+    """CFBundleShortVersionString of the IPA's one app (verify.ipa_identity has already checked its shape)."""
+    try:
+        with zipfile.ZipFile(ipa) as archive:
+            plists = [name for name in archive.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", name)]
+            info = plistlib.loads(archive.read(plists[0])) if len(plists) == 1 else None
+    except (zipfile.BadZipFile, KeyError, plistlib.InvalidFileException):
+        info = None
+    version = info.get("CFBundleShortVersionString") if isinstance(info, dict) else None
+    if not (isinstance(version, str) and SHORT_VERSION.fullmatch(version)):
+        raise StoreError("IPA has no valid CFBundleShortVersionString")
+    return version
 
 
 def upload(target, source_sha, build_number, get=asc_get, sleep=time.sleep, clock=time.monotonic):
@@ -242,27 +281,35 @@ def upload(target, source_sha, build_number, get=asc_get, sleep=time.sleep, cloc
     if not ipa.is_file() or ipa.is_symlink():
         raise StoreError("Signed iOS IPA is unavailable")
     verify.ipa_identity(ipa, APPLE_TEAM, app_id, build_number)
-    ipa_sha256 = file_sha256(ipa)
+    ipa_sha256, short_version = file_sha256(ipa), ipa_short_version(ipa)
     key = secret_bytes("MAY_ASC_KEY_BASE64")
     if not key.startswith(b"-----BEGIN PRIVATE KEY-----"):
         raise StoreError("App Store Connect key is not a PEM private key")
     keys = private / "asc-keys"
     keys.mkdir(mode=0o700)
-    started = time.time()
+    started, altool_finished = time.time(), False
     try:
-        key_path = keys / ("AuthKey_" + APPLE_KEY_ID + ".p8")
-        write_private(key_path, key)
-        env = child_env(DEVELOPER_DIR=XCODE_DEVELOPER_DIR, API_PRIVATE_KEYS_DIR=str(keys))
         try:
-            run_private(["/usr/bin/xcrun", "altool", "--upload-app", "--file", str(ipa), "--type", "ios",
-                         "--apiKey", APPLE_KEY_ID, "--apiIssuer", issuer],
-                        private, private / "ios-upload.log", env)
+            key_path = keys / ("AuthKey_" + APPLE_KEY_ID + ".p8")
+            write_private(key_path, key)
+            env = child_env(DEVELOPER_DIR=XCODE_DEVELOPER_DIR, API_PRIVATE_KEYS_DIR=str(keys))
+            try:
+                run_private(["/usr/bin/xcrun", "altool", "--upload-app", "--file", str(ipa), "--type", "ios",
+                             "--apiKey", APPLE_KEY_ID, "--apiIssuer", issuer],
+                            private, private / "ios-upload.log", env)
+            finally:
+                print("\n".join(altool_excerpt(private / "ios-upload.log")), flush=True)
+            altool_finished = True
+            token = asc_token(key_path, issuer)
         finally:
-            print("\n".join(altool_excerpt(private / "ios-upload.log")), flush=True)
-        token = asc_token(key_path, issuer)
-    finally:
-        shutil.rmtree(keys, ignore_errors=True)
-    upload_id, state = await_build_upload(token, ASC_APP_IDS[target], build_number, started, get, sleep, clock)
+            shutil.rmtree(keys, ignore_errors=True)
+        upload_id, state = await_build_upload(token, ASC_APP_IDS[target], build_number, short_version, started,
+                                              get, sleep, clock)
+    except StoreError:
+        if altool_finished:
+            print("altool finished, so the upload may be in App Store Connect; check there before retrying",
+                  flush=True)
+        raise
     print("App Store Connect build upload " + upload_id + " is " + state + " for build " + build_number)
     print("\n".join(write_upload_record("ios", app_id, build_number, IOS_TRACK, ipa_sha256, upload_id)))
 

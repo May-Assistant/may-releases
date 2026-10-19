@@ -1,10 +1,13 @@
 import base64
+import io
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
+import plistlib
 
 import ios_upload
 from store import StoreError
@@ -14,9 +17,11 @@ STARTED = 4102444800.0  # 2100-01-01T00:00:00Z
 FRESH = "2100-01-01T00:01:00.000+00:00"
 
 
-def item(upload_id="upload-1", build="9", state="PROCESSING", created=FRESH, nested=True):
+def item(upload_id="upload-1", build="9", state="PROCESSING", created=FRESH, nested=True, platform="IOS",
+         short="1.0"):
     return {"type": "buildUploads", "id": upload_id,
-            "attributes": {"cfBundleVersion": build, "createdDate": created,
+            "attributes": {"cfBundleVersion": build, "cfBundleShortVersionString": short, "platform": platform,
+                           "createdDate": created,
                            "state": {"state": state, "errors": [], "warnings": []} if nested else state}}
 
 
@@ -49,7 +54,7 @@ class Clock:
 
 def poll(get, build="9"):
     clock = Clock()
-    return ios_upload.await_build_upload("token", "6822072535", build, STARTED, get, clock.sleep, clock), clock
+    return ios_upload.await_build_upload("token", "6822072535", build, "1.0", STARTED, get, clock.sleep, clock), clock
 
 
 class BuildUploadReadbackTests(unittest.TestCase):
@@ -85,18 +90,20 @@ class BuildUploadReadbackTests(unittest.TestCase):
             poll(Replies(listing(item(state="FAILED"))))
         self.assertEqual(refused.exception.args[0], "App Store Connect build upload FAILED; the build was not accepted")
 
-    def test_older_failed_attempt_does_not_hide_a_newer_accepted_one(self):
+    def test_the_newest_upload_in_the_window_decides(self):
         older = item("upload-0", state="FAILED", created="2100-01-01T00:00:30Z")
         (found, _) = poll(Replies(listing(older, item(state="COMPLETE"))))
         self.assertEqual(found, ("upload-1", "COMPLETE"))
         newer_failed = item("upload-2", state="FAILED", created="2100-01-01T00:02:00Z")
-        (found, _) = poll(Replies(listing(item(state="AWAITING_UPLOAD"), newer_failed, item("upload-3"))))
-        self.assertEqual(found, ("upload-3", "PROCESSING"))
+        with self.assertRaises(StoreError) as refused:
+            poll(Replies(listing(item(state="PROCESSING"), newer_failed)))
+        self.assertEqual(refused.exception.args[0], "App Store Connect build upload FAILED; the build was not accepted")
 
     def test_other_build_numbers_and_stale_uploads_do_not_count(self):
         stale = item(created="2099-12-31T23:54:59Z")  # before the step started, beyond the clock-skew margin
         for items in ([item(build="10")], [item(build="19")], [stale], [item(created=None)],
-                      [item(created="2100-01-01T00:01:00")], [item(created="yesterday")]):
+                      [item(created="2100-01-01T00:01:00")], [item(created="yesterday")], [item(platform="MAC_OS")],
+                      [item(platform=None)], [item(short="1.1")], [item(short=None)]):
             with self.subTest(items=items):
                 with self.assertRaises(StoreError) as refused:
                     poll(Replies(listing(*items)))
@@ -110,14 +117,26 @@ class BuildUploadReadbackTests(unittest.TestCase):
                                ((404, None), "found no such app or build upload list (HTTP 404)"),
                                ((400, None), "build upload readback was rejected"),
                                ((200, None), "build upload list was invalid"),
-                               ((200, {"data": {}}), "build upload list was invalid"),
-                               (listing("x"), "build upload list was invalid"),
-                               (listing(item(upload_id="bad id")), "build upload record was invalid"),
-                               (listing(item(state="UNKNOWN")), "build upload record was invalid")):
+                               ((200, {"data": {}}), "build upload list was invalid")):
             with self.subTest(reply=reply):
                 with self.assertRaises(StoreError) as refused:
                     poll(Replies(reply))
                 self.assertIn(message, refused.exception.args[0])
+
+    def test_unreadable_uploads_are_skipped_and_their_field_names_named_at_the_timeout(self):
+        unreadable = (["x"], [item(upload_id="bad id")], [item(state="UNKNOWN")], [item(created=None)],
+                      [item(platform=None, short=7)])
+        names = ("attributes", "id", "state", "createdDate", "cfBundleShortVersionString, platform")
+        for items, fields in zip(unreadable, names):
+            with self.subTest(fields=fields), patch("sys.stdout", new_callable=io.StringIO) as output:
+                with self.assertRaises(StoreError) as refused:
+                    poll(Replies(listing(*items)))
+                self.assertIn("before the timeout", refused.exception.args[0])
+                self.assertEqual(output.getvalue(), "App Store Connect build upload fields that could not be read: "
+                                 + fields + "\n")
+        with patch("sys.stdout", new_callable=io.StringIO) as output, self.assertRaises(StoreError):
+            poll(Replies(listing(item(build="8", short=None))))  # another build's fields are not this upload's
+        self.assertEqual(output.getvalue(), "")
 
     def test_requests_go_only_to_the_app_store_connect_api(self):
         for url in ("https://api.appstoreconnect.apple.com.evil.example/v1/apps", "http://api.appstoreconnect.apple.com/v1/",
@@ -154,7 +173,7 @@ class TokenTests(unittest.TestCase):
             decode = lambda part: base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
             self.assertEqual(json.loads(decode(header)), {"alg": "ES256", "kid": "23VX669FGY", "typ": "JWT"})
             self.assertEqual(json.loads(decode(claims)), {"iss": "00000000-1111-2222-3333-444444444444", "iat": 1000,
-                                                          "exp": 2200, "aud": "appstoreconnect-v1"})
+                                                          "exp": 2140, "aud": "appstoreconnect-v1"})
             raw = decode(signature)
             self.assertEqual(len(raw), 64)
 
@@ -176,6 +195,23 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(refused.exception.args[0], "App Store Connect token could not be signed")
 
 
+class ShortVersionTests(unittest.TestCase):
+    def ipa(self, info):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "May.ipa"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("Payload/May.app/Info.plist", plistlib.dumps(info))
+        return path
+
+    def test_reads_a_valid_short_version_only(self):
+        self.assertEqual(ios_upload.ipa_short_version(self.ipa({"CFBundleShortVersionString": "1.2.3"})), "1.2.3")
+        for info in ({}, {"CFBundleShortVersionString": 1}, {"CFBundleShortVersionString": "1.0 beta"},
+                     {"CFBundleShortVersionString": "1.2.3.4"}):
+            with self.subTest(info=info), self.assertRaises(StoreError):
+                ios_upload.ipa_short_version(self.ipa(info))
+
+
 class AltoolExcerptTests(unittest.TestCase):
     def excerpt(self, text):
         with tempfile.TemporaryDirectory() as directory:
@@ -191,17 +227,18 @@ class AltoolExcerptTests(unittest.TestCase):
             "2026-10-19 10:00:00.000 *** Error: Error uploading '" + secret_path + "'.",
             "*** Error: Unable to upload: ENTITY_ERROR.ATTRIBUTE.INVALID (-19232) ITMS-90062 issuer "
             "00000000-1111-2222-3333-444444444444 key 23VX669FGY",
-            "WARNING: something about Private Repo May",
+            "WARNING: something about Private Repo May ABCDEF DEADBEEF",
             "Delivery UUID: 0a1b2c3d-1111-2222-3333-444455556666",
             "No errors uploading."])
         lines = self.excerpt(log)
         self.assertEqual(lines, [
             "altool output (scrubbed; the full log stays private and is deleted at cleanup):",
             "  delivery UUID: 0a1b2c3d-1111-2222-3333-444455556666",
-            "  lines naming an error: 3; naming a warning: 1",
+            "  lines naming an error: 2; naming a warning: 1",
             "  codes: -19232, ENTITY_ERROR.ATTRIBUTE.INVALID, ITMS-90062"])
         printed = "\n".join(lines)
-        for leak in ("runner", "AuthKey", "23VX669FGY", "00000000-1111", "Private Repo", "Xcode_26.3", "/"):
+        for leak in ("runner", "AuthKey", "23VX669FGY", "VX", "00000000-1111", "Private Repo", "ABCDEF", "DEADBEEF",
+                     "Xcode_26.3", "/"):
             self.assertNotIn(leak, printed.replace("delivery UUID: 0a1b2c3d", ""))
 
     def test_missing_or_malformed_values_print_nothing_from_the_log(self):

@@ -106,6 +106,8 @@ IOS_TRACK = "TestFlight internal testing only"
 # Written under may-release by play_upload.py or ios_upload.py once an upload has
 # succeeded; confirm_upload.py requires it whenever dry_run is false.
 UPLOAD_RECORD = "upload-record.json"
+# An App Store Connect build upload ID, as ios_upload.py records it and confirm_upload.py requires it.
+ASC_UPLOAD_ID = re.compile(r"[A-Za-z0-9-]{1,100}")
 
 # Every secret any May release step can hold. Each step names the subset it may
 # see; a step that finds any other one present refuses to run.
