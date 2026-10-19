@@ -131,8 +131,9 @@ PUBLISH_SIGNED_STEP = (
     "          retention-days: 3\n"
     "          compression-level: 0\n")
 READ_KEYS = {"MAY_APP_READ_KEY", "MAY_DS_READ_KEY"}
-# The Android build step holds the PostHog crash-report key and nothing else (store.POSTHOG_SECRETS).
-ANDROID_BUILD = "Build unsigned Android App Bundle with only the crash-report key"
+# The Android build step holds the PostHog crash-report key and the Firebase config (store.GOOGLE_SERVICES_SECRET)
+# and nothing else.
+ANDROID_BUILD = "Build unsigned Android App Bundle with only the crash-report key and Firebase config"
 # That step runs exactly this and nothing else (it is the one build step holding a secret past the fetch), and only it
 # may read the PostHog host variable.
 ANDROID_BUILD_COMMAND = ('python3 -I -S -B tools/may_release/store.py --platform android --target "$MAY_TARGET" '
@@ -151,7 +152,7 @@ STORE_JOBS = {
     "android-build": (
         ["Install pinned JDK and age", FETCH, ANDROID_BUILD,
          "Encrypt unsigned bundle to the target's public key"],
-        {FETCH: READ_KEYS, ANDROID_BUILD: {"MAY_POSTHOG_ANDROID_KEY"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
+        {FETCH: READ_KEYS, ANDROID_BUILD: {"MAY_POSTHOG_ANDROID_KEY", "MAY_GOOGLE_SERVICES_JSON"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "android-release": (
         ["Install pinned JDK and age", DECRYPT, "Sign and verify Android App Bundle",
          "Upload update to the internal track only", CONFIRM, REPORT],

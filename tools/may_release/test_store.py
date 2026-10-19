@@ -1,3 +1,4 @@
+import base64
 import json
 import contextlib
 import io
@@ -115,8 +116,10 @@ class StoreTests(unittest.TestCase):
     def test_unsigned_build_refuses_when_any_secret_is_in_its_step(self):
         # Each build may hold its own platform's PostHog key (their own tests below), and no other secret: not even
         # the other platform's key.
-        cases = [(p, n) for p in ("android", "ios") for n in SECRET_NAMES if n != POSTHOG_NAMES[p][0]]
+        cases = [(p, n) for p in ("android", "ios") for n in SECRET_NAMES if n != POSTHOG_NAMES[p][0] and
+                 (p, n) != ("android", "MAY_GOOGLE_SERVICES_JSON")]
         self.assertIn(("ios", "MAY_POSTHOG_ANDROID_KEY"), cases)
+        self.assertIn(("ios", "MAY_GOOGLE_SERVICES_JSON"), cases)
         self.assertIn(("android", "MAY_POSTHOG_IOS_KEY"), cases)
         for platform, name in cases:
             with self.subTest(platform=platform, name=name), tempfile.TemporaryDirectory() as directory:
@@ -283,3 +286,129 @@ class StoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def google_services(*packages, project="may-firebase-testLeak"):
+    return {"project_info": {"project_number": "123", "project_id": project, "storage_bucket": project + ".app"},
+            "client": [{"client_info": {"mobilesdk_app_id": "1:123:android:abc",
+                                        "android_client_info": {"package_name": name}},
+                        "api_key": [{"current_key": "AIza-testLeak"}]} for name in packages],
+            "configuration_version": "1"}
+
+
+def encoded(config):
+    return base64.b64encode(json.dumps(config).encode()).decode()
+
+
+class GoogleServicesTests(unittest.TestCase):
+    """MAY_GOOGLE_SERVICES_JSON: the Android build step alone holds it; the build script gets only a private path."""
+
+    def build(self, environ, platform="android", target="playground", fail=False):
+        product = "May.xcarchive" if platform == "ios" else "unsigned.aab"
+        seen = {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, private = prepared_tree(root)
+
+            def fake_private(argv, cwd, log, env):
+                seen.update(env=dict(env))
+                path = env.get("MAY_GOOGLE_SERVICES_FILE")
+                if path:
+                    seen.update(bytes=Path(path).read_bytes(), mode=Path(path).stat().st_mode & 0o777,
+                                folder_mode=Path(path).parent.stat().st_mode & 0o777)
+                if fail:
+                    raise StoreError("Protected native release failed; inspect private runner diagnostics")
+                made = Path(env["MAY_ARTIFACT_DIR"]) / product
+                made.mkdir() if platform == "ios" else made.write_bytes(b"unsigned")
+
+            printed = io.StringIO()
+            try:
+                with patch.dict(os.environ, {"RUNNER_TEMP": directory, **environ}, clear=True), \
+                        patch("store.prepared", return_value=(source, private)), \
+                        patch("store.run_private", side_effect=fake_private), \
+                        contextlib.redirect_stdout(printed):
+                    build(platform, target, "a" * 40, "9")
+            finally:
+                seen.update(root=root, printed=printed.getvalue(),
+                            left=sorted(str(q.relative_to(root)) for q in root.rglob("*") if "firebase" in str(q)))
+        return seen
+
+    def test_the_config_reaches_the_android_build_only_as_a_private_file(self):
+        config = google_services("io.github.mayassistant.may", "io.github.mayassistant.may.playground")
+        seen = self.build({"MAY_GOOGLE_SERVICES_JSON": encoded(config)})
+        path = Path(seen["env"]["MAY_GOOGLE_SERVICES_FILE"])
+        self.assertEqual(path, seen["root"].resolve() / "may-private/firebase/google-services.json")
+        self.assertEqual(json.loads(seen["bytes"]), config)
+        self.assertEqual((seen["mode"], seen["folder_mode"]), (0o600, 0o700))
+        self.assertNotIn("MAY_GOOGLE_SERVICES_JSON", seen["env"])
+        self.assertFalse(set(seen["env"]) & set(SECRET_NAMES))
+        # Removed once the build ends; never in the checkout android.sh checks; nothing of it printed.
+        self.assertEqual(seen["left"], [])
+        self.assertEqual(seen["printed"].count("Firebase config checked for io.github.mayassistant.may.playground "
+                                               "and passed to the Android build as a private file"), 1)
+        self.assertNotIn("testLeak", seen["printed"])
+
+    def test_the_file_is_removed_when_the_build_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, private = prepared_tree(root)
+            seen = []
+
+            def failing(argv, cwd, log, env):
+                seen.append(Path(env["MAY_GOOGLE_SERVICES_FILE"]).is_file())
+                raise StoreError("Protected native release failed; inspect private runner diagnostics")
+
+            with patch.dict(os.environ, {"RUNNER_TEMP": directory, "MAY_GOOGLE_SERVICES_JSON":
+                                         encoded(google_services("io.github.mayassistant.may.playground"))}, clear=True), \
+                    patch("store.prepared", return_value=(source, private)), \
+                    patch("store.run_private", side_effect=failing), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(StoreError):
+                    build("android", "playground", "a" * 40, "9")
+            self.assertEqual(seen, [True])
+            self.assertFalse((private / "firebase").exists())
+
+    def test_without_the_config_the_build_has_none_and_says_so_once(self):
+        for environ in ({}, {"MAY_GOOGLE_SERVICES_JSON": ""}, {"MAY_GOOGLE_SERVICES_JSON": "  "}):
+            with self.subTest(environ=environ):
+                seen = self.build(environ)
+                self.assertNotIn("MAY_GOOGLE_SERVICES_FILE", seen["env"])
+                self.assertEqual(seen["printed"].count("No Firebase config in this build environment; this build has "
+                                                       "no push (FCM) config"), 1)
+
+    def test_a_malformed_config_or_one_for_another_app_is_refused_before_building(self):
+        playground = "io.github.mayassistant.may.playground"
+        bad = {
+            "not base64": "not base64 testLeak!",
+            "not JSON": base64.b64encode(b"testLeak").decode(),
+            "a list": encoded([google_services(playground)]),
+            "no project_info": encoded(dict(google_services(playground), project_info=None)),
+            "no project_id": encoded(dict(google_services(playground), project_info={"name": "testLeak"})),
+            "no client list": encoded(dict(google_services(playground), client={"testLeak": 1})),
+            "only May production": encoded(google_services("io.github.mayassistant.may")),
+            "a lookalike package": encoded(google_services(playground + ".testLeak")),
+            "malformed clients": encoded(dict(google_services(), client=["testLeak", {"client_info": "testLeak"},
+                                                                         {"client_info": {"android_client_info": 1}}])),
+            "too large": encoded(dict(google_services(playground), padding="x" * (256 * 1024))),
+        }
+        for case, value in bad.items():
+            with self.subTest(case=case):
+                with self.assertRaises(StoreError) as caught:
+                    self.build({"MAY_GOOGLE_SERVICES_JSON": value})
+                self.assertIn("MAY_GOOGLE_SERVICES_JSON", caught.exception.args[0])
+                self.assertNotIn("testLeak", caught.exception.args[0])
+        # For May production, a production client is required.
+        with self.assertRaises(StoreError):
+            self.build({"MAY_GOOGLE_SERVICES_JSON": encoded(google_services(playground))}, target="production")
+
+    def test_the_ios_build_and_every_other_step_refuse_it(self):
+        with self.assertRaises(StoreError):
+            self.build({"MAY_GOOGLE_SERVICES_JSON": encoded(google_services("io.github.mayassistant.may.playground"))},
+                       platform="ios")
+        from store import (ANDROID_SIGNING_SECRETS, HANDOFF_SECRETS, IOS_SIGNING_SECRETS, IOS_UPLOAD_SECRETS,
+                           PLAY_UPLOAD_SECRETS, SOURCE_READ_SECRETS, require_step_secrets)
+        for allowed in ((), SOURCE_READ_SECRETS, HANDOFF_SECRETS, ANDROID_SIGNING_SECRETS, PLAY_UPLOAD_SECRETS,
+                        IOS_SIGNING_SECRETS, IOS_UPLOAD_SECRETS, POSTHOG_SECRETS):
+            with self.subTest(allowed=allowed), patch.dict(os.environ, {"MAY_GOOGLE_SERVICES_JSON": "x"}), \
+                    self.assertRaises(StoreError):
+                require_step_secrets(allowed)
+        self.assertIn("MAY_GOOGLE_SERVICES_JSON", SECRET_NAMES)
