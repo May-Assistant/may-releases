@@ -12,19 +12,21 @@ This repository only performs later updates. It refuses an app whose tracks show
 
 ## Current state
 
-**Activation status: stage 3, Android uploads to the Play internal track (May and May Playground), plus sign-only for May production.** The [store-release workflow](.github/workflows/store-release-draft.yml) can run an Android **dry run**, or, with `dry_run: false`, upload **May** or **May Playground** to its Play **`internal`** track, or, for May production with `sign_only: true` and `dry_run: true`, sign and verify in a separate `android-sign-only` job (no Play secret) and then publish the signed bundle, encrypted, for a manual Play Console upload. Promoting a build from internal to production stays a manual step in Play Console (Samuel's decision, 14 Oct). A job or step is held **inert** by a condition that requires an event name the workflow never registers (`may-store-disabled-pending-review`), so it is always skipped. In stage 3:
+**Activation status: stage 4, Android uploads to the Play internal track and iOS uploads to internal TestFlight (May and May Playground), plus sign-only for May production.** The [store-release workflow](.github/workflows/store-release-draft.yml) can run an Android **dry run**, or, with `dry_run: false`, upload **May** or **May Playground** to its Play **`internal`** track, or, for May production with `sign_only: true` and `dry_run: true`, sign and verify in a separate `android-sign-only` job (no Play secret) and then publish the signed bundle, encrypted, for a manual Play Console upload. Promoting a build from internal to production stays a manual step in Play Console (Samuel's decision, 14 Oct). An iOS dispatch can dry-run or, with `dry_run: false`, upload May or May Playground to **internal TestFlight** only (Samuel's go, 19 Oct). Earlier stages held a job or step **inert** with a condition that requires an event name the workflow never registers (`may-store-disabled-pending-review`); in stage 4 that guard appears nowhere. In stage 4:
 
-| Part of the store workflow | Stage 3 |
+| Part of the store workflow | Stage 4 |
 | --- | --- |
 | `admission` | active (runs on every dispatch) |
 | `android-build`, `android-release` | active when `platform` is `android` (`android-release` only when `sign_only` is not `true`) |
 | Android upload step (`play_upload.py`) | **active** when `dry_run` is `false`; admission admits that for target `playground` or `production` (track `internal` only) |
 | Android loud-failure check (`confirm_upload.py`) | runs whenever `dry_run` is `false`; fails the job unless the upload step succeeded |
 | `android-sign-only` (`sign_only.py`, the publish step, `confirm_upload.py --sign-only`) | runs instead of `android-release` when `sign_only` is `true`; admission admits that only for May production Android with `dry_run: true`, and only once Samuel's Console-upload key is committed (it is a placeholder today). The job references no Play secret or variable |
-| `ios-build`, `ios-release` (and the iOS upload step) | **inert**: `tools/release/ios.sh` does not exist yet. The iOS loud-failure check is in place but inert with its job |
+| `ios-build`, `ios-release` | active when `platform` is `ios` (`tools/release/ios.sh archive-unsigned`, rehearsed on macOS in runs 39100919695 and 39101524181) |
+| iOS upload step (`ios_upload.py`) | **active** when `dry_run` is `false`; admission admits that for target `playground` or `production` (`gate.TESTFLIGHT_TARGETS`), and the export is `testFlightInternalTestingOnly` |
+| iOS loud-failure check (`confirm_upload.py`) | runs whenever `dry_run` is `false`; fails the job unless the upload step succeeded |
 | Dry-run report (`dry_run.py`) | runs whenever `dry_run` is not `false`; for Android it now also rechecks the build-number floor, the signer and the Play account |
 
-`static_check.py` pins exactly this layout (`STAGE`, `STORE_JOB_IF`, `UPLOAD_IF`, `CONFIRM_IF`, `PLAY_UPLOAD_TRACKS`, and the three sign-only steps, `PUBLISH_SIGNED_STEP` exactly), and requires `gate.py`'s `UPLOADS_HELD` to name exactly the platforms whose upload step is held (stage 3: `{"ios"}`). A guard that disappears from an iOS job or the iOS upload step fails the check. So does a guard that reappears on `admission`, an Android job or the Android upload step: that is flagged as a stage mismatch rather than accepted, so going back to an earlier stage, or to fully inert, is a deliberate, reviewed change to those constants too.
+`static_check.py` pins exactly this layout (`STAGE`, `STORE_JOB_IF`, `UPLOAD_IF`, `CONFIRM_IF`, `PLAY_UPLOAD_TRACKS`, and the three sign-only steps, `PUBLISH_SIGNED_STEP` exactly), and requires `gate.py`'s `UPLOADS_HELD` to name exactly the platforms whose upload step is held (stage 4: none, `set()`). A guard that reappears on any job or upload step is flagged as a stage mismatch rather than accepted, so going back to an earlier stage, or to fully inert, is a deliberate, reviewed change to those constants too.
 
 The [pull-request compile workflow](.github/workflows/native-compile-pr.yml) compiles iOS May Playground at the head of an open may-app pull request against `main`, in its own environment `may-native-compile-pr`. It needs no approval (Samuel, 17 Oct), and it is not usable until Samuel creates that environment and its secrets (see [iOS compile of a pull request head](#ios-compile-of-a-pull-request-head)).
 
@@ -112,7 +114,7 @@ Each store run is **two jobs on separate fresh VMs**:
      - Every link is re-resolved in its final location before any signing secret is on the VM.
    - `integrity.py` runs before each secret step (decrypt, sign, upload). It refuses unless `git status --ignored` is empty and every file under `tools/may_release/` matches the checked-out commit's blob, mode and file list. It runs git with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `-c core.fsmonitor=false` and only `PATH` in its environment, so no system, global or `HOME`-based setting (hooks, fsmonitor, excludes) applies.
    - Because the attempt is bound, re-running a store run means **re-running all jobs**. Re-running only the release job finds no artifact for the new attempt and stops with "Re-run all jobs: this release only accepts a build from the same run attempt".
-   - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads, unless this is a [dry run](#dry-run). In [stage 3](#current-state) only the Android upload step can run (May and May Playground), or, for May production, the [sign-only](#sign-only) job instead, which publishes the encrypted signed bundle and holds no Play secret.
+   - `sign.py` signs and verifies, then `play_upload.py` or `ios_upload.py` uploads, unless this is a [dry run](#dry-run). In [stage 4](#current-state) both upload steps can run (May and May Playground, Play internal or internal TestFlight), or, for May production Android, the [sign-only](#sign-only) job instead, which publishes the encrypted signed bundle and holds no Play secret.
    - Whenever `dry_run` is `false`, `confirm_upload.py` then fails the job unless the upload step's outcome is `success` and it left its upload record (see [Fail loudly](#fail-loudly)).
 
 Within a job, each step receives only its own secrets, and each script refuses to run if it finds another step's secret. Tools get an allowlisted environment. `static_check.py` enforces:
@@ -158,7 +160,7 @@ Samuel's decision (2026-10-14): relax the design-system pin match for internal b
 - `dry_run.py` reports what would have been uploaded: package or bundle ID, versionCode or build number, track, and the signed artifact's SHA-256. For iOS, it re-verifies the IPA first.
 - Upload steps run only when `github.event.inputs.dry_run == 'false'`. That context holds the boolean as a string, so a missing value never uploads. The comparison ignores case, so any casing of `false` passes it.
 - Each upload script also refuses unless `MAY_DRY_RUN` is exactly `false`.
-- **In stage 3 the iOS upload step is still held inert.** Admission (`gate.py --dry-run`) refuses `dry_run: false` for iOS (`UPLOADS_HELD`) and for any Android target `store.PLAY_UPLOAD_TRACKS` does not map to `internal`, before any approval, build or secret, rather than finishing green without uploading.
+- **In stage 4 no upload step is held.** Admission (`gate.py --dry-run`) refuses `dry_run: false` for a held platform (`UPLOADS_HELD`, empty), for any Android target `store.PLAY_UPLOAD_TRACKS` does not map to `internal` and for any iOS target outside `gate.TESTFLIGHT_TARGETS`, before any approval, build or secret, rather than finishing green without uploading.
 - **What an Android dry run proves.** It runs everything except the Play client: admission and both environments' protection, the build-number floor, the build, seal and open, signing with the target's own key (`sign.py` refuses another target's alias or certificate pin), verification, and then `dry_run.py`, which rechecks, as `play_upload.py` would before any request, the floor, that `MAY_PLAY_ACCOUNT` is the target's own Play account, that the signed bundle's sole signer is the target's pinned upload certificate, and that the bundle's own manifest names the target's package at the requested versionCode. The package and versionCode it prints are the ones read from the signed bundle. It does not contact Play: the token, edit, track read, bundle upload, track update and commit run only in a real upload. So a dry run cannot see whether the app has a first release; a real run refuses that case clearly (see [Store records](#store-records)).
 
 ### Sign-only
@@ -313,7 +315,7 @@ Stage 2 (#8, `1c2e0b1`) took the guard off the Android upload, set `UPLOADS_HELD
 
 **Before the first automated upload for any new Play app, confirm that `androidpublisher.googleapis.com` (the Google Play Android Developer API) is enabled on the Cloud project that owns the service account** (`may-assistant-app`). Play Console does not show it, and manual Console uploads never need it. It is now enabled on that project, which both May service accounts belong to.
 
-### Stage 3: May production uploads to its internal track, and sign-only (this change)
+### Stage 3: May production uploads to its internal track, and sign-only (done)
 
 Samuel's decision (14 Oct): may-releases may upload the production May app to its Play **internal** track only (`"production": "internal"` in `PLAY_UPLOAD_TRACKS`). A passing production dry run comes first. Promoting a build from internal to production stays a manual step in Play Console. This change:
 
@@ -326,7 +328,17 @@ Samuel's decision (14 Oct): may-releases may upload the production May app to it
 - reads every signed bundle's own manifest on the release side (`verify.check_aab_identity`) and refuses another package or versionCode, in `dry_run.py`, `sign_only.py` and `play_upload.py`;
 - moves `static_check.py` to stage 3.
 
-`confirm_upload.py` checks May production exactly as it checks Playground: package, versionCode, track `internal`, signed SHA-256 and committed edit ID. The iOS jobs and the iOS upload stay inert until `ios.sh` exists and a macOS rehearsal has passed.
+`confirm_upload.py` checks May production exactly as it checks Playground: package, versionCode, track `internal`, signed SHA-256 and committed edit ID.
+
+### Stage 4: iOS uploads to internal TestFlight (this change)
+
+Samuel's go, 19 Oct, in the build-lane session: "lift the iOS hold and ship TestFlight". may-app's `tools/release/ios.sh archive-unsigned` exists, and the macOS archive rehearsal passed twice (runs [39100919695](https://github.com/May-Assistant/may-releases/actions/runs/39100919695) and [39101524181](https://github.com/May-Assistant/may-releases/actions/runs/39101524181)). This change:
+
+- takes the inert guard off `ios-build`, `ios-release` and the iOS upload step, which keep their platform and dry-run conditions;
+- empties `gate.UPLOADS_HELD`, and admits an iOS `dry_run: false` only for `gate.TESTFLIGHT_TARGETS` (May and May Playground); `sign.py` exports for `testFlightInternalTestingOnly`, so neither can reach external testers or the App Store;
+- moves `static_check.py` to stage 4: the guard must appear nowhere, and putting it back on any job or upload is a stage mismatch.
+
+Nothing else changes: the same two approvals per run (`may-native-compile`, then `may-ios-playground-internal` or `may-ios-internal`), the same encrypted handoff, and the same loud-failure check after the upload. The iOS paths have not yet run against App Store Connect, so the first dispatch is a **dry run** (it builds, signs and verifies the IPA, and uploads nothing), then the upload. TestFlight processing and the internal group's testers are checked in App Store Connect: `ios_upload.py` stops at a successful `altool` upload, and May Playground's internal group (`8a709a78-…`) is empty until Samuel adds testers.
 
 ### What Samuel does
 
@@ -381,7 +393,7 @@ The next workflow upload must then use a versionCode above it, and above every v
 gh workflow run store-release-draft.yml -f platform=android -f target=production -f source_sha=<reviewed may-app main SHA> -f build_number=3 -f dry_run=true -f sign_only=false --repo May-Assistant/may-releases --ref main
 ```
 
-In the Actions UI, choose **May protected store release (stage 3, Android internal uploads; iOS inert)**, **Run workflow** from `main`, and set the inputs above. A run that did not do what it was asked is **red**: admission refuses what it does not admit, the upload step fails on any Play refusal or error (deleting the edit), and the loud-failure checks fail the job whenever the upload, or the sign-only publication, did not succeed.
+In the Actions UI, choose **May protected store release (stage 4, Android internal and internal TestFlight uploads)**, **Run workflow** from `main`, and set the inputs above. A run that did not do what it was asked is **red**: admission refuses what it does not admit, the upload step fails on any Play refusal or error (deleting the edit), and the loud-failure checks fail the job whenever the upload, or the sign-only publication, did not succeed.
 
 ### iOS compile each build
 
@@ -603,7 +615,7 @@ No repository secret is needed.
 - a **custom** deployment branch policy (not "protected branches") with exactly one rule, `main`;
 - exactly **one required-reviewer rule**, whose **sole** reviewer is Samuel (user ID `58840187`);
 - the self-review setting is readable, and it is not the deadlock case: the gate denies only when *Prevent self-review* is **on and** the sole reviewer (Samuel) dispatched the run, because that run could never be approved. **In practice it must be off**, because Samuel dispatches and approves his own runs. That is Samuel's decision for internal builds only (see [Self-review](#environments-and-protection));
-- in stage 3, a dispatch with `dry_run: false` is Android May or May Playground, and one with `sign_only: true` is May production Android with `dry_run: true` and a committed Console-upload key (admission only; see [Dry run](#dry-run));
+- in stage 4, a dispatch with `dry_run: false` is May or May Playground, to the Play internal track or internal TestFlight, and one with `sign_only: true` is May production Android with `dry_run: true` and a committed Console-upload key (admission only; see [Dry run](#dry-run));
 - the build number is at least the app's floor (May production: 3);
 - the target's **artifact public key is committed** and well-formed: `tools/may_release/artifact_keys/may-android-internal.age.pub` (`age1kpcl…skyd7vg`) for May production, `may-android-playground-internal.age.pub` (`age1cv26…sex4n5j`) for Playground, both committed 2026-10-13. A placeholder or malformed key denies before any request. Its private half is that environment's `MAY_ARTIFACT_DECRYPT_KEY`, which `handoff.py open` checks against it.
 
@@ -615,7 +627,7 @@ Also needed, which the gate cannot see:
 
 `android-release` references `MAY_PLAY_JSON`, so once it is set the runner receives it with every `android-release` job, dry runs included, even though only the upload step is given it. A sign-only run does not run `android-release`; its own job references no Play secret.
 
-The Play client has run against Play for May Playground (build 5). It has not yet run for May production, and the iOS paths have not yet run against App Store Connect.
+The Play client has run against Play for May Playground (build 5). It has not yet run for May production, and the iOS paths have not yet run against App Store Connect (stage 4's first dispatches do that).
 
 No May backend deployment should be inferred from a mobile compile. Model-spend limits and default-off voice activation are separate staging admission gates.
 

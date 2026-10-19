@@ -68,30 +68,29 @@ UPLOAD_IDS = {"android-release": "play_upload", "ios-release": "testflight_uploa
 # A job or step whose condition requires this event never runs: the workflow
 # registers only workflow_dispatch. That is how a job or step is held inert.
 INERT = "github.event_name == 'may-store-disabled-pending-review'"
-STAGE = "stage 3"
-# Activation stage 3 (Android uploads to the Play internal track, May and May
-# Playground; sign-only for May production). Each store
-# job's exact job-level `if:` (None: no condition). Admission and the Android jobs
-# are active and keep their platform condition; the iOS jobs stay inert
-# (tools/release/ios.sh does not exist yet). The Android upload step is active and
-# the iOS upload step is still held (UPLOAD_IF). The guard appears nowhere else in
-# the workflow's code.
+STAGE = "stage 4"
+# Activation stage 4 (Android uploads to the Play internal track, May and May
+# Playground; sign-only for May production; iOS uploads to internal TestFlight, May
+# and May Playground, Samuel's go of 19 Oct). Each store job's exact job-level
+# `if:` (None: no condition). Every job is active and keeps its platform
+# condition, both upload steps are active (UPLOAD_IF), and the guard appears
+# nowhere in the workflow's code.
 STORE_JOB_IF = {
     "admission": None,
     "android-build": "${{ inputs.platform == 'android' }}",
     "android-release": "${{ inputs.platform == 'android' && github.event.inputs.sign_only != 'true' }}",
     "android-sign-only": "${{ inputs.platform == 'android' && github.event.inputs.sign_only == 'true' }}",
-    "ios-build": "${{ " + INERT + " && inputs.platform == 'ios' }}",
-    "ios-release": "${{ " + INERT + " && inputs.platform == 'ios' }}",
+    "ios-build": "${{ inputs.platform == 'ios' }}",
+    "ios-release": "${{ inputs.platform == 'ios' }}",
 }
 # A store upload runs only when dry_run is exactly 'false' (github.event.inputs
 # holds booleans as strings, so a missing value never uploads), and the upload
 # script receives the same value to recheck. The report runs in every other case.
-# A held upload also carries the guard first (HELD_UPLOAD_IF). Stage 3: the
-# Android upload is active (DRY_RUN_UPLOAD_IF), the iOS upload is still held.
+# A held upload also carries the guard first (HELD_UPLOAD_IF). Stage 4: both
+# uploads are active (DRY_RUN_UPLOAD_IF).
 DRY_RUN_UPLOAD_IF = "${{ github.event.inputs.dry_run == 'false' }}"
 HELD_UPLOAD_IF = "${{ " + INERT + " && github.event.inputs.dry_run == 'false' }}"
-UPLOAD_IF = {"android-release": DRY_RUN_UPLOAD_IF, "ios-release": HELD_UPLOAD_IF}
+UPLOAD_IF = {"android-release": DRY_RUN_UPLOAD_IF, "ios-release": DRY_RUN_UPLOAD_IF}
 REPORT_IF = "${{ github.event.inputs.dry_run != 'false' }}"
 # Loud failure: right after each upload step, whenever dry_run is false (unless the
 # run was cancelled, and even after an earlier failure), confirm_upload.py fails the
@@ -1680,7 +1679,7 @@ if __name__ == "__main__":
         print("Static check failed: " + failure)
     if failures:
         sys.exit(1)
-    print("May store workflow is at activation stage 3 (Android uploads to the Play internal track for May "
-          "and May Playground, May production sign-only in its own job with no Play secret, each checked "
-          "loudly; iOS inert), the native compile workflow compiles iOS May Playground only, and the no-secret controls are "
+    print("May store workflow is at activation stage 4 (Android uploads to the Play internal track and iOS uploads "
+          "to internal TestFlight, for May and May Playground, May production sign-only in its own job with no Play "
+          "secret, each checked loudly), the native compile workflow compiles iOS May Playground only, and the no-secret controls are "
           "structurally present")
