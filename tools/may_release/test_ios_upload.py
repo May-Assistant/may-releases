@@ -248,6 +248,66 @@ class DiagnosticsTests(unittest.TestCase):
                          ["App Store Connect diagnostics unavailable"])
 
 
+class AppleApiErrorTests(unittest.TestCase):
+    """Run 39423195473: a 400 from App Store Connect printed only its status; Apple's JSON:API errors name why."""
+
+    BODY = {"errors": [
+        {"id": "x", "status": "400", "code": "PARAMETER_ERROR.INVALID", "title": "A parameter has an invalid value",
+         "detail": "secret detail /Users/runner", "source": {"parameter": "sort"}},
+        {"status": "4OO", "code": "lower; rm -rf", "source": {"parameter": "x y/<z>"}},
+        {"status": "409", "code": "ENTITY_ERROR.ATTRIBUTE.INVALID"},
+        "not an object"]}
+
+    def test_codes_statuses_and_parameters_are_checked(self):
+        self.assertEqual(ios_upload.api_errors(self.BODY), [
+            "PARAMETER_ERROR.INVALID (status 400, parameter sort)", "? (status ?, parameter ?)",
+            "ENTITY_ERROR.ATTRIBUTE.INVALID (status 409)"])
+        for body in (None, [], {"errors": "x"}, {"errors": []}):
+            self.assertEqual(ios_upload.api_errors(body), [])
+
+    def test_diagnostics_name_apple_errors_and_list_uploads_without_sort(self):
+        asked = []
+
+        def get(token, url):
+            asked.append(url)
+            if "/buildUploads?" in url:
+                return 400, self.BODY
+            return 200, {"data": []}
+
+        lines = ios_upload.asc_diagnostics("token", get)
+        self.assertIn("  build uploads: unreadable (HTTP 400); Apple says PARAMETER_ERROR.INVALID (status 400, "
+                      "parameter sort); ? (status ?, parameter ?); ENTITY_ERROR.ATTRIBUTE.INVALID (status 409)", lines)
+        uploads = [url for url in asked if "/buildUploads?" in url]
+        self.assertEqual(uploads, [ios_upload.ASC_API + "apps/" + app + "/buildUploads?limit=200"
+                                   for app in ("6822072535", "6821782401")])
+        printed = "\n".join(lines)
+        for leak in ("secret", "/Users", "rm -rf", "invalid value"):
+            self.assertNotIn(leak, printed)
+
+    def test_diagnostics_list_build_uploads_newest_first(self):
+        def get(token, url):
+            if "/buildUploads?" in url:
+                return 200, {"data": [
+                    {"attributes": {"cfBundleVersion": "1", "createdDate": "2026-10-18T00:00:00Z"}},
+                    {"attributes": "odd"},
+                    {"attributes": {"cfBundleVersion": "3", "createdDate": "2026-10-20T00:00:00Z"}},
+                    {"attributes": {"cfBundleVersion": "2", "createdDate": "2026-10-19T00:00:00Z"}}]}
+            return 200, {"data": []}
+
+        lines = ios_upload.asc_diagnostics("token", get)
+        builds = [line.split()[1] for line in lines[:6] if line.startswith("    build ")]
+        self.assertEqual(builds, ["3", "2", "1", "?"])
+
+    def test_readback_prints_apple_errors_on_a_4xx(self):
+        clock = iter(range(0, 10000, 30))
+        with patch("sys.stdout", new_callable=io.StringIO) as output, self.assertRaises(StoreError):
+            ios_upload.await_build_upload("token", "6822072535", "9", "1.0", 0, lambda token, url: (400, self.BODY),
+                                          lambda _: None, lambda: next(clock))
+        self.assertIn("App Store Connect said: PARAMETER_ERROR.INVALID (status 400, parameter sort); ? (status ?, "
+                      "parameter ?); ENTITY_ERROR.ATTRIBUTE.INVALID (status 409)", output.getvalue().splitlines())
+        self.assertNotIn("secret", output.getvalue())
+
+
 class ShortVersionTests(unittest.TestCase):
     def ipa(self, info):
         directory = tempfile.TemporaryDirectory()
@@ -330,6 +390,61 @@ class AltoolExcerptTests(unittest.TestCase):
                 for leak in ("/Users", "runner", "23VX669FGY", "secret", "mayassistant", "Payload"):
                     self.assertNotIn(leak, printed)
         self.assertEqual(ios_upload.error_lines(Path("/nonexistent/ios-upload.log")), 0)
+
+    def test_json_report_names_apple_codes_status_and_titles_only(self):
+        """Run 39423195473: --output-format json; product errors give Apple's codes, status and fixed title."""
+        issuer = "00000000-1111-2222-3333-444444444444"
+        report = {"tool-version": "26.3", "tool-path": "/Applications/Xcode_26.3.app/altool", "product-errors": [
+            {"code": -19232, "message": "Validation failed (409) ITMS-90189 at /Users/runner/key",
+             "userInfo": {"NSLocalizedDescription": "Redundant Binary Upload for build 9",
+                          "iris-code": "ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE", "status": "409",
+                          "title": "The provided entity includes an attribute with a value that has already been used",
+                          "NSUnderlyingError": {"code": "STATE_ERROR.VALIDATION_ERROR",
+                                                "userInfo": {"title": "should be ignored: the first title is shown"}}}},
+            {"code": "not a code; rm -rf /", "userInfo": {"title": "Key 23VX669FGY is not authorized"}},
+            {"code": 401, "userInfo": {"title": "Issuer " + issuer + " unknown"}},
+            {"code": 7, "userInfo": {"title": "See https://example.com/x?y=<script>"}},
+            "not an object"], "details": {"delivery-uuid": "0a1b2c3d-1111-2222-3333-444455556666"}}
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ios-upload.log"
+            log.write_text("Running altool at path '/Applications/Xcode_26.3.app/altool'...\n" +
+                           json.dumps(report, indent=2) + "\nWARNING: tail\n")
+            lines = ios_upload.altool_excerpt(log, (issuer,))
+            self.assertEqual(ios_upload.error_lines(log), 4)
+        self.assertEqual(lines, [
+            "altool output (scrubbed; the full log stays private and is deleted at cleanup):",
+            "  delivery UUID: 0a1b2c3d-1111-2222-3333-444455556666",
+            "  lines naming an error: 0; naming a warning: 1",
+            "  codes: -19232, 401, 7, ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE, ITMS-90189, STATE_ERROR.VALIDATION_ERROR",
+            "  error kinds: authentication or API key, build number already used, conflict (409), unrecognised",
+            "  JSON report: 4 product errors",
+            "    codes -19232, ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE, ITMS-90189, STATE_ERROR.VALIDATION_ERROR; "
+            "status 409; title The provided entity includes an attribute with a value that has already been used",
+            "    codes none; title ?",
+            "    codes 401; title ?",
+            "    codes 7; title ?"])
+        printed = "\n".join(lines)
+        for leak in ("/Users", "runner", "rm -rf", "23VX669FGY", "00000000-1111", "example.com", "script",
+                     "Xcode_26.3", "Redundant", "ignored"):
+            self.assertNotIn(leak, printed)
+
+    def test_a_json_report_without_product_errors_is_no_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ios-upload.log"
+            log.write_text(json.dumps({"success-message": "No errors uploading 'May.ipa'", "product-errors": [],
+                                       "details": {"delivery-uuid": "0a1b2c3d-1111-2222-3333-444455556666"}},
+                                      indent=2) + "\n")
+            self.assertEqual(ios_upload.error_lines(log), 0)
+            lines = ios_upload.altool_excerpt(log)
+        self.assertEqual(lines[1:], ["  delivery UUID: 0a1b2c3d-1111-2222-3333-444455556666",
+                                     "  lines naming an error: 0; naming a warning: 0", "  codes: none",
+                                     "  error kinds: none", "  JSON report: 0 product errors"])
+
+    def test_codes_on_plain_lines_that_do_not_say_error_are_kept(self):
+        """altool's plain error dictionary spans lines; a code on a line without "error" is still named."""
+        lines = self.excerpt("*** Error: Upload failed.\n{\n    NSLocalizedFailureReason = \"ITMS-90062: x\";\n"
+                             "    code = \"STATE_ERROR.VALIDATION_ERROR\";\n}\n")
+        self.assertEqual(lines[3], "  codes: ITMS-90062, STATE_ERROR.VALIDATION_ERROR")
 
     def test_code_list_is_capped(self):
         log = "\n".join("ERROR CODE_" + chr(65 + i // 26) + chr(65 + i % 26) for i in range(30))
