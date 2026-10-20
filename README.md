@@ -370,6 +370,15 @@ Only GETs are sent. Every value is printed only if it matches a fixed shape (dig
 
   A title is printed only when it is at most 160 characters of letters, digits, spaces and `,.'()&:;?!-`, and holds no UUID and not the key ID or issuer. Otherwise it prints "?". Each message is classified into the fixed kinds on its own. The delivery UUID is also read from the report's `details`. Code tokens are now read from every plain line of altool's output, since its error dictionaries span lines that don't say "error".
 
+**Validation messages, and validation before the upload (20 Oct).** Build 6 (run 39481657122) failed with one product error: codes `-19241`, `STATE_ERROR.VALIDATION_ERROR`, status 409, title "Validation failed". The title doesn't say which rule. Since then:
+
+- each product error's messages print under it when they name an Info.plist key (`CFBundle…`, `NS…UsageDescription`, `UI…`, `LS…`, `MinimumOSVersion`, `DT…`, `aps-environment`, `Info.plist`), an `ITMS-NNNNN` code, or a known error kind. Each message is scrubbed before it prints:
+  - UUIDs, the key ID and the issuer are replaced;
+  - a quoted value is kept only when it is empty or a list of Info.plist keys, codes or version numbers; otherwise it reads `'<quoted>'`;
+  - any word with `/ \ @ ~` and similar characters reads `<path>`;
+  - the message is cut to 300 characters, and printed only if what remains is plain text (otherwise "?").
+- before the upload, `xcrun altool --validate-app -f <ipa> -t ios --apiKey … --apiIssuer … --output-format json` runs, and its output gets the same excerpt, headed "altool validation". Its product errors stop the step with nothing uploaded. If the validation can't run (an option refused, a non-zero exit), that is printed and the upload goes ahead, because the upload validates again.
+
 TestFlight processing (the build itself) and the internal group's testers are still checked in App Store Connect.
 
 ### What Samuel does

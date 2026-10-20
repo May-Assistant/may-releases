@@ -47,6 +47,17 @@ STATE_ERROR.VALIDATION_ERROR, ITMS-NNNNN in messages), HTTP status, and title.
 A title is Apple's fixed string, printed only as short plain text (ERROR_TITLE)
 holding neither the key ID, the issuer nor any UUID; otherwise "?".
 
+Each product error's messages that name an Info.plist key, an ITMS-NNNNN code
+or a known ERROR_KINDS topic print too (run 39481657122: the title alone was
+"Validation failed"), scrubbed by apple_message: UUIDs, the key ID and issuer
+replaced, quoted values other than keys, codes and versions replaced, words with
+a path or address character replaced, cut to 300 characters, plain text only.
+
+Before the upload, altool --validate-app runs on the IPA with the same JSON
+output and excerpt ("altool validation"). Its product errors stop the step with
+nothing uploaded; if the validation itself can't run, that is printed and the
+upload goes ahead (the upload validates again).
+
 Any 4xx from the App Store Connect API (diagnostics or readback) prints Apple's
 JSON:API errors[] code, status and source.parameter, each checked against a
 fixed shape (api_errors); never its title or detail.
@@ -114,6 +125,14 @@ MAX_PRODUCT_ERRORS = 5
 # An Apple error title (a fixed string such as "The provided entity includes an attribute with a value that has already
 # been used") is printed only as short plain text: no path, address, markup or quoting characters.
 ERROR_TITLE = re.compile(r"[A-Za-z0-9 ,.'()&:;?!-]{1,160}")
+# The Info.plist keys (and Info.plist itself) an Apple validation message can name; a message naming one, an
+# ITMS-NNNNN code or a known ERROR_KINDS topic is printed, scrubbed (apple_message).
+PLIST_KEY = re.compile(r"\b(?:CFBundle\w+|NS\w*UsageDescription|UI[A-Z]\w+|LS[A-Z]\w+|MinimumOSVersion|"
+                       r"ITSAppUsesNonExemptEncryption|DT[A-Z]\w+|aps-environment|Info\.plist)\b")
+ITMS_CODE = re.compile(r"\bITMS-\d{4,6}\b")
+ERROR_MESSAGE = re.compile(r"[A-Za-z0-9 ,.'()&:;?!_<>\[\]=+%#*-]{1,320}")
+MESSAGE_LIMIT = 300
+MAX_MESSAGES = 8
 # What an altool error line is about, as fixed labels (the line itself is never printed). The first match wins;
 # a line that matches none counts as "unrecognised".
 ERROR_KINDS = (
@@ -485,6 +504,44 @@ def apple_error(error, hidden):
             ("; title " + title if title is not None else ""))
 
 
+def apple_message(text, hidden):
+    """One of Apple's validation messages fit for the public log, or None: whitespace collapsed; UUIDs, the key
+    ID and the issuer replaced; a quoted value kept only if it is empty or a comma list of Info.plist keys, codes
+    or version numbers (else <quoted>); any word with a path, address or home character replaced by <path>; cut to MESSAGE_LIMIT;
+    then printed only if every character is plain text (ERROR_MESSAGE), else "?"."""
+    text = UUID.sub("<uuid>", " ".join(text.split()))
+    for item in hidden:
+        if item:
+            text = re.sub(re.escape(item), "<hidden>", text, flags=re.I)
+
+    def quoted(match):
+        inner = match.group(2)
+        keep = inner == "" or all(PLIST_KEY.fullmatch(part) or CODE_TOKENS.fullmatch(part) or
+                                  SHORT_VERSION.fullmatch(part) for part in re.split(r"\s*,\s*", inner))
+        return "'" + (inner if keep else "<quoted>") + "'"
+
+    text = re.sub(r"(['\"‘“])([^'\"‘’“”]{0,200})['\"’”]", quoted, text)
+    text = " ".join("<path>" if re.search(r"[/\\@~`$|{}]", word) else word for word in text.split(" "))
+    if len(text) > MESSAGE_LIMIT:
+        text = text[:MESSAGE_LIMIT].rsplit(" ", 1)[0] + " ..."
+    return text if ERROR_MESSAGE.fullmatch(text) else "?"
+
+
+def apple_messages(error, hidden):
+    """The messages of one product error worth printing (each scrubbed by apple_message, duplicates dropped): those
+    naming an Info.plist key, an ITMS-NNNNN code, or a known ERROR_KINDS topic. Codes, statuses, IDs and the title
+    are printed elsewhere."""
+    found = []
+    for key, value in walk(error):
+        if key in ("code", "iris-code", "status", "title", "id") or not isinstance(value, str):
+            continue
+        if PLIST_KEY.search(value) or ITMS_CODE.search(value) or error_kind(value) != "unrecognised":
+            message = apple_message(value, hidden)
+            if message not in found:
+                found.append(message)
+    return ["      message: " + message for message in found[:MAX_MESSAGES]]
+
+
 def error_kinds(error):
     """The ERROR_KINDS labels of a product error's messages, each message read on its own; "unrecognised" only
     when none is recognised."""
@@ -492,12 +549,12 @@ def error_kinds(error):
     return kinds or {"unrecognised"}
 
 
-def altool_excerpt(log, hidden=()):
+def altool_excerpt(log, hidden=(), label="altool output"):
     """The scrubbed lines this public log may carry about altool's output: no raw line, path or credential.
-    `hidden` (the issuer) and the key ID never reach an Apple error title that is printed."""
+    `hidden` (the issuer) and the key ID never reach an Apple error title or message that is printed."""
     output = altool_output(log)
     if output is None:
-        return ["altool output: none recorded"]
+        return [label + ": none recorded"]
     lines, report = output
     hidden = (APPLE_KEY_ID,) + tuple(hidden)
     errors = [line for line in lines if re.search(r"(?i)(?<!no )\berror", line)]  # not "No errors uploading."
@@ -513,7 +570,7 @@ def altool_excerpt(log, hidden=()):
     codes = sorted({code for line in lines for code in CODE_TOKENS.findall(line)} |
                    {code for error in reported for code in error_codes(error)})
     kinds = sorted({error_kind(line) for line in errors} | {kind for error in reported for kind in error_kinds(error)})
-    excerpt = ["altool output (scrubbed; the full log stays private and is deleted at cleanup):",
+    excerpt = [label + " (scrubbed; the full log stays private and is deleted at cleanup):",
                "  delivery UUID: " + (uuid or "none"),
                "  lines naming an error: " + str(len(errors)) + "; naming a warning: " + str(len(warnings)),
                "  codes: " + (", ".join(codes[:MAX_CODES]) if codes else "none") +
@@ -521,8 +578,32 @@ def altool_excerpt(log, hidden=()):
                "  error kinds: " + (", ".join(kinds) if kinds else "none")]
     if report is not None:
         excerpt.append("  JSON report: " + str(len(reported)) + " product error" + ("" if len(reported) == 1 else "s"))
-        excerpt += [apple_error(error, hidden) for error in reported[:MAX_PRODUCT_ERRORS]]
+        for error in reported[:MAX_PRODUCT_ERRORS]:
+            excerpt += [apple_error(error, hidden)] + apple_messages(error, hidden)
     return excerpt
+
+
+def validation_errors(log):
+    """How many product errors altool's JSON report from --validate-app names; 0 without a log or a report."""
+    output = altool_output(log)
+    return len(product_errors(output[1])) if output is not None else 0
+
+
+def validate(ipa, issuer, private, env):
+    """altool --validate-app before the upload, so App Store Connect's validation errors are named before anything
+    is sent. Its product errors stop the step (nothing has been uploaded); a validation altool itself could not run
+    (an option refused, a non-zero exit) is reported and the upload goes ahead, since the upload validates again."""
+    log = private / "ios-validate.log"
+    try:
+        run_private(["/usr/bin/xcrun", "altool", "--validate-app", "-f", str(ipa), "-t", "ios",
+                     "--apiKey", APPLE_KEY_ID, "--apiIssuer", issuer, "--output-format", "json"], private, log, env)
+    except StoreError:
+        print("altool validation exited non-zero; the upload validates again", flush=True)
+    finally:
+        print("\n".join(altool_excerpt(log, (issuer,), "altool validation")), flush=True)
+    if validation_errors(log):
+        raise StoreError("App Store Connect validation reported errors before the upload; nothing was uploaded; "
+                         "see the validation excerpt above")
 
 
 def error_lines(log):
@@ -590,6 +671,7 @@ def upload(target, source_sha, build_number, get=asc_get, sleep=time.sleep, cloc
             # can't leave the readback with an expired token.
             print("Before the upload:\n" + "\n".join(diagnostics(asc_token(key_path, issuer), get)), flush=True)
             env = child_env(DEVELOPER_DIR=XCODE_DEVELOPER_DIR, API_PRIVATE_KEYS_DIR=str(keys))
+            validate(ipa, issuer, private, env)
             try:
                 run_private(["/usr/bin/xcrun", "altool", "--upload-package", str(ipa), "--type", "ios",
                              "--apple-id", ASC_APP_IDS[target], "--bundle-id", app_id,

@@ -301,6 +301,8 @@ class IosUploadTests(unittest.TestCase):
         captured = {}
 
         def fake_altool(argv, cwd, log, env):
+            if argv[2] == "--validate-app":
+                return  # validation: no output, so it passes
             key_dir = Path(env["API_PRIVATE_KEYS_DIR"])
             captured.update(argv=argv, env=env, keys=sorted(p.name for p in key_dir.iterdir()))
             log.write_text("No errors uploading '" + argv[3] + "'.\nDelivery UUID: 0a1b2c3d-1111-2222-3333-444455556666\n")
@@ -357,6 +359,8 @@ class IosUploadTests(unittest.TestCase):
 
     def test_failed_upload_leaves_no_record(self):
         def failed_altool(argv, cwd, log, env):
+            if argv[2] == "--validate-app":
+                return  # validation: no output, so it passes
             log.write_text("*** Error: Error uploading '" + argv[4] + "'. ITMS-90062\n")
             raise StoreError("Protected native release failed")
 
@@ -392,6 +396,8 @@ class IosUploadTests(unittest.TestCase):
     def test_altool_error_lines_fail_at_once_even_with_exit_zero(self):
         """Run 39363085983: altool exited 0 with three error lines; Xcode 26's altool doesn't fail its exit status."""
         def erring_altool(argv, cwd, log, env):
+            if argv[2] == "--validate-app":
+                return  # validation: no output, so it passes
             log.write_text("*** Error: The file couldn't be opened because it isn't in the correct format. (259)\n"
                            "*** Error: Upload failed for '" + argv[3] + "'.\n")
 
@@ -426,6 +432,8 @@ class IosUploadTests(unittest.TestCase):
         issuer, clock = self.env["MAY_ASC_ISSUER_ID"], iter(range(0, 10000, 30))
 
         def json_altool(argv, cwd, log, env):
+            if argv[2] == "--validate-app":
+                return  # validation: no output, so it passes
             log.write_text("Running altool at path '/Applications/Xcode_26.3.app/altool'...\n" + json.dumps({
                 "tool-path": "/Applications/Xcode_26.3.app/altool", "product-errors": [
                     {"code": -19232, "message": "The provided entity includes an attribute with a value that has "
@@ -454,6 +462,70 @@ class IosUploadTests(unittest.TestCase):
         self.assertNotIn(issuer, output.getvalue())
         self.assertNotIn(str(self.work.root), output.getvalue())
         self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
+
+    def test_validation_errors_stop_before_the_upload(self):
+        """Run 39481657122: validation failed at the upload; --validate-app names it before anything is sent."""
+        called, clock = [], iter(range(0, 10000, 30))
+
+        def validating_altool(argv, cwd, log, env):
+            called.append(argv[2])
+            if argv[2] == "--validate-app":
+                log.write_text(json.dumps({"product-errors": [{"code": -19241, "userInfo": {
+                    "status": "409", "title": "Validation failed",
+                    "NSLocalizedFailureReason": "Missing Info.plist value for 'CFBundleIconName' in "
+                                                + str(self.work.root)}}]}))
+
+        with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=validating_altool), \
+                patch("ios_upload.asc_token", return_value="token"), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(StoreError) as refused:
+                ios_upload.upload("playground", "a" * 40, "9", get=lambda token, url: (200, {"data": []}),
+                                  sleep=lambda _: None, clock=lambda: next(clock))
+        self.assertEqual(called, ["--validate-app"])
+        self.assertEqual(refused.exception.args[0], "App Store Connect validation reported errors before the upload; "
+                                                    "nothing was uploaded; see the validation excerpt above")
+        lines = output.getvalue().splitlines()
+        at = lines.index("altool validation (scrubbed; the full log stays private and is deleted at cleanup):")
+        self.assertEqual(lines[at + 5:at + 8], ["  JSON report: 1 product error",
+                                                "    codes -19241; status 409; title Validation failed",
+                                                "      message: Missing Info.plist value for 'CFBundleIconName' in "
+                                                "<path>"])
+        self.assertNotIn("may be in App Store Connect", output.getvalue())
+        self.assertNotIn(str(self.work.root), output.getvalue())
+        self.assertFalse((self.work.root / "may-private/asc-keys").exists())
+
+    def test_validation_altool_cannot_run_is_reported_and_the_upload_goes_ahead(self):
+        captured = []
+
+        def altool(argv, cwd, log, env):
+            captured.append(argv)
+            if argv[2] == "--validate-app":
+                log.write_text("*** Error: Unrecognized option '--validate-app'\n")
+                raise StoreError("Protected native release failed")
+            log.write_text("No errors uploading.\n")
+
+        def get(token, url):
+            return 200, {"data": [{"id": "upload-1", "attributes": {
+                "cfBundleVersion": "9", "cfBundleShortVersionString": "1.0", "platform": "IOS",
+                "createdDate": "2099-01-01T00:00:00Z", "state": {"state": "PROCESSING"}}}]}
+
+        with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=altool), \
+                patch("ios_upload.asc_token", return_value="token"), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            try:
+                ios_upload.upload("playground", "a" * 40, "9", get=get, sleep=lambda _: None)
+            except StoreError as error:
+                self.fail("the upload did not go ahead: " + error.args[0])
+        ipa = str(self.work.root / "may-release/May.ipa")
+        self.assertEqual(captured[0], ["/usr/bin/xcrun", "altool", "--validate-app", "-f", ipa, "-t", "ios",
+                                       "--apiKey", "23VX669FGY", "--apiIssuer", self.env["MAY_ASC_ISSUER_ID"],
+                                       "--output-format", "json"])
+        self.assertEqual(captured[1][2], "--upload-package")
+        lines = output.getvalue().splitlines()
+        self.assertIn("altool validation exited non-zero; the upload validates again", lines)
+        at = lines.index("altool validation (scrubbed; the full log stays private and is deleted at cleanup):")
+        self.assertEqual(lines[at + 4], "  error kinds: altool option refused or deprecated")
+        self.assertIn("App Store Connect build upload upload-1 is PROCESSING for build 9", lines)
 
     def test_an_unsigned_token_stops_before_altool(self):
         with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private") as runner, \

@@ -420,12 +420,14 @@ class AltoolExcerptTests(unittest.TestCase):
             "  JSON report: 4 product errors",
             "    codes -19232, ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE, ITMS-90189, STATE_ERROR.VALIDATION_ERROR; "
             "status 409; title The provided entity includes an attribute with a value that has already been used",
+            "      message: Validation failed (409) ITMS-90189 at <path>",
+            "      message: Redundant Binary Upload for build 9",
             "    codes none; title ?",
             "    codes 401; title ?",
             "    codes 7; title ?"])
         printed = "\n".join(lines)
         for leak in ("/Users", "runner", "rm -rf", "23VX669FGY", "00000000-1111", "example.com", "script",
-                     "Xcode_26.3", "Redundant", "ignored"):
+                     "Xcode_26.3", "ignored"):
             self.assertNotIn(leak, printed)
 
     def test_a_json_report_without_product_errors_is_no_error(self):
@@ -445,6 +447,43 @@ class AltoolExcerptTests(unittest.TestCase):
         lines = self.excerpt("*** Error: Upload failed.\n{\n    NSLocalizedFailureReason = \"ITMS-90062: x\";\n"
                              "    code = \"STATE_ERROR.VALIDATION_ERROR\";\n}\n")
         self.assertEqual(lines[3], "  codes: ITMS-90062, STATE_ERROR.VALIDATION_ERROR")
+
+    def test_validation_messages_name_the_rule_and_nothing_private(self):
+        """Run 39481657122: one product error, title "Validation failed"; its messages carry the rule broken."""
+        issuer = "00000000-1111-2222-3333-444444444444"
+        error = {"code": -19241, "userInfo": {
+            "code": "STATE_ERROR.VALIDATION_ERROR", "status": "409", "title": "Validation failed",
+            "NSLocalizedDescription": "Validation failed",
+            "NSLocalizedFailureReason": "Invalid Bundle. iPad Multitasking support requires these orientations: "
+                                        "'UIInterfaceOrientationPortrait,UIInterfaceOrientationPortraitUpsideDown'. "
+                                        "Found '' in bundle 'io.github.mayassistant.may.playground'. "
+                                        "(ID: 0a1b2c3d-1111-2222-3333-444455556666)",
+            "detail": "Missing Info.plist value. A value for the Info.plist key 'CFBundleIconName' is missing in "
+                      "the bundle '/Users/runner/work/_temp/May Playground.app'. ITMS-90713",
+            "NSLocalizedRecoverySuggestion": "Key 23VX669FGY of " + issuer + " lacks the role; see "
+                                             "https://appstoreconnect.apple.com/access",
+            "other": "Something with no key, code or topic at /Users/runner",
+            "shell": "Invalid binary: `rm -rf ~` {payload}",
+            "long": "ITMS-90000: " + "word " * 100}}
+        lines = ios_upload.apple_messages(error, (ios_upload.APPLE_KEY_ID, issuer))
+        self.assertEqual(lines, [
+            "      message: Invalid Bundle. iPad Multitasking support requires these orientations: "
+            "'UIInterfaceOrientationPortrait,UIInterfaceOrientationPortraitUpsideDown'. "
+            "Found '' in bundle '<quoted>'. (ID: <uuid>)",
+            "      message: Missing Info.plist value. A value for the Info.plist key 'CFBundleIconName' is missing in "
+            "the bundle '<quoted>'. ITMS-90713",
+            "      message: Key <hidden> of <uuid> lacks the role; see <path>",
+            "      message: Invalid binary: <path> -rf <path> <path>",
+            "      message: ITMS-90000: " + " ".join(["word"] * 57) + " ..."])
+        printed = "\n".join(lines)
+        for leak in ("23VX669FGY", "00000000-1111", "0a1b2c3d", "/Users", "runner", "Something", "rm -rf",
+                     "payload", "appstoreconnect", "mayassistant"):
+            self.assertNotIn(leak, printed)
+        self.assertTrue(all(len(line) <= len("      message: ") + ios_upload.MESSAGE_LIMIT + 4 for line in lines))
+
+    def test_a_message_that_is_not_plain_text_prints_as_a_question_mark(self):
+        self.assertEqual(ios_upload.apple_message("Info.plist value \u00e9\u00e8 <script>", ()), "?")
+        self.assertEqual(ios_upload.apple_message("ITMS-90474: Invalid Bundle", ()), "ITMS-90474: Invalid Bundle")
 
     def test_code_list_is_capped(self):
         log = "\n".join("ERROR CODE_" + chr(65 + i // 26) + chr(65 + i % 26) for i in range(30))
