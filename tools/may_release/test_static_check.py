@@ -1000,9 +1000,20 @@ class StaticCheckTests(unittest.TestCase):
                 self.fresh()
                 self.mutate(STORE, old, new)
                 if "run-name" in new:
-                    self.assertFlagged("top-level keys are not exactly name, on, permissions, concurrency, jobs")
+                    self.assertFlagged("top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
                 else:
                     self.assertLayoutFlagged()
+
+    def test_store_run_name_is_pinned_to_its_inputs(self):
+        run_name = "\n" + static_check.STORE_RUN_NAME + "\n"
+        for new in ("\nrun-name: May store release\n", "\n" + static_check.STORE_RUN_NAME.replace("inputs.build_number",
+                                                                                              "github.ref_name") + "\n",
+                    "\n" + static_check.STORE_RUN_NAME.replace(" (dry run)", "") + "\n", "\n"):
+            with self.subTest(new=new.strip()[:60]):
+                self.fresh()
+                self.mutate(STORE, run_name, new)
+                self.assertTrue(any("run-name" in problem for problem in static_check.problems(self.root)),
+                                "a changed or missing run-name was not flagged")
 
     def assertLayoutFlagged(self):
         self.assertFlagged(": is not a plain one-line `key: value` in this repository's layout")

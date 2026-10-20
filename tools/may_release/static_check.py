@@ -261,6 +261,8 @@ def stage_problems(store):
 # so the line-based rules here read what GitHub's YAML parser reads: no quoted,
 # spaced or explicit (`?`) keys, no anchors, aliases, tags or merge keys, no tabs,
 # no multi-line quoted, plain or flow values (block scalars only after `key: |`).
+# The store run's name: the app, platform and build number, plus "(dry run)" or "(sign only)", from its inputs alone.
+STORE_RUN_NAME = ("run-name: ${{ inputs.target == 'playground' && 'May Playground' || 'May' }} · ${{ inputs.platform == 'ios' && 'iOS' || 'Android' }} · build ${{ inputs.build_number }}${{ inputs.dry_run && ' (dry run)' || '' }}${{ inputs.sign_only && ' (sign only)' || '' }}")
 LAYOUT_LINE = re.compile(r"( *)(- )?([A-Za-z][\w-]*):(?: (.*))?")
 LAYOUT_VALUE = re.compile(r"""[^\s&*!{}?|>%@`'"\[\]#,][^#]*|'(?:[^']|'')*'|\[[^\[\]{}'"#]*\]|[|>]-?""")
 ADMISSION_ENV = [("GH_TOKEN", "${{ github.token }}"), ("MAY_PLATFORM", "${{ inputs.platform }}"),
@@ -287,8 +289,10 @@ def layout_problems(store):
             continue
         if value[:1] in ("|", ">"):
             block = len(match.group(1)) + (2 if match.group(2) else 0)
-    if re.findall(r"(?m)^([\w-]+):", store) != ["name", "on", "permissions", "concurrency", "jobs"]:
-        found.append("store-release-draft.yml: top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    if re.findall(r"(?m)^([\w-]+):", store) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
+        found.append("store-release-draft.yml: top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
+    if store.count("\nrun-name: ") != 1 or "\n" + STORE_RUN_NAME + "\n" not in store:
+        found.append("store-release-draft.yml: run-name is not exactly the app, platform, build number and mode from its inputs")
     if re.findall(r"(?m)^  ([\w-]+):", store.partition("\non:\n")[2].partition("\npermissions:")[0]) != ["workflow_dispatch"]:
         found.append("store-release-draft.yml: is triggered by something other than workflow_dispatch")
     if re.findall(r"(?m)^  ([\w-]+):", store.partition("\njobs:\n")[2]) != list(STORE_JOB_IF):
