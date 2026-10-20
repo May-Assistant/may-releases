@@ -235,7 +235,8 @@ class AltoolExcerptTests(unittest.TestCase):
             "altool output (scrubbed; the full log stays private and is deleted at cleanup):",
             "  delivery UUID: 0a1b2c3d-1111-2222-3333-444455556666",
             "  lines naming an error: 2; naming a warning: 1",
-            "  codes: -19232, ENTITY_ERROR.ATTRIBUTE.INVALID, ITMS-90062"])
+            "  codes: -19232, ENTITY_ERROR.ATTRIBUTE.INVALID, ITMS-90062",
+            "  error kinds: authentication or API key, unrecognised"])
         printed = "\n".join(lines)
         for leak in ("runner", "AuthKey", "23VX669FGY", "VX", "00000000-1111", "Private Repo", "ABCDEF", "DEADBEEF",
                      "Xcode_26.3", "/"):
@@ -245,7 +246,33 @@ class AltoolExcerptTests(unittest.TestCase):
         self.assertEqual(self.excerpt(None), ["altool output: none recorded"])
         lines = self.excerpt("Delivery UUID: /Users/runner/secret-path-that-is-36-chars\n")
         self.assertEqual(lines[1:], ["  delivery UUID: none", "  lines naming an error: 0; naming a warning: 0",
-                                     "  codes: none"])
+                                     "  codes: none", "  error kinds: none"])
+
+    def test_error_lines_are_named_by_kind_only(self):
+        cases = {
+            "*** Error: The file couldn't be opened because it isn't in the correct format. (259)":
+                "file format (the package could not be read)",
+            "Error: Unrecognized option '--upload-app'": "altool option refused or deprecated",
+            "ERROR: Failed to authenticate with the API key 23VX669FGY": "authentication or API key",
+            "Error: 403 Forbidden for /Users/runner/key": "permission or API key role",
+            "*** Error: The bundle version must be higher than the previously uploaded version: '3'.":
+                "build number already used or conflict",
+            "ERROR: status code: 409 (conflict)": "build number already used or conflict",
+            "*** Error: No suitable application records were found. Verify your bundle identifier "
+            "'io.github.mayassistant.may.playground' is correct.": "no matching App Store Connect app or bundle ID",
+            "Error: Invalid provisioning profile in Payload/May.app": "signing, provisioning or entitlements",
+            "ERROR ITMS-90683: Missing purpose string in Info.plist": "invalid binary or Info.plist",
+            "Error: The request timed out.": "network or timeout",
+            "*** Error: Something entirely new happened at /Users/runner/secret": "unrecognised",
+        }
+        for line, label in cases.items():
+            with self.subTest(label=label):
+                lines = self.excerpt(line + "\n")
+                self.assertEqual(lines[4], "  error kinds: " + label)
+                printed = "\n".join(lines)
+                for leak in ("/Users", "runner", "23VX669FGY", "secret", "mayassistant", "Payload"):
+                    self.assertNotIn(leak, printed)
+        self.assertEqual(ios_upload.error_lines(Path("/nonexistent/ios-upload.log")), 0)
 
     def test_code_list_is_capped(self):
         log = "\n".join("ERROR CODE_" + chr(65 + i // 26) + chr(65 + i % 26) for i in range(30))
