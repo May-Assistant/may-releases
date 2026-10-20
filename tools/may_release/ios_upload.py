@@ -17,7 +17,7 @@ finished says the upload may be in App Store Connect, and a timeout also names
 any fields it could not read (names only). It prints
 that build upload's ID and state and records the ID as the upload's store_id,
 which confirm_upload.py requires. Only GETs are sent, only to ASC_API, with
-redirects refused; Apple's error bodies are discarded unread.
+redirects refused; an error body is read only for api_errors (below).
 
 The upload is `altool --upload-package` with the app's App Store Connect ID,
 bundle ID, CFBundleVersion and CFBundleShortVersionString (all from the target
@@ -39,6 +39,17 @@ error codes on those lines (ITMS-NNNNN, negative numeric codes, and upper-case
 code tokens such as ENTITY_ERROR.ATTRIBUTE.INVALID), and the kinds of error
 those lines describe, each a fixed label from ERROR_KINDS. Never a raw line, a
 path, the key ID or the issuer.
+
+altool runs with --output-format json (run 39423195473: its plain error lines
+carried no code). Its JSON report's product-errors each add to the error count
+and print as one line: their codes (numeric, code-shaped strings such as
+STATE_ERROR.VALIDATION_ERROR, ITMS-NNNNN in messages), HTTP status, and title.
+A title is Apple's fixed string, printed only as short plain text (ERROR_TITLE)
+holding neither the key ID, the issuer nor any UUID; otherwise "?".
+
+Any 4xx from the App Store Connect API (diagnostics or readback) prints Apple's
+JSON:API errors[] code, status and source.parameter, each checked against a
+fixed shape (api_errors); never its title or detail.
 
 Diagnostics: before altool, and again after any failure once altool has run,
 this prints what App Store Connect holds for both May apps (asc_diagnostics):
@@ -99,6 +110,10 @@ UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 # ENTITY_ERROR.ATTRIBUTE.INVALID). A bare upper-case run (which could be a fragment of an ID) never matches.
 CODE_TOKENS = re.compile(r"ITMS-\d{4,6}|(?<![\w.-])-\d{3,6}\b|\b[A-Z]{2,30}(?:[_.][A-Z]{2,30}){1,5}\b")
 MAX_CODES = 20
+MAX_PRODUCT_ERRORS = 5
+# An Apple error title (a fixed string such as "The provided entity includes an attribute with a value that has already
+# been used") is printed only as short plain text: no path, address, markup or quoting characters.
+ERROR_TITLE = re.compile(r"[A-Za-z0-9 ,.'()&:;?!-]{1,160}")
 # What an altool error line is about, as fixed labels (the line itself is never printed). The first match wins;
 # a line that matches none counts as "unrecognised".
 ERROR_KINDS = (
@@ -184,14 +199,45 @@ def asc_get(token, url, opener=OPENER):
         with opener.open(request, timeout=30) as reply:
             status, body = reply.status, reply.read()
     except urllib.error.HTTPError as error:
-        error.close()
-        return error.code, None  # Apple's error bodies are discarded unread.
+        # Apple's JSON:API error body is read (at most ERROR_BODY_LIMIT bytes) so api_errors can name its code,
+        # status and parameter; nothing else from it is ever printed.
+        try:
+            raw = error.read(ERROR_BODY_LIMIT)
+        except (OSError, http.client.HTTPException):
+            raw = b""
+        finally:
+            error.close()
+        try:
+            return error.code, json.loads(raw)
+        except ValueError:
+            return error.code, None
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
         return None, None
     try:
         return status, json.loads(body)
     except ValueError:
         return status, None
+
+
+ERROR_BODY_LIMIT = 65536
+API_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_.]{1,80}")
+API_ERROR_PARAMETER = re.compile(r"[A-Za-z0-9_.\[\]-]{1,60}")
+
+
+def api_errors(body):
+    """Apple's JSON:API errors[] as "CODE (status N, parameter P)" strings, each part checked against a fixed shape
+    (anything else reads "?"); no title or detail is printed. Empty when there are none."""
+    errors = body.get("errors") if isinstance(body, dict) else None
+    found = []
+    for error in errors[:5] if isinstance(errors, list) else []:
+        if not isinstance(error, dict):
+            continue
+        source = error.get("source") if isinstance(error.get("source"), dict) else {}
+        parameter = source.get("parameter")
+        found.append(shown(error.get("code"), API_ERROR_CODE) + " (status " +
+                     shown(error.get("status"), re.compile(r"\d{3}")) +
+                     (", parameter " + shown(parameter, API_ERROR_PARAMETER) if parameter is not None else "") + ")")
+    return found
 
 
 def upload_state(item):
@@ -257,6 +303,8 @@ def await_build_upload(token, asc_app_id, build_number, short_version, started, 
     deadline, unreadable = clock() + POLL_TIMEOUT, set()
     while True:
         status, body = get(token, url)
+        if status is not None and 400 <= status <= 499 and api_errors(body):
+            print("App Store Connect said: " + "; ".join(api_errors(body)), flush=True)
         if status in (401, 403):
             raise StoreError("App Store Connect refused the build upload readback (HTTP 401 or 403)")
         if status == 404:
@@ -297,6 +345,11 @@ def shown(value, pattern=None, allowed=None):
     return value
 
 
+def said(body):
+    errors = api_errors(body)
+    return "; Apple says " + "; ".join(errors) if errors else ""
+
+
 def http(status):
     return "HTTP " + str(status) if type(status) is int else "no reply"
 
@@ -322,13 +375,17 @@ def asc_diagnostics(token, get=asc_get):
         data = body.get("data") if isinstance(body, dict) else None
         bundle = shown((data.get("attributes") or {}).get("bundleId") if isinstance(data, dict) else None, BUNDLE_ID)
         lines.append("App Store Connect app " + asc_id + " (" + target + "): bundle " +
-                     (bundle if status == 200 else "unreadable (" + http(status) + ")"))
-        status, body = get(token, base + "/buildUploads?" + urlencode({"limit": str(DIAGNOSTIC_LIMIT),
-                                                                        "sort": "-createdDate"}))
+                     (bundle if status == 200 else "unreadable (" + http(status) + ")" + said(body)))
+        # Run 39423195473: this list with sort=-createdDate got HTTP 400 on both apps, while the readback's query (no
+        # sort, limit 200) has been answered; so no sort, and newest first is done here from createdDate.
+        status, body = get(token, base + "/buildUploads?" + urlencode({"limit": "200"}))
         items = body.get("data") if isinstance(body, dict) else None
         if status != 200 or not isinstance(items, list):
-            lines.append("  build uploads: unreadable (" + http(status) + ")")
+            lines.append("  build uploads: unreadable (" + http(status) + ")" + said(body))
         else:
+            items = sorted(items, key=lambda item: (created_at(item) if isinstance(item, dict) and
+                                                    isinstance(item.get("attributes"), dict) else None) or 0,
+                           reverse=True)
             lines.append("  build uploads: " + str(len(items)) + (" (newest first)" if items else ""))
             for item in items[:DIAGNOSTIC_LIMIT]:
                 attributes = item.get("attributes") if isinstance(item, dict) else None
@@ -347,7 +404,7 @@ def asc_diagnostics(token, get=asc_get):
                                                                    "sort": "-uploadedDate"}))
         items = body.get("data") if isinstance(body, dict) else None
         if status != 200 or not isinstance(items, list):
-            lines.append("  builds: unreadable (" + http(status) + ")")
+            lines.append("  builds: unreadable (" + http(status) + ")" + said(body))
         else:
             lines.append("  builds: " + str(len(items)) + (" (newest first)" if items else ""))
             for item in items[:DIAGNOSTIC_LIMIT]:
@@ -359,33 +416,123 @@ def asc_diagnostics(token, get=asc_get):
     return lines
 
 
-def altool_excerpt(log):
-    """The scrubbed lines this public log may carry about altool's output: no raw line, path or credential."""
+def altool_output(log):
+    """altool's output as (lines outside its JSON report, the JSON report or None); None when there is no log.
+    With --output-format json altool prints one JSON object (Apple's product-errors and details); anything else
+    it prints (such as "Running altool at path ...") stays as plain lines."""
     try:
         text = log.read_text(errors="replace")
     except OSError:
+        return None
+    decoder = json.JSONDecoder()
+    for start in (match.start(1) for match in re.finditer(r"(?m)^[ \t]*(\{)", text)):
+        try:
+            report, end = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(report, dict):
+            return (text[:start] + text[end:]).splitlines(), report
+    return text.splitlines(), None
+
+
+def product_errors(report):
+    """The product-errors of altool's JSON report, as dicts (at most MAX_PRODUCT_ERRORS are described)."""
+    errors = report.get("product-errors") if isinstance(report, dict) else None
+    return [error for error in errors if isinstance(error, dict)] if isinstance(errors, list) else []
+
+
+def walk(value, depth=0):
+    """(key, value) for every entry of a product error and of the dicts and lists nested in it (userInfo,
+    NSUnderlyingError ...), to a fixed depth."""
+    if depth > 5:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key, item
+            yield from walk(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value[:20]:
+            yield from walk(item, depth + 1)
+
+
+def error_codes(error):
+    """A product error's codes: numeric codes (such as -19232), code-shaped strings under "code" or "iris-code"
+    (such as STATE_ERROR.VALIDATION_ERROR), and code tokens in its messages (such as ITMS-90062)."""
+    codes = set()
+    for key, value in walk(error):
+        if key in ("code", "iris-code") and type(value) is int and -999999 <= value <= 999999:
+            codes.add(str(value))
+        elif key in ("code", "iris-code") and isinstance(value, str) and API_ERROR_CODE.fullmatch(value):
+            codes.add(value)
+        elif isinstance(value, str):
+            codes.update(CODE_TOKENS.findall(value))
+    return codes
+
+
+def apple_error(error, hidden):
+    """One product error as a line fit for the public log: its codes, HTTP status and title. The title is Apple's
+    fixed string, printed only if it is short plain text holding nothing in `hidden` and no UUID; else "?"."""
+    statuses = sorted({value for key, value in walk(error) if key == "status" and isinstance(value, str) and
+                       re.fullmatch(r"\d{3}", value)})
+    titles = [value for key, value in walk(error) if key == "title" and isinstance(value, str)]
+    title = titles[0] if titles else None
+    if title is not None and (not ERROR_TITLE.fullmatch(title) or UUID.search(title) or
+                              any(item and item.lower() in title.lower() for item in hidden)):
+        title = "?"
+    codes = sorted(error_codes(error))
+    return ("    codes " + (", ".join(codes[:MAX_CODES]) if codes else "none") +
+            ("; status " + ", ".join(statuses) if statuses else "") +
+            ("; title " + title if title is not None else ""))
+
+
+def error_kinds(error):
+    """The ERROR_KINDS labels of a product error's messages, each message read on its own; "unrecognised" only
+    when none is recognised."""
+    kinds = {error_kind(value) for _, value in walk(error) if isinstance(value, str)} - {"unrecognised"}
+    return kinds or {"unrecognised"}
+
+
+def altool_excerpt(log, hidden=()):
+    """The scrubbed lines this public log may carry about altool's output: no raw line, path or credential.
+    `hidden` (the issuer) and the key ID never reach an Apple error title that is printed."""
+    output = altool_output(log)
+    if output is None:
         return ["altool output: none recorded"]
-    lines = text.splitlines()
+    lines, report = output
+    hidden = (APPLE_KEY_ID,) + tuple(hidden)
     errors = [line for line in lines if re.search(r"(?i)(?<!no )\berror", line)]  # not "No errors uploading."
     warnings = [line for line in lines if re.search(r"(?i)\bwarning", line)]
-    uuid = re.search(r"(?i)delivery\s*uuid\W{0,5}([0-9A-Fa-f-]{36})", text)
-    codes = sorted({code for line in errors + warnings for code in CODE_TOKENS.findall(line)})
-    kinds = sorted({error_kind(line) for line in errors})
-    return ["altool output (scrubbed; the full log stays private and is deleted at cleanup):",
-            "  delivery UUID: " + (uuid.group(1) if uuid and UUID.fullmatch(uuid.group(1)) else "none"),
-            "  lines naming an error: " + str(len(errors)) + "; naming a warning: " + str(len(warnings)),
-            "  codes: " + (", ".join(codes[:MAX_CODES]) if codes else "none") +
-            (" (" + str(len(codes) - MAX_CODES) + " more)" if len(codes) > MAX_CODES else ""),
-            "  error kinds: " + (", ".join(kinds) if kinds else "none")]
+    reported = product_errors(report)
+    details = report.get("details") if isinstance(report, dict) else None
+    uuid = details.get("delivery-uuid") if isinstance(details, dict) else None
+    if not (isinstance(uuid, str) and UUID.fullmatch(uuid)):
+        uuid = re.search(r"(?i)delivery[\s_-]*uuid\W{0,5}([0-9A-Fa-f-]{36})", "\n".join(lines))
+        uuid = uuid.group(1) if uuid and UUID.fullmatch(uuid.group(1)) else None
+    # Codes from every plain line (altool's own error dictionaries span lines that don't say "error"), and from
+    # the JSON report's product errors.
+    codes = sorted({code for line in lines for code in CODE_TOKENS.findall(line)} |
+                   {code for error in reported for code in error_codes(error)})
+    kinds = sorted({error_kind(line) for line in errors} | {kind for error in reported for kind in error_kinds(error)})
+    excerpt = ["altool output (scrubbed; the full log stays private and is deleted at cleanup):",
+               "  delivery UUID: " + (uuid or "none"),
+               "  lines naming an error: " + str(len(errors)) + "; naming a warning: " + str(len(warnings)),
+               "  codes: " + (", ".join(codes[:MAX_CODES]) if codes else "none") +
+               (" (" + str(len(codes) - MAX_CODES) + " more)" if len(codes) > MAX_CODES else ""),
+               "  error kinds: " + (", ".join(kinds) if kinds else "none")]
+    if report is not None:
+        excerpt.append("  JSON report: " + str(len(reported)) + " product error" + ("" if len(reported) == 1 else "s"))
+        excerpt += [apple_error(error, hidden) for error in reported[:MAX_PRODUCT_ERRORS]]
+    return excerpt
 
 
 def error_lines(log):
-    """How many lines of altool's output name an error (not "No errors uploading."); 0 when there is no log."""
-    try:
-        return sum(1 for line in log.read_text(errors="replace").splitlines()
-                   if re.search(r"(?i)(?<!no )\berror", line))
-    except OSError:
+    """How many errors altool reported: lines of its output naming an error (not "No errors uploading."), plus
+    the product errors in its JSON report; 0 when there is no log."""
+    output = altool_output(log)
+    if output is None:
         return 0
+    lines, report = output
+    return sum(1 for line in lines if re.search(r"(?i)(?<!no )\berror", line)) + len(product_errors(report))
 
 
 def error_kind(line):
@@ -447,10 +594,10 @@ def upload(target, source_sha, build_number, get=asc_get, sleep=time.sleep, cloc
                 run_private(["/usr/bin/xcrun", "altool", "--upload-package", str(ipa), "--type", "ios",
                              "--apple-id", ASC_APP_IDS[target], "--bundle-id", app_id,
                              "--bundle-version", build_number, "--bundle-short-version-string", short_version,
-                             "--apiKey", APPLE_KEY_ID, "--apiIssuer", issuer],
+                             "--apiKey", APPLE_KEY_ID, "--apiIssuer", issuer, "--output-format", "json"],
                             private, private / "ios-upload.log", env)
             finally:
-                print("\n".join(altool_excerpt(private / "ios-upload.log")), flush=True)
+                print("\n".join(altool_excerpt(private / "ios-upload.log", (issuer,))), flush=True)
             altool_finished = True
             if error_lines(private / "ios-upload.log"):
                 # Xcode 26's altool exits 0 on a failed upload; its own error lines are the failure.

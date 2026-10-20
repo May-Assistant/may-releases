@@ -345,7 +345,8 @@ class IosUploadTests(unittest.TestCase):
         self.assertEqual(captured["argv"][:3], ["/usr/bin/xcrun", "altool", "--upload-package"])
         self.assertEqual(captured["argv"][3:], [ipa, "--type", "ios", "--apple-id", "6822072535", "--bundle-id", PLAYGROUND,
                                                 "--bundle-version", "9", "--bundle-short-version-string", "1.0",
-                                                "--apiKey", "23VX669FGY", "--apiIssuer", self.env["MAY_ASC_ISSUER_ID"]])
+                                                "--apiKey", "23VX669FGY", "--apiIssuer", self.env["MAY_ASC_ISSUER_ID"],
+                                                "--output-format", "json"])
         self.assertNotIn("--upload-app", captured["argv"])
         self.assertFalse((self.work.root / "may-private/asc-keys").exists())
         # It records the upload for the loud-failure step (confirm_upload.py).
@@ -419,6 +420,40 @@ class IosUploadTests(unittest.TestCase):
         self.assertNotIn(str(self.work.root), output.getvalue())
         self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
         self.assertFalse((self.work.root / "may-private/asc-keys").exists())
+
+    def test_product_errors_in_altool_json_fail_at_once_and_name_apple_codes(self):
+        """Run 39423195473: altool's three error lines carried no code; its JSON report names Apple's codes."""
+        issuer, clock = self.env["MAY_ASC_ISSUER_ID"], iter(range(0, 10000, 30))
+
+        def json_altool(argv, cwd, log, env):
+            log.write_text("Running altool at path '/Applications/Xcode_26.3.app/altool'...\n" + json.dumps({
+                "tool-path": "/Applications/Xcode_26.3.app/altool", "product-errors": [
+                    {"code": -19232, "message": "The provided entity includes an attribute with a value that has "
+                                                "already been used.",
+                     "userInfo": {"code": "STATE_ERROR.VALIDATION_ERROR", "status": "409",
+                                  "title": "The provided entity includes an attribute with a value that has already "
+                                           "been used",
+                                  "detail": issuer + " " + str(self.work.root)}}]}, indent=2) + "\n")
+
+        with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=json_altool), \
+                patch("ios_upload.asc_token", return_value="token"), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(StoreError) as refused:
+                ios_upload.upload("playground", "a" * 40, "9", get=lambda token, url: (200, {"data": []}),
+                                  sleep=lambda _: None, clock=lambda: next(clock))
+        self.assertEqual(refused.exception.args[0], "altool reported errors (exit status 0 notwithstanding); "
+                                                    "see the error kinds above")
+        lines = output.getvalue().splitlines()
+        at = lines.index("altool output (scrubbed; the full log stays private and is deleted at cleanup):")
+        self.assertEqual(lines[at + 3:at + 7], [
+            "  codes: -19232, STATE_ERROR.VALIDATION_ERROR",
+            "  error kinds: build number already used, conflict (409)",
+            "  JSON report: 1 product error",
+            "    codes -19232, STATE_ERROR.VALIDATION_ERROR; status 409; title The provided entity includes an "
+            "attribute with a value that has already been used"])
+        self.assertNotIn(issuer, output.getvalue())
+        self.assertNotIn(str(self.work.root), output.getvalue())
+        self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
 
     def test_an_unsigned_token_stops_before_altool(self):
         with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private") as runner, \
