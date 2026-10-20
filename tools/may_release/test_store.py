@@ -400,6 +400,29 @@ class GoogleServicesTests(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.build({"MAY_GOOGLE_SERVICES_JSON": encoded(google_services(playground))}, target="production")
 
+    def test_wrapped_base64_is_accepted_and_other_characters_are_not(self):
+        """Linux `base64` wraps at 76 characters; a secret pasted from it keeps the breaks (build 13's first try)."""
+        config = google_services("io.github.mayassistant.may", "io.github.mayassistant.may.playground")
+        flat = encoded(config)
+        wrapped = {"\\n every 76": "\n".join(flat[i:i + 76] for i in range(0, len(flat), 76)) + "\n",
+                   "\\r\\n every 64": "\r\n".join(flat[i:i + 64] for i in range(0, len(flat), 64)),
+                   "spaces and tabs": " \t".join(flat[i:i + 10] for i in range(0, len(flat), 10))}
+
+        def checked(value):
+            try:
+                with patch.dict(os.environ, {"MAY_GOOGLE_SERVICES_JSON": value}, clear=True):
+                    return store.google_services("io.github.mayassistant.may.playground")
+            except StoreError as refused:
+                return refused.args[0]
+
+        for case, value in wrapped.items():
+            with self.subTest(case=case):
+                self.assertEqual(checked(value), json.dumps(config).encode())
+        for case, value in {"a comma": flat[:40] + "," + flat[40:], "a raw JSON paste": json.dumps(config),
+                            "a data: prefix": "data:application/json;base64," + flat}.items():
+            with self.subTest(case=case):
+                self.assertEqual(checked(value), "MAY_GOOGLE_SERVICES_JSON is not the base64 of a google-services.json object")
+
     def test_the_ios_build_and_every_other_step_refuse_it(self):
         with self.assertRaises(StoreError):
             self.build({"MAY_GOOGLE_SERVICES_JSON": encoded(google_services("io.github.mayassistant.may.playground"))},
