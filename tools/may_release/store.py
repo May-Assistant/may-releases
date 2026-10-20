@@ -389,7 +389,9 @@ def google_services(app_id):
     if not os.environ.get(GOOGLE_SERVICES_SECRET, "").strip():
         return None
     try:
-        data = base64.b64decode(os.environ[GOOGLE_SERVICES_SECRET].strip(), validate=True)
+        # Whitespace inside is dropped first: Linux `base64` wraps its output at 76 characters, and a pasted
+        # secret often keeps those line breaks (or gains \r\n). Anything else outside the alphabet is still refused.
+        data = base64.b64decode("".join(os.environ[GOOGLE_SERVICES_SECRET].split()), validate=True)
         config = json.loads(data.decode("utf-8")) if 0 < len(data) <= GOOGLE_SERVICES_MAX_BYTES else None
     except (binascii.Error, ValueError):
         config = None
