@@ -19,12 +19,26 @@ that build upload's ID and state and records the ID as the upload's store_id,
 which confirm_upload.py requires. Only GETs are sent, only to ASC_API, with
 redirects refused; Apple's error bodies are discarded unread.
 
+The upload is `altool --upload-package` with the app's App Store Connect ID,
+bundle ID, CFBundleVersion and CFBundleShortVersionString (all from the target
+and the verified IPA). Apple's altool guide: "The --upload-app command is
+deprecated. Use the --upload-package command instead." Xcode 26's altool also
+picks the wrong app when two bundle IDs share a prefix unless --apple-id names
+it (fastlane #29698, quoting Apple), and May's two do. Runs 39192306300 and
+39363085983 used --upload-app and reached no build upload.
+
+Xcode 26's altool does not exit non-zero on a failed upload (Bitrise's App Store
+Connect step v2.0.0 changelog), so any line of its output naming an error fails
+this step at once, before the readback, with the same "may be in App Store
+Connect" note.
+
 altool's output stays in the private log, which cleanup deletes. Before that,
 altool_excerpt prints a scrubbed summary to this public log: the delivery UUID
-(only if it is a UUID), the number of lines naming an error or a warning, and
-the error codes on those lines (ITMS-NNNNN, negative numeric codes, and
-upper-case code tokens such as ENTITY_ERROR.ATTRIBUTE.INVALID). Never a raw
-line, a path, the key ID or the issuer.
+(only if it is a UUID), the number of lines naming an error or a warning, the
+error codes on those lines (ITMS-NNNNN, negative numeric codes, and upper-case
+code tokens such as ENTITY_ERROR.ATTRIBUTE.INVALID), and the kinds of error
+those lines describe, each a fixed label from ERROR_KINDS. Never a raw line, a
+path, the key ID or the issuer.
 
 Dry run: the workflow skips this step unless `dry_run` is false, and this
 script also refuses unless MAY_DRY_RUN is exactly "false". dry_run.py reports
@@ -77,6 +91,28 @@ UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 # ENTITY_ERROR.ATTRIBUTE.INVALID). A bare upper-case run (which could be a fragment of an ID) never matches.
 CODE_TOKENS = re.compile(r"ITMS-\d{4,6}|(?<![\w.-])-\d{3,6}\b|\b[A-Z]{2,30}(?:[_.][A-Z]{2,30}){1,5}\b")
 MAX_CODES = 20
+# What an altool error line is about, as fixed labels (the line itself is never printed). The first match wins;
+# a line that matches none counts as "unrecognised".
+ERROR_KINDS = (
+    ("file format (the package could not be read)",
+     r"correct format|\(259\)|could ?n.?t be opened|not a valid (ipa|package|archive)|unsupported file"),
+    ("altool option refused or deprecated", r"unrecogni[sz]ed (option|argument)|unknown (option|argument)|"
+                                            r"invalid (option|argument)|deprecated|usage:"),
+    ("authentication or API key", r"authenticat|unauthori[sz]ed|\b401\b|credential|invalid (api )?key|"
+                                  r"private key|jwt|issuer"),
+    ("permission or API key role", r"forbidden|\b403\b|permission|not allowed|\brole\b|not authori[sz]ed to"),
+    ("build number already used or conflict", r"already (been )?(used|uploaded|exists?)|redundant binary|"
+                                               r"must be (higher|greater)|\b409\b|conflict|duplicate"),
+    ("no matching App Store Connect app or bundle ID", r"no suitable application|could ?n.?t find (the )?(app|"
+                                                        r"application|bundle)|apple ?id|bundle ?id|"
+                                                        r"no (app|application) (record|found)|wrong app"),
+    ("signing, provisioning or entitlements", r"provision|code ?sign|signature|entitlement|certificate|team"),
+    ("invalid binary or Info.plist", r"info\.plist|cfbundle|invalid (binary|bundle)|missing (required )?"
+                                     r"(key|icon|purpose)|itsappusesnonexemptencryption|export compliance|"
+                                     r"icon|minimumosversion|architecture"),
+    ("network or timeout", r"timed? ?out|network|connection|could ?n.?t connect|offline|\b5\d\d\b|"
+                           r"service unavailable|try again later"),
+)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -245,11 +281,30 @@ def altool_excerpt(log):
     warnings = [line for line in lines if re.search(r"(?i)\bwarning", line)]
     uuid = re.search(r"(?i)delivery\s*uuid\W{0,5}([0-9A-Fa-f-]{36})", text)
     codes = sorted({code for line in errors + warnings for code in CODE_TOKENS.findall(line)})
+    kinds = sorted({error_kind(line) for line in errors})
     return ["altool output (scrubbed; the full log stays private and is deleted at cleanup):",
             "  delivery UUID: " + (uuid.group(1) if uuid and UUID.fullmatch(uuid.group(1)) else "none"),
             "  lines naming an error: " + str(len(errors)) + "; naming a warning: " + str(len(warnings)),
             "  codes: " + (", ".join(codes[:MAX_CODES]) if codes else "none") +
-            (" (" + str(len(codes) - MAX_CODES) + " more)" if len(codes) > MAX_CODES else "")]
+            (" (" + str(len(codes) - MAX_CODES) + " more)" if len(codes) > MAX_CODES else ""),
+            "  error kinds: " + (", ".join(kinds) if kinds else "none")]
+
+
+def error_lines(log):
+    """How many lines of altool's output name an error (not "No errors uploading."); 0 when there is no log."""
+    try:
+        return sum(1 for line in log.read_text(errors="replace").splitlines()
+                   if re.search(r"(?i)(?<!no )\berror", line))
+    except OSError:
+        return 0
+
+
+def error_kind(line):
+    """The fixed ERROR_KINDS label for one altool error line, or "unrecognised"."""
+    for label, pattern in ERROR_KINDS:
+        if re.search("(?i)" + pattern, line):
+            return label
+    return "unrecognised"
 
 
 def ipa_short_version(ipa):
@@ -294,12 +349,17 @@ def upload(target, source_sha, build_number, get=asc_get, sleep=time.sleep, cloc
             write_private(key_path, key)
             env = child_env(DEVELOPER_DIR=XCODE_DEVELOPER_DIR, API_PRIVATE_KEYS_DIR=str(keys))
             try:
-                run_private(["/usr/bin/xcrun", "altool", "--upload-app", "--file", str(ipa), "--type", "ios",
+                run_private(["/usr/bin/xcrun", "altool", "--upload-package", str(ipa), "--type", "ios",
+                             "--apple-id", ASC_APP_IDS[target], "--bundle-id", app_id,
+                             "--bundle-version", build_number, "--bundle-short-version-string", short_version,
                              "--apiKey", APPLE_KEY_ID, "--apiIssuer", issuer],
                             private, private / "ios-upload.log", env)
             finally:
                 print("\n".join(altool_excerpt(private / "ios-upload.log")), flush=True)
             altool_finished = True
+            if error_lines(private / "ios-upload.log"):
+                # Xcode 26's altool exits 0 on a failed upload; its own error lines are the failure.
+                raise StoreError("altool reported errors (exit status 0 notwithstanding); see the error kinds above")
             token = asc_token(key_path, issuer)
         finally:
             shutil.rmtree(keys, ignore_errors=True)
