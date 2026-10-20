@@ -13,6 +13,7 @@ import ios_upload
 from store import StoreError
 
 SHA = "a" * 40
+PLAYGROUND_BUNDLE = "io.github.mayassistant.may.playground"
 STARTED = 4102444800.0  # 2100-01-01T00:00:00Z
 FRESH = "2100-01-01T00:01:00.000+00:00"
 
@@ -195,6 +196,58 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(refused.exception.args[0], "App Store Connect token could not be signed")
 
 
+class DiagnosticsTests(unittest.TestCase):
+    """What App Store Connect holds for both apps, printed with only fixed-shape values."""
+
+    def replies(self, url):
+        if url.endswith("?fields%5Bapps%5D=bundleId"):
+            app = "6822072535" if "6822072535" in url else "6821782401"
+            bundle = PLAYGROUND_BUNDLE if app == "6822072535" else "io.github.mayassistant.may"
+            return 200, {"data": {"id": app, "attributes": {"bundleId": bundle}}}
+        if "/buildUploads?" in url:
+            if "6821782401" in url:
+                return 403, None
+            return 200, {"data": [
+                {"id": "u-4", "attributes": {"cfBundleVersion": "4", "cfBundleShortVersionString": "1.0",
+                                             "platform": "IOS", "createdDate": "2026-10-20T12:05:00.000+00:00",
+                                             "state": {"state": "FAILED", "errors": [
+                                                 {"code": "STATE_ERROR.VALIDATION_ERROR",
+                                                  "description": "secret text /Users/runner/x"}]}}},
+                {"id": "u-x", "attributes": {"cfBundleVersion": "4 ; rm -rf", "platform": "IOS\nINJECT",
+                                             "createdDate": "yesterday", "state": "WEIRD"}},
+                "not an object"]}
+        if url.startswith(ios_upload.ASC_API + "builds?"):
+            if "6822072535" in url:
+                return 200, {"data": [{"attributes": {"version": "2", "processingState": "VALID",
+                                                      "uploadedDate": "2026-10-19T03:00:00Z"}}]}
+            return None, None
+        raise AssertionError("unexpected request " + url)
+
+    def test_both_apps_are_described_with_only_checked_values(self):
+        lines = ios_upload.asc_diagnostics("token", lambda token, url: self.replies(url))
+        self.assertEqual(lines, [
+            "App Store Connect app 6822072535 (playground): bundle " + PLAYGROUND_BUNDLE,
+            "  build uploads: 3 (newest first)",
+            "    build 4 version 1.0 IOS FAILED created 2026-10-20T12:05:00.000+00:00 errors STATE_ERROR.VALIDATION_ERROR",
+            "    build ? version ? ? ? created ?",
+            "    build ? version ? ? ? created ?",
+            "  builds: 1 (newest first)",
+            "    build 2 VALID uploaded 2026-10-19T03:00:00Z",
+            "App Store Connect app 6821782401 (production): bundle io.github.mayassistant.may",
+            "  build uploads: unreadable (HTTP 403)",
+            "  builds: unreadable (no reply)"])
+        printed = "\n".join(lines)
+        for leak in ("secret", "/Users", "rm -rf", "INJECT", "yesterday", "WEIRD", "token"):
+            self.assertNotIn(leak, printed)
+
+    def test_only_gets_to_the_api_and_never_a_failure(self):
+        asked = []
+        ios_upload.asc_diagnostics("token", lambda token, url: asked.append(url) or (200, {"data": []}))
+        self.assertTrue(asked and all(url.startswith(ios_upload.ASC_API) for url in asked))
+        self.assertEqual(ios_upload.diagnostics("token", lambda token, url: 1 / 0),
+                         ["App Store Connect diagnostics unavailable"])
+
+
 class ShortVersionTests(unittest.TestCase):
     def ipa(self, info):
         directory = tempfile.TemporaryDirectory()
@@ -256,8 +309,12 @@ class AltoolExcerptTests(unittest.TestCase):
             "ERROR: Failed to authenticate with the API key 23VX669FGY": "authentication or API key",
             "Error: 403 Forbidden for /Users/runner/key": "permission or API key role",
             "*** Error: The bundle version must be higher than the previously uploaded version: '3'.":
-                "build number already used or conflict",
-            "ERROR: status code: 409 (conflict)": "build number already used or conflict",
+                "build number already used",
+            "ERROR: status code: 409 (conflict)": "conflict (409)",
+            "*** Error: You must accept the updated Program License Agreement in your developer account.":
+                "agreement or contract pending",
+            "Error: No App Store version was found for this train; create a new version.":
+                "missing app version record",
             "*** Error: No suitable application records were found. Verify your bundle identifier "
             "'io.github.mayassistant.may.playground' is correct.": "no matching App Store Connect app or bundle ID",
             "Error: Invalid provisioning profile in Payload/May.app": "signing, provisioning or entitlements",

@@ -40,6 +40,14 @@ code tokens such as ENTITY_ERROR.ATTRIBUTE.INVALID), and the kinds of error
 those lines describe, each a fixed label from ERROR_KINDS. Never a raw line, a
 path, the key ID or the issuer.
 
+Diagnostics: before altool, and again after any failure once altool has run,
+this prints what App Store Connect holds for both May apps (asc_diagnostics):
+each app's bundle ID and its newest build uploads and builds (build number,
+version, state, date, error codes), every value checked against a fixed shape
+so no free text from Apple is printed. It first prints the IPA's own bundle ID,
+build number and version. A token is signed for the diagnostics and a fresh one
+after altool for the readback, so a slow upload can't expire it.
+
 Dry run: the workflow skips this step unless `dry_run` is false, and this
 script also refuses unless MAY_DRY_RUN is exactly "false". dry_run.py reports
 instead.
@@ -94,6 +102,7 @@ MAX_CODES = 20
 # What an altool error line is about, as fixed labels (the line itself is never printed). The first match wins;
 # a line that matches none counts as "unrecognised".
 ERROR_KINDS = (
+    ("agreement or contract pending", r"agreement|contract|program license|paid apps|terms (and|&) conditions"),
     ("file format (the package could not be read)",
      r"correct format|\(259\)|could ?n.?t be opened|not a valid (ipa|package|archive)|unsupported file"),
     ("altool option refused or deprecated", r"unrecogni[sz]ed (option|argument)|unknown (option|argument)|"
@@ -101,8 +110,11 @@ ERROR_KINDS = (
     ("authentication or API key", r"authenticat|unauthori[sz]ed|\b401\b|credential|invalid (api )?key|"
                                   r"private key|jwt|issuer"),
     ("permission or API key role", r"forbidden|\b403\b|permission|not allowed|\brole\b|not authori[sz]ed to"),
-    ("build number already used or conflict", r"already (been )?(used|uploaded|exists?)|redundant binary|"
-                                               r"must be (higher|greater)|\b409\b|conflict|duplicate"),
+    ("conflict (409)", r"\b409\b|conflict"),
+    ("build number already used", r"already (been )?(used|uploaded|exists?)|redundant binary|"
+                                  r"must be (higher|greater)|duplicate"),
+    ("missing app version record", r"app ?store version|version record|no (app )?version|create (a )?new version|"
+                                   r"(pre-?release )?train .*(closed|not open)"),
     ("no matching App Store Connect app or bundle ID", r"no suitable application|could ?n.?t find (the )?(app|"
                                                         r"application|bundle)|apple ?id|bundle ?id|"
                                                         r"no (app|application) (record|found)|wrong app"),
@@ -270,6 +282,83 @@ def await_build_upload(token, asc_app_id, build_number, short_version, started, 
         sleep(POLL_SECONDS)
 
 
+DIAGNOSTIC_LIMIT = 10
+DIAGNOSTIC_DATE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:?\d{2})")
+DIAGNOSTIC_CODE = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+BUILD_STATES = {"PROCESSING", "FAILED", "INVALID", "VALID"}
+BUNDLE_ID = re.compile(r"[A-Za-z0-9.-]{1,155}")
+
+
+def shown(value, pattern=None, allowed=None):
+    """A value from Apple fit for this public log, or "?": a string matching pattern or in allowed, never free text."""
+    if not isinstance(value, str) or (pattern is not None and not pattern.fullmatch(value)) or \
+            (allowed is not None and value not in allowed):
+        return "?"
+    return value
+
+
+def http(status):
+    return "HTTP " + str(status) if type(status) is int else "no reply"
+
+
+def diagnostics(token, get=asc_get):
+    """asc_diagnostics, or one fixed line if reading them failed in any way: they never fail the step."""
+    try:
+        return asc_diagnostics(token, get)
+    except Exception:
+        return ["App Store Connect diagnostics unavailable"]
+
+
+def asc_diagnostics(token, get=asc_get):
+    """What App Store Connect holds for both May apps, as lines fit for the public log: each app's bundle ID, and
+    its newest build uploads and builds (build number, version, state, date, error codes). Only GETs; every value is
+    checked against a fixed shape (shown) before it is printed, so no free text from Apple reaches the log. A failed
+    read prints its HTTP status and nothing else; diagnostics never fail the step."""
+    lines = []
+    for target in ("playground", "production"):
+        asc_id = ASC_APP_IDS[target]
+        base = ASC_API + "apps/" + asc_id
+        status, body = get(token, base + "?" + urlencode({"fields[apps]": "bundleId"}))
+        data = body.get("data") if isinstance(body, dict) else None
+        bundle = shown((data.get("attributes") or {}).get("bundleId") if isinstance(data, dict) else None, BUNDLE_ID)
+        lines.append("App Store Connect app " + asc_id + " (" + target + "): bundle " +
+                     (bundle if status == 200 else "unreadable (" + http(status) + ")"))
+        status, body = get(token, base + "/buildUploads?" + urlencode({"limit": str(DIAGNOSTIC_LIMIT),
+                                                                        "sort": "-createdDate"}))
+        items = body.get("data") if isinstance(body, dict) else None
+        if status != 200 or not isinstance(items, list):
+            lines.append("  build uploads: unreadable (" + http(status) + ")")
+        else:
+            lines.append("  build uploads: " + str(len(items)) + (" (newest first)" if items else ""))
+            for item in items[:DIAGNOSTIC_LIMIT]:
+                attributes = item.get("attributes") if isinstance(item, dict) else None
+                attributes = attributes if isinstance(attributes, dict) else {}
+                state = attributes.get("state")
+                errors = state.get("errors") if isinstance(state, dict) else None
+                codes = sorted({shown(error.get("code"), DIAGNOSTIC_CODE) for error in errors or []
+                                if isinstance(error, dict)}) if isinstance(errors, list) else []
+                lines.append("    build " + shown(attributes.get("cfBundleVersion"), SHORT_VERSION) + " version " +
+                             shown(attributes.get("cfBundleShortVersionString"), SHORT_VERSION) + " " +
+                             shown(attributes.get("platform"), allowed={"IOS", "MAC_OS", "TV_OS", "VISION_OS"}) + " " +
+                             ((upload_state(item) if isinstance(item, dict) else None) or "?") + " created " +
+                             shown(attributes.get("createdDate"), DIAGNOSTIC_DATE) +
+                             (" errors " + ", ".join(codes) if codes else ""))
+        status, body = get(token, ASC_API + "builds?" + urlencode({"filter[app]": asc_id, "limit": str(DIAGNOSTIC_LIMIT),
+                                                                   "sort": "-uploadedDate"}))
+        items = body.get("data") if isinstance(body, dict) else None
+        if status != 200 or not isinstance(items, list):
+            lines.append("  builds: unreadable (" + http(status) + ")")
+        else:
+            lines.append("  builds: " + str(len(items)) + (" (newest first)" if items else ""))
+            for item in items[:DIAGNOSTIC_LIMIT]:
+                attributes = item.get("attributes") if isinstance(item, dict) else None
+                attributes = attributes if isinstance(attributes, dict) else {}
+                lines.append("    build " + shown(attributes.get("version"), SHORT_VERSION) + " " +
+                             shown(attributes.get("processingState"), allowed=BUILD_STATES) + " uploaded " +
+                             shown(attributes.get("uploadedDate"), DIAGNOSTIC_DATE))
+    return lines
+
+
 def altool_excerpt(log):
     """The scrubbed lines this public log may carry about altool's output: no raw line, path or credential."""
     try:
@@ -342,11 +431,17 @@ def upload(target, source_sha, build_number, get=asc_get, sleep=time.sleep, cloc
         raise StoreError("App Store Connect key is not a PEM private key")
     keys = private / "asc-keys"
     keys.mkdir(mode=0o700)
-    started, altool_finished = time.time(), False
+    started, altool_finished, token = time.time(), False, None
+    # The IPA's own numbers, read from its Info.plist (verify.ipa_identity checked them against the dispatch).
+    print("IPA to upload: " + app_id + " build " + build_number + " version " + short_version +
+          " to App Store Connect app " + ASC_APP_IDS[target], flush=True)
     try:
         try:
             key_path = keys / ("AuthKey_" + APPLE_KEY_ID + ".p8")
             write_private(key_path, key)
+            # A token now for the diagnostics, and a fresh one after altool for the readback, so a slow upload
+            # can't leave the readback with an expired token.
+            print("Before the upload:\n" + "\n".join(diagnostics(asc_token(key_path, issuer), get)), flush=True)
             env = child_env(DEVELOPER_DIR=XCODE_DEVELOPER_DIR, API_PRIVATE_KEYS_DIR=str(keys))
             try:
                 run_private(["/usr/bin/xcrun", "altool", "--upload-package", str(ipa), "--type", "ios",
@@ -360,13 +455,21 @@ def upload(target, source_sha, build_number, get=asc_get, sleep=time.sleep, cloc
             if error_lines(private / "ios-upload.log"):
                 # Xcode 26's altool exits 0 on a failed upload; its own error lines are the failure.
                 raise StoreError("altool reported errors (exit status 0 notwithstanding); see the error kinds above")
-            token = asc_token(key_path, issuer)
         finally:
+            if altool_finished:
+                try:
+                    token = asc_token(key_path, issuer)
+                except StoreError:
+                    token = None
             shutil.rmtree(keys, ignore_errors=True)
+        if token is None:
+            raise StoreError("App Store Connect token could not be signed")
         upload_id, state = await_build_upload(token, ASC_APP_IDS[target], build_number, short_version, started,
                                               get, sleep, clock)
     except StoreError:
         if altool_finished:
+            if token is not None:
+                print("After the upload:\n" + "\n".join(diagnostics(token, get)), flush=True)
             print("altool finished, so the upload may be in App Store Connect; check there before retrying",
                   flush=True)
         raise
