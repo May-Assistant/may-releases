@@ -352,6 +352,13 @@ Nothing else changes: the same two approvals per run (`may-native-compile`, then
 - uploads with `xcrun altool --upload-package <ipa> --type ios --apple-id <ASC app ID> --bundle-id <bundle> --bundle-version <build> --bundle-short-version-string <IPA's version> --apiKey … --apiIssuer …`. Apple's altool guide: "The `--upload-app` command is deprecated. Use the `--upload-package` command instead." ([Using altool](https://help.apple.com/asc/appsaltool/en.lproj/static.html); also `altool(7)`). On Xcode 26, altool can upload to the wrong app when two bundle IDs share a prefix unless `--apple-id` names it ([fastlane #29698](https://github.com/fastlane/fastlane/issues/29698), quoting Apple), and May's two do (`io.github.mayassistant.may`, `…may.playground`). The `--upload-app` path has also been reported failing on Xcode 26 with "isn't in the correct format. (259)" ([Kinematic-iOS #336](https://github.com/Shaggywize63/Kinematic-iOS/pull/336));
 - fails at once, before the readback, when any line of altool's output names an error, since Xcode 26's altool exits 0 on a failed upload ([Bitrise App Store Connect step v2.0.0](https://discuss.bitrise.io/t/deploy-to-app-store-connect-application-loader-formerly-itunes-connect-v2-0-0/25564)). It still prints that the upload may be in App Store Connect.
 
+**Diagnostics (20 Oct).** Build 4 (run 39417850241) failed fast with the error kinds "build number already used or conflict, unrecognised", one label covering two causes. The kinds now separate "conflict (409)" from "build number already used", and add "agreement or contract pending" and "missing app version record". Before altool, and again after any failure once it has run, the upload step prints the IPA's bundle ID, build number and version, then what App Store Connect holds for **both** apps (6822072535 and 6821782401):
+- each app's bundle ID;
+- its ten newest build uploads (build number, version, platform, state, created date, error codes);
+- its ten newest builds (build number, processing state, uploaded date).
+
+Only GETs are sent. Every value is printed only if it matches a fixed shape (digits and dots, a known state, an ISO date, a code token), and anything else prints as "?". A failed read prints its HTTP status alone. The diagnostics never fail the step.
+
 TestFlight processing (the build itself) and the internal group's testers are still checked in App Store Connect.
 
 ### What Samuel does
