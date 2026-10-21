@@ -92,7 +92,8 @@ MARKER = "may-ios-renders"
 AUTHOR = ("-c", "user.name=May renders", "-c", "user.email=renders@may-releases.invalid")
 README = ("# May parity renders and device tests\n\nWritten by may-releases, never by hand.\n\n"
           "- ios-renders.yml: one folder per may-app commit (its first 12 hex digits), the newest " + str(KEEP) +
-          " kept (runs.json lists them, newest first). Each holds index.html (Android | iOS per screen and mode), "
+          " kept (runs.json lists them, newest first). Each holds README.md (open the folder) and index.html (Android | "
+          "iOS per screen and mode), "
           "sheet/ (the two side by side), ios/, android/, the manifest copy and build.log.\n"
           "- device-tests.yml: device-tests/<UTC date>-<may-app short sha>/, the newest " + str(KEEP) + " kept "
           "(device-tests/runs.json). Each holds README.md (open the folder: verdicts and screenshots), index.html, and "
@@ -119,7 +120,8 @@ def allowed(name, folder):
     if len(parts) == 1:
         return "dir"
     if len(parts) == 2:
-        return "dir" if parts[1] in KINDS else "file" if parts[1] in ("index.html", "screens.json", "build.log") else None
+        return "dir" if parts[1] in KINDS else "file" if parts[1] in ("index.html", "README.md", "screens.json", "build.log") \
+            else None
     return "file" if parts[1] in KINDS and FILE.fullmatch(parts[2]) else None
 
 
@@ -170,7 +172,7 @@ def extract(archive, members, destination):
                 json.loads(data)
             except ValueError:
                 raise PublishError("The manifest copy is not JSON") from None
-        if path.name == "index.html" and re.search(rb"(?i)<\s*(script|iframe|object|embed)|javascript:", data):
+        if path.name in ("index.html", "README.md") and re.search(rb"(?i)<\s*(script|iframe|object|embed)|javascript:", data):
             raise PublishError("The contact sheet holds active content")
 
 

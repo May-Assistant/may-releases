@@ -19,7 +19,8 @@ code, so this runner never holds a write key or a decrypt key):
   (every row in light and dark), per mode, and how many are not the 1179 x 2556 frame. Without a usable manifest
   (not yet in the commit, or malformed) the renders in the snapshot folder named <id>-<mode>.png stand in for its
   rows, so the run still publishes them and the build log, and `verdict` fails the job.
-- sheet: the run folder: the contact sheet (one HTML page, Android | iOS per row and mode), one stitched PNG per row
+- sheet: the run folder: the contact sheet (index.html, Android | iOS per row and mode, and the same table as
+  README.md, which GitHub shows when the folder is opened), one stitched PNG per row
   and mode where both renders exist (stitch.swift, CoreGraphics, compiled here with the pinned Xcode), the manifest,
   and the tail of the build log.
 - seal: one tar of the run folder (<may-app short sha>/), encrypted to MAY_RENDERS_RECIPIENT. Without that variable it
@@ -331,15 +332,18 @@ def checked_record(private):
     return record
 
 
+HEAD = ["<!doctype html>", '<meta charset="utf-8">', "<title>May parity renders</title>",
+        "<style>body{font:14px system-ui;margin:24px}table{border-collapse:collapse}"
+        "td,th{border:1px solid #ccc;padding:8px;vertical-align:top}img{max-width:360px}</style>"]
+
+
 def page(sha, ds_sha, rows, expected, stitched, manifest=True):
-    """The contact sheet's HTML: every value from may-app escaped, every image a relative path in the run folder."""
+    """The contact sheet's body: every value from may-app escaped, every image a relative path in the run folder.
+    index.html is HEAD plus this; README.md (GitHub shows it when the folder is opened) is this alone."""
     by_row = {}
     for entry in expected:
         by_row.setdefault(entry["id"], []).append(entry)
-    parts = ["<!doctype html>", '<meta charset="utf-8">', "<title>May parity renders</title>",
-             "<style>body{font:14px system-ui;margin:24px}table{border-collapse:collapse}"
-             "td,th{border:1px solid #ccc;padding:8px;vertical-align:top}img{max-width:360px}</style>",
-             f"<h1>May parity renders, may-app {html.escape(sha)}</h1>",
+    parts = [f"<h1>May parity renders, may-app {html.escape(sha)}</h1>",
              f"<p>Design system: {html.escape(ds_sha) if ds_sha else 'may-app pin'}. "
              f"Device: {DEVICE}, light and dark.</p>",
              '<p><a href="build.log">Build and test log</a> (its last 8 MB).</p>',
@@ -352,6 +356,8 @@ def page(sha, ds_sha, rows, expected, stitched, manifest=True):
             android = f'<img src="android/{key}.png" alt="Android">' if entry["android"] else "missing"
             ios = f'<img src="ios/{key}.png" alt="iOS">' if entry["rendered"] else "missing"
             sheet = f'<br><a href="sheet/{key}.png">side by side</a>' if key in stitched else ""
+            # GitHub sizes README images by attribute only (it drops style), so each carries width="300".
+            android, ios = android.replace(' alt=', ' width="300" alt='), ios.replace(' alt=', ' width="300" alt=')
             parts.append(f"<tr><td>{html.escape(row['title'])}<br><small>{html.escape(row['id'])} "
                          f"{html.escape(row['spec'])}</small>{sheet}</td>"
                          f"<td>{html.escape(entry['mode'])}</td><td>{android}</td><td>{ios}</td></tr>")
@@ -417,7 +423,9 @@ def sheet(sha, ds_sha=None, build_stitcher=stitcher, tool=quiet):
             (out / "build.log").write_bytes(stream.read(MAX_LOG))
     except OSError:
         (out / "build.log").write_bytes(b"")
-    (out / "index.html").write_text(page(sha, ds_sha, record["rows"], record["expected"], stitched, manifest))
+    body = page(sha, ds_sha, record["rows"], record["expected"], stitched, manifest)
+    (out / "index.html").write_text("\n".join(HEAD) + "\n" + body)
+    (out / "README.md").write_text(body)
     rows = len(record["expected"])
     if binary is None:
         print(f"May iOS renders: contact sheet of {rows} rows; the stitcher did not build, so none were stitched")
