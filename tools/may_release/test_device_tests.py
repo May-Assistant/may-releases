@@ -80,7 +80,9 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "connections"])
+        self.assertEqual(ids, ["sign-in", "connections", "chat", "notes"])
+        self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ["sign-in", "connections"],
+                         "agent scenarios are Android's until the iOS job")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
             device_tests.scenarios("sign-in,unknown")
@@ -93,6 +95,15 @@ class ScenarioTests(unittest.TestCase):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "s.json"
                 path.write_text(json.dumps([dict(good, **change)]))
+                with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
+                    device_tests.scenarios()
+        agent = device_tests.scenarios("notes")[0]
+        for change in ({"goal": "no tag here"}, {"goal": "{tag} " + "x" * 1500}, {"flow": "notes.yaml"},
+                       {"truth": [{"get": "/v1/account/devices"}]}, {"truth": [{"get": "/v1/routines", "x": 1}]},
+                       {"truth": "/v1/routines"}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "s.json"
+                path.write_text(json.dumps([dict(agent, **change)]))
                 with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
                     device_tests.scenarios()
 
@@ -167,10 +178,11 @@ class RunTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def run_it(self, env=None, selection="all", fail=(), status=200):
+    def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200):
         calls = []
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
+        (self.private / device_tests.AGENTS).unlink(missing_ok=True)
 
         class Process:
             def terminate(self):
@@ -199,13 +211,14 @@ class RunTests(unittest.TestCase):
             device_tests.run_scenarios(selection, minted=lambda base, secret: TOKEN,
                                        checked=lambda base, token, path: status)
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
+            device_tests.judge_scenarios(judged_by=lambda *args: self.fail("judged a Maestro scenario"))
         runs = list((self.root / device_tests.OUT).iterdir())
         report = json.loads((runs[0] / "android" / "report.json").read_text())
         return calls, report, out.getvalue(), runs[0]
 
     def test_signs_in_runs_each_flow_records_and_reports(self):
         calls, report, out, run = self.run_it()
-        start = [argv for argv in calls if "am" in argv][0]
+        start = [argv for argv in calls if "start" in argv][0]
         self.assertEqual(start[-3:], ["--es", "may_test_session", TOKEN])
         self.assertEqual([row["id"] for row in report["scenarios"]], ["sign-in", "connections"])
         sign_in, connections = report["scenarios"]
@@ -214,6 +227,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual((connections["verdict"], connections["reason"]),
                          ("fail", "may-app has no Maestro flow for this scenario"))
         self.assertEqual(out.splitlines(), [
+            "May device tests (android): 2 scenarios ran; verdicts follow the judge step",
             "May device tests (android): sign-in: ui-pass", "May device tests (android): connections: fail",
             "May device tests (android): 0 passed, 1 passed on screen alone (server checks not configured), 1 failed, "
             "0 skipped"])
@@ -244,8 +258,6 @@ class RunTests(unittest.TestCase):
         with patch("device_tests.SCENARIOS", path):
             _, report, _, _ = self.run_it(env={"MAY_DEVICE_TESTS_OUTWARD": "off"})
             self.assertEqual(report["scenarios"][0]["verdict"], "skipped")
-            shutil.rmtree(self.root / device_tests.OUT)
-            (self.private / device_tests.VERDICTS).unlink()
             _, report, _, _ = self.run_it()
             self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass")
 
@@ -604,6 +616,20 @@ class WorkflowPinTests(unittest.TestCase):
         self.assertEqual(self.text.count(line), 1)
         self.flagged(self.text.replace(line, "").replace(push, push + line), "a secret, variable or env entry")
         self.flagged(self.text.replace("publish.py device-release", "publish.py device-push"), "runs something other")
+
+    def test_the_claude_token_and_model_stay_in_the_agent_and_judge_steps(self):
+        line = "          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n"
+        model = "          MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}\n"
+        judge = "      - name: Judge the agent scenarios\n        env:\n"
+        seal = "      - name: Encrypt the report to the renders public key\n        env:\n"
+        self.assertEqual((self.text.count(line), self.text.count(model), self.text.count(judge)), (2, 2, 1))
+        moved = self.text.replace(judge + line, judge).replace(seal, seal + line)
+        self.flagged(moved, "a secret, variable or env entry")
+        self.flagged(self.text.replace(judge + line + model, judge + line).replace(seal, seal + model),
+                     "a secret, variable or env entry")
+        self.flagged(self.text.replace(model, "", 1).replace(seal, seal + model), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, "", 1), "a secret, variable or env entry")
+        self.flagged(self.text.replace("device_tests.py judge", "device_tests.py seal"), "runs something other")
 
     def test_variables_stay_in_their_steps(self):
         line = "          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}\n"

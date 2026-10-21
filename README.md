@@ -686,19 +686,22 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
 
 ### Device tests of May Playground against staging
 
-`device-tests.yml` runs May Playground on an Android emulator against live staging, signed in as the staging test account, and drives it with may-app's Maestro flows. It runs on dispatch (`source_sha`, empty for main's head, and `scenarios`) and nightly at 03:17 UTC on may-app main's head. iOS follows in a later change. This repository is public, so the log shows scenario ids, verdicts and counts only. Screenshots, recordings and reports leave the runner age-encrypted. Screenshots and reports go to the private `May-Assistant/may-renders`, under `device-tests/<UTC date>-<may-app short sha>/`, and recordings go to that run's may-renders release.
+`device-tests.yml` runs May Playground on an Android emulator against live staging, signed in as the staging test account, and drives it with may-app's Maestro flows and with an agent: Claude Code driving the emulator. It runs on dispatch (`source_sha`, empty for main's head, and `scenarios`) and nightly at 03:17 UTC on may-app main's head. iOS follows in a later change. This repository is public, so the log shows scenario ids, verdicts and counts only. Screenshots, recordings and reports leave the runner age-encrypted. Screenshots and reports go to the private `May-Assistant/may-renders`, under `device-tests/<UTC date>-<may-app short sha>/`, and recordings go to that run's may-renders release.
 
 1. **admission** (`gate.py --action device-tests`) checks the inputs and the environment `may-device-tests`, which allows main only and has no required reviewer, because the nightly run can't wait for one. Only this action may start from a schedule.
 2. **android**, on Linux with KVM:
    - the fetch (`prepare.py`, read keys) admits may-app main commits only, never a pull request, because the run step holds the sign-in secret;
    - `device_tests.py build` builds the Playground debug APK without secrets;
    - `run`:
-     - installs the app and the pinned Maestro CLI 2.8.0, its zip checked against a SHA-256;
-     - mints a short-lived staging session for the test account (`POST /v1/auth/test-session` with `{"secret": MAY_TEST_SIGNIN_SECRET}` in the body; staging fixes the account and replies `{token, expires_at, user_id}`, of which only the token is kept);
-     - hands it to the app through a Playground-debug-only intent extra (`may_test_session`);
-     - for each scenario in `device_scenarios.json`, records the screen (about 720p, about 1 Mbps, 3-minute parts), runs the scenario's flow from may-app's `tools/device-tests/flows/`, takes a screenshot and runs its read-only server checks.
+     - installs the app and the pinned Maestro CLI 2.8.0, its zip checked against a SHA-256, and, when an agent scenario is chosen, review.py's pinned Claude Code, checked against its sha512;
+     - for each scenario in `device_scenarios.json`, mints a fresh staging session for the test account (`POST /v1/auth/test-session` with `{"secret": MAY_TEST_SIGNIN_SECRET}` in the body; staging fixes the account and replies `{token, expires_at, user_id}`, of which only the token is kept; it lasts 30 minutes, with no refresh) and restarts the app with it through a Playground-debug-only intent extra (`may_test_session`);
+     - records the screen (about 720p, about 1 Mbps, 3-minute parts) and runs the scenario: a Maestro scenario runs its flow from may-app's `tools/device-tests/flows/`; an agent scenario runs Claude Code headless (`device_agent.py`) with the scenario's goal;
+     - takes a screenshot and reads the server: a Maestro scenario's status checks, and for an agent scenario whether K's reads (approvals, inbox, commitments, event notes, routines) list an item carrying the run's tag, `qa-<run id>`;
+     - last, `POST /v1/auth/test-session/cleanup` with the tag and the run's start time removes what the run created.
 
      A scenario with no server checks configured passes on screen alone ("ui-pass").
+   - **The agent** has no built-in tool (`--tools ""`), no settings beyond an empty HOME, and one MCP server, `device_mcp.py` (`--strict-mcp-config`, permission mode `dontAsk`, only `mcp__device` allowed). Its tools are screenshot, hierarchy, tap, type (plain text only), swipe, back, wait and done, all on the emulator through adb, with at most 80 steps. Its environment holds `CLAUDE_CODE_OAUTH_TOKEN` (the repository's, as the code review uses) and nothing else secret; the model is the variable `MAY_DEVICE_TESTS_MODEL`. Its system prompt forbids signing out, account, device, billing or connection settings, approving, paying and sending outside May's chat, and puts the tag in everything it creates. Its output stays on the runner, in the encrypted report only.
+   - `judge` (the token and the model, nothing else) runs Claude Code with no tool at all on each agent run: the goal, the agent's own report and the last screen's hierarchy, answered in a fixed JSON schema (pass or fail, and a short note). A scenario passes when the agent completed, the judge passed it and the server shows the tagged item; with no server reads configured, it is "ui-pass". A rate limit or usage limit is **skipped, never a pass**. This step prints every scenario's verdict.
    - `seal` age-encrypts the run folder to `MAY_RENDERS_RECIPIENT`. Only that file is uploaded, kept for 7 days, as the recordings' fallback.
    - `verdict` fails the job if any scenario failed.
 3. **publish**, on a fresh Linux runner that runs no may-app code:
@@ -709,8 +712,8 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
 **Outward actions:** a scenario marked `"outward": true` runs unless `MAY_DEVICE_TESTS_OUTWARD` is `off`. So far only the self-addressed Gmail send to harlahke@gmail.com is planned to use this. Samuel approved it directly on 21 Oct, conditional on staging's guard for test sessions.
 
 **Setup** in the environment `may-device-tests`:
-- secrets: `MAY_TEST_SIGNIN_SECRET`, `MAY_RENDERS_RELEASE_TOKEN` (fine-grained, may-renders only, Contents read and write), plus copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_RENDERS_DECRYPT_KEY` and `MAY_APP_RENDERS_WRITE_KEY`;
-- variables: `MAY_STAGING_API_URL`, `MAY_RENDERS_RECIPIENT` and, optionally, `MAY_DEVICE_TESTS_OUTWARD`.
+- secrets: `MAY_TEST_SIGNIN_SECRET`, `MAY_RENDERS_RELEASE_TOKEN` (fine-grained, may-renders only, Contents read and write), plus copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_RENDERS_DECRYPT_KEY` and `MAY_APP_RENDERS_WRITE_KEY`; `CLAUDE_CODE_OAUTH_TOKEN` is the repository secret;
+- variables: `MAY_STAGING_API_URL`, `MAY_RENDERS_RECIPIENT`, `MAY_DEVICE_TESTS_MODEL` and, optionally, `MAY_DEVICE_TESTS_OUTWARD`.
 
 ### Prerequisites that remain
 

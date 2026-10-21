@@ -11,10 +11,16 @@ pull request's code is ever built here.
 
 Commands, one per workflow step:
   build    the Playground debug APK (no secret in the step)
-  run      start the emulator, install the app, install the pinned Maestro, mint a staging test session and hand it
-           to the app (a Playground-debug-only intent extra), then each scenario: record the screen, run its Maestro
-           flow (may-app's FLOWS_DIR), take screenshots and run its read-only server checks. A failed scenario does
-           not fail this step, so its evidence is still published; `verdict` fails the job afterwards.
+  run      start the emulator, install the app and the pinned Maestro (and Claude Code when an agent scenario is
+           chosen), then each scenario: mint a fresh staging test session (it lasts 30 minutes) and start the app
+           with it (a Playground-debug-only intent extra), record the screen, run its Maestro flow (may-app's
+           FLOWS_DIR) or its agent (device_agent.py: Claude Code driving the emulator through device_mcp.py), take a
+           screenshot and read the server: status checks, and for an agent scenario whether K's read endpoints show
+           an item carrying the run's tag (qa-<run id>). Last, the test session's cleanup removes what the run
+           created (POST /v1/auth/test-session/cleanup with the tag). A failed scenario does not fail this step, so
+           its evidence is still published; `verdict` fails the job afterwards.
+  judge    Claude Code, with no tool, judges each agent run from its goal, the agent's report and the last screen's
+           hierarchy, then every verdict is printed. A rate limit skips the scenario; it is never a pass.
   seal     one tar of the run folder (<UTC date>-<may-app short sha>/android/), encrypted to MAY_RENDERS_RECIPIENT
   verdict  fails the job if any scenario failed
 
@@ -43,6 +49,8 @@ import zipfile
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import device_agent
+from device_agent import AgentError
 import flows
 from gate import AGE_RECIPIENT
 from prepare import head_revision
@@ -54,6 +62,9 @@ FLOWS_DIR = "tools/device-tests/flows"
 SCENARIO_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
 FLOW_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\.yaml")
 SERVER_PATH = re.compile(r"/v1/[a-z0-9/_-]{1,120}")
+# K's reads that list what a test session's run created (server truth for agent scenarios), 21 Oct.
+TRUTH_PATHS = ("/v1/approvals", "/v1/inbox", "/v1/commitments", "/v1/event-notes", "/v1/routines")
+MAX_GOAL = 1500
 PLATFORMS = ("android", "ios")
 APP_ID = "io.github.mayassistant.may.playground"
 APK = "android/app/build/outputs/apk/playground/debug/app-playground-debug.apk"
@@ -68,6 +79,15 @@ TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{20,4096}")
 RECORD_SIZE, RECORD_BITRATE, RECORD_SECONDS = "720x1600", "1000000", 180
 FLOW_SECONDS = 600
 OUT, SEALED, VERDICTS = "may-device-out", "may-device-sealed", "device-verdicts.json"
+AGENTS = "device-agents.json"
+SERIAL = "emulator-5554"
+# The fixed reasons a report may give (publish.py accepts these words alone).
+RATE_LIMITED = "Claude is rate limited (skipped, never a pass)"
+UNFINISHED = "the agent did not finish"
+BLOCKED = "the agent reported it was blocked"
+NO_TRUTH = "the server did not show the tagged item"
+NOT_JUDGED = "not judged"
+UNCONFIGURED = "server checks not configured"
 
 
 class DeviceTestsError(ValueError):
@@ -82,9 +102,15 @@ def scenarios(selection="all", platform="android"):
         raise DeviceTestsError("The scenario list is unreadable") from None
     checked, ids = [], set()
     for row in rows if isinstance(rows, list) else []:
+        driver = row.get("driver") if isinstance(row, dict) else None
         if not (isinstance(row, dict) and isinstance(row.get("id"), str) and SCENARIO_ID.fullmatch(row["id"]) and
-                row["id"] not in ids and row.get("driver") == "maestro" and isinstance(row.get("flow"), str) and
-                FLOW_NAME.fullmatch(row["flow"]) and isinstance(row.get("title"), str) and
+                row["id"] not in ids and (
+                    driver == "maestro" and isinstance(row.get("flow"), str) and FLOW_NAME.fullmatch(row["flow"]) and
+                    "goal" not in row and "truth" not in row or
+                    driver == "agent" and "flow" not in row and isinstance(row.get("goal"), str) and
+                    "{tag}" in row["goal"] and len(row["goal"]) <= MAX_GOAL and isinstance(row.get("truth"), list) and
+                    all(isinstance(c, dict) and set(c) == {"get"} and c["get"] in TRUTH_PATHS for c in row["truth"]))
+                and isinstance(row.get("title"), str) and
                 isinstance(row.get("platforms"), list) and set(row["platforms"]) <= set(PLATFORMS) and
                 isinstance(row.get("outward"), bool) and isinstance(row.get("server"), list) and
                 all(isinstance(c, dict) and isinstance(c.get("get"), str) and SERVER_PATH.fullmatch(c["get"]) and
@@ -152,6 +178,61 @@ def server_check(base, token, path, get=urllib.request.urlopen):
         return error.code
     except (urllib.error.URLError, TimeoutError):
         return 0
+
+
+def holds(data, tag, depth=0):
+    """Whether any string in a JSON value holds tag (case-insensitive)."""
+    if depth > 20:
+        return False
+    if isinstance(data, str):
+        return tag.lower() in data.lower()
+    if isinstance(data, dict):
+        return any(holds(value, tag, depth + 1) for value in data.values())
+    if isinstance(data, list):
+        return any(holds(value, tag, depth + 1) for value in data)
+    return False
+
+
+def tagged(base, token, path, tag, get=urllib.request.urlopen):
+    """Server truth: (HTTP status, whether the read lists an item carrying the run's tag). Nothing is printed."""
+    request = urllib.request.Request(base + path, headers={"Authorization": "Bearer " + token})
+    try:
+        with get(request, timeout=30) as reply:
+            return reply.status, holds(json.loads(reply.read(8 * 1024 * 1024)), tag)
+    except urllib.error.HTTPError as error:
+        return error.code, False
+    except (urllib.error.URLError, TimeoutError, ValueError, RecursionError):
+        return 0, False
+
+
+def cleanup(base, token, since, tag, post=urllib.request.urlopen):
+    """K's cleanup of what the run created (only items made after since whose name or title holds tag): how many
+    were removed, or None when it did not answer 200."""
+    request = urllib.request.Request(base + "/v1/auth/test-session/cleanup", method="POST",
+                                     data=json.dumps({"since": since, "tag": tag}).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            data = json.loads(reply.read(1024 * 1024))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return None
+    counts = [data.get(key) for key in ("chats", "tasks", "notes", "routines", "for_you")] \
+        if isinstance(data, dict) else []
+    return sum(count for count in counts if type(count) is int and count >= 0)
+
+
+def run_tag():
+    """qa-<GitHub run id>: K's cleanup takes a tag of at least 8 characters, matched in names and titles."""
+    run = os.environ.get("GITHUB_RUN_ID", "")
+    return "qa-" + (run if re.fullmatch(r"[1-9][0-9]{4,19}", run) else str(int(time.time())))
+
+
+def launch(adb, env, token, log):
+    """The app, stopped and started again with a fresh test session."""
+    flows.run_private([adb, "shell", "am", "force-stop", APP_ID], log, env=env, check=False)
+    flows.run_private([adb, "shell", "am", "start", "-W", "-a", "android.intent.action.MAIN", "-c",
+                       "android.intent.category.LAUNCHER", "-p", APP_ID, "--es", "may_test_session", token],
+                      log, env=env)
 
 
 class Recorder:
@@ -244,14 +325,18 @@ def maestro(root, private, log):
     return launcher
 
 
-def run_scenarios(selection, minted=mint, checked=server_check):
-    require_step_secrets((SIGNIN_SECRET,))
+def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, cleaned=cleanup,
+                  agent=device_agent.run_agent, install=device_agent.install):
+    chosen = scenarios(selection, "android")
+    agents = any(row["driver"] == "agent" for row in chosen)
+    require_step_secrets((SIGNIN_SECRET, device_agent.OAUTH))
     secret = os.environ.pop(SIGNIN_SECRET, "")
+    # The OAuth token is popped (held in memory, for the agent's environment alone) whether or not it is used.
+    claude = device_agent.settings(os.environ) if agents else (os.environ.pop(device_agent.OAUTH, ""), None)
     root = runner_root()
     source, private = root / "may-source", root / "may-private"
     if not source.is_dir() or not (source / APK).is_file():
         raise DeviceTestsError("The Playground app is not built")
-    chosen = scenarios(selection, "android")
     base = os.environ.get(STAGING, "").strip().rstrip("/")
     if not STAGING_URL.fullmatch(base):
         raise DeviceTestsError("MAY_STAGING_API_URL is not an https host in may-device-tests")
@@ -262,15 +347,12 @@ def run_scenarios(selection, minted=mint, checked=server_check):
     folder.mkdir(parents=True, mode=0o700)
     log = private / "device-run.log"
     launcher = maestro(root, private, log)
+    cli = install(root) if agents else None
+    tag, since = run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     adb, emulator, env = boot(root, log)
-    results = []
+    results, records, cleaned_count = [], {}, None
     try:
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
-        token = minted(base, secret)
-        secret = ""
-        flows.run_private([adb, "shell", "am", "start", "-W", "-a", "android.intent.action.MAIN", "-c",
-                           "android.intent.category.LAUNCHER", "-p", APP_ID, "--es", "may_test_session", token],
-                          log, env=env)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()))
         for row in chosen:
@@ -280,19 +362,26 @@ def run_scenarios(selection, minted=mint, checked=server_check):
             if row["outward"] and not outward:
                 entry["reason"] = "outward actions are off (MAY_DEVICE_TESTS_OUTWARD)"
                 continue
-            flow = source / FLOWS_DIR / row["flow"]
-            if not flow.is_file() or flow.is_symlink():
+            flow = source / FLOWS_DIR / row["flow"] if row["driver"] == "maestro" else None
+            if flow is not None and (not flow.is_file() or flow.is_symlink()):
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
                 continue
+            # A fresh session per scenario: one lasts 30 minutes and has no refresh.
+            token = minted(base, secret)
+            launch(adb, env, token, log)
             recorder = Recorder(adb, env, row["id"], log)
             recorder.start()
             started = time.monotonic()
-            try:
-                passed = not flows.run_private(
-                    [str(launcher), "--device", "emulator-5554", "test", str(flow), "--format", "junit", "--output",
-                     str(folder / (row["id"] + ".xml"))], log, env=maestro_env, check=False, timeout=FLOW_SECONDS)
-            except subprocess.TimeoutExpired:
-                passed = False
+            if flow is not None:
+                try:
+                    passed = not flows.run_private(
+                        [str(launcher), "--device", SERIAL, "test", str(flow), "--format", "junit", "--output",
+                         str(folder / (row["id"] + ".xml"))], log, env=maestro_env, check=False, timeout=FLOW_SECONDS)
+                except subprocess.TimeoutExpired:
+                    passed = False
+            else:
+                records[row["id"]] = agent(cli, row["goal"], tag, adb, SERIAL, private / "agent" / row["id"],
+                                           claude[0], claude[1])
             entry["seconds"] = int(time.monotonic() - started)
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
@@ -300,12 +389,22 @@ def run_scenarios(selection, minted=mint, checked=server_check):
             for check in row["server"]:
                 status = checked(base, token, check["get"])
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
-            server_ok = all(check["pass"] for check in entry["server"])
-            entry["verdict"] = ("fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass")
-            if entry["verdict"] == "ui-pass":
-                entry["reason"] = "server checks not configured"
+            for check in row.get("truth", []):
+                status, found = truth(base, token, check["get"], tag)
+                entry["server"].append({"get": check["get"], "status": status, "pass": status == 200 and found})
+            if flow is not None:
+                server_ok = all(check["pass"] for check in entry["server"])
+                entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
+                if entry["verdict"] == "ui-pass":
+                    entry["reason"] = UNCONFIGURED
+            else:
+                entry.update(verdict="fail", reason=NOT_JUDGED)
+            token = ""
+        if any(row["driver"] == "agent" for row in chosen):
+            token = minted(base, secret)
+            cleaned_count = cleaned(base, token, since, tag)
     finally:
-        token = ""
+        token = secret = ""
         emulator.terminate()
         try:
             emulator.wait(timeout=60)
@@ -313,12 +412,81 @@ def run_scenarios(selection, minted=mint, checked=server_check):
             emulator.kill()
     report = {"run": folder.parent.name, "device": "android", "scenarios": results}
     (folder / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    write_private(private / AGENTS, json.dumps({"tag": tag, "agents": records}).encode())
     write_private(private / VERDICTS, json.dumps([entry["verdict"] for entry in results]).encode())
-    for entry in results:
+    ran = sum(1 for entry in results if entry["verdict"] != "skipped")
+    print(f"May device tests (android): {ran} scenarios ran; verdicts follow the judge step")
+    if cleaned_count is not None:
+        print(f"May device tests (android): the test session's cleanup removed {cleaned_count} tagged items")
+    elif agents:
+        print("May device tests (android): the test session's cleanup did not answer; tagged items may remain")
+
+
+def combined(entry, record, judged):
+    """An agent scenario's verdict from its run, the judge and the server truth."""
+    if record.get("state") == "rate_limited" or judged[0] == "rate_limited":
+        return {"verdict": "skipped", "reason": RATE_LIMITED}
+    if record.get("outcome") == "blocked":
+        return {"verdict": "fail", "reason": BLOCKED}
+    if record.get("outcome") != "completed":
+        return {"verdict": "fail", "reason": UNFINISHED}
+    if judged[0] != "pass":
+        return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
+    if not entry["server"]:
+        return {"verdict": "ui-pass", "reason": UNCONFIGURED}
+    if all(check["pass"] for check in entry["server"]):
+        return {"verdict": "pass", "reason": None}
+    return {"verdict": "fail", "reason": NO_TRUTH}
+
+
+def judge_scenarios(judged_by=device_agent.judge):
+    """Each agent scenario judged, then every verdict printed; the report and the recorded verdicts updated."""
+    require_step_secrets((device_agent.OAUTH,))
+    root = runner_root()
+    private = root / "may-private"
+    runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
+    if len(runs) != 1 or not (runs[0] / "android" / "report.json").is_file():
+        raise DeviceTestsError("There is no report to judge")
+    path = runs[0] / "android" / "report.json"
+    report = json.loads(path.read_text())
+    try:
+        stored = json.loads((private / AGENTS).read_text())
+    except (OSError, ValueError):
+        stored = {}
+    records = stored.get("agents", {}) if isinstance(stored, dict) else {}
+    goals = {row["id"]: row["goal"] for row in scenarios("all", "android") if row["driver"] == "agent"}
+    pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
+    token = model = None
+    if pending:
+        token, model = device_agent.settings(os.environ)
+    else:
+        os.environ.pop(device_agent.OAUTH, None)
+    cli = root / "may-claude" / "claude"
+    for entry in pending:
+        record = records[entry["id"]]
+        judged = ("skipped", "")
+        if record.get("state") != "rate_limited" and record.get("outcome") == "completed":
+            try:
+                judged = judged_by(cli, goals[entry["id"]], stored.get("tag", ""), record,
+                                   private / "judge" / entry["id"], token, model)
+            except (OSError, subprocess.SubprocessError, KeyError):
+                judged = ("error", "")
+        verdict_reason = combined(entry, record, judged)
+        entry["verdict"] = verdict_reason["verdict"]
+        entry.pop("reason", None)
+        if verdict_reason["reason"]:
+            entry["reason"] = verdict_reason["reason"]
+        if judged[1]:
+            entry["notes"] = judged[1]
+    token = ""
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    (private / VERDICTS).unlink(missing_ok=True)
+    write_private(private / VERDICTS, json.dumps([entry["verdict"] for entry in report["scenarios"]]).encode())
+    for entry in report["scenarios"]:
         scenario, word = entry["id"], entry["verdict"]
         print(f"May device tests (android): {scenario}: {word}")
-    counts = {word: sum(1 for entry in results if entry["verdict"] == word) for word in ("pass", "ui-pass", "fail",
-                                                                                          "skipped")}
+    counts = {word: sum(1 for entry in report["scenarios"] if entry["verdict"] == word)
+              for word in ("pass", "ui-pass", "fail", "skipped")}
     passed, ui_passed, failed, skipped = counts["pass"], counts["ui-pass"], counts["fail"], counts["skipped"]
     print(f"May device tests (android): {passed} passed, {ui_passed} passed on screen alone (server checks not "
           f"configured), {failed} failed, {skipped} skipped")
@@ -371,15 +539,15 @@ def verdict():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("build", "run", "seal", "verdict"))
+    parser.add_argument("command", choices=("build", "run", "judge", "seal", "verdict"))
     parser.add_argument("--scenarios", default="all")
     args = parser.parse_args()
     try:
         if args.command == "run":
             run_scenarios(args.scenarios or "all")
         else:
-            {"build": build, "seal": seal, "verdict": verdict}[args.command]()
-    except (DeviceTestsError, StoreError) as error:
+            {"build": build, "judge": judge_scenarios, "seal": seal, "verdict": verdict}[args.command]()
+    except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None
     except Exception:
         raise SystemExit("May device tests failed; private logs and evidence were not published") from None
