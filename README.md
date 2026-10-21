@@ -684,6 +684,35 @@ This repository is public and may-app is private, and anyone signed in to GitHub
 
 Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing and publishes nothing, and says so. Without the write key it pushes nothing. Without `MAY_APP_PR_COMMENT_TOKEN`, it still publishes to may-renders and logs "comment skipped: no token". Without `MAY_APP_PR_READ_TOKEN`, a pull request's renders skip the API read of the pull request, so nothing checks that it is open, against main and not from a fork. The fetch still requires `refs/pull/<number>/head` to be exactly `source_sha`, which means the commit is still the pull request's current head.
 
+### Device tests of May Playground against staging
+
+`device-tests.yml` runs May Playground on an Android emulator against live staging, signed in as the staging test account, and drives it with may-app's Maestro flows. It runs on dispatch (`source_sha`, empty for main's head, and `scenarios`) and nightly at 03:17 UTC on may-app main's head. iOS follows in a later change. This repository is public, so the log shows scenario ids, verdicts and counts only. Screenshots, recordings and reports go age-encrypted to the private `May-Assistant/may-renders`, under `device-tests/<UTC date>-<may-app short sha>/`.
+
+1. **admission** (`gate.py --action device-tests`) checks the inputs and the environment `may-device-tests`, which allows main only and has no required reviewer, because the nightly run can't wait for one. Only this action may start from a schedule.
+2. **android**, on Linux with KVM:
+   - the fetch (`prepare.py`, read keys) admits may-app main commits only, never a pull request, because the run step holds the sign-in secret;
+   - `device_tests.py build` builds the Playground debug APK without secrets;
+   - `run`:
+     - installs the app and the pinned Maestro CLI 2.8.0, its zip checked against a SHA-256;
+     - mints a short-lived staging session for the test account (`POST /v1/auth/test-session` with `MAY_TEST_SIGNIN_SECRET`);
+     - hands it to the app through a Playground-debug-only intent extra (`may_test_session`);
+     - for each scenario in `device_scenarios.json`, records the screen (about 720p, about 1 Mbps, 3-minute parts), runs the scenario's flow from may-app's `tools/device-tests/flows/`, takes a screenshot and runs its read-only server checks.
+
+     A scenario with no server checks configured passes on screen alone ("ui-pass").
+   - `seal` age-encrypts the run folder to `MAY_RENDERS_RECIPIENT`. Only that file is uploaded, kept for one day.
+   - `verdict` fails the job if any scenario failed.
+3. **publish**, on a fresh Linux runner that runs no may-app code:
+   - `publish.py device-open` decrypts with `MAY_RENDERS_DECRYPT_KEY` and accepts only the fixed layout: `report.json`, MP4s, end screenshots and Maestro reports. It builds the run folder's `README.md`, which GitHub shows when the folder is opened, and `index.html`, both from the checked reports and this repository's own scenario titles.
+   - `device-push` adds the folder under `device-tests/` with `MAY_APP_RENDERS_WRITE_KEY`, keeping the newest 10 in `device-tests/runs.json`, and never force-pushes.
+
+**Outward actions:** a scenario marked `"outward": true` runs unless `MAY_DEVICE_TESTS_OUTWARD` is `off`. So far only the self-addressed Gmail send to harlahke@gmail.com is planned to use this. Samuel approved it directly on 21 Oct, conditional on staging's guard for test sessions.
+
+**Setup** in the environment `may-device-tests`:
+- secrets: `MAY_TEST_SIGNIN_SECRET`, plus copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_RENDERS_DECRYPT_KEY` and `MAY_APP_RENDERS_WRITE_KEY`;
+- variables: `MAY_STAGING_API_URL`, `MAY_RENDERS_RECIPIENT` and, optionally, `MAY_DEVICE_TESTS_OUTWARD`.
+
+**Recordings:** they are currently kept in git. Pruning to 10 runs doesn't shrink git history, so they may move to release assets on may-renders, which would need a token with may-renders contents access.
+
 ### Prerequisites that remain
 
 `gate.py` checks these, before any secret and again after each review. Any one failing denies the run. The environment checks apply to **both** `may-native-compile` and the target's store environment (`may-android-internal` for May production):

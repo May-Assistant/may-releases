@@ -1,0 +1,131 @@
+name: May device tests (Playground on an emulator against staging; reports only to the private may-renders)
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: may-app commit in main history to test (empty for main's head)
+        required: false
+        type: string
+        default: ""
+      scenarios:
+        description: Scenario ids from device_scenarios.json, comma-separated, or all
+        required: false
+        type: string
+        default: all
+  schedule:
+    - cron: "17 3 * * *"
+permissions:
+  contents: read
+concurrency:
+  group: may-device-tests
+  cancel-in-progress: false
+jobs:
+  admission:
+    # May Playground on an Android emulator against live staging, signed in as the staging test account through a
+    # short-lived session (POST /v1/auth/test-session, MAY_TEST_SIGNIN_SECRET), driven by may-app's Maestro flows.
+    # Environment may-device-tests: main only, no required reviewer (the nightly run cannot wait for one). Trust: v1
+    # tests may-app main commits alone (prepare.py checks main history; the nightly run takes main's head), never a
+    # pull request, because the run step holds the sign-in secret. This repository is public and may-app private:
+    # the log carries scenario ids, verdict words and counts; screenshots, recordings and reports leave the runner
+    # only age-encrypted, and the publish job, on a fresh runner that runs no may-app code, decrypts them and
+    # pushes them to the private May-Assistant/may-renders (publish.py device-open, device-push).
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha || 'main' }}
+        run: python3 -I -S -B tools/may_release/gate.py --action device-tests --source-sha "$MAY_SOURCE_SHA"
+  android:
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the may-app commit and its design system quietly
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha || 'main' }}
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"
+      - name: Build May Playground for the emulator without secrets
+        run: python3 -I -S -B tools/may_release/device_tests.py build
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the scenarios against staging and record them
+        env:
+          MAY_SCENARIOS: ${{ inputs.scenarios || 'all' }}
+          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}
+          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
+          MAY_DEVICE_TESTS_OUTWARD: ${{ vars.MAY_DEVICE_TESTS_OUTWARD }}
+        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"
+      - name: Encrypt the report to the renders public key
+        env:
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/device_tests.py seal
+      - name: Hand over only the encrypted report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-device-android-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-device-sealed/android.age
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Fail if any scenario failed
+        run: python3 -I -S -B tools/may_release/device_tests.py verdict
+      - name: Remove private source, logs, recordings and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"
+  publish:
+    # A fresh runner that runs no may-app code: the decrypt key and the may-renders write key each live in one step.
+    # It publishes whatever the device jobs sealed, even when one then failed its verdict.
+    needs: [admission, android]
+    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Nothing to download (no recipient yet, or the device job stopped first) is reported by the next step.
+        continue-on-error: true
+        with:
+          name: may-device-android-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-device-download
+      - name: Decrypt and check the reports
+        env:
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
+        run: python3 -I -S -B tools/may_release/publish.py device-open
+      - name: Push the run folder to may-renders
+        env:
+          MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}
+        run: python3 -I -S -B tools/may_release/publish.py device-push
+      - name: Remove the decrypted reports and the branch checkout
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-device-download" "$RUNNER_TEMP/may-publish-tree" "$RUNNER_TEMP/may-publish-git"
