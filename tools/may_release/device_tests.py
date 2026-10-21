@@ -93,6 +93,14 @@ BLOCKED = "the agent reported it was blocked"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
 UNCONFIGURED = "server checks not configured"
+SWITCHED_OFF = "switched off (MAY_DEVICE_TESTS_SKIP)"
+SKIP = "MAY_DEVICE_TESTS_SKIP"
+
+
+def switched_off():
+    """The scenario ids the variable MAY_DEVICE_TESTS_SKIP lists (comma-separated), skipped until it no longer does: a
+    scenario whose server side is merged but not yet deployed, say."""
+    return {part.strip() for part in os.environ.get(SKIP, "").split(",") if part.strip()}
 
 
 class DeviceTestsError(ValueError):
@@ -253,7 +261,7 @@ def cleanup(base, token, since, tag, post=urllib.request.urlopen):
             data = json.loads(reply.read(1024 * 1024))
     except (urllib.error.URLError, TimeoutError, ValueError):
         return None
-    counts = [data.get(key) for key in ("chats", "tasks", "notes", "routines", "for_you")] \
+    counts = [data.get(key) for key in ("chats", "tasks", "notes", "routines", "for_you", "approvals_expired")] \
         if isinstance(data, dict) else []
     return sum(count for count in counts if type(count) is int and count >= 0)
 
@@ -380,6 +388,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     if not secret:
         raise DeviceTestsError("MAY_TEST_SIGNIN_SECRET is not set in may-device-tests; no scenario ran")
     outward = os.environ.get(OUTWARD, "").strip() != "off"
+    skipped = switched_off()
     folder = root / OUT / run_folder(source) / "android"
     folder.mkdir(parents=True, mode=0o700)
     log = private / "device-run.log"
@@ -398,6 +407,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             results.append(entry)
             if row["outward"] and not outward:
                 entry["reason"] = "outward actions are off (MAY_DEVICE_TESTS_OUTWARD)"
+                continue
+            if row["id"] in skipped:
+                entry["reason"] = SWITCHED_OFF
                 continue
             flow = source / FLOWS_DIR / row["flow"] if row["driver"] == "maestro" else None
             if flow is not None and (not flow.is_file() or flow.is_symlink()):

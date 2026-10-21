@@ -24,14 +24,6 @@ from test_device_tests import FakeRecorder, SHA, TOKEN
 from test_renders import png
 
 OAUTH = "sk-ant-oat01-" + "o" * 40
-# A third agent row whose truth is an approval (as a routine proposal would be): not in the committed list, since
-# K's cleanup leaves approvals, so a nightly run would leave Samuel a pending one each night.
-ROUTINES = {
-    "id": "routines", "title": "Ask May for a routine", "driver": "agent", "platforms": ["android"],
-    "outward": False, "server": [], "truth": [{"get": "/v1/approvals"}],
-    "goal": ("In May Playground, open Chats and start a new chat with May. Send this message: Create a routine called "
-             "{tag} stretch that reminds me to stretch every weekday at 9am. Wait for May's answer. If May shows a "
-             "proposal or approval card, leave it as it is: do not approve or dismiss it.")}
 MODEL = "claude-sonnet-5-5"
 
 
@@ -49,11 +41,6 @@ class AgentRunTests(unittest.TestCase):
         (self.source / "android/app/build/outputs/apk/playground/debug").mkdir(parents=True)
         (self.source / device_tests.APK).write_bytes(b"apk")
         self.private.mkdir()
-        listed = self.root / "scenarios.json"
-        listed.write_text(json.dumps(json.loads(device_tests.SCENARIOS.read_text()) + [ROUTINES]))
-        patcher = patch("device_tests.SCENARIOS", listed)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.env = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                     "MAY_STAGING_API_URL": "https://staging.example", "PATH": "/usr/bin:/bin",
                     "CLAUDE_CODE_OAUTH_TOKEN": OAUTH, "MAY_DEVICE_TESTS_MODEL": MODEL, "GITHUB_RUN_ID": "39557415738"}
@@ -109,7 +96,7 @@ class AgentRunTests(unittest.TestCase):
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             device_tests.run_scenarios(selection, minted=mint, checked=lambda *a: 200,
                                        truth=lambda base, token, path, tag: truth,
-                                       asked=asked or (lambda *a: self.fail("asked about a question")),
+                                       asked=asked or (lambda base, token, state, tag: truth),
                                        cleaned=clean, agent=agent,
                                        install=lambda root: root / "may-claude" / "claude")
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
@@ -141,7 +128,8 @@ class AgentRunTests(unittest.TestCase):
         self.assertRegex(seen["cleanup"][1], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual([row["verdict"] for row in report["scenarios"]], ["ui-pass", "ui-pass", "pass"])
         self.assertEqual(report["scenarios"][0]["reason"], "server checks not configured")
-        self.assertEqual(report["scenarios"][2]["server"], [{"get": "/v1/approvals", "status": 200, "pass": True}])
+        self.assertEqual(report["scenarios"][2]["server"], [{"get": "/v1/routines", "status": 200, "pass": True},
+                                                            {"get": "/v1/agents", "status": 200, "pass": True}])
         self.assertEqual(report["scenarios"][0]["notes"], "fine <b>")
         self.assertEqual(run_out.splitlines(), [
             "May device tests (android): 3 scenarios ran; verdicts follow the judge step",
@@ -196,6 +184,17 @@ class AgentRunTests(unittest.TestCase):
         for name in (device_tests.VERDICTS, device_tests.AGENTS):
             (self.private / name).unlink(missing_ok=True)
         return again()
+
+    def test_a_switched_off_scenario_is_skipped_and_never_run(self):
+        try:
+            _, minted, seen, report, _, _ = self.run_and_judge([record(), record()], [("pass", ""), ("pass", "")],
+                                                               env={"MAY_DEVICE_TESTS_SKIP": "routines, ../x,chat"})
+        except IndexError:
+            self.fail("a switched-off scenario ran")
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", "skipped", device_tests.SWITCHED_OFF), ("notes", "ui-pass", device_tests.UNCONFIGURED),
+            ("routines", "skipped", device_tests.SWITCHED_OFF)])
+        self.assertEqual(len(seen["goals"]), 1, "only notes ran")
 
     def test_a_cleanup_that_does_not_answer_is_said(self):
         _, _, _, _, run_out, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3, cleaned=None)
@@ -259,9 +258,10 @@ class ServerTruthTests(unittest.TestCase):
         def post(request, timeout):
             seen.update(url=request.full_url, body=json.loads(request.data), auth=request.headers.get("Authorization"))
             return FakeReply(json.dumps({"chats": 1, "tasks": 0, "notes": 2, "routines": 1, "for_you": 0,
-                                         "skipped": 5}).encode())
+                                         "approvals_expired": 2, "skipped": 5}).encode())
 
-        self.assertEqual(device_tests.cleanup("https://s", TOKEN, "2026-10-21T08:00:00Z", "qa-12345678", post=post), 4)
+        self.assertEqual(device_tests.cleanup("https://s", TOKEN, "2026-10-21T08:00:00Z", "qa-12345678", post=post), 6,
+                         "removed items and expired test approvals; skipped ones are not counted")
         self.assertEqual(seen, {"url": "https://s/v1/auth/test-session/cleanup", "auth": "Bearer " + TOKEN,
                                 "body": {"since": "2026-10-21T08:00:00Z", "tag": "qa-12345678"}})
 

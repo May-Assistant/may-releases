@@ -69,7 +69,7 @@ DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped")
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
            device_tests.UNCONFIGURED, device_tests.RATE_LIMITED, device_tests.UNFINISHED, device_tests.BLOCKED,
-           device_tests.NO_TRUTH, device_tests.NOT_JUDGED)
+           device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF)
 MAX_NOTES = 600
 # The sealed device artifact's retention (device-tests.yml): the recordings' fallback when the release upload fails.
 VIDEO_DAYS = 7

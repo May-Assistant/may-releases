@@ -138,6 +138,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     if not secret:
         raise DeviceTestsError("MAY_TEST_SIGNIN_SECRET is not set in may-device-tests; no scenario ran")
     outward = os.environ.get(device_tests.OUTWARD, "").strip() != "off"
+    skipped = device_tests.switched_off()
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
     folder.mkdir(parents=True, mode=0o700)
     log = private / "device-run.log"
@@ -154,6 +155,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             results.append(entry)
             if row["outward"] and not outward:
                 entry["reason"] = "outward actions are off (MAY_DEVICE_TESTS_OUTWARD)"
+                continue
+            if row["id"] in skipped:
+                entry["reason"] = device_tests.SWITCHED_OFF
                 continue
             flow = source / device_tests.FLOWS_DIR / row["flow"]
             if not flow.is_file() or flow.is_symlink():

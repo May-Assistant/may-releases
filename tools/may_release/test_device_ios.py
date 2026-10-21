@@ -158,6 +158,12 @@ class RunTests(Workspace):
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("fail", None), ("fail", "may-app has no Maestro flow for this scenario")])
 
+    def test_a_switched_off_scenario_is_skipped(self):
+        calls, minted, report, _, _ = self.run_it(env={"MAY_DEVICE_TESTS_SKIP": "sign-in"})
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]][0],
+                         ("sign-in", "skipped", device_tests.SWITCHED_OFF))
+        self.assertEqual(len(minted), 0, "connections has no flow, sign-in is switched off: no session minted")
+
     def test_a_selection_of_android_scenarios_runs_none_here(self):
         _, minted, report, _, _ = self.run_it(selection="chat,notes")
         self.assertEqual((report["scenarios"], minted), ([], []))
