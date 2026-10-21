@@ -1044,7 +1044,8 @@ def renders_workflow_problems(text):
 
 
 RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)"}
-PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices"}
+PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices",
+                        "uploaded", "kept", "removed"}
 
 
 def renders_print_problems(root):
@@ -1076,6 +1077,7 @@ DEVICE_RUNS = [
     '"$RUNNER_TEMP/may-device-sealed"',
     "python3 -I -S -B tools/may_release/toolchain.py age",
     "python3 -I -S -B tools/may_release/publish.py device-open", "python3 -I -S -B tools/may_release/publish.py device-push",
+    "python3 -I -S -B tools/may_release/publish.py device-release",
     'rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-device-download" "$RUNNER_TEMP/may-publish-tree" '
     '"$RUNNER_TEMP/may-publish-git"']
 DEVICE_UPLOAD = (
@@ -1090,7 +1092,8 @@ DEVICE_DOWNLOAD = ("name: may-device-android-${{ github.run_attempt }}\n"
                    "          path: ${{ runner.temp }}/may-device-download\n")
 DEVICE_CONDITIONS = ["if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
-DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY"}
+DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"
+DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", DEVICE_RELEASE}
 DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
                ("MAY_DEVICE_TESTS_OUTWARD", "${{ vars.MAY_DEVICE_TESTS_OUTWARD }}"),
                ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")}
@@ -1147,8 +1150,9 @@ def device_tests_workflow_problems(text):
     seal = steps["android"].get("Encrypt the report to the renders public key", "")
     decrypt = steps["publish"].get("Decrypt and check the reports", "")
     push = steps["publish"].get("Push the run folder to may-renders", "")
+    release = steps["publish"].get("Upload the recordings as may-renders release assets", "")
     others = [chunk for job in ("android", "publish") for chunk in steps[job].values()
-              if chunk not in (fetch, scenarios, seal, decrypt, push)]
+              if chunk not in (fetch, scenarios, seal, decrypt, push, release)]
     recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
     if secrets_in(text) != DEVICE_SECRETS or any(text.count("secrets." + n) != 1 for n in DEVICE_SECRETS) or \
             secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(scenarios) != {DEVICE_SIGNIN} or \
@@ -1158,7 +1162,8 @@ def device_tests_workflow_problems(text):
             text.count("vars.") != 4 or text.count("GH_TOKEN") != 1 or \
             any(e not in DEVICE_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret, variable or env entry other than the fetch's two source-read keys, the sign-in "
-                     "secret in the scenarios step, the decrypt and write keys (each in its one step) and the inputs")
+                     "secret in the scenarios step, the decrypt and write keys and the release token (each in its one step) and "
+                     "the inputs")
     if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
         found.append(name + "writes a step summary or carries a value between steps")
     return found
