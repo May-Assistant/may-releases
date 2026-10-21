@@ -84,6 +84,7 @@ class GateTests(unittest.TestCase):
             "compile": "may-native-compile",
             "compile-pr": "may-native-compile-pr",
             "ds-compile": "may-ds-renders",
+            "renders": "may-ios-renders",
             ("ios", "production"): "may-ios-internal",
             ("ios", "playground"): "may-ios-playground-internal",
             ("android", "production"): "may-android-internal",

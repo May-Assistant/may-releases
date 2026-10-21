@@ -926,6 +926,130 @@ def ios_rehearsal_print_problems(root):
     return quiet_tool_problems(root, REHEARSAL_TOOL, REHEARSAL_PRINT_VALUES, REHEARSAL_EXIT_CLASSES)
 
 
+# May Playground's iOS renders (ios-renders.yml, renders.py, publish.py). The render job runs may-app's build and
+# snapshot tests, so it holds the PR read token in the pull request check alone and the two source-read keys in the
+# fetch alone, and every later step holds no secret and no GitHub token; it hands over one age-encrypted file, kept a
+# day. The publish job, a fresh Linux runner that runs no may-app code, binds the decrypt key, the may-app write key
+# and the comment token each in one step. Pinned whole: dispatch with exactly source_sha, pr_number and ds_sha,
+# read-only, its own concurrency group, nothing run but its commands, the one encrypted upload, and only the
+# conditions named here. renders.py and publish.py print only fixed lines, counts and the dispatch's own inputs.
+RENDERS = "ios-renders.yml"
+RENDERS_PR = '${MAY_PR_NUMBER:+--pr-number "$MAY_PR_NUMBER"}'
+RENDERS_DS = '${MAY_DS_SHA:+--ds-sha "$MAY_DS_SHA"}'
+RENDERS_TOOL = 'python3 -I -S -B tools/may_release/renders.py {} --source-sha "$MAY_SOURCE_SHA"'
+PUBLISH_TOOL = 'python3 -I -S -B tools/may_release/publish.py {} --source-sha "$MAY_SOURCE_SHA"'
+RENDERS_RUNS = [
+    'python3 -I -S -B tools/may_release/gate.py --action renders --source-sha "$MAY_SOURCE_SHA" ' + RENDERS_PR + " " +
+    RENDERS_DS,
+    'python3 -I -S -B tools/may_release/gate.py --action renders --source-sha "$MAY_SOURCE_SHA" --pr-number '
+    '"$MAY_PR_NUMBER" ' + RENDERS_DS + " --check-pull",
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    'python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" ' +
+    RENDERS_PR + " " + RENDERS_DS,
+    RENDERS_TOOL.format("run"), RENDERS_TOOL.format("check"), RENDERS_TOOL.format("sheet") + " " + RENDERS_DS,
+    RENDERS_TOOL.format("seal"), RENDERS_TOOL.format("verdict"),
+    'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+    '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-renders-snapshots" '
+    '"$RUNNER_TEMP/may-renders-out" "$RUNNER_TEMP/may-renders-sealed"',
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    PUBLISH_TOOL.format("open"), PUBLISH_TOOL.format("push") + " " + RENDERS_PR,
+    PUBLISH_TOOL.format("comment") + " " + RENDERS_PR,
+    'rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-renders-download" "$RUNNER_TEMP/may-publish-tree" '
+    '"$RUNNER_TEMP/may-publish-git"']
+RENDERS_UPLOAD = (
+    "name: Hand over only the encrypted renders\n"
+    "        uses: " + UPLOAD_ARTIFACT + " # v4\n"
+    "        with:\n"
+    "          name: may-ios-renders-${{ github.run_attempt }}\n"
+    "          path: ${{ runner.temp }}/may-renders-sealed/renders.age\n"
+    "          if-no-files-found: ignore\n"
+    "          retention-days: 1\n")
+RENDERS_DOWNLOAD = ("name: may-ios-renders-${{ github.run_attempt }}\n"
+                    "          path: ${{ runner.temp }}/may-renders-download\n")
+RENDERS_CONDITIONS = ["if: inputs.pr_number != ''", "if: always()",
+                      "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
+RENDERS_DECRYPT, RENDERS_WRITE = "MAY_ARTIFACT_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY"
+RENDERS_SECRETS = set(COMPILE_SECRETS) | {PR_READ_SECRET, PR_COMMENT_SECRET, RENDERS_DECRYPT, RENDERS_WRITE}
+RENDERS_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
+                  ("MAY_DS_SHA", "${{ inputs.ds_sha }}")}
+RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in RENDERS_SECRETS}
+
+
+def renders_workflow_problems(text):
+    name = RENDERS + ": "
+    found = []
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "pr_number", "ds_sha"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "string"]:
+        found.append(name + "is not dispatched with exactly source_sha, pr_number and ds_sha")
+    if "\nconcurrency:\n  group: may-ios-renders\n  cancel-in-progress: false\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    jobs = ("admission", "render", "publish")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1] or \
+            text.count("permissions:") != 4:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs) or \
+            [re.findall(r"(?m)^    runs-on: (.+)$", job_text(text, job)) for job in jobs] != \
+            [["ubuntu-24.04"], ["macos-15"], ["ubuntu-24.04"]]:
+        found.append(name + "jobs are not exactly admission and publish on Linux and render on macOS")
+    for job in ("render", "publish"):
+        if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job_text(text, job):
+            found.append(name + job + "'s environment is not the one admission chose")
+    if re.search(r"(?m)^    environment:", job_text(text, "admission")) or \
+            "    needs: admission\n" not in job_text(text, "render") or \
+            "    needs: [admission, render]\n" not in job_text(text, "publish"):
+        found.append(name + "render and publish do not run after admission (and publish after render)")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != RENDERS_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the check, age, the fetch, the renders steps, the "
+                     "publish steps and the cleanups")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    if uses_in(text) != [CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT] or \
+            text.count("upload-artifact") != 1 or RENDERS_UPLOAD not in text or RENDERS_DOWNLOAD not in text:
+        found.append(name + "hands over something other than exactly the one encrypted renders file")
+    conditions = re.findall(r"(?m)^\s+(if: .+)$", text)
+    if conditions != RENDERS_CONDITIONS or re.search(r"(?m)^\s*(defaults|shell):", text) or \
+            text.count("continue-on-error: true") != 1 or \
+            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["120", "30"]:
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
+    steps = {job: dict(job_steps(text, job)[1]) for job in jobs}
+    render, publish = steps["render"], steps["publish"]
+    check = render.get("Check the pull request head and environment before fetching", "")
+    fetch = render.get("Fetch the may-app commit and its design system quietly", "")
+    decrypt = publish.get("Decrypt and check the renders", "")
+    push = publish.get("Push the run folder to may-app's parity/renders branch", "")
+    post = publish.get("Link the renders on the may-app pull request", "")
+    others = [chunk for job in ("render", "publish") for title, chunk in steps[job].items()
+              if chunk not in (check, fetch, decrypt, push, post)]
+    if secrets_in(text) != RENDERS_SECRETS or any(text.count("secrets." + n) != 1 for n in RENDERS_SECRETS) or \
+            secrets_in(check) != {PR_READ_SECRET} or secrets_in(fetch) != set(COMPILE_SECRETS) or \
+            secrets_in(decrypt) != {RENDERS_DECRYPT} or secrets_in(push) != {RENDERS_WRITE} or \
+            secrets_in(post) != {PR_COMMENT_SECRET} or any(secrets_in(chunk) for chunk in others) or \
+            text.count("GH_TOKEN") != 2 or "GH_TOKEN" in fetch or \
+            any(e not in RENDERS_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
+                     "the decrypt key, the write key, the comment token (each in its one step) and the inputs")
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
+        found.append(name + "writes a step summary or carries a value between steps")
+    return found
+
+
+RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "others", "android", "rows", "len(stitched)"}
+PUBLISH_PRINT_VALUES = {"folder", "pngs", "BRANCH", "len(kept)", "len(removed)", "number"}
+
+
+def renders_print_problems(root):
+    return quiet_tool_problems(root, "renders.py", RENDERS_PRINT_VALUES, {"RendersError", "StoreError"}) + \
+        quiet_tool_problems(root, "publish.py", PUBLISH_PRINT_VALUES,
+                            {"PublishError", "StoreError", "GateDenial", "DsCompileError"})
+
+
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same
 # admission, pull request check, fetch and environment as native-compile-pr.yml (gate.py --action compile-pr,
 # may-native-compile-pr), so it holds nothing that compile does not: the PR read token in the check alone, the two
@@ -1528,9 +1652,9 @@ def review_tool_problems(root):
 
 def control_problems(root):
     found = []
-    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr", "ds-compile"}:
-        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\", \"ds-compile\"}: only the two compile-only "
-                     "lanes may run without Samuel's review")
+    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr", "ds-compile", "renders"}:
+        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\", \"ds-compile\", \"renders\"}: only the "
+                     "two compile-only lanes and the iOS renders may run without Samuel's review")
     flows = root / ".github/workflows"
     check = (flows / "control-check.yml").read_text()
     compile_workflow = (flows / "native-compile-draft.yml").read_text()
@@ -1550,6 +1674,8 @@ def control_problems(root):
     found += android_unit_print_problems(root)
     found += android_ci_schedule_workflow_problems((flows / SCHEDULE).read_text())
     found += android_ci_schedule_tool_problems(root)
+    found += renders_workflow_problems((flows / RENDERS).read_text())
+    found += renders_print_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

@@ -654,6 +654,33 @@ Its secrets, and nothing else:
 
 No repository secret is needed.
 
+### iOS renders of May Playground (parity with Android)
+
+`ios-renders.yml` renders May Playground in the simulator and publishes the images to may-app, never here. It runs on a may-app main commit, or on the current head of an open may-app pull request (`pr_number`). An optional `ds_sha` renders against another may-design-system commit, which must be in its `main` or `claude/may-integration` history. It runs on the same runner and Xcode as the iOS compile: `macos-15`, Xcode 26.3, an iPhone 16 Pro simulator, light and dark. It never signs anything.
+
+This repository is public and may-app is private, and anyone signed in to GitHub can download a public repository's artifacts. So the images are never uploaded here in the clear, and the log shows only counts and fixed words. The workflow has three jobs:
+
+1. **admission** (`gate.py --action renders`) checks the inputs and the environment `may-ios-renders`, which allows main only and has no required reviewer.
+2. **render**, on macOS, holds no secret once may-app's code runs:
+   - `prepare.py` fetches the commit with the two read-only deploy keys, which only that step holds.
+   - `renders.py run` builds with the pinned XcodeGen and runs `xcodebuild test` of `MayPlaygroundSnapshots`, with `MAY_SNAPSHOT_DIR` set to a private folder.
+   - `check` compares the PNGs with may-app's `docs/evidence/parity/screens.json` (rows of `{id, spec, ios, android, modes}`) and prints rendered against expected, per mode.
+   - `sheet` builds the contact sheet: `index.html` with Android and iOS side by side per row and mode, and one stitched PNG per row and mode from `stitch.swift`.
+   - `seal` age-encrypts the run folder to `artifact_keys/may-ios-renders.age.pub`. Only that encrypted file is uploaded, kept for one day.
+   - `verdict` then fails the job if the tests failed or a render is missing.
+3. **publish**, on a fresh Linux runner that runs no may-app code, has three steps, each holding one secret:
+   - `publish.py open` decrypts with `MAY_ARTIFACT_DECRYPT_KEY` and accepts only the run folder's fixed layout.
+   - `push` adds `parity/<may-app short sha>/` to may-app's `parity/renders` branch with `MAY_APP_RENDERS_WRITE_KEY`, keeping the newest 10 run folders. That branch has no history in common with main and is never merged, and it is never force-pushed.
+   - For a pull request, `comment` links the folder on it with `MAY_APP_PR_COMMENT_TOKEN`.
+
+**Setup Samuel does before the first run:**
+- create `may-ios-renders`: main only, administrator bypass off, no required reviewer;
+- add `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_APP_PR_READ_TOKEN` and `MAY_APP_PR_COMMENT_TOKEN` to it;
+- add `MAY_APP_RENDERS_WRITE_KEY`, a new may-app deploy key with write access, ideally fenced by a may-app ruleset so that deploy keys can't update main;
+- generate an age key pair, commit the public line to `artifact_keys/may-ios-renders.age.pub`, and put the identity in `MAY_ARTIFACT_DECRYPT_KEY` in `may-ios-renders`.
+
+Until the public key is committed, the workflow renders and counts, seals nothing and publishes nothing, and says so. Without the write key it pushes nothing, and without the comment token it posts nothing.
+
 ### Prerequisites that remain
 
 `gate.py` checks these, before any secret and again after each review. Any one failing denies the run. The environment checks apply to **both** `may-native-compile` and the target's store environment (`may-android-internal` for May production):
