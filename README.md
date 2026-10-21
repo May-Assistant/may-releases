@@ -666,7 +666,7 @@ This repository is public and may-app is private, and anyone signed in to GitHub
    - `renders.py run` builds with the pinned XcodeGen and runs `xcodebuild test` of `MayPlaygroundSnapshots`, with `TEST_RUNNER_MAY_SNAPSHOT_DIR` set to a private folder. Each test writes `<id>-light.png` and `<id>-dark.png`, at 1179 × 2556.
    - `check` compares the PNGs with may-app's `docs/evidence/parity/screens.json`, an array of `{id, title, spec, android: {light, dark}, ios: {light, dark}}` with paths relative to `docs/evidence/parity/`. Every row is expected in light and dark. It prints rendered against expected, per mode, and how many renders are not the 1179 × 2556 frame. If the commit has no usable manifest (not there yet, or malformed), it says so, and the `<id>-<mode>.png` renders in the snapshot folder stand in for its rows. The run still publishes them and the build log, without an Android column or `screens.json`, and `verdict` fails.
    - `sheet` builds the run folder:
-     - `index.html`, with Android and iOS side by side per row and mode;
+     - `index.html`, with Android and iOS side by side per row and mode, and the same table as `README.md`, which GitHub shows when the folder is opened in may-renders;
      - one stitched PNG per row and mode, from `stitch.swift`;
      - the manifest;
      - `build.log`, the last 8 MB of the build and test log, for the may-app lane.
