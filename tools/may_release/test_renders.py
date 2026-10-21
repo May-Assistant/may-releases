@@ -283,7 +283,13 @@ class SheetSealVerdictTests(unittest.TestCase):
         page = (out / "index.html").read_text()
         self.assertIn("Chat reply &lt;b&gt;", page)
         self.assertNotIn("<b>", page)
-        self.assertIn('<img src="ios/sign-in-light.png" alt="iOS">', page)
+        self.assertIn('<img src="ios/sign-in-light.png" width="300" alt="iOS">', page)
+        self.assertTrue(page.startswith("<!doctype html>"))
+        self.assertTrue((out / "README.md").is_file(), "the run folder has a README.md")
+        readme = (out / "README.md").read_text()
+        self.assertEqual(readme, page.split("</style>\n", 1)[1], "README.md is the contact sheet's body")
+        self.assertIn("Chat reply &lt;b&gt;", readme)
+        self.assertNotIn("<style>", readme)
         self.assertEqual(json.loads((out / "screens.json").read_text())[0]["id"], "chat-reply")
         self.assertTrue((out / "build.log").is_file(), "the build log is in the run folder")
         self.assertEqual((out / "build.log").read_text(), "Compiling MayPlaygroundSnapshots\n" * 3)
@@ -428,7 +434,8 @@ def tar_of(entries):
 
 GOOD = [(FOLDER, None, "dir"), (f"{FOLDER}/ios", None, "dir"), (f"{FOLDER}/ios/chat-reply-light.png", png(), "file"),
         (f"{FOLDER}/screens.json", b"[]", "file"), (f"{FOLDER}/build.log", b"log", "file"),
-        (f"{FOLDER}/index.html", b"<!doctype html><img src='ios/chat-reply-light.png'>", "file")]
+        (f"{FOLDER}/index.html", b"<!doctype html><img src='ios/chat-reply-light.png'>", "file"),
+        (f"{FOLDER}/README.md", b"<h1>May parity renders</h1>", "file")]
 
 
 class PublishOpenTests(unittest.TestCase):
@@ -450,9 +457,13 @@ class PublishOpenTests(unittest.TestCase):
         return tree
 
     def test_only_the_run_folder_layout_is_extracted(self):
-        tree = self.extract(GOOD)
+        try:
+            tree = self.extract(GOOD)
+        except PublishError as error:
+            self.fail("the run folder's own layout was refused: " + error.args[0])
         self.assertEqual((tree / f"{FOLDER}/ios/chat-reply-light.png").read_bytes(), png())
         self.assertEqual((tree / f"{FOLDER}/build.log").read_bytes(), b"log")
+        self.assertEqual((tree / f"{FOLDER}/README.md").read_bytes(), b"<h1>May parity renders</h1>")
         bad = {
             "other folder": GOOD + [("bbbbbbbbbbbb", None, "dir")],
             "escape": GOOD + [(f"{FOLDER}/../../x.png", png(), "file")],
@@ -464,6 +475,8 @@ class PublishOpenTests(unittest.TestCase):
             "not a png": GOOD + [(f"{FOLDER}/ios/fake.png", b"GIF89a", "file")],
             "script": [e for e in GOOD if not e[0].endswith("index.html")] +
                       [(f"{FOLDER}/index.html", b"<script>alert(1)</script>", "file")],
+            "script in the readme": [e for e in GOOD if not e[0].endswith("README.md")] +
+                                    [(f"{FOLDER}/README.md", b"<a href='javascript:x'>x</a>", "file")],
         }
         for label, entries in bad.items():
             with self.subTest(label=label):
