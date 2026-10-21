@@ -364,8 +364,10 @@ def main():
                        args.build_number, args.target)
     validate_dry_run(args.action, args.dry_run, args.target)
     validate_sign_only(args.action, args.sign_only, args.dry_run, args.target)
-    # A pull-request compile builds in its own environment alone, never may-native-compile or a store one.
-    build_env = env if args.action in PULL_ACTIONS + OPTIONAL_PULL_ACTIONS else ENVIRONMENTS["compile"]
+    # A pull-request compile, the renders and the device tests build in their own environment alone, never
+    # may-native-compile (whose required reviewer would deny a no-reviewer action) or a store one.
+    build_env = env if args.action in PULL_ACTIONS + OPTIONAL_PULL_ACTIONS + ("device-tests",) else \
+        ENVIRONMENTS["compile"]
     if args.action not in OWN_ENVIRONMENT_ACTIONS and artifact_recipient(env) is None:
         raise GateDenial("Artifact encryption public key for this target is still a placeholder; "
                          "the setup lane must commit it first")

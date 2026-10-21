@@ -50,6 +50,41 @@ class GateTests(unittest.TestCase):
                 validate_run(repo, ref, event, sha, action)
 
 
+    def test_admission_reads_may_device_tests_alone_never_may_native_compile(self):
+        # Run 39668495406: admission also checked may-native-compile, whose required reviewer (Samuel) the
+        # no-reviewer rule refuses, so a dispatch could never be admitted.
+        from test_compile_pr import ENVIRONMENT, POLICIES, REVIEWER_RULE
+        checked = []
+
+        def fake_json(path, token):
+            name = path.split("/")[1]
+            checked.append(name)
+            if path.endswith("per_page=100"):
+                return POLICIES
+            return dict(ENVIRONMENT, protection_rules=[REVIEWER_RULE] if name == "may-native-compile" else [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH, "GH_TOKEN": "fixture",
+                   "GITHUB_OUTPUT": str(output), "GITHUB_TRIGGERING_ACTOR": "samuelalake"}
+            with patch.dict(os.environ, env, clear=True), patch("gate.get_json", side_effect=fake_json), \
+                    patch("sys.argv", ["gate.py", "--action", "device-tests", "--source-sha", "main"]), \
+                    patch("sys.stdout", new_callable=io.StringIO) as out:
+                try:
+                    gate.main()
+                except GateDenial as denial:
+                    self.fail("device-tests admission was denied: " + denial.args[0])
+            self.assertEqual(sorted(set(checked)), ["may-device-tests"])
+            self.assertEqual(output.read_text(), "environment=may-device-tests\nbuild_environment=may-device-tests\n")
+        self.assertEqual(out.getvalue().strip(), "May device-tests admission passed for may-app main's head (a may-app "
+                                                 "main commit; dispatched by samuelalake)")
+        with patch("gate.get_json", side_effect=lambda path, token: POLICIES if path.endswith("per_page=100") else
+                   dict(ENVIRONMENT, protection_rules=[REVIEWER_RULE])), \
+                patch.dict(os.environ, env, clear=True), \
+                patch("sys.argv", ["gate.py", "--action", "device-tests", "--source-sha", "main"]), \
+                self.assertRaises(GateDenial):
+            gate.main()
+
 class MainHeadTests(unittest.TestCase):
     def test_main_resolves_to_main_head_and_is_checked_out_exactly(self):
         with tempfile.TemporaryDirectory() as directory:
