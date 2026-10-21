@@ -1043,7 +1043,8 @@ def renders_workflow_problems(text):
     return found
 
 
-RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)"}
+RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)",
+                        "not_ios", "len(entries)"}
 PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices",
                         "uploaded", "kept", "removed"}
 

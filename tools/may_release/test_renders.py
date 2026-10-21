@@ -54,9 +54,10 @@ class Workspace:
         self.rows = rows if rows is not None else [
             {"id": "chat-reply", "title": "Chat reply <b>", "spec": "docs/design/chat.md",
              "android": {"light": "android/chat-reply-light.png", "dark": "android/chat-reply-dark.png"},
-             "ios": {"light": "ios/chat-reply-light.png", "dark": None}},
+             "ios": {"light": "ios/chat-reply-light.png", "dark": "ios/chat-reply-dark.png"}},
             {"id": "sign-in", "title": "Sign in", "spec": "docs/design/sign-in.md",
-             "android": {"light": None, "dark": None}, "ios": {"light": None, "dark": None}}]
+             "android": {"light": None, "dark": None},
+             "ios": {"light": "ios/sign-in-light.png", "dark": "ios/sign-in-dark.png"}}]
         manifest.write_text(json.dumps(self.rows))
         android = self.source / renders.EVIDENCE / "android"
         android.mkdir(parents=True)
@@ -269,7 +270,8 @@ class ManifestAndCountTests(unittest.TestCase):
             renders.check(SHA)
         self.assertEqual(out.getvalue().strip(), "May iOS renders: 2 of 4 expected renders made (light 2 of 2, dark 0 "
                                                  "of 2); 1 not the 1179 x 2556 frame; 1 other files in the snapshot "
-                                                 "folder, not published; Android renders found for 2 of 4")
+                                                 "folder, not published; 0 not drawn on iOS yet (null iOS paths); "
+                                                 "Android renders found for 2 of 4")
         for leak in ("chat", "Chat", "sign", "docs/design", "android/"):
             self.assertNotIn(leak, out.getvalue())
 
@@ -394,6 +396,50 @@ class SheetSealVerdictTests(unittest.TestCase):
             self.assertEqual(refused.exception.args[0], "Some expected renders are missing")
 
 
+class NotOnIosTests(unittest.TestCase):
+    """A row (or one mode) whose iOS path is null is a screen iOS doesn't draw yet: on the sheet, never expected."""
+
+    def setUp(self):
+        rows = [
+            {"id": "chat-reply", "title": "Chat reply", "spec": "",
+             "android": {"light": "android/chat-reply-light.png", "dark": "android/chat-reply-dark.png"},
+             "ios": {"light": "ios/chat-reply-light.png", "dark": "ios/chat-reply-dark.png"}},
+            {"id": "voice-call", "title": "A voice call", "spec": "", "note": "iOS: after may-app #947 <merges>",
+             "android": {"light": "android/chat-reply-light.png", "dark": None}, "ios": None},
+            {"id": "sign-in", "title": "Sign in", "spec": "", "android": None,
+             "ios": {"light": "ios/sign-in-light.png", "dark": None}}]
+        self.work = Workspace(rows)
+        self.work.snapshot("chat-reply-light.png", "chat-reply-dark.png", "sign-in-light.png")
+        (self.work.private / renders.OUTCOME).write_text(json.dumps({"tests": "passed"}))
+        with patch.dict(os.environ, self.work.env, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
+            renders.check(SHA)
+            renders.sheet(SHA, None, build_stitcher=lambda private, log: None)
+            try:
+                renders.verdict(SHA)
+                self.refusal = None
+            except RendersError as error:
+                self.refusal = error.args[0]
+        self.out = out.getvalue()
+        self.folder = self.work.root / renders.OUT / FOLDER
+
+    def tearDown(self):
+        self.work.directory.cleanup()
+
+    def test_null_ios_paths_are_not_expected_and_the_verdict_passes(self):
+        self.assertIn("May iOS renders: 3 of 3 expected renders made (light 2 of 2, dark 1 of 1); 3 not the 1179 x "
+                      "2556 frame; 0 other files in the snapshot folder, not published; 3 not drawn on iOS yet (null "
+                      "iOS paths); Android renders found for 3 of 6", self.out)
+        self.assertIsNone(self.refusal, "the screens iOS doesn't draw yet are not missing")
+        self.assertIn("May iOS renders: snapshot tests passed and every expected render was made", self.out)
+
+    def test_the_sheet_shows_them_android_only_with_the_note_escaped(self):
+        page = (self.folder / "index.html").read_text()
+        self.assertIn("not on iOS yet: iOS: after may-app #947 &lt;merges&gt;", page)
+        self.assertIn('<img src="android/voice-call-light.png" width="300" alt="Android">', page)
+        self.assertFalse((self.folder / "ios" / "voice-call-light.png").exists())
+        self.assertEqual(page.count("not on iOS yet"), 3)
+
+
 class NoManifestTests(unittest.TestCase):
     """A commit without a usable manifest still publishes its renders and build log, and the verdict fails."""
 
@@ -430,7 +476,8 @@ class NoManifestTests(unittest.TestCase):
                     "May iOS renders: may-app's screens manifest is missing or malformed; the renders in the snapshot "
                     "folder are published without it, and the verdict fails",
                     "May iOS renders: 3 of 4 expected renders made (light 2 of 2, dark 1 of 2); 3 not the 1179 x 2556 "
-                    "frame; 2 other files in the snapshot folder, not published; Android renders found for 0 of 4"])
+                    "frame; 2 other files in the snapshot folder, not published; 0 not drawn on iOS yet (null iOS "
+                    "paths); Android renders found for 0 of 4"])
                 self.assertEqual(sorted(p.relative_to(out).as_posix() for p in out.rglob("*.png")), [
                     "ios/chat-reply-dark.png", "ios/chat-reply-light.png", "ios/sign-in-light.png"])
                 self.assertEqual((out / "build.log").read_text(), "Compiling MayPlaygroundSnapshots\n")
