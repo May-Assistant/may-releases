@@ -103,11 +103,61 @@ jobs:
       - name: Remove private source, logs, recordings and products
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" "$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"
+  ios:
+    # The same scenarios on an iPhone 16 Pro simulator (device_ios.py): May Playground built as ios-renders builds it,
+    # the test session handed over in SIMCTL_CHILD_MAY_TEST_SESSION. Agent scenarios are Android's alone for now. No
+    # Claude token here.
+    needs: admission
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the may-app commit and its design system quietly
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha || 'main' }}
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"
+      - name: Build May Playground for the simulator without secrets
+        run: python3 -I -S -B tools/may_release/device_tests.py build --platform ios
+      - name: Run the scenarios against staging and record them
+        env:
+          MAY_SCENARIOS: ${{ inputs.scenarios || 'all' }}
+          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}
+          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
+          MAY_DEVICE_TESTS_OUTWARD: ${{ vars.MAY_DEVICE_TESTS_OUTWARD }}
+        run: python3 -I -S -B tools/may_release/device_tests.py run --platform ios --scenarios "$MAY_SCENARIOS"
+      - name: Print the verdicts
+        run: python3 -I -S -B tools/may_release/device_tests.py judge --platform ios
+      - name: Encrypt the report to the renders public key
+        env:
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/device_tests.py seal --platform ios
+      - name: Hand over only the encrypted report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-device-ios-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-device-sealed/ios.age
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Fail if any scenario failed
+        run: python3 -I -S -B tools/may_release/device_tests.py verdict --platform ios
+      - name: Remove private source, logs, recordings and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"
   publish:
     # A fresh runner that runs no may-app code: the decrypt key, the may-renders write key and its release token each
     # live in one step. Recordings never enter may-renders' git history: they are assets of the run's release.
     # It publishes whatever the device jobs sealed, even when one then failed its verdict.
-    needs: [admission, android]
+    needs: [admission, android, ios]
     if: ${{ !cancelled() && needs.admission.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
@@ -126,6 +176,11 @@ jobs:
         continue-on-error: true
         with:
           name: may-device-android-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-device-download
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: may-device-ios-${{ github.run_attempt }}
           path: ${{ runner.temp }}/may-device-download
       - name: Decrypt and check the reports
         env:

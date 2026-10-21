@@ -407,7 +407,7 @@ def workflow_problems(root):
             if "toolchain.py jdk" in job_text(text, job) and runs_on and "macos" in runs_on.group(1) and \
                     "inputs.platform == 'android' && 'ubuntu-24.04'" not in runs_on.group(1):
                 found.append(f"{path.name}: job {job} installs the linux-only pinned JDK on macOS")
-            if re.search(r"(?m)^    environment:", header) and not re.search(r"(?m)^    needs: (admission|\[admission, [\w-]+\])$", header):
+            if re.search(r"(?m)^    environment:", header) and not re.search(r"(?m)^    needs: (admission|\[admission(?:, [\w-]+)+\])$", header):
                 found.append(f"{path.name}: protected job {job} does not wait for admission")
     return found
 
@@ -1066,8 +1066,10 @@ DEVICE_TOOL = "python3 -I -S -B tools/may_release/device_tests.py "
 KVM_RUN = ("echo 'KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"' | sudo tee "
            "/etc/udev/rules.d/99-kvm4all.rules > /dev/null sudo udevadm control --reload-rules sudo udevadm trigger "
            "--name-match=kvm")
+IOS_TOOL = DEVICE_TOOL + "{} --platform ios"
 DEVICE_RUNS = [
     'python3 -I -S -B tools/may_release/gate.py --action device-tests --source-sha "$MAY_SOURCE_SHA"',
+    # android
     "python3 -I -S -B tools/may_release/toolchain.py age",
     'python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"',
     DEVICE_TOOL + "build", "|", DEVICE_TOOL + 'run --scenarios "$MAY_SCENARIOS"', DEVICE_TOOL + "judge",
@@ -1075,6 +1077,15 @@ DEVICE_RUNS = [
     'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
     '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
     '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
+    # ios
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    'python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"',
+    IOS_TOOL.format("build"), DEVICE_TOOL + 'run --platform ios --scenarios "$MAY_SCENARIOS"',
+    IOS_TOOL.format("judge"), IOS_TOOL.format("seal"), IOS_TOOL.format("verdict"),
+    'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+    '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" '
+    '"$RUNNER_TEMP/may-device-sealed"',
+    # publish
     "python3 -I -S -B tools/may_release/toolchain.py age",
     "python3 -I -S -B tools/may_release/publish.py device-open", "python3 -I -S -B tools/may_release/publish.py device-push",
     "python3 -I -S -B tools/may_release/publish.py device-release",
@@ -1084,19 +1095,24 @@ DEVICE_UPLOAD = (
     "name: Hand over only the encrypted report\n"
     "        uses: " + UPLOAD_ARTIFACT + " # v4\n"
     "        with:\n"
-    "          name: may-device-android-${{ github.run_attempt }}\n"
-    "          path: ${{ runner.temp }}/may-device-sealed/android.age\n"
+    "          name: may-device-{0}-${{{{ github.run_attempt }}}}\n"
+    "          path: ${{{{ runner.temp }}}}/may-device-sealed/{0}.age\n"
     "          if-no-files-found: ignore\n"
     "          retention-days: 7\n")
-DEVICE_DOWNLOAD = ("name: may-device-android-${{ github.run_attempt }}\n"
-                   "          path: ${{ runner.temp }}/may-device-download\n")
-DEVICE_CONDITIONS = ["if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
+DEVICE_DOWNLOAD = ("name: may-device-{}-${{{{ github.run_attempt }}}}\n"
+                   "          path: ${{{{ runner.temp }}}}/may-device-download\n")
+DEVICE_CONDITIONS = ["if: always()", "if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}",
+                     "if: always()"]
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
 DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"
-# The repository's Claude token (as claude-code-review.yml's): the agent (in the scenarios step) and the judge alone.
+# The repository's Claude token (as claude-code-review.yml's): the agent (in Android's scenarios step) and the judge
+# alone; never in the iOS job.
 DEVICE_CLAUDE = "CLAUDE_CODE_OAUTH_TOKEN"
 DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", DEVICE_RELEASE,
                                          DEVICE_CLAUDE}
+# How often each secret is named: the read keys in each fetch, the sign-in secret in each scenarios step, the Claude
+# token in Android's scenarios and judge steps.
+DEVICE_SECRET_COUNTS = {name: 2 for name in (*COMPILE_SECRETS, DEVICE_SIGNIN, DEVICE_CLAUDE)}
 DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
                ("MAY_DEVICE_TESTS_OUTWARD", "${{ vars.MAY_DEVICE_TESTS_OUTWARD }}"),
                ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}"),
@@ -1118,67 +1134,78 @@ def device_tests_workflow_problems(text):
         found.append(name + "is not dispatched with exactly source_sha and scenarios, plus one nightly schedule")
     if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
-    jobs = ("admission", "android", "publish")
+    jobs = ("admission", "android", "ios", "publish")
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
-            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1] or \
-            text.count("permissions:") != 4:
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1, 1] or \
+            text.count("permissions:") != 5:
         found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
     if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs) or \
-            [re.findall(r"(?m)^    runs-on: (.+)$", job_text(text, job)) for job in jobs] != [["ubuntu-24.04"]] * 3:
-        found.append(name + "jobs are not exactly admission, android and publish on Linux")
-    for job in ("android", "publish"):
+            [re.findall(r"(?m)^    runs-on: (.+)$", job_text(text, job)) for job in jobs] != \
+            [["ubuntu-24.04"], ["ubuntu-24.04"], ["macos-15"], ["ubuntu-24.04"]]:
+        found.append(name + "jobs are not exactly admission, android and publish on Linux and ios on macOS")
+    for job in ("android", "ios", "publish"):
         if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job_text(text, job):
             found.append(name + job + "'s environment is not the one admission chose")
     if re.search(r"(?m)^    environment:", job_text(text, "admission")) or \
             "    needs: admission\n" not in job_text(text, "android") or \
-            "    needs: [admission, android]\n" not in job_text(text, "publish"):
-        found.append(name + "android and publish do not run after admission (and publish after android)")
+            "    needs: admission\n" not in job_text(text, "ios") or \
+            "    needs: [admission, android, ios]\n" not in job_text(text, "publish"):
+        found.append(name + "android and ios do not run after admission (and publish after both)")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
     kvm = re.sub(r"\s+", " ", text.partition("      - name: Let the emulator use KVM\n        run: |\n")[2]
                  .partition("      - name:")[0]).strip()
-    if runs != DEVICE_RUNS or kvm != KVM_RUN or text.count("run: |") != 1:
+    if runs != DEVICE_RUNS or kvm != KVM_RUN or text.count("run: |") != 1 or "Let the emulator use KVM" in \
+            job_text(text, "ios"):
         found.append(name + "runs something other than the gate, age, the fetch, the build, KVM, the scenarios, the "
                      "seal, the verdict, the publish steps and the cleanups")
     if "${{ inputs." in "\n".join(runs):
         found.append(name + "interpolates inputs into shell")
-    if uses_in(text) != [CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT] or \
-            text.count("upload-artifact") != 1 or DEVICE_UPLOAD not in text or DEVICE_DOWNLOAD not in text:
-        found.append(name + "hands over something other than exactly the one encrypted report")
+    if uses_in(text) != [CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT,
+                         DOWNLOAD_ARTIFACT] or text.count("upload-artifact") != 2 or \
+            DEVICE_UPLOAD.format("android") not in job_text(text, "android") or \
+            DEVICE_UPLOAD.format("ios") not in job_text(text, "ios") or \
+            any(DEVICE_DOWNLOAD.format(device) not in job_text(text, "publish") for device in ("android", "ios")):
+        found.append(name + "hands over something other than exactly one encrypted report per device")
     if re.findall(r"(?m)^\s+(if: .+)$", text) != DEVICE_CONDITIONS or re.search(r"(?m)^\s*(defaults|shell):", text) or \
-            text.count("continue-on-error: true") != 1 or \
-            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["120", "30"]:
+            text.count("continue-on-error: true") != 2 or \
+            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["120", "120", "30"]:
         found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
     steps = {job: dict(job_steps(text, job)[1]) for job in jobs}
-    fetch = steps["android"].get("Fetch the may-app commit and its design system quietly", "")
-    scenarios = steps["android"].get("Run the scenarios against staging and record them", "")
-    seal = steps["android"].get("Encrypt the report to the renders public key", "")
+    fetch_step, scenarios_step = "Fetch the may-app commit and its design system quietly", \
+        "Run the scenarios against staging and record them"
+    seal_step = "Encrypt the report to the renders public key"
+    fetches = [steps[job].get(fetch_step, "") for job in ("android", "ios")]
+    scenarios, ios_scenarios = (steps[job].get(scenarios_step, "") for job in ("android", "ios"))
+    seals = [steps[job].get(seal_step, "") for job in ("android", "ios")]
     decrypt = steps["publish"].get("Decrypt and check the reports", "")
     push = steps["publish"].get("Push the run folder to may-renders", "")
     release = steps["publish"].get("Upload the recordings as may-renders release assets", "")
     judge = steps["android"].get("Judge the agent scenarios", "")
-    others = [chunk for job in ("android", "publish") for chunk in steps[job].values()
-              if chunk not in (fetch, scenarios, judge, seal, decrypt, push, release)]
+    named = (*fetches, scenarios, ios_scenarios, judge, *seals, decrypt, push, release)
+    others = [chunk for job in ("android", "ios", "publish") for chunk in steps[job].values() if chunk not in named]
     model = ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}")
     recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
+    staging = ("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}")
     if secrets_in(text) != DEVICE_SECRETS or \
-            any(text.count("secrets." + n) != (2 if n == DEVICE_CLAUDE else 1) for n in DEVICE_SECRETS) or \
-            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(scenarios) != {DEVICE_SIGNIN, DEVICE_CLAUDE} or \
-            model not in env_entries(scenarios) or \
-            model not in env_entries(judge) or \
+            any(text.count("secrets." + n) != DEVICE_SECRET_COUNTS.get(n, 1) for n in DEVICE_SECRETS) or \
+            any(secrets_in(fetch) != set(COMPILE_SECRETS) for fetch in fetches) or \
+            secrets_in(scenarios) != {DEVICE_SIGNIN, DEVICE_CLAUDE} or secrets_in(ios_scenarios) != {DEVICE_SIGNIN} or \
+            model not in env_entries(scenarios) or model not in env_entries(judge) or \
+            staging not in env_entries(ios_scenarios) or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
-            secrets_in(seal) or any(secrets_in(chunk) or "vars." in chunk for chunk in others) or \
-            recipient not in env_entries(seal) or recipient not in env_entries(decrypt) or \
-            text.count("vars.") != 6 or text.count("GH_TOKEN") != 1 or \
+            any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
+            any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
+            text.count("vars.") != 9 or text.count("GH_TOKEN") != 1 or \
             any(e not in DEVICE_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
-        found.append(name + "a secret, variable or env entry other than the fetch's two source-read keys, the sign-in "
-                     "secret and the Claude token in the scenarios step, the Claude token in the judge step, the decrypt and "
-                     "write keys and the release token (each in its one step) and the inputs")
+        found.append(name + "a secret, variable or env entry other than each fetch's two source-read keys, the sign-in "
+                     "secret in each scenarios step, the Claude token in Android's scenarios and judge steps alone, the "
+                     "decrypt and write keys and the release token (each in its one step) and the inputs")
     if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
         found.append(name + "writes a step summary or carries a value between steps")
     return found
 
 
-DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count"}
+DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count", "platform"}
 
 
 def device_tests_print_problems(root):
@@ -1186,7 +1213,8 @@ def device_tests_print_problems(root):
     stdio server, like review_mcp.py: its stdout is the protocol, read by Claude Code, never this log."""
     return quiet_tool_problems(root, "device_tests.py", DEVICE_PRINT_VALUES,
                                {"DeviceTestsError", "StoreError", "AgentError"}) + \
-        quiet_tool_problems(root, "device_agent.py", set(), set())
+        quiet_tool_problems(root, "device_agent.py", set(), set()) + \
+        quiet_tool_problems(root, "device_ios.py", {"ran"}, set())
 
 
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same
