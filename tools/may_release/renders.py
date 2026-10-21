@@ -66,7 +66,8 @@ MANIFEST = EVIDENCE + "/screens.json"
 FRAME = (1179, 2556)
 MODES = ("light", "dark")
 SCREEN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
-EVIDENCE_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,239}\.png")
+# Relative to EVIDENCE; one leading "../" reaches a sibling evidence folder (docs/evidence/<other>/), never further.
+EVIDENCE_PATH = re.compile(r"(?:\.\./[A-Za-z0-9_][A-Za-z0-9_-]{0,63}/)?[A-Za-z0-9_][A-Za-z0-9_./-]{0,239}\.png")
 MAX_LOG = 8 * 1024 * 1024
 MAX_SCREENS = 300
 MAX_MANIFEST = 256 * 1024
@@ -210,14 +211,17 @@ def png_size(path):
 
 
 def evidence_paths(value, what):
-    """A row's {light, dark} paths (each a relative PNG path inside EVIDENCE, or null)."""
+    """A row's {light, dark} paths (each a relative PNG path inside EVIDENCE or a sibling evidence folder, or null);
+    null for the whole platform means it has no render of that screen yet."""
+    if value is None:
+        return {mode: None for mode in MODES}
     if not isinstance(value, dict) or set(value) - set(MODES):
         raise RendersError("A screens manifest row's " + what + " paths are malformed")
     paths = {}
     for mode in MODES:
         path = value.get(mode)
         if path is not None and not (isinstance(path, str) and EVIDENCE_PATH.fullmatch(path) and
-                                     ".." not in path.split("/")):
+                                     ".." not in path.removeprefix("../").split("/")):
             raise RendersError("A screens manifest row's " + what + " paths are malformed")
         paths[mode] = path
     return paths
@@ -253,7 +257,7 @@ def manifest_rows(source):
 
 
 def android_render(source, row, mode):
-    """The row's Android render for a mode, inside the checkout and a valid PNG; else None."""
+    """The row's Android render for a mode, inside the checkout's docs/evidence/ and a valid PNG; else None."""
     if not row["android"][mode]:
         return None
     path = source / EVIDENCE / PurePosixPath(row["android"][mode])
@@ -261,7 +265,7 @@ def android_render(source, row, mode):
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    if not resolved.is_relative_to(source.resolve()) or png_size(resolved) is None:
+    if not resolved.is_relative_to((source / EVIDENCE).parent.resolve()) or png_size(resolved) is None:
         return None
     return resolved
 
