@@ -78,5 +78,24 @@
         "question": "closed"
       }
     ]
+  },
+  {
+    "id": "routines",
+    "title": "Make a routine from chat",
+    "driver": "agent",
+    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Make a daily routine called {tag} stretch that reminds me to stretch at 9am. When May shows a question card asking whether to create the routine, tap Create it. Then wait until May confirms the routine is made.",
+    "platforms": [
+      "android"
+    ],
+    "outward": false,
+    "server": [],
+    "truth": [
+      {
+        "get": "/v1/routines"
+      },
+      {
+        "question": "answered"
+      }
+    ]
   }
 ]

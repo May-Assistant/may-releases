@@ -1115,6 +1115,7 @@ DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY
 DEVICE_SECRET_COUNTS = {name: 2 for name in (*COMPILE_SECRETS, DEVICE_SIGNIN, DEVICE_CLAUDE)}
 DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
                ("MAY_DEVICE_TESTS_OUTWARD", "${{ vars.MAY_DEVICE_TESTS_OUTWARD }}"),
+               ("MAY_DEVICE_TESTS_SKIP", "${{ vars.MAY_DEVICE_TESTS_SKIP }}"),
                ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}"),
                ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")}
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
@@ -1195,7 +1196,7 @@ def device_tests_workflow_problems(text):
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
-            text.count("vars.") != 9 or text.count("GH_TOKEN") != 1 or \
+            text.count("vars.") != 11 or text.count("GH_TOKEN") != 1 or \
             any(e not in DEVICE_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret, variable or env entry other than each fetch's two source-read keys, the sign-in "
                      "secret in each scenarios step, the Claude token in Android's scenarios and judge steps alone, the "

@@ -715,11 +715,13 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
    - `device-push` adds the folder under `device-tests/` with `MAY_APP_RENDERS_WRITE_KEY`, keeping the newest 10 in `device-tests/runs.json`, and never force-pushes.
    - `device-release` uploads the MP4s, as `<device>-<file>.mp4`, to the may-renders release `device-tests-<run>` with `MAY_RENDERS_RELEASE_TOKEN`. On a re-run it reuses the release and skips assets already there. It keeps the newest 10 `device-tests-*` releases and deletes older ones with their tags, never touching other releases. Its only calls are those releases on may-renders. Without the token, it uploads nothing and says so, and the recordings stay in the encrypted artifact.
 
+**Switching a scenario off:** the variable `MAY_DEVICE_TESTS_SKIP` lists scenario ids, comma-separated, that both jobs skip ("switched off"), for instance one whose server side is merged but not yet deployed. The test session's cleanup also expires the pending approvals test sessions asked for since the run began (`approvals_expired`, counted with the removed items).
+
 **Outward actions:** a scenario marked `"outward": true` runs unless `MAY_DEVICE_TESTS_OUTWARD` is `off`. So far only the self-addressed Gmail send to harlahke@gmail.com is planned to use this. Samuel approved it directly on 21 Oct, conditional on staging's guard for test sessions.
 
 **Setup** in the environment `may-device-tests`:
 - secrets: `MAY_TEST_SIGNIN_SECRET`, `MAY_RENDERS_RELEASE_TOKEN` (fine-grained, may-renders only, Contents read and write), plus copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_RENDERS_DECRYPT_KEY` and `MAY_APP_RENDERS_WRITE_KEY`; `CLAUDE_CODE_OAUTH_TOKEN` is the repository secret;
-- variables: `MAY_STAGING_API_URL`, `MAY_RENDERS_RECIPIENT`, `MAY_DEVICE_TESTS_MODEL` and, optionally, `MAY_DEVICE_TESTS_OUTWARD`.
+- variables: `MAY_STAGING_API_URL`, `MAY_RENDERS_RECIPIENT`, `MAY_DEVICE_TESTS_MODEL` and, optionally, `MAY_DEVICE_TESTS_OUTWARD` and `MAY_DEVICE_TESTS_SKIP`.
 
 ### Prerequisites that remain
 
