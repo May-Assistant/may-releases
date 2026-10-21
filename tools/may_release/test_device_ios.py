@@ -87,6 +87,8 @@ class BuildTests(Workspace):
 
 
 class FakeRecorder:
+    dropped = None
+
     def __init__(self, udid, env, scenario, private, log):
         self.scenario = scenario
 
@@ -237,11 +239,43 @@ class RecorderTests(Workspace):
         self.assertEqual(argv[0][argv[0].index("--preset") + 1], "PresetAppleM4V720pHD")
         self.assertFalse(recorder.raw.exists(), "the raw recording is not kept")
 
-    def test_too_large_or_failed_is_dropped(self):
-        for size, code in ((device_ios.MAX_RECORDING + 1, 0), (10, 1)):
+    def test_too_large_or_failed_is_dropped_and_says_why(self):
+        for size, code, why in ((device_ios.MAX_RECORDING + 1, 0, "over the cap at 38 MB"),
+                                (10, 1, "the 720p conversion failed")):
             with self.subTest(size=size, code=code):
-                names, _, _, folder, _ = self.recorder(size, code)
-                self.assertEqual((names, list(folder.iterdir())), ([], []))
+                names, _, _, folder, recorder = self.recorder(size, code)
+                self.assertEqual((names, list(folder.iterdir()), recorder.dropped), ([], [], why))
+        _, _, _, _, recorder = self.recorder(1000)
+        self.assertIsNone(recorder.dropped, "a kept recording gives no reason")
+
+    def test_a_recorder_that_does_not_stop_is_dropped_and_says_why(self):
+        class Stuck:
+            def send_signal(self, number):
+                pass
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("recordVideo", timeout)
+
+            def kill(self):
+                pass
+
+        recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
+        recorder.process = Stuck()
+        self.assertEqual(recorder.stop(self.root), [])
+        self.assertEqual(recorder.dropped, "the recorder did not stop")
+
+    def test_the_run_prints_why_a_recording_was_dropped(self):
+        class Dropping(FakeRecorder):
+            dropped = "over the cap at 51 MB"
+
+            def stop(self, folder):
+                return []
+
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text("appId: x\n")
+        with patch("test_device_ios.FakeRecorder", Dropping):
+            _, _, report, out, _ = RunTests.run_it(self)
+        self.assertIn("May device tests (ios): sign-in: its recording was dropped (over the cap at 51 MB)", out)
+        self.assertEqual(report["scenarios"][0]["videos"], [])
 
     def test_start_records_the_configured_simulator(self):
         recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")

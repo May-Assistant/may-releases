@@ -1217,7 +1217,7 @@ def device_tests_print_problems(root):
     return quiet_tool_problems(root, "device_tests.py", DEVICE_PRINT_VALUES,
                                {"DeviceTestsError", "StoreError", "AgentError"}) + \
         quiet_tool_problems(root, "device_agent.py", set(), set()) + \
-        quiet_tool_problems(root, "device_ios.py", {"ran", "cleaned_count"}, set())
+        quiet_tool_problems(root, "device_ios.py", {"ran", "cleaned_count", "scenario", "why"}, set())
 
 
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same

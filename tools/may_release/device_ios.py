@@ -73,6 +73,8 @@ class Recorder:
         self.udid, self.env, self.scenario, self.log = udid, env, scenario, log
         self.raw = private / (scenario + "-recording.mov")
         self.process = None
+        # Why stop() kept no recording, in fixed words and a size in MB, for the public log (None when one was kept).
+        self.dropped = None
 
     def start(self):
         with self.log.open("ab") as output:
@@ -88,6 +90,7 @@ class Recorder:
             self.process.wait(timeout=STOP_SECONDS)
         except subprocess.TimeoutExpired:
             self.process.kill()
+            self.dropped = "the recorder did not stop"
             return []
         out = folder / (self.scenario + ".mp4")
         with self.log.open("ab") as output:
@@ -95,7 +98,12 @@ class Recorder:
                                         "PresetAppleM4V720pHD", "--replace"], stdout=output, stderr=output,
                                        stdin=subprocess.DEVNULL, env=self.env)
         self.raw.unlink(missing_ok=True)
-        if converted.returncode or not out.is_file() or out.stat().st_size > MAX_RECORDING:
+        if converted.returncode or not out.is_file():
+            out.unlink(missing_ok=True)
+            self.dropped = "the 720p conversion failed"
+            return []
+        if out.stat().st_size > MAX_RECORDING:
+            self.dropped = f"over the cap at {out.stat().st_size // (1024 * 1024)} MB"
             out.unlink(missing_ok=True)
             return []
         return [out.name]
@@ -200,6 +208,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
             entry["videos"] = recorder.stop(folder)
+            if recorder.dropped:
+                scenario, why = row["id"], recorder.dropped
+                print(f"May device tests (ios): {scenario}: its recording was dropped ({why})")
             for check in row["server"]:
                 status = checked(base, token, check["get"])
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})

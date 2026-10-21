@@ -96,5 +96,43 @@ class FailureLineTests(Workspace):
         self.assertNotIn("private/path", done.stdout + done.stderr)
 
 
+
+class AndroidLaunchTests(unittest.TestCase):
+    """Smoke run 39677407348 failed at "smoke: launching the app": the start now names MainActivity, retries once."""
+
+    def launch(self, token, codes):
+        calls, slept = [], []
+
+        def private(argv, log, *, cwd=None, env=None, check=True, timeout=None):
+            calls.append(list(argv))
+            if check:
+                self.fail("a start that fails must not raise a tool error: " + " ".join(argv[2:4]))
+            return codes.pop(0) if "start" in argv else 0
+
+        with patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.flows.sleep", side_effect=slept.append):
+            try:
+                device_tests.launch("/sdk/adb", {}, token, Path("/dev/null"))
+                raised = None
+            except DeviceTestsError as error:
+                raised = error.args[0]
+        return [argv for argv in calls if "start" in argv], slept, raised
+
+    def test_the_start_names_main_activity_with_or_without_a_session(self):
+        starts, slept, raised = self.launch("token-" + "x" * 30, [0])
+        self.assertEqual(starts, [["/sdk/adb", "shell", "am", "start", "-W", "-n",
+                                   "io.github.mayassistant.may.playground/io.github.mayassistant.may.MainActivity",
+                                   "--es", "may_test_session", "token-" + "x" * 30]])
+        self.assertEqual((slept, raised), ([], None))
+        starts, _, _ = self.launch("", [0])
+        self.assertEqual(starts[0][-2:], ["-n", device_tests.APP_ID + "/" + device_tests.ACTIVITY])
+
+    def test_one_retry_then_a_readable_stop(self):
+        starts, slept, raised = self.launch("", [1, 0])
+        self.assertEqual((len(starts), slept, raised), (2, [10], None))
+        starts, slept, raised = self.launch("", [1, 1])
+        self.assertEqual((len(starts), slept), (2, [10]))
+        self.assertEqual(raised, "May Playground did not start on the emulator after one retry")
+
 if __name__ == "__main__":
     unittest.main()
