@@ -24,6 +24,7 @@ from may-app, and no git or API output.
 """
 
 import argparse
+import html
 import json
 import os
 from pathlib import Path
@@ -66,6 +67,8 @@ DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped")
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
            "server checks not configured")
+# The sealed device artifact's retention (device-tests.yml): the only home of the recordings until release assets.
+VIDEO_DAYS = 7
 MAX_FILES = 2000
 MAX_FILE = 40 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
@@ -77,8 +80,9 @@ README = ("# May parity renders and device tests\n\nWritten by may-releases, nev
           " kept (runs.json lists them, newest first). Each holds index.html (Android | iOS per screen and mode), "
           "sheet/ (the two side by side), ios/, android/, the manifest copy and build.log.\n"
           "- device-tests.yml: device-tests/<UTC date>-<may-app short sha>/, the newest " + str(KEEP) + " kept "
-          "(device-tests/runs.json). Each holds README.md (open the folder: verdicts, screenshots, recordings), "
-          "index.html, and per device the recordings, screenshots, Maestro reports and report.json.\n")
+          "(device-tests/runs.json). Each holds README.md (open the folder: verdicts and screenshots), index.html, and "
+          "per device the screenshots, Maestro reports and report.json. Recordings are never committed: they stay in "
+          "the run's encrypted workflow artifact for " + str(VIDEO_DAYS) + " days.\n")
 
 
 class PublishError(ValueError):
@@ -346,16 +350,23 @@ def device_report(path, files, titles):
     return report["device"], checked
 
 
-def device_pages(run, reports):
+def recordings_note(url, attempt):
+    """Where the recordings are: never in git, only in the run's encrypted artifact (sealed to the renders key)."""
+    return (f"Recordings are not committed. They are in the encrypted artifact may-device-<device>-{attempt} of {url or 'the workflow run'}, "
+            f"kept {VIDEO_DAYS} days: download it and decrypt with the renders key "
+            "(age -d -i key.txt android.age | tar -x).")
+
+
+def device_pages(run, reports, note):
     """The run folder's README.md (GitHub shows it when the folder is opened) and index.html, from checked reports."""
     order = [row["id"] for rows in reports.values() for row in rows]
     ids = list(dict.fromkeys(order))
     lines = [f"# May device tests: {run}", "", "Each scenario on each device: its verdict, the last screenshot and the "
-             "recording. Open a recording's link to play it.", ""]
+             "names of its recordings.", "", note, ""]
     html_parts = ["<!doctype html>", '<meta charset="utf-8">', f"<title>May device tests {run}</title>",
-                  "<style>body{font:14px system-ui;margin:24px}video,img{max-width:360px}td{vertical-align:top;"
+                  "<style>body{font:14px system-ui;margin:24px}img{max-width:360px}td{vertical-align:top;"
                   "padding:8px;border:1px solid #ccc}table{border-collapse:collapse}</style>",
-                  f"<h1>May device tests: {run}</h1>", "<table>"]
+                  f"<h1>May device tests: {run}</h1>", f"<p>{html.escape(note)}</p>", "<table>"]
     for scenario in ids:
         title = next(row["title"] for rows in reports.values() for row in rows if row["id"] == scenario)
         lines += [f"## {scenario}: {title}", ""]
@@ -368,10 +379,10 @@ def device_pages(run, reports):
             server = "; ".join(f"GET {path}: {status}" for path, status in row["server"])
             lines.append(f"**{device}: {row['verdict']}**{note}" + (f". Server: {server}" if server else ""))
             lines += [f'<img src="{device}/{shot}" width="300">' for shot in row["screenshots"]]
-            lines += [f"[Recording]({device}/{video})" for video in row["videos"]]
+            lines += [f"Recording: `{video}`" for video in row["videos"]]
             lines.append("")
             media = "".join(f'<img src="{device}/{shot}" alt="screenshot">' for shot in row["screenshots"]) + \
-                "".join(f'<video controls src="{device}/{video}"></video>' for video in row["videos"])
+                "".join(f"<br>Recording: <code>{video}</code>" for video in row["videos"])
             html_parts.append(f"<td><b>{device}: {row['verdict']}</b>{note}<br>{server}<br>{media}</td>")
         html_parts.append("</tr>")
     html_parts.append("</table>")
@@ -423,7 +434,12 @@ def open_device():
             folder = tree / run / device
             reports[device] = device_report(folder / "report.json", {p.name for p in folder.iterdir()}, titles)[1]
         run = runs.pop()
-        readme, page = device_pages(run, reports)
+        # Checked as MP4s above, then dropped: recordings never enter may-renders history.
+        for video in (tree / run).glob("*/*.mp4"):
+            video.unlink()
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+        readme, page = device_pages(run, reports, recordings_note(
+            run_url(os.environ), attempt if re.fullmatch(r"[1-9][0-9]{0,3}", attempt) else "<attempt>"))
         (tree / run / "README.md").write_text(readme)
         (tree / run / "index.html").write_text(page)
     except BaseException:

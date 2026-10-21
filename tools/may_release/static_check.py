@@ -1085,7 +1085,7 @@ DEVICE_UPLOAD = (
     "          name: may-device-android-${{ github.run_attempt }}\n"
     "          path: ${{ runner.temp }}/may-device-sealed/android.age\n"
     "          if-no-files-found: ignore\n"
-    "          retention-days: 1\n")
+    "          retention-days: 7\n")
 DEVICE_DOWNLOAD = ("name: may-device-android-${{ github.run_attempt }}\n"
                    "          path: ${{ runner.temp }}/may-device-download\n")
 DEVICE_CONDITIONS = ["if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]

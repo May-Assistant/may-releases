@@ -378,7 +378,8 @@ class PublishDeviceTests(unittest.TestCase):
 
         key = "AGE-SECRET-KEY-1" + "Q" * 58
         with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_RENDERS_DECRYPT_KEY": key,
-                                     "MAY_RENDERS_RECIPIENT": RECIPIENT}, clear=True), \
+                                     "MAY_RENDERS_RECIPIENT": RECIPIENT, "GITHUB_RUN_ID": "9",
+                                     "GITHUB_RUN_ATTEMPT": "2"}, clear=True), \
                 patch("publish.decrypt", side_effect=decrypt), patch("sys.stdout", new_callable=io.StringIO) as out:
             publish.open_device()
             self.assertNotIn("MAY_RENDERS_DECRYPT_KEY", os.environ)
@@ -396,10 +397,16 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertIn("## sign-in: Sign in with a staging test session", readme)
         self.assertIn("**android: ui-pass** (server checks not configured)", readme)
         self.assertIn('<img src="android/sign-in-end.png" width="300">', readme)
-        self.assertIn("[Recording](android/sign-in.mp4)", readme)
+        self.assertIn("Recording: `sign-in.mp4`", readme)
+        self.assertIn("encrypted artifact may-device-<device>-2 of "
+                      "https://github.com/May-Assistant/may-releases/actions/runs/9, kept 7 days", readme)
+        self.assertEqual(list(tree.rglob("*.mp4")), [], "recordings never enter may-renders history")
         self.assertIn("GET /v1/connections: 500", readme)
         self.assertNotIn("<script>", readme + (tree / "index.html").read_text())
-        self.assertIn('<video controls src="android/sign-in.mp4"></video>', (tree / "index.html").read_text())
+        page = (tree / "index.html").read_text()
+        self.assertIn("Recording: <code>sign-in.mp4</code>", page)
+        self.assertIn("may-device-&lt;device&gt;-2", page)
+        self.assertNotIn("<video", page)
 
     def test_anything_outside_the_layout_or_report_shape_is_refused(self):
         def report(**change):
@@ -453,7 +460,8 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(len(kept), 10)
         self.assertIn(["rm", "-r", "-q", "--ignore-unmatch", "--", "device-tests/20261010-00000000000a"], calls)
         self.assertEqual(json.loads((work / "runs.json").read_text()), [{"folder": "b" * 12}], "renders' list untouched")
-        self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in.mp4").is_file())
+        self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
+        self.assertFalse((work / "device-tests" / RUN / "android" / "sign-in.mp4").exists())
         self.assertEqual([argv for argv in calls if argv[0] == "push"], [["push", "--quiet", "origin", "HEAD:refs/heads/main"]])
         self.assertEqual(out.getvalue().strip(), f"May device tests published to may-renders as device-tests/{RUN}/ (10 run folders "
                                       "kept, 1 removed)")
@@ -508,7 +516,8 @@ class WorkflowPinTests(unittest.TestCase):
             shutil.copytree(ROOT / ".github", copy / ".github")
             shutil.copytree(ROOT / "tools", copy / "tools", ignore=shutil.ignore_patterns("__pycache__"))
             path = copy / WORKFLOW
-            path.write_text(path.read_text().replace("retention-days: 1\n", "retention-days: 5\n"))
+            self.assertIn(f"retention-days: {publish.VIDEO_DAYS}\n", path.read_text(), "the README names this retention")
+            path.write_text(path.read_text().replace("retention-days: 7\n", "retention-days: 5\n"))
             self.assertTrue(any(p.startswith("device-tests.yml: hands over") for p in static_check.problems(copy)))
 
 

@@ -88,7 +88,7 @@ jobs:
           name: may-device-android-${{ github.run_attempt }}
           path: ${{ runner.temp }}/may-device-sealed/android.age
           if-no-files-found: ignore
-          retention-days: 1
+          retention-days: 7
       - name: Fail if any scenario failed
         run: python3 -I -S -B tools/may_release/device_tests.py verdict
       - name: Remove private source, logs, recordings and products
