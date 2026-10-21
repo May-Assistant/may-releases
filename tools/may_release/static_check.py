@@ -1044,13 +1044,131 @@ def renders_workflow_problems(text):
 
 
 RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)"}
-PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number"}
+PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices"}
 
 
 def renders_print_problems(root):
     return quiet_tool_problems(root, "renders.py", RENDERS_PRINT_VALUES, {"RendersError", "StoreError"}) + \
         quiet_tool_problems(root, "publish.py", PUBLISH_PRINT_VALUES,
                             {"PublishError", "StoreError", "GateDenial", "DsCompileError"})
+
+
+# May Playground's device tests against staging (device-tests.yml, device_tests.py, publish.py device-*). The Android
+# job holds the two source-read keys in its fetch alone and the staging sign-in secret in its run step alone; it hands
+# over one age-encrypted report, kept a day. The publish job, a fresh Linux runner that runs no may-app code, binds the
+# decrypt key and the may-renders write key each in one step. Pinned whole: dispatch with exactly source_sha and
+# scenarios plus one nightly schedule, read-only, its own concurrency group, nothing run but its commands, the one
+# encrypted upload, and only the conditions named here. device_tests.py prints only scenario ids, verdict words and
+# counts.
+DEVICE_TESTS = "device-tests.yml"
+DEVICE_TOOL = "python3 -I -S -B tools/may_release/device_tests.py "
+KVM_RUN = ("echo 'KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"' | sudo tee "
+           "/etc/udev/rules.d/99-kvm4all.rules > /dev/null sudo udevadm control --reload-rules sudo udevadm trigger "
+           "--name-match=kvm")
+DEVICE_RUNS = [
+    'python3 -I -S -B tools/may_release/gate.py --action device-tests --source-sha "$MAY_SOURCE_SHA"',
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    'python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"',
+    DEVICE_TOOL + "build", "|", DEVICE_TOOL + 'run --scenarios "$MAY_SCENARIOS"', DEVICE_TOOL + "seal",
+    DEVICE_TOOL + "verdict",
+    'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+    '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" '
+    '"$RUNNER_TEMP/may-device-sealed"',
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    "python3 -I -S -B tools/may_release/publish.py device-open", "python3 -I -S -B tools/may_release/publish.py device-push",
+    'rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-device-download" "$RUNNER_TEMP/may-publish-tree" '
+    '"$RUNNER_TEMP/may-publish-git"']
+DEVICE_UPLOAD = (
+    "name: Hand over only the encrypted report\n"
+    "        uses: " + UPLOAD_ARTIFACT + " # v4\n"
+    "        with:\n"
+    "          name: may-device-android-${{ github.run_attempt }}\n"
+    "          path: ${{ runner.temp }}/may-device-sealed/android.age\n"
+    "          if-no-files-found: ignore\n"
+    "          retention-days: 1\n")
+DEVICE_DOWNLOAD = ("name: may-device-android-${{ github.run_attempt }}\n"
+                   "          path: ${{ runner.temp }}/may-device-download\n")
+DEVICE_CONDITIONS = ["if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
+DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
+DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY"}
+DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
+               ("MAY_DEVICE_TESTS_OUTWARD", "${{ vars.MAY_DEVICE_TESTS_OUTWARD }}"),
+               ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")}
+DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
+              ("GH_TOKEN", "${{ github.token }}")} | DEVICE_VARS | \
+    {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
+
+
+def device_tests_workflow_problems(text):
+    name = DEVICE_TESTS + ": "
+    found = []
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios"] or \
+            re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
+        found.append(name + "is not dispatched with exactly source_sha and scenarios, plus one nightly schedule")
+    if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    jobs = ("admission", "android", "publish")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1] or \
+            text.count("permissions:") != 4:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs) or \
+            [re.findall(r"(?m)^    runs-on: (.+)$", job_text(text, job)) for job in jobs] != [["ubuntu-24.04"]] * 3:
+        found.append(name + "jobs are not exactly admission, android and publish on Linux")
+    for job in ("android", "publish"):
+        if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job_text(text, job):
+            found.append(name + job + "'s environment is not the one admission chose")
+    if re.search(r"(?m)^    environment:", job_text(text, "admission")) or \
+            "    needs: admission\n" not in job_text(text, "android") or \
+            "    needs: [admission, android]\n" not in job_text(text, "publish"):
+        found.append(name + "android and publish do not run after admission (and publish after android)")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    kvm = re.sub(r"\s+", " ", text.partition("      - name: Let the emulator use KVM\n        run: |\n")[2]
+                 .partition("      - name:")[0]).strip()
+    if runs != DEVICE_RUNS or kvm != KVM_RUN or text.count("run: |") != 1:
+        found.append(name + "runs something other than the gate, age, the fetch, the build, KVM, the scenarios, the "
+                     "seal, the verdict, the publish steps and the cleanups")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    if uses_in(text) != [CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT] or \
+            text.count("upload-artifact") != 1 or DEVICE_UPLOAD not in text or DEVICE_DOWNLOAD not in text:
+        found.append(name + "hands over something other than exactly the one encrypted report")
+    if re.findall(r"(?m)^\s+(if: .+)$", text) != DEVICE_CONDITIONS or re.search(r"(?m)^\s*(defaults|shell):", text) or \
+            text.count("continue-on-error: true") != 1 or \
+            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["120", "30"]:
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
+    steps = {job: dict(job_steps(text, job)[1]) for job in jobs}
+    fetch = steps["android"].get("Fetch the may-app commit and its design system quietly", "")
+    scenarios = steps["android"].get("Run the scenarios against staging and record them", "")
+    seal = steps["android"].get("Encrypt the report to the renders public key", "")
+    decrypt = steps["publish"].get("Decrypt and check the reports", "")
+    push = steps["publish"].get("Push the run folder to may-renders", "")
+    others = [chunk for job in ("android", "publish") for chunk in steps[job].values()
+              if chunk not in (fetch, scenarios, seal, decrypt, push)]
+    recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
+    if secrets_in(text) != DEVICE_SECRETS or any(text.count("secrets." + n) != 1 for n in DEVICE_SECRETS) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(scenarios) != {DEVICE_SIGNIN} or \
+            secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
+            secrets_in(seal) or any(secrets_in(chunk) or "vars." in chunk for chunk in others) or \
+            recipient not in env_entries(seal) or recipient not in env_entries(decrypt) or \
+            text.count("vars.") != 4 or text.count("GH_TOKEN") != 1 or \
+            any(e not in DEVICE_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret, variable or env entry other than the fetch's two source-read keys, the sign-in "
+                     "secret in the scenarios step, the decrypt and write keys (each in its one step) and the inputs")
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
+        found.append(name + "writes a step summary or carries a value between steps")
+    return found
+
+
+DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped"}
+
+
+def device_tests_print_problems(root):
+    return quiet_tool_problems(root, "device_tests.py", DEVICE_PRINT_VALUES, {"DeviceTestsError", "StoreError"})
 
 
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same
@@ -1655,9 +1773,11 @@ def review_tool_problems(root):
 
 def control_problems(root):
     found = []
-    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr", "ds-compile", "renders"}:
-        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\", \"ds-compile\", \"renders\"}: only the "
-                     "two compile-only lanes and the iOS renders may run without Samuel's review")
+    if assigned_literal(root / "tools/may_release/gate.py", "NO_REVIEWER_ACTIONS") != {"compile-pr", "ds-compile", "renders",
+                                                                                     "device-tests"}:
+        found.append("gate.py: NO_REVIEWER_ACTIONS is not exactly {\"compile-pr\", \"ds-compile\", \"renders\", "
+                     "\"device-tests\"}: only the two compile-only lanes, the iOS renders and the device tests may run "
+                     "without Samuel's review")
     flows = root / ".github/workflows"
     check = (flows / "control-check.yml").read_text()
     compile_workflow = (flows / "native-compile-draft.yml").read_text()
@@ -1679,6 +1799,8 @@ def control_problems(root):
     found += android_ci_schedule_tool_problems(root)
     found += renders_workflow_problems((flows / RENDERS).read_text())
     found += renders_print_problems(root)
+    found += device_tests_workflow_problems((flows / DEVICE_TESTS).read_text())
+    found += device_tests_print_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

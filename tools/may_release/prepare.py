@@ -127,7 +127,10 @@ def pull_ref(value):
 
 
 def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pull=None, bases=()):
-    exact_sha(sha)
+    """Fetch and check out exactly sha; returns it. With main_history, sha may be "main": main's head when fetched
+    (device-tests.yml's nightly run)."""
+    if not (main_history and sha == "main"):
+        exact_sha(sha)
     if sum((bool(main_history), pull is not None, bool(bases))) > 1:
         raise PrepareError("Main history, a pull request head and base branches are exclusive")
     pull_head = pull_ref(pull) if pull is not None else None
@@ -159,6 +162,8 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pu
     finally:
         key.unlink(missing_ok=True)
         known.unlink(missing_ok=True)
+    if sha == "main":
+        sha = exact_sha(head_of(dest, "refs/remotes/origin/main", env) or "unresolved")
     if git_status(["git", "-C", str(dest), "cat-file", "-e", sha + "^{commit}"], env=env):
         raise PrepareError("Exact private commit was not fetched")
     if main_history and git_status(["git", "-C", str(dest), "merge-base", "--is-ancestor", sha,
@@ -173,6 +178,7 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pu
            "--detach", sha], log, env=env)
     if git_status(["git", "-C", str(dest), "diff", "--quiet", "HEAD", "--"], env=env):
         raise PrepareError("Private checkout differs from exact commit")
+    return sha
 
 
 def head_of(checkout, ref, env):
@@ -199,8 +205,11 @@ def prepare(source_sha, platform=None, target=None, pull=None, ds_sha=None):
     private.mkdir(mode=0o700)
     source = root / "may-source"
     if pull is None:
-        fetch(source, APP, exact_sha(source_sha), os.environ.get("MAY_APP_READ_KEY", ""),
-              private, "app", main_history=True)
+        # "main" (device-tests.yml's nightly run alone): main's head when fetched, recorded below as the exact commit.
+        fetched = fetch(source, APP, source_sha if source_sha == "main" else exact_sha(source_sha),
+                        os.environ.get("MAY_APP_READ_KEY", ""), private, "app", main_history=True)
+        if source_sha == "main":
+            source_sha = fetched
     else:
         fetch(source, APP, exact_sha(source_sha), os.environ.get("MAY_APP_READ_KEY", ""),
               private, "app", pull=pull)

@@ -1,0 +1,20 @@
+[
+  {
+    "id": "sign-in",
+    "title": "Sign in with a staging test session",
+    "driver": "maestro",
+    "flow": "sign-in.yaml",
+    "platforms": ["android", "ios"],
+    "outward": false,
+    "server": []
+  },
+  {
+    "id": "connections",
+    "title": "Connections are listed",
+    "driver": "maestro",
+    "flow": "connections.yaml",
+    "platforms": ["android", "ios"],
+    "outward": false,
+    "server": []
+  }
+]

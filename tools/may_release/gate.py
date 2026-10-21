@@ -66,6 +66,10 @@ which has no required reviewer either (NO_REVIEWER_ACTIONS): the renders sign, u
 published only to the private repository may-renders (renders.py, publish.py). That environment holds a write key
 for may-renders alone, so this is Samuel's decision to confirm; until then the policy is checked as for the compile
 lanes.
+
+Device tests of May Playground against staging (action device-tests, device-tests.yml): a may-app main commit, or
+"main" for main's head; the one action a schedule (its nightly run) may start. They run in their own environment,
+may-device-tests, with no required reviewer (NO_REVIEWER_ACTIONS), which Samuel is asked to confirm.
 """
 
 import argparse
@@ -95,6 +99,7 @@ ENVIRONMENTS = {
     "compile-pr": "may-native-compile-pr",
     "ds-compile": "may-ds-renders",
     "renders": "may-ios-renders",
+    "device-tests": "may-device-tests",
     ("ios", "production"): "may-ios-internal",
     ("ios", "playground"): "may-ios-playground-internal",
     ("android", "production"): "may-android-internal",
@@ -112,15 +117,18 @@ ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
 # Actions whose environment has no required reviewer (Samuel, 17 Oct: compile-only pull-request runs need no
 # approval), the design-system Swift compile (Samuel's decision for ds-swift-compile.yml: it compiles and comments
 # on a may-design-system pull request, nothing else), and the iOS renders (ios-renders.yml: simulator snapshots of
-# May Playground, published only to the private repository may-renders). static_check.py pins this to exactly these
-# three: no signing, store or release action may join it.
-NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders"}
+# May Playground, published only to the private repository may-renders), and the device tests (device-tests.yml:
+# Playground on an emulator against staging, nightly, so nothing can wait for a review). static_check.py pins this to
+# exactly these four: no signing, store or release action may join it.
+NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders", "device-tests"}
 # Actions that take a pull request number (and, with --check-pull, read that pull request).
 PULL_ACTIONS = ("compile-pr", "ds-compile")
 # Actions that may name a pull request (the renders of a may-app pull request head, or of a main commit without one).
 OPTIONAL_PULL_ACTIONS = ("renders",)
 # Actions that build in their own environment alone, with no store or may-native-compile environment.
-OWN_ENVIRONMENT_ACTIONS = ("compile", "compile-pr", "ds-compile", "renders")
+OWN_ENVIRONMENT_ACTIONS = ("compile", "compile-pr", "ds-compile", "renders", "device-tests")
+# The one action a schedule may start (device-tests.yml's nightly run), and then on may-app main's head ("main").
+SCHEDULED_ACTIONS = ("device-tests",)
 LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?")
 AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
@@ -139,9 +147,10 @@ def artifact_recipient(environment):
 
 
 def validate_run(repo, ref, event, sha, action, build_number=None, target="production"):
-    if (repo, ref, event) != (CONTROL_REPO, "refs/heads/main", "workflow_dispatch"):
+    events = ("workflow_dispatch", "schedule") if action in SCHEDULED_ACTIONS else ("workflow_dispatch",)
+    if (repo, ref) != (CONTROL_REPO, "refs/heads/main") or event not in events:
         raise GateDenial("May control must run by manual dispatch from its main branch")
-    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+    if not (re.fullmatch(r"[0-9a-f]{40}", sha) or action in SCHEDULED_ACTIONS and sha == "main"):
         raise GateDenial("Private source must be an exact lowercase commit SHA")
     key = action if action in OWN_ENVIRONMENT_ACTIONS else (action, target)
     if key not in ENVIRONMENTS:
@@ -327,8 +336,8 @@ def get_app_pull(number, token, repo=APP_REPO):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=("compile", "compile-pr", "ds-compile", "renders", "ios", "android"),
-                        required=True)
+    parser.add_argument("--action", choices=("compile", "compile-pr", "ds-compile", "renders", "device-tests", "ios",
+                                             "android"), required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--build-number")
     parser.add_argument("--target", choices=("production", "playground"), default="production")
@@ -419,6 +428,11 @@ def main():
             return
         print(f"May renders {'pull request check' if args.check_pull else 'admission'} passed for {args.source_sha} "
               f"({subject}{design}; dispatched by {dispatcher})")
+        return
+    if args.action == "device-tests":
+        dispatcher = login_or_unknown(os.environ.get("GITHUB_TRIGGERING_ACTOR"))
+        subject = "may-app main's head" if args.source_sha == "main" else args.source_sha
+        print(f"May device-tests admission passed for {subject} (a may-app main commit; dispatched by {dispatcher})")
         return
     if args.action == "ds-compile":
         # may-design-system is private: only the dispatch's own inputs (commit and number) and the dispatcher are

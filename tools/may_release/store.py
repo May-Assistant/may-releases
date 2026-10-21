@@ -132,6 +132,8 @@ SECRET_NAMES = (
     # ios-renders.yml: the may-renders deploy key with write access (publish.py push alone) and the renders handoff's
     # age identity (publish.py open alone), both on the publish job's fresh runner. No other step may hold either.
     "MAY_APP_RENDERS_WRITE_KEY", "MAY_RENDERS_DECRYPT_KEY",
+    # device-tests.yml: the staging secret that mints the test account's session (device_tests.py run alone).
+    "MAY_TEST_SIGNIN_SECRET",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
 # Crash reports (PostHog): each platform's build step alone may hold its project key, and
