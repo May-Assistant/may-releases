@@ -1,4 +1,4 @@
-name: May iOS renders of a may-app commit (MayPlaygroundSnapshots, simulator, published only to may-app's parity/renders)
+name: May iOS renders of a may-app commit (MayPlaygroundSnapshots, simulator, published only to the private may-renders)
 on:
   workflow_dispatch:
     inputs:
@@ -28,8 +28,8 @@ jobs:
     # reviewer, main only). This repository is public and may-app is private: the render job holds no secret beyond
     # the two read-only deploy keys, which its fetch step alone binds and removes before may-app's code runs; it prints
     # counts alone and hands over one age-encrypted file (renders.py). The publish job, on a fresh runner that runs no
-    # may-app code, decrypts it and pushes it to may-app's own parity/renders branch (publish.py). Nothing derived
-    # from may-app is printed, summarised or uploaded here in the clear.
+    # may-app code, decrypts it and pushes it to the private repository May-Assistant/may-renders (publish.py). Nothing
+    # derived from may-app is printed, summarised or uploaded here in the clear.
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -94,6 +94,7 @@ jobs:
       - name: Encrypt the run folder to the renders public key
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
         run: python3 -I -S -B tools/may_release/renders.py seal --source-sha "$MAY_SOURCE_SHA"
       - name: Hand over only the encrypted renders
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -110,7 +111,7 @@ jobs:
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-renders-snapshots" "$RUNNER_TEMP/may-renders-out" "$RUNNER_TEMP/may-renders-sealed"
   publish:
-    # A fresh runner that runs no may-app code: the decrypt key, the may-app write key and the comment token each live
+    # A fresh runner that runs no may-app code: the decrypt key, the may-renders write key and the comment token each live
     # in one step of this job alone. It publishes whatever the render job sealed, even when that job then failed its
     # verdict, so the renders that were made can be seen.
     needs: [admission, render]
@@ -136,9 +137,10 @@ jobs:
       - name: Decrypt and check the renders
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
-          MAY_ARTIFACT_DECRYPT_KEY: ${{ secrets.MAY_ARTIFACT_DECRYPT_KEY }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
         run: python3 -I -S -B tools/may_release/publish.py open --source-sha "$MAY_SOURCE_SHA"
-      - name: Push the run folder to may-app's parity/renders branch
+      - name: Push the run folder to may-renders
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}

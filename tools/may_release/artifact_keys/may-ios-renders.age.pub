@@ -1,1 +1,0 @@
-PLACEHOLDER: Samuel replaces this whole file with the one-line age public key (age1...) printed by age-keygen for the iOS renders handoff (ios-renders.yml). Its private half goes in the may-ios-renders environment secret MAY_ARTIFACT_DECRYPT_KEY.

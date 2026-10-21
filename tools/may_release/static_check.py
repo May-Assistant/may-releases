@@ -929,7 +929,7 @@ def ios_rehearsal_print_problems(root):
 # May Playground's iOS renders (ios-renders.yml, renders.py, publish.py). The render job runs may-app's build and
 # snapshot tests, so it holds the PR read token in the pull request check alone and the two source-read keys in the
 # fetch alone, and every later step holds no secret and no GitHub token; it hands over one age-encrypted file, kept a
-# day. The publish job, a fresh Linux runner that runs no may-app code, binds the decrypt key, the may-app write key
+# day. The publish job, a fresh Linux runner that runs no may-app code, binds the decrypt key, the may-renders write key
 # and the comment token each in one step. Pinned whole: dispatch with exactly source_sha, pr_number and ds_sha,
 # read-only, its own concurrency group, nothing run but its commands, the one encrypted upload, and only the
 # conditions named here. renders.py and publish.py print only fixed lines, counts and the dispatch's own inputs.
@@ -968,11 +968,12 @@ RENDERS_DOWNLOAD = ("name: may-ios-renders-${{ github.run_attempt }}\n"
                     "          path: ${{ runner.temp }}/may-renders-download\n")
 RENDERS_CONDITIONS = ["if: inputs.pr_number != ''", "if: always()",
                       "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
-RENDERS_DECRYPT, RENDERS_WRITE = "MAY_ARTIFACT_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY"
+RENDERS_DECRYPT, RENDERS_WRITE = "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY"
 RENDERS_SECRETS = set(COMPILE_SECRETS) | {PR_READ_SECRET, PR_COMMENT_SECRET, RENDERS_DECRYPT, RENDERS_WRITE}
 RENDERS_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
                   ("MAY_DS_SHA", "${{ inputs.ds_sha }}")}
-RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+RENDERS_RECIPIENT = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
+RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}"), RENDERS_RECIPIENT} | \
     {(name, "${{ secrets." + name + " }}") for name in RENDERS_SECRETS}
 
 
@@ -1023,7 +1024,8 @@ def renders_workflow_problems(text):
     check = render.get("Check the pull request head and environment before fetching", "")
     fetch = render.get("Fetch the may-app commit and its design system quietly", "")
     decrypt = publish.get("Decrypt and check the renders", "")
-    push = publish.get("Push the run folder to may-app's parity/renders branch", "")
+    push = publish.get("Push the run folder to may-renders", "")
+    seal = render.get("Encrypt the run folder to the renders public key", "")
     post = publish.get("Link the renders on the may-app pull request", "")
     others = [chunk for job in ("render", "publish") for title, chunk in steps[job].items()
               if chunk not in (check, fetch, decrypt, push, post)]
@@ -1031,7 +1033,8 @@ def renders_workflow_problems(text):
             secrets_in(check) != {PR_READ_SECRET} or secrets_in(fetch) != set(COMPILE_SECRETS) or \
             secrets_in(decrypt) != {RENDERS_DECRYPT} or secrets_in(push) != {RENDERS_WRITE} or \
             secrets_in(post) != {PR_COMMENT_SECRET} or any(secrets_in(chunk) for chunk in others) or \
-            text.count("GH_TOKEN") != 2 or "GH_TOKEN" in fetch or \
+            text.count("GH_TOKEN") != 2 or "GH_TOKEN" in fetch or text.count("vars.") != 2 or \
+            RENDERS_RECIPIENT not in env_entries(seal) or RENDERS_RECIPIENT not in env_entries(decrypt) or \
             any(e not in RENDERS_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
                      "the decrypt key, the write key, the comment token (each in its one step) and the inputs")
@@ -1040,8 +1043,8 @@ def renders_workflow_problems(text):
     return found
 
 
-RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "others", "android", "rows", "len(stitched)"}
-PUBLISH_PRINT_VALUES = {"folder", "pngs", "BRANCH", "len(kept)", "len(removed)", "number"}
+RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)"}
+PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number"}
 
 
 def renders_print_problems(root):

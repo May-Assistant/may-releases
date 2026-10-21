@@ -656,30 +656,33 @@ No repository secret is needed.
 
 ### iOS renders of May Playground (parity with Android)
 
-`ios-renders.yml` renders May Playground in the simulator and publishes the images to may-app, never here. It runs on a may-app main commit, or on the current head of an open may-app pull request (`pr_number`). An optional `ds_sha` renders against another may-design-system commit, which must be in its `main` or `claude/may-integration` history. It runs on the same runner and Xcode as the iOS compile: `macos-15`, Xcode 26.3, an iPhone 16 Pro simulator, light and dark. It never signs anything.
+`ios-renders.yml` renders May Playground in the simulator and publishes the images to the private repository `May-Assistant/may-renders`, never here. It runs on a may-app main commit, or on the current head of an open may-app pull request (`pr_number`). An optional `ds_sha` renders against another may-design-system commit, which must be in its `main` or `claude/may-integration` history. It runs on the same runner and Xcode as the iOS compile: `macos-15`, Xcode 26.3, an iPhone 16 Pro simulator, light and dark. It never signs anything.
 
-This repository is public and may-app is private, and anyone signed in to GitHub can download a public repository's artifacts. So the images are never uploaded here in the clear, and the log shows only counts and fixed words. The workflow has three jobs:
+This repository is public and may-app is private, and anyone signed in to GitHub can download a public repository's artifacts. So the images are never uploaded here in the clear, and the log shows only counts and fixed words. The renders go to `may-renders`, not a may-app branch: may-app is on GitHub's free plan, where no branch can be protected, so a write deploy key there could push to its `main`. The workflow has three jobs:
 
 1. **admission** (`gate.py --action renders`) checks the inputs and the environment `may-ios-renders`, which allows main only and has no required reviewer.
 2. **render**, on macOS, holds no secret once may-app's code runs:
    - `prepare.py` fetches the commit with the two read-only deploy keys, which only that step holds.
-   - `renders.py run` builds with the pinned XcodeGen and runs `xcodebuild test` of `MayPlaygroundSnapshots`, with `MAY_SNAPSHOT_DIR` set to a private folder.
-   - `check` compares the PNGs with may-app's `docs/evidence/parity/screens.json` (rows of `{id, spec, ios, android, modes}`) and prints rendered against expected, per mode.
-   - `sheet` builds the contact sheet: `index.html` with Android and iOS side by side per row and mode, and one stitched PNG per row and mode from `stitch.swift`.
-   - `seal` age-encrypts the run folder to `artifact_keys/may-ios-renders.age.pub`. Only that encrypted file is uploaded, kept for one day.
-   - `verdict` then fails the job if the tests failed or a render is missing.
+   - `renders.py run` builds with the pinned XcodeGen and runs `xcodebuild test` of `MayPlaygroundSnapshots`, with `TEST_RUNNER_MAY_SNAPSHOT_DIR` set to a private folder. Each test writes `<id>-light.png` and `<id>-dark.png`, at 1179 × 2556.
+   - `check` compares the PNGs with may-app's `docs/evidence/parity/screens.json`, an array of `{id, title, spec, android: {light, dark}, ios: {light, dark}}` with paths relative to `docs/evidence/parity/`. Every row is expected in light and dark. It prints rendered against expected, per mode, and how many renders are not the 1179 × 2556 frame.
+   - `sheet` builds the run folder:
+     - `index.html`, with Android and iOS side by side per row and mode;
+     - one stitched PNG per row and mode, from `stitch.swift`;
+     - the manifest;
+     - `build.log`, the last 8 MB of the build and test log, for the may-app lane.
+   - `seal` age-encrypts the run folder to the environment variable `MAY_RENDERS_RECIPIENT`. Only that encrypted file is uploaded, kept for one day.
+   - `verdict` then fails the job if the build or tests failed or a render is missing. A failed build is still published first, with its log.
 3. **publish**, on a fresh Linux runner that runs no may-app code, has three steps, each holding one secret:
-   - `publish.py open` decrypts with `MAY_ARTIFACT_DECRYPT_KEY` and accepts only the run folder's fixed layout.
-   - `push` adds `parity/<may-app short sha>/` to may-app's `parity/renders` branch with `MAY_APP_RENDERS_WRITE_KEY`, keeping the newest 10 run folders. That branch has no history in common with main and is never merged, and it is never force-pushed.
-   - For a pull request, `comment` links the folder on it with `MAY_APP_PR_COMMENT_TOKEN`.
+   - `publish.py open` decrypts with `MAY_RENDERS_DECRYPT_KEY`, after checking it against `MAY_RENDERS_RECIPIENT`, and accepts only the run folder's fixed layout.
+   - `push` adds `<may-app short sha>/` to may-renders' `main` with `MAY_APP_RENDERS_WRITE_KEY`, a deploy key on may-renders alone. It lists the run folders in `runs.json` and keeps the newest 10, and it never force-pushes.
+   - For a pull request, `comment` links the run folder, contact sheet and log on it, using `MAY_APP_PR_COMMENT_TOKEN`.
 
-**Setup Samuel does before the first run:**
-- create `may-ios-renders`: main only, administrator bypass off, no required reviewer;
-- add `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_APP_PR_READ_TOKEN` and `MAY_APP_PR_COMMENT_TOKEN` to it;
-- add `MAY_APP_RENDERS_WRITE_KEY`, a new may-app deploy key with write access, ideally fenced by a may-app ruleset so that deploy keys can't update main;
-- generate an age key pair, commit the public line to `artifact_keys/may-ios-renders.age.pub`, and put the identity in `MAY_ARTIFACT_DECRYPT_KEY` in `may-ios-renders`.
+**Setup** in the environment `may-ios-renders` (main only, administrator bypass off, no required reviewer):
+- `MAY_APP_RENDERS_WRITE_KEY`: the deploy key `may-ios-renders`, with write access on may-renders only;
+- `MAY_RENDERS_DECRYPT_KEY`, and the variable `MAY_RENDERS_RECIPIENT`: its age key pair;
+- copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_APP_PR_READ_TOKEN` and `MAY_APP_PR_COMMENT_TOKEN`.
 
-Until the public key is committed, the workflow renders and counts, seals nothing and publishes nothing, and says so. Without the write key it pushes nothing, and without the comment token it posts nothing.
+Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing and publishes nothing, and says so. Without the write key it pushes nothing, and without the comment token it posts nothing.
 
 ### Prerequisites that remain
 

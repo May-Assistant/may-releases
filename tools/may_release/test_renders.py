@@ -33,6 +33,7 @@ FOLDER = SHA[:12]
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/ios-renders.yml"
 RECIPIENT = "age1" + "q" * 58
+FRAME = renders.FRAME
 
 
 def png(width=4, height=8):
@@ -51,11 +52,13 @@ class Workspace:
         manifest = self.source / renders.MANIFEST
         manifest.parent.mkdir(parents=True)
         self.rows = rows if rows is not None else [
-            {"id": "chat-reply", "spec": "docs/design/chat.md <b>", "ios": "ChatReply",
-             "android": "android/app/src/test/snapshots/chat-reply-{mode}.png", "modes": ["light", "dark"]},
-            {"id": "sign-in", "spec": "Sign in", "ios": "SignIn", "android": None, "modes": ["light"]}]
-        manifest.write_text(json.dumps({"screens": self.rows}))
-        android = self.source / "android/app/src/test/snapshots"
+            {"id": "chat-reply", "title": "Chat reply <b>", "spec": "docs/design/chat.md",
+             "android": {"light": "android/chat-reply-light.png", "dark": "android/chat-reply-dark.png"},
+             "ios": {"light": "ios/chat-reply-light.png", "dark": None}},
+            {"id": "sign-in", "title": "Sign in", "spec": "docs/design/sign-in.md",
+             "android": {"light": None, "dark": None}, "ios": {"light": None, "dark": None}}]
+        manifest.write_text(json.dumps(self.rows))
+        android = self.source / renders.EVIDENCE / "android"
         android.mkdir(parents=True)
         for mode in ("light", "dark"):
             (android / f"chat-reply-{mode}.png").write_bytes(png(3, 3))
@@ -207,9 +210,9 @@ class ManifestAndCountTests(unittest.TestCase):
     def test_rows_are_checked_against_fixed_shapes(self):
         self.assertEqual([row["id"] for row in renders.manifest_rows(self.work.source)], ["chat-reply", "sign-in"])
         good = dict(self.work.rows[0])
-        for change in ({"id": "Chat Reply"}, {"ios": "../x"}, {"android": "../../etc/passwd.png"},
-                       {"android": "/abs/path.png"}, {"android": "x.jpg"}, {"modes": ["light", "sepia"]},
-                       {"modes": []}, {"spec": ""}):
+        for change in ({"id": "Chat Reply"}, {"ios": {"light": "../x.png"}}, {"android": {"light": "../../etc/passwd.png"}},
+                       {"android": {"light": "/abs/path.png"}}, {"android": {"light": "x.jpg"}},
+                       {"android": {"sepia": "a.png"}}, {"android": "a.png"}, {"title": ""}, {"spec": 7}):
             with self.subTest(change=change):
                 (self.work.source / renders.MANIFEST).write_text(json.dumps([dict(good, **change)]))
                 with self.assertRaises(RendersError):
@@ -219,20 +222,21 @@ class ManifestAndCountTests(unittest.TestCase):
             renders.manifest_rows(self.work.source)
 
     def test_counts_are_printed_and_nothing_from_may_app(self):
-        self.work.snapshot("ChatReply-light.png", "SignIn-light.png", "stray.png")
-        (self.work.snapshots / "ChatReply-dark.png").write_bytes(b"not a png")
+        self.work.snapshot("chat-reply-light.png", "sign-in-light.png", "stray.png")
+        (self.work.snapshots / "sign-in-light.png").write_bytes(png(*FRAME))
+        (self.work.snapshots / "chat-reply-dark.png").write_bytes(b"not a png")
         with patch.dict(os.environ, self.work.env, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
             renders.check(SHA)
-        self.assertEqual(out.getvalue().strip(), "May iOS renders: 2 of 3 expected renders made (light 2 of 2, dark 0 "
-                                                 "of 1); 1 other files in the snapshot folder, not published; Android "
-                                                 "renders found for 2 of 3")
-        for leak in ("chat", "Chat", "sign", "docs/design", "android/app"):
+        self.assertEqual(out.getvalue().strip(), "May iOS renders: 2 of 4 expected renders made (light 2 of 2, dark 0 "
+                                                 "of 2); 1 not the 1179 x 2556 frame; 1 other files in the snapshot "
+                                                 "folder, not published; Android renders found for 2 of 4")
+        for leak in ("chat", "Chat", "sign", "docs/design", "android/"):
             self.assertNotIn(leak, out.getvalue())
 
     def test_an_android_path_out_of_the_checkout_is_not_used(self):
         outside = self.work.root / "outside.png"
         outside.write_bytes(png())
-        link = self.work.source / "android/app/src/test/snapshots/chat-reply-light.png"
+        link = self.work.source / renders.EVIDENCE / "android/chat-reply-light.png"
         link.unlink()
         link.symlink_to(outside)
         self.assertIsNone(renders.android_render(self.work.source, renders.manifest_rows(self.work.source)[0], "light"))
@@ -242,7 +246,8 @@ class ManifestAndCountTests(unittest.TestCase):
 class SheetSealVerdictTests(unittest.TestCase):
     def setUp(self):
         self.work = Workspace()
-        self.work.snapshot("ChatReply-light.png", "ChatReply-dark.png", "SignIn-light.png")
+        self.work.snapshot("chat-reply-light.png", "chat-reply-dark.png", "sign-in-light.png", "sign-in-dark.png")
+        (self.work.private / "ios-renders.log").write_text("Compiling MayPlaygroundSnapshots\n" * 3)
         with patch.dict(os.environ, self.work.env, clear=True), patch("sys.stdout", new_callable=io.StringIO):
             renders.check(SHA)
 
@@ -257,29 +262,31 @@ class SheetSealVerdictTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.work.env, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
             renders.sheet(SHA, DS, build_stitcher=lambda private, log: Path("/fake/stitch"), tool=stitch)
-        return self.work.root / renders.OUT / "parity" / FOLDER, out.getvalue()
+        return self.work.root / renders.OUT / FOLDER, out.getvalue()
 
     def test_the_contact_sheet_holds_every_row_and_escapes_may_app_text(self):
         out, printed = self.sheet()
-        self.assertEqual(printed.strip(), "May iOS renders: contact sheet of 3 rows, 2 stitched side by side")
+        self.assertEqual(printed.strip(), "May iOS renders: contact sheet of 4 rows, 2 stitched side by side")
         self.assertEqual(sorted(p.relative_to(out).as_posix() for p in out.rglob("*.png")), [
             "android/chat-reply-dark.png", "android/chat-reply-light.png", "ios/chat-reply-dark.png",
-            "ios/chat-reply-light.png", "ios/sign-in-light.png", "sheet/chat-reply-dark.png",
+            "ios/chat-reply-light.png", "ios/sign-in-dark.png", "ios/sign-in-light.png", "sheet/chat-reply-dark.png",
             "sheet/chat-reply-light.png"])
         page = (out / "index.html").read_text()
-        self.assertIn("docs/design/chat.md &lt;b&gt;", page)
+        self.assertIn("Chat reply &lt;b&gt;", page)
         self.assertNotIn("<b>", page)
         self.assertIn('<img src="ios/sign-in-light.png" alt="iOS">', page)
-        self.assertEqual(json.loads((out / "screens.json").read_text())["screens"][0]["id"], "chat-reply")
+        self.assertEqual(json.loads((out / "screens.json").read_text())[0]["id"], "chat-reply")
+        self.assertTrue((out / "build.log").is_file(), "the build log is in the run folder")
+        self.assertEqual((out / "build.log").read_text(), "Compiling MayPlaygroundSnapshots\n" * 3)
         self.assertNotIn("chat", printed)
 
     def test_a_failed_stitch_or_a_linked_render_is_left_out(self):
         outside = self.work.root / "outside.png"
         outside.write_bytes(png())
-        (self.work.snapshots / "SignIn-light.png").unlink()
-        (self.work.snapshots / "SignIn-light.png").symlink_to(outside)
+        (self.work.snapshots / "sign-in-light.png").unlink()
+        (self.work.snapshots / "sign-in-light.png").symlink_to(outside)
         out, printed = self.sheet(stitch_ok=False)
-        self.assertEqual(printed.strip(), "May iOS renders: contact sheet of 3 rows, 0 stitched side by side")
+        self.assertEqual(printed.strip(), "May iOS renders: contact sheet of 4 rows, 0 stitched side by side")
         self.assertFalse((out / "ios/sign-in-light.png").exists())
         self.assertEqual(list((out / "sheet").iterdir()), [])
 
@@ -289,11 +296,14 @@ class SheetSealVerdictTests(unittest.TestCase):
             Path(argv[argv.index("-o") + 1]).write_bytes(b"sealed to nobody")
             return subprocess.CompletedProcess(argv, 0)
 
-        with patch.dict(os.environ, self.work.env, clear=True), patch("renders.artifact_recipient", return_value=None), \
+        with patch.dict(os.environ, self.work.env, clear=True), \
                 patch("renders.toolchain.tool_path", return_value="/fake/age"), \
                 patch("renders.subprocess.run", side_effect=age), patch("sys.stdout", new_callable=io.StringIO) as out:
-            renders.seal(SHA)
-        self.assertIn("still a placeholder; nothing was sealed", out.getvalue())
+            try:
+                renders.seal(SHA)
+            except RendersError as error:
+                self.fail("an unset recipient is reported, not refused: " + error.args[0])
+        self.assertIn("MAY_RENDERS_RECIPIENT is not set in may-ios-renders; nothing was sealed", out.getvalue())
         self.assertFalse((self.work.root / renders.SEALED).exists())
 
     def test_seal_encrypts_one_tar_of_the_run_folder_and_keeps_no_plaintext(self):
@@ -307,13 +317,14 @@ class SheetSealVerdictTests(unittest.TestCase):
             Path(argv[argv.index("-o") + 1]).write_bytes(b"age-encryption.org/v1 fixture")
             return subprocess.CompletedProcess(argv, 0)
 
-        with patch.dict(os.environ, self.work.env, clear=True), patch("renders.artifact_recipient", return_value=RECIPIENT), \
+        with patch.dict(os.environ, dict(self.work.env, MAY_RENDERS_RECIPIENT=RECIPIENT), clear=True), \
                 patch("renders.toolchain.tool_path", return_value="/fake/age"), \
                 patch("renders.subprocess.run", side_effect=age), patch("sys.stdout", new_callable=io.StringIO):
             renders.seal(SHA)
         self.assertEqual(seen["argv"][:3], ["/fake/age", "-r", RECIPIENT])
-        self.assertIn(f"parity/{FOLDER}/index.html", seen["names"])
-        self.assertTrue(all(n == "parity" or n.startswith(f"parity/{FOLDER}") for n in seen["names"]))
+        self.assertIn(f"{FOLDER}/index.html", seen["names"])
+        self.assertIn(f"{FOLDER}/build.log", seen["names"])
+        self.assertTrue(all(n == FOLDER or n.startswith(FOLDER + "/") for n in seen["names"]))
         self.assertEqual(sorted(p.name for p in (self.work.root / renders.SEALED).iterdir()), ["renders.age"])
 
     def test_verdict(self):
@@ -355,10 +366,9 @@ def tar_of(entries):
     return stream.getvalue()
 
 
-GOOD = [("parity", None, "dir"), (f"parity/{FOLDER}", None, "dir"), (f"parity/{FOLDER}/ios", None, "dir"),
-        (f"parity/{FOLDER}/ios/chat-reply-light.png", png(), "file"),
-        (f"parity/{FOLDER}/screens.json", b'{"screens": []}', "file"),
-        (f"parity/{FOLDER}/index.html", b"<!doctype html><img src='ios/chat-reply-light.png'>", "file")]
+GOOD = [(FOLDER, None, "dir"), (f"{FOLDER}/ios", None, "dir"), (f"{FOLDER}/ios/chat-reply-light.png", png(), "file"),
+        (f"{FOLDER}/screens.json", b"[]", "file"), (f"{FOLDER}/build.log", b"log", "file"),
+        (f"{FOLDER}/index.html", b"<!doctype html><img src='ios/chat-reply-light.png'>", "file")]
 
 
 class PublishOpenTests(unittest.TestCase):
@@ -381,18 +391,19 @@ class PublishOpenTests(unittest.TestCase):
 
     def test_only_the_run_folder_layout_is_extracted(self):
         tree = self.extract(GOOD)
-        self.assertEqual((tree / f"parity/{FOLDER}/ios/chat-reply-light.png").read_bytes(), png())
+        self.assertEqual((tree / f"{FOLDER}/ios/chat-reply-light.png").read_bytes(), png())
+        self.assertEqual((tree / f"{FOLDER}/build.log").read_bytes(), b"log")
         bad = {
-            "other folder": GOOD + [("parity/bbbbbbbbbbbb", None, "dir")],
-            "escape": GOOD + [(f"parity/{FOLDER}/../../x.png", png(), "file")],
-            "unknown kind": GOOD + [(f"parity/{FOLDER}/logs", None, "dir")],
-            "not a png name": GOOD + [(f"parity/{FOLDER}/ios/run.sh", b"x", "file")],
-            "symlink": GOOD + [(f"parity/{FOLDER}/ios/link.png", None, "sym")],
+            "other folder": GOOD + [("bbbbbbbbbbbb", None, "dir")],
+            "escape": GOOD + [(f"{FOLDER}/../../x.png", png(), "file")],
+            "unknown kind": GOOD + [(f"{FOLDER}/logs", None, "dir")],
+            "not a png name": GOOD + [(f"{FOLDER}/ios/run.sh", b"x", "file")],
+            "symlink": GOOD + [(f"{FOLDER}/ios/link.png", None, "sym")],
             "no sheet": [e for e in GOOD if not e[0].endswith("index.html")],
-            "orphan file": GOOD + [(f"parity/{FOLDER}/sheet/a.png", png(), "file")],
-            "not a png": GOOD + [(f"parity/{FOLDER}/ios/fake.png", b"GIF89a", "file")],
+            "orphan file": GOOD + [(f"{FOLDER}/sheet/a.png", png(), "file")],
+            "not a png": GOOD + [(f"{FOLDER}/ios/fake.png", b"GIF89a", "file")],
             "script": [e for e in GOOD if not e[0].endswith("index.html")] +
-                      [(f"parity/{FOLDER}/index.html", b"<script>alert(1)</script>", "file")],
+                      [(f"{FOLDER}/index.html", b"<script>alert(1)</script>", "file")],
         }
         for label, entries in bad.items():
             with self.subTest(label=label):
@@ -405,10 +416,10 @@ class PublishOpenTests(unittest.TestCase):
                 self.fail(f"{label}: extracted")
 
     def test_nothing_sealed_publishes_nothing(self):
-        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_ARTIFACT_DECRYPT_KEY": "x"}, clear=True), \
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_RENDERS_DECRYPT_KEY": "x"}, clear=True), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             publish.open_renders(SHA)
-            self.assertNotIn("MAY_ARTIFACT_DECRYPT_KEY", os.environ)
+            self.assertNotIn("MAY_RENDERS_DECRYPT_KEY", os.environ)
         self.assertEqual(out.getvalue().strip(), "May iOS renders: no sealed renders from this run attempt; nothing will "
                                                  "be published")
 
@@ -422,13 +433,12 @@ class PublishOpenTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, b"age1" + b"p" * 58 + b"\n", b"")
 
         key = "AGE-SECRET-KEY-1" + "Q" * 58
-        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_ARTIFACT_DECRYPT_KEY": key}, clear=True), \
-                patch("publish.artifact_recipient", return_value=RECIPIENT), \
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_RENDERS_DECRYPT_KEY": key,
+                                     "MAY_RENDERS_RECIPIENT": RECIPIENT}, clear=True), \
                 patch("publish.toolchain.tool_path", side_effect=lambda tool, name: "/fake/" + name), \
                 patch("publish.subprocess.run", side_effect=age), self.assertRaises(PublishError) as refused:
             publish.open_renders(SHA)
-        self.assertEqual(refused.exception.args[0], "The renders decryption key does not match the committed renders "
-                                                    "public key")
+        self.assertEqual(refused.exception.args[0], "The renders decryption key does not match MAY_RENDERS_RECIPIENT")
         self.assertEqual([argv[0] for argv in calls], ["/fake/age-keygen"])
         self.assertFalse(any(p.name.endswith(".key") for p in self.root.rglob("*")))
 
@@ -439,7 +449,7 @@ class PublishPushTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
-        tree = self.root / publish.TREE / "parity" / FOLDER
+        tree = self.root / publish.TREE / FOLDER
         (tree / "ios").mkdir(parents=True)
         (tree / "index.html").write_text("<!doctype html>")
         (tree / "ios" / "a.png").write_bytes(png())
@@ -455,11 +465,10 @@ class PublishPushTests(unittest.TestCase):
             if argv[0] == "init":
                 Path(argv[-1]).mkdir()
             if argv[0] == "checkout" and existing_runs is not None:
-                (work / "parity").mkdir(exist_ok=True)
-                (work / "parity" / "runs.json").write_text(json.dumps(existing_runs))
+                (work / "runs.json").write_text(json.dumps(existing_runs))
                 for run in existing_runs:
-                    (work / "parity" / run["folder"]).mkdir(exist_ok=True)
-            return b"abc\trefs/heads/parity/renders\n" if branch_exists and argv[0] == "ls-remote" else b""
+                    (work / run["folder"]).mkdir(exist_ok=True)
+            return b"abc\trefs/heads/main\n" if branch_exists and argv[0] == "ls-remote" else b""
 
         environ = {"RUNNER_TEMP": str(self.root), "MAY_APP_RENDERS_WRITE_KEY": self.KEY, "GITHUB_RUN_ID": "123"}
         environ.update(env or {})
@@ -469,27 +478,29 @@ class PublishPushTests(unittest.TestCase):
             self.assertNotIn("MAY_APP_RENDERS_WRITE_KEY", os.environ)
         return calls, work, out.getvalue()
 
-    def test_pushes_only_the_renders_branch_and_never_by_force(self):
+    def test_pushes_only_may_renders_main_and_never_by_force(self):
         runs = [{"folder": "%012x" % n} for n in range(1, 11)]
         calls, work, out = self.push(existing_runs=runs)
         pushes = [argv for argv in calls if argv[0] == "push"]
-        self.assertEqual(pushes, [["push", "--quiet", "origin", "HEAD:refs/heads/parity/renders"]])
+        self.assertEqual(pushes, [["push", "--quiet", "origin", "HEAD:refs/heads/main"]])
+        self.assertIn(["remote", "add", "origin", "git@github.com:May-Assistant/may-renders.git"], calls)
         self.assertFalse(any("--force" in argv or "-f" in argv or any(a.startswith("+") for a in argv[1:])
                              for argv in calls if argv[0] == "push"))
-        kept = json.loads((work / "parity" / "runs.json").read_text())
+        kept = json.loads((work / "runs.json").read_text())
         self.assertEqual([run["folder"] for run in kept], [FOLDER] + ["%012x" % n for n in range(1, 10)])
         self.assertEqual(kept[0], {"folder": FOLDER, "source_sha": SHA, "pull": 42, "run": "123"})
-        self.assertIn(["rm", "-r", "-q", "--ignore-unmatch", "parity/" + "%012x" % 10], calls)
-        self.assertTrue((work / "parity" / FOLDER / "ios" / "a.png").is_file())
-        self.assertEqual(out.strip(), f"May iOS renders published to may-app's parity/renders branch as parity/{FOLDER}/ "
-                                      "(10 run folders kept, 1 removed)")
+        self.assertIn(["rm", "-r", "-q", "--ignore-unmatch", "--", "%012x" % 10], calls)
+        self.assertFalse((work / ("%012x" % 10)).exists())
+        self.assertTrue((work / FOLDER / "ios" / "a.png").is_file())
+        self.assertEqual(out.strip(), f"May iOS renders published to may-renders as {FOLDER}/ (10 run folders kept, "
+                                      "1 removed)")
         self.assertFalse(any(p.name.endswith(".key") or p.name == "known_hosts" for p in self.root.rglob("*")))
 
-    def test_the_branch_is_created_with_no_history_when_absent(self):
+    def test_main_is_created_when_may_renders_is_empty(self):
         calls, work, _ = self.push(branch_exists=False)
         self.assertIn(["checkout", "-q", "--orphan", "renders"], calls)
         self.assertFalse(any(argv[0] == "fetch" for argv in calls))
-        self.assertIn("never merged", (work / "README.md").read_text())
+        self.assertIn("never by hand", (work / "README.md").read_text())
 
     def test_without_the_key_nothing_is_pushed(self):
         calls, _, out = self.push(env={"MAY_APP_RENDERS_WRITE_KEY": None})
@@ -509,7 +520,7 @@ class PublishCommentTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
-        tree = self.root / publish.TREE / "parity" / FOLDER / "ios"
+        tree = self.root / publish.TREE / FOLDER / "ios"
         tree.mkdir(parents=True)
         (tree / "a.png").write_bytes(png())
 
@@ -541,7 +552,8 @@ class PublishCommentTests(unittest.TestCase):
         calls, out, error = self.comment()
         self.assertIsNone(error)
         body = [payload for method, _, payload in calls if method == "POST"][0]["body"]
-        self.assertIn(f"https://github.com/May-Assistant/may-app/tree/parity/renders/parity/{FOLDER}", body)
+        self.assertIn(f"https://github.com/May-Assistant/may-renders/tree/main/{FOLDER}", body)
+        self.assertIn(f"https://github.com/May-Assistant/may-renders/blob/main/{FOLDER}/build.log", body)
         self.assertIn(f"<!-- may-ios-renders head={SHA} -->", body)
         self.assertIn("1 images", body)
         self.assertEqual(out.strip(), "May iOS renders linked on may-app #42")
@@ -589,7 +601,7 @@ class WorkflowPinTests(unittest.TestCase):
 
     def test_each_publish_secret_is_in_its_own_step(self):
         write = "          MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}\n"
-        decrypt = "          MAY_ARTIFACT_DECRYPT_KEY: ${{ secrets.MAY_ARTIFACT_DECRYPT_KEY }}\n"
+        decrypt = "          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}\n"
         moved = self.text.replace(write, "").replace(decrypt, decrypt + write)
         self.assertTrue(any("a secret or env entry other than" in p
                             for p in static_check.renders_workflow_problems(moved)))
@@ -622,9 +634,18 @@ class SecretNameTests(unittest.TestCase):
         with patch.dict(os.environ, {"MAY_APP_RENDERS_WRITE_KEY": "x"}, clear=True), self.assertRaises(store.StoreError):
             store.require_step_secrets(store.SOURCE_READ_SECRETS)
 
-    def test_the_renders_public_key_is_a_placeholder_until_samuel_commits_it(self):
-        self.assertIsNone(gate.artifact_recipient("may-ios-renders"))
-        self.assertTrue((gate.ARTIFACT_KEYS / "may-ios-renders.age.pub").read_text().startswith("PLACEHOLDER"))
+    def test_the_decrypt_key_is_refused_by_every_other_step(self):
+        self.assertIn("MAY_RENDERS_DECRYPT_KEY", store.SECRET_NAMES)
+        self.assertNotIn("may-ios-renders.age.pub", [p.name for p in gate.ARTIFACT_KEYS.iterdir()])
+
+    def test_the_recipient_reaches_only_the_seal_and_the_decrypt(self):
+        text = (ROOT / WORKFLOW).read_text()
+        line = "          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n"
+        step = "      - name: Run the snapshot tests in the simulator without any credential\n        env:\n"
+        self.assertEqual(text.count(step), 1)
+        moved = text.replace(line, "", 1).replace(step, step + line)
+        self.assertTrue(any("a secret or env entry other than" in p
+                            for p in static_check.renders_workflow_problems(moved)))
 
 
 if __name__ == "__main__":

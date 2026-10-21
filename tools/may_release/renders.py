@@ -2,29 +2,31 @@
 
 This repository is public and may-app is private, so nothing derived from may-app is printed, summarised or
 uploaded in the clear. The public log carries counts and fixed words only. The renders, may-app's manifest of
-screens, and the contact sheet built from them leave this runner only as one age-encrypted file
-(artifact_keys/may-ios-renders.age.pub); the publish job decrypts it on a fresh runner that has run no may-app code,
-and pushes it to may-app's own parity/renders branch (publish.py).
+screens, the contact sheet built from them and the build log leave this runner only as one age-encrypted file, to
+the environment's public key (the variable MAY_RENDERS_RECIPIENT). The publish job decrypts it on a fresh runner that
+has run no may-app code, and pushes it to the private repository May-Assistant/may-renders (publish.py).
 
 Commands, each a step of the render job, none holding a secret (the build and the snapshot tests run may-app's own
 code, so this runner never holds a write key or a decrypt key):
 
 - run: XcodeGen (the pinned release, hash-checked, as compile.py) and `xcodebuild test` of MayPlaygroundSnapshots on
-  an iPhone 16 Pro simulator (found, or created on the newest iOS runtime), with MAY_SNAPSHOT_DIR (and
-  TEST_RUNNER_MAY_SNAPSHOT_DIR, which xcodebuild passes to the test process) set to a private folder. The test
-  outcome is recorded privately; a failed test does not fail this step, so the renders that were made are still
+  an iPhone 16 Pro simulator (found, or created on the newest iOS runtime), with TEST_RUNNER_MAY_SNAPSHOT_DIR (which
+  xcodebuild passes to the test process as MAY_SNAPSHOT_DIR) set to a private folder. The test outcome is recorded
+  privately; a failed build or test does not fail this step, so its log and the renders that were made are still
   published, and `verdict` fails the job afterwards.
-- check: reads may-app's manifest (MANIFEST: rows of {id, spec, ios, android, modes}), checks it and every PNG
-  against fixed shapes, and prints rendered against expected, per mode.
-- sheet: the contact sheet: one HTML page (Android | iOS per manifest row and mode) and one stitched PNG per row
-  and mode where both renders exist, stitched by stitch.swift (CoreGraphics), compiled here with the pinned Xcode.
-- seal: one tar of the run folder (parity/<may-app short sha>/), encrypted to the committed renders public key. With
-  that key still a placeholder it seals nothing, says so, and the publish job has nothing to publish.
-- verdict: fails the job if the snapshot tests failed or any expected render is missing.
+- check: reads may-app's manifest (MANIFEST: rows of {id, title, spec, android: {light, dark}, ios: {light, dark}},
+  paths relative to EVIDENCE), checks it and every PNG against fixed shapes, and prints rendered against expected
+  (every row in light and dark), per mode, and how many are not the 1179 x 2556 frame.
+- sheet: the run folder: the contact sheet (one HTML page, Android | iOS per row and mode), one stitched PNG per row
+  and mode where both renders exist (stitch.swift, CoreGraphics, compiled here with the pinned Xcode), the manifest,
+  and the tail of the build log.
+- seal: one tar of the run folder (<may-app short sha>/), encrypted to MAY_RENDERS_RECIPIENT. Without that variable it
+  seals nothing, says so, and the publish job has nothing to publish.
+- verdict: fails the job if the build or the snapshot tests failed or any expected render is missing.
 
-Interface with may-app (N's snapshot target): each expected render is MAY_SNAPSHOT_DIR/<ios>-<mode>.png, and each
-row's Android render is the repository path in `android`, with "{mode}" replaced by the mode. Both are taken from
-the manifest and checked; nothing else in the snapshot folder is published.
+Interface with may-app (N's snapshot target, M's manifest): each expected render is <snapshot folder>/<id>-<mode>.png;
+each row's Android render is EVIDENCE/<android[mode]>. Both are checked; nothing else in the snapshot folder is
+published.
 """
 
 import argparse
@@ -45,22 +47,24 @@ import tarfile
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import compile as native
-from gate import artifact_recipient
+from gate import AGE_RECIPIENT
 from store import StoreError, child_env, require_step_secrets, write_private
 import toolchain
 
-ENVIRONMENT = "may-ios-renders"
+RECIPIENT = "MAY_RENDERS_RECIPIENT"
 SCHEME = "MayPlaygroundSnapshots"
 DEVICE = "iPhone 16 Pro"
 DEVICE_TYPE = "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro"
 IOS_RUNTIME = re.compile(r"com\.apple\.CoreSimulator\.SimRuntime\.iOS-(\d{1,3})-(\d{1,3})")
 UDID = re.compile(r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}")
 XCODE = Path("/Applications/Xcode_26.3.app/Contents/Developer")
-MANIFEST = "docs/evidence/parity/screens.json"
+EVIDENCE = "docs/evidence/parity"
+MANIFEST = EVIDENCE + "/screens.json"
+FRAME = (1179, 2556)
 MODES = ("light", "dark")
 SCREEN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
-IOS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
-ANDROID_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./{}-]{0,239}")
+EVIDENCE_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,239}\.png")
+MAX_LOG = 8 * 1024 * 1024
 MAX_SCREENS = 300
 MAX_MANIFEST = 256 * 1024
 MAX_PNG = 20 * 1024 * 1024
@@ -202,6 +206,20 @@ def png_size(path):
     return (width, height) if 0 < width <= MAX_SIDE and 0 < height <= MAX_SIDE else None
 
 
+def evidence_paths(value, what):
+    """A row's {light, dark} paths (each a relative PNG path inside EVIDENCE, or null)."""
+    if not isinstance(value, dict) or set(value) - set(MODES):
+        raise RendersError("A screens manifest row's " + what + " paths are malformed")
+    paths = {}
+    for mode in MODES:
+        path = value.get(mode)
+        if path is not None and not (isinstance(path, str) and EVIDENCE_PATH.fullmatch(path) and
+                                     ".." not in path.split("/")):
+            raise RendersError("A screens manifest row's " + what + " paths are malformed")
+        paths[mode] = path
+    return paths
+
+
 def manifest_rows(source):
     """may-app's manifest of screens, every field checked against a fixed shape; refuses anything else."""
     path = source / MANIFEST
@@ -218,29 +236,24 @@ def manifest_rows(source):
     for row in rows:
         if not isinstance(row, dict):
             raise RendersError("A screens manifest row is not an object")
-        screen, spec, ios, android, modes = (row.get(k) for k in ("id", "spec", "ios", "android", "modes"))
+        screen, title, spec = row.get("id"), row.get("title"), row.get("spec")
         if not (isinstance(screen, str) and SCREEN_ID.fullmatch(screen)) or screen in ids:
             raise RendersError("A screens manifest id is malformed or repeated")
-        if not (isinstance(ios, str) and IOS_NAME.fullmatch(ios)):
-            raise RendersError("A screens manifest iOS name is malformed")
-        if not (isinstance(spec, str) and 0 < len(spec) <= 300):
-            raise RendersError("A screens manifest spec is malformed")
-        if android is not None and not (isinstance(android, str) and ANDROID_PATH.fullmatch(android) and
-                                        ".." not in android.split("/") and android.endswith(".png")):
-            raise RendersError("A screens manifest Android path is malformed")
-        if not (isinstance(modes, list) and modes and len(set(modes)) == len(modes) and
-                all(mode in MODES for mode in modes)):
-            raise RendersError("A screens manifest row's modes are malformed")
+        if not (isinstance(title, str) and 0 < len(title) <= 200) or \
+                not (spec is None or isinstance(spec, str) and len(spec) <= 300):
+            raise RendersError("A screens manifest title or spec is malformed")
         ids.add(screen)
-        checked.append({"id": screen, "spec": spec, "ios": ios, "android": android, "modes": list(modes)})
+        checked.append({"id": screen, "title": title, "spec": spec or "",
+                        "android": evidence_paths(row.get("android"), "Android"),
+                        "ios": evidence_paths(row.get("ios", {}), "iOS")})
     return checked
 
 
 def android_render(source, row, mode):
     """The row's Android render for a mode, inside the checkout and a valid PNG; else None."""
-    if not row["android"]:
+    if not row["android"][mode]:
         return None
-    path = source / PurePosixPath(row["android"].replace("{mode}", mode))
+    path = source / EVIDENCE / PurePosixPath(row["android"][mode])
     try:
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -256,30 +269,31 @@ def check(sha):
     root, source, private = root_dirs()
     rows = manifest_rows(source)
     snapshots = root / SNAPSHOTS
-    expected, rendered, android, per_mode = [], [], 0, {mode: [0, 0] for mode in MODES}
+    expected, rendered, android, wrong, per_mode = [], [], 0, 0, {mode: [0, 0] for mode in MODES}
     for row in rows:
-        for mode in row["modes"]:
-            name = f"{row['ios']}-{mode}.png"
-            entry = {"id": row["id"], "mode": mode, "ios": name, "rendered": png_size(snapshots / name) is not None,
-                     "android": None}
+        for mode in MODES:
+            name = f"{row['id']}-{mode}.png"
+            size = png_size(snapshots / name)
+            entry = {"id": row["id"], "mode": mode, "ios": name, "rendered": size is not None, "android": None}
             found = android_render(source, row, mode)
             if found is not None:
                 entry["android"] = str(found)
                 android += 1
             expected.append(entry)
             per_mode[mode][1] += 1
-            if entry["rendered"]:
+            if size is not None:
                 rendered.append(entry)
                 per_mode[mode][0] += 1
+                wrong += size != FRAME
     names = {entry["ios"] for entry in expected}
     try:
         others = sum(1 for path in snapshots.iterdir() if path.name not in names) if snapshots.is_dir() else 0
     except OSError:
         others = 0
     write_private(private / CHECKED, json.dumps({"rows": rows, "expected": expected}).encode())
-    modes = ", ".join(f"{mode} {per_mode[mode][0]} of {per_mode[mode][1]}" for mode in MODES if per_mode[mode][1])
+    modes = ", ".join(f"{mode} {per_mode[mode][0]} of {per_mode[mode][1]}" for mode in MODES)
     print(f"May iOS renders: {len(rendered)} of {len(expected)} expected renders made ({modes}); "
-          f"{others} other files in the snapshot folder, not published; "
+          f"{wrong} not the 1179 x 2556 frame; {others} other files in the snapshot folder, not published; "
           f"Android renders found for {android} of {len(expected)}")
 
 
@@ -304,6 +318,7 @@ def page(sha, ds_sha, rows, expected, stitched):
              f"<h1>May parity renders, may-app {html.escape(sha)}</h1>",
              f"<p>Design system: {html.escape(ds_sha) if ds_sha else 'may-app pin'}. "
              f"Device: {DEVICE}, light and dark.</p>",
+             '<p><a href="build.log">Build and test log</a> (its last 8 MB).</p>',
              "<table><tr><th>Screen</th><th>Mode</th><th>Android</th><th>iOS</th></tr>"]
     for row in rows:
         for entry in by_row.get(row["id"], []):
@@ -311,7 +326,8 @@ def page(sha, ds_sha, rows, expected, stitched):
             android = f'<img src="android/{key}.png" alt="Android">' if entry["android"] else "missing"
             ios = f'<img src="ios/{key}.png" alt="iOS">' if entry["rendered"] else "missing"
             sheet = f'<br><a href="sheet/{key}.png">side by side</a>' if key in stitched else ""
-            parts.append(f"<tr><td>{html.escape(row['id'])}<br><small>{html.escape(row['spec'])}</small>{sheet}</td>"
+            parts.append(f"<tr><td>{html.escape(row['title'])}<br><small>{html.escape(row['id'])} "
+                         f"{html.escape(row['spec'])}</small>{sheet}</td>"
                          f"<td>{html.escape(entry['mode'])}</td><td>{android}</td><td>{ios}</td></tr>")
     parts.append("</table>")
     return "\n".join(parts) + "\n"
@@ -334,7 +350,7 @@ def sheet(sha, ds_sha=None, build_stitcher=stitcher, tool=quiet):
         raise RendersError("Design-system SHA is not an exact lowercase commit SHA")
     root, source, private = root_dirs()
     record = checked_record(private)
-    out = root / OUT / "parity" / folder
+    out = root / OUT / folder
     out.mkdir(parents=True, mode=0o700)
     for name in ("ios", "android", "sheet"):
         (out / name).mkdir(mode=0o700)
@@ -363,7 +379,16 @@ def sheet(sha, ds_sha=None, build_stitcher=stitcher, tool=quiet):
                 stitched.add(key)
             else:
                 (out / "sheet" / (key + ".png")).unlink(missing_ok=True)
-    (out / "screens.json").write_text(json.dumps({"screens": record["rows"]}, indent=2) + "\n")
+    (out / "screens.json").write_text(json.dumps(record["rows"], indent=2) + "\n")
+    # The build and test log's tail, for the may-app lane (the first runs of a new target are read there).
+    build_log = private / "ios-renders.log"
+    try:
+        size = build_log.stat().st_size if build_log.is_file() and not build_log.is_symlink() else 0
+        with build_log.open("rb") as stream:
+            stream.seek(max(0, size - MAX_LOG))
+            (out / "build.log").write_bytes(stream.read(MAX_LOG))
+    except OSError:
+        (out / "build.log").write_bytes(b"")
     (out / "index.html").write_text(page(sha, ds_sha, record["rows"], record["expected"], stitched))
     rows = len(record["expected"])
     if binary is None:
@@ -373,18 +398,20 @@ def sheet(sha, ds_sha=None, build_stitcher=stitcher, tool=quiet):
 
 
 def seal(sha):
-    """One tar of the run folder, encrypted to the committed renders key; nothing in the clear leaves the runner."""
+    """One tar of the run folder, encrypted to MAY_RENDERS_RECIPIENT; nothing in the clear leaves the runner."""
     require_step_secrets(())
     folder = short(sha)
     root, _, _ = root_dirs()
     out = root / OUT
-    if not (out / "parity" / folder / "index.html").is_file():
+    if not (out / folder / "index.html").is_file():
         raise RendersError("The contact sheet is not built; nothing was sealed")
-    recipient = artifact_recipient(ENVIRONMENT)
-    if recipient is None:
-        print("May iOS renders: the renders public key (artifact_keys/may-ios-renders.age.pub) is still a "
-              "placeholder; nothing was sealed, so nothing will be published")
+    recipient = os.environ.get(RECIPIENT, "").strip()
+    if not recipient:
+        print("May iOS renders: MAY_RENDERS_RECIPIENT is not set in may-ios-renders; nothing was sealed, so nothing "
+              "will be published")
         return
+    if not AGE_RECIPIENT.fullmatch(recipient):
+        raise RendersError("MAY_RENDERS_RECIPIENT is not an age public key")
     sealed = root / SEALED
     sealed.mkdir(mode=0o700)
     plain = sealed / "renders.tar"

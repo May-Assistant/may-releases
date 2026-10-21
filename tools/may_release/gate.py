@@ -63,8 +63,9 @@ iOS renders of May Playground (action renders, ios-renders.yml): a may-app main 
 open may-app pull request against main from may-app itself (--pr-number, optional for this action alone), with an
 optional may-design-system commit to render with (--ds-sha). They run in their own environment, may-ios-renders,
 which has no required reviewer either (NO_REVIEWER_ACTIONS): the renders sign, upload and release nothing, and are
-published only to may-app's own parity/renders branch (renders.py, publish.py). That environment holds a may-app
-write key, so this is Samuel's decision to confirm; until then the policy is checked as for the compile lanes.
+published only to the private repository may-renders (renders.py, publish.py). That environment holds a write key
+for may-renders alone, so this is Samuel's decision to confirm; until then the policy is checked as for the compile
+lanes.
 """
 
 import argparse
@@ -111,7 +112,7 @@ ARTIFACT_KEYS = Path(__file__).resolve().parent / "artifact_keys"
 # Actions whose environment has no required reviewer (Samuel, 17 Oct: compile-only pull-request runs need no
 # approval), the design-system Swift compile (Samuel's decision for ds-swift-compile.yml: it compiles and comments
 # on a may-design-system pull request, nothing else), and the iOS renders (ios-renders.yml: simulator snapshots of
-# May Playground, published only to may-app's own parity/renders branch). static_check.py pins this to exactly these
+# May Playground, published only to the private repository may-renders). static_check.py pins this to exactly these
 # three: no signing, store or release action may join it.
 NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders"}
 # Actions that take a pull request number (and, with --check-pull, read that pull request).

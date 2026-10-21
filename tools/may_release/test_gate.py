@@ -144,10 +144,8 @@ class GateTests(unittest.TestCase):
         # Samuel's sign-only Console-upload key: a placeholder until he commits its public half.
         self.assertEqual(gate.SIGN_ONLY_RECIPIENT, "may-android-console-upload")
         self.assertIsNone(gate.artifact_recipient(gate.SIGN_ONLY_RECIPIENT))
-        # The iOS renders handoff key (ios-renders.yml): a placeholder until Samuel commits its public half.
-        self.assertIsNone(gate.artifact_recipient("may-ios-renders"))
         self.assertEqual(sorted(p.name for p in gate.ARTIFACT_KEYS.iterdir()),
-                         sorted(e + ".age.pub" for e in list(expected) + [gate.SIGN_ONLY_RECIPIENT, "may-ios-renders"]))
+                         sorted(e + ".age.pub" for e in list(expected) + [gate.SIGN_ONLY_RECIPIENT]))
 
     def test_placeholder_artifact_key_denies_before_any_request(self):
         with tempfile.TemporaryDirectory() as directory:

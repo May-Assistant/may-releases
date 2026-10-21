@@ -1,17 +1,20 @@
-"""Publish the iOS renders to may-app's own parity/renders branch (ios-renders.yml, the publish job).
+"""Publish the iOS renders to the private repository May-Assistant/may-renders (ios-renders.yml, the publish job).
+
+may-renders holds nothing but renders: may-app is on GitHub's free plan, where a branch cannot be protected, so a
+write deploy key there could push to its main. The deploy key here (MAY_APP_RENDERS_WRITE_KEY) writes may-renders
+alone.
 
 The publish job runs on a fresh runner that never runs may-app code: the render job, which ran may-app's build and
 snapshot tests, holds no secret and hands over only one age-encrypted file (renders.py seal). Each step here holds
 exactly one secret, read into memory and removed from the environment before any child process starts:
 
-- open (MAY_ARTIFACT_DECRYPT_KEY, the renders key's private half): checks the key against the committed public key
-  (artifact_keys/may-ios-renders.age.pub), decrypts, and extracts only the run folder: parity/<may-app short sha>/
-  holding index.html, screens.json, and PNGs under ios/, android/ and sheet/, every name of a fixed shape, every
-  entry a plain file or folder, with size caps. Anything else refuses. With no sealed file (the key still a
-  placeholder) it says so and the steps after it publish nothing.
-- push (MAY_APP_RENDERS_WRITE_KEY, a may-app deploy key with write access): adds the run folder to parity/renders
-  (created with no history of its own, never merged into main), records it first in parity/runs.json, removes the
-  run folders beyond the newest KEEP, and pushes that one branch, never by force. Without the key it pushes nothing.
+- open (MAY_RENDERS_DECRYPT_KEY): checks the key against the environment's public key (the variable
+  MAY_RENDERS_RECIPIENT), decrypts, and extracts only the run folder: <may-app short sha>/ holding index.html,
+  screens.json, build.log, and PNGs under ios/, android/ and sheet/, every name of a fixed shape, every entry a plain
+  file or folder, with size caps. Anything else refuses. With no sealed file it says so and the steps after it
+  publish nothing.
+- push (MAY_APP_RENDERS_WRITE_KEY): adds the run folder to may-renders' main, records it first in runs.json, removes
+  the run folders beyond the newest KEEP, and pushes main, never by force (the first push creates it).
 - comment (MAY_APP_PR_COMMENT_TOKEN), for a pull request's renders alone: one comment per head on that may-app pull
   request linking the run folder and its contact sheet, after reading the pull request again to check it is still
   open at that head.
@@ -36,16 +39,18 @@ import tarfile
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from ds_compile import DsCompileError, MAX_BODY, post_once, request, run_url
-from gate import APP_REPO, GateDenial, artifact_recipient, pull_number, validate_pull_request
-from prepare import APP, GITHUB_HOST_KEY
-from renders import ENVIRONMENT, PNG
+from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
+from prepare import GITHUB_HOST_KEY
+from renders import PNG, RECIPIENT
 from review_mcp import FOOTER, holds
 from store import StoreError, child_env, require_step_secrets, runner_root, write_private
 import toolchain
 
-BRANCH = "parity/renders"
+RENDERS_REPO = "May-Assistant/may-renders"
+REMOTE = "git@github.com:" + RENDERS_REPO + ".git"
+BRANCH = "main"
 KEEP = 10
-DECRYPT_KEY, WRITE_KEY, COMMENT_TOKEN = "MAY_ARTIFACT_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", "MAY_APP_PR_COMMENT_TOKEN"
+DECRYPT_KEY, WRITE_KEY, COMMENT_TOKEN = "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", "MAY_APP_PR_COMMENT_TOKEN"
 AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
 SSH_KEY = re.compile(r"-----BEGIN OPENSSH PRIVATE KEY-----\n[A-Za-z0-9+/=\n]{100,10000}\n-----END OPENSSH PRIVATE KEY-----")
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -58,8 +63,9 @@ DOWNLOAD, TREE = "may-renders-download/renders.age", "may-publish-tree"
 MARKER = "may-ios-renders"
 AUTHOR = ("-c", "user.name=May renders", "-c", "user.email=renders@may-releases.invalid")
 README = ("# May parity renders\n\nWritten by may-releases' ios-renders.yml, never by hand: one folder per may-app "
-          "commit under parity/, the newest " + str(KEEP) + " kept (parity/runs.json lists them, newest first). "
-          "This branch has no history in common with main and is never merged.\n")
+          "commit (its first 12 hex digits), the newest " + str(KEEP) + " kept (runs.json lists them, newest first). "
+          "Each holds index.html (Android | iOS per screen and mode), sheet/ (the two side by side), ios/, android/, "
+          "the manifest copy and build.log.\n")
 
 
 class PublishError(ValueError):
@@ -73,15 +79,15 @@ def folder_of(sha):
 
 
 def allowed(name, folder):
-    """Whether a tar member name is part of the run folder's fixed layout."""
+    """Whether a tar member name is part of the run folder's fixed layout: "dir", "file" or None."""
     parts = name.split("/")
-    if parts[:2] != ["parity", folder][:len(parts[:2])] or len(parts) > 4:
+    if parts[0] != folder or len(parts) > 3:
         return None
-    if len(parts) <= 2:
+    if len(parts) == 1:
         return "dir"
-    if len(parts) == 3:
-        return "dir" if parts[2] in KINDS else "file" if parts[2] in ("index.html", "screens.json") else None
-    return "file" if parts[2] in KINDS and FILE.fullmatch(parts[3]) else None
+    if len(parts) == 2:
+        return "dir" if parts[1] in KINDS else "file" if parts[1] in ("index.html", "screens.json", "build.log") else None
+    return "file" if parts[1] in KINDS and FILE.fullmatch(parts[2]) else None
 
 
 def checked_members(archive, folder):
@@ -101,7 +107,7 @@ def checked_members(archive, folder):
             if member.size > MAX_FILE:
                 raise PublishError("A render is too large")
             total += member.size
-    if total > MAX_TOTAL or "parity/" + folder + "/index.html" not in seen:
+    if total > MAX_TOTAL or folder + "/index.html" not in seen:
         raise PublishError("The renders are too large or have no contact sheet")
     # Parents before children, as renders.py seal writes them.
     for name in seen:
@@ -140,11 +146,11 @@ def open_renders(sha):
     if not sealed.is_file() or sealed.is_symlink():
         print("May iOS renders: no sealed renders from this run attempt; nothing will be published")
         return
-    recipient = artifact_recipient(ENVIRONMENT)
-    if recipient is None:
-        raise PublishError("The renders public key is still a placeholder")
+    recipient = os.environ.get(RECIPIENT, "").strip()
+    if not AGE_RECIPIENT.fullmatch(recipient):
+        raise PublishError("MAY_RENDERS_RECIPIENT is not set to an age public key in may-ios-renders")
     if len(lines) != 1 or not AGE_IDENTITY.fullmatch(lines[0]):
-        raise PublishError("The renders decryption key is malformed (MAY_ARTIFACT_DECRYPT_KEY in may-ios-renders)")
+        raise PublishError("The renders decryption key is malformed (MAY_RENDERS_DECRYPT_KEY in may-ios-renders)")
     private = root / "may-private"
     private.mkdir(mode=0o700, exist_ok=True)
     key, plain, tree = private / "renders.key", private / "renders.tar", root / TREE
@@ -155,7 +161,7 @@ def open_renders(sha):
             derived = subprocess.run([toolchain.tool_path("age", "age-keygen"), "-y", str(key)],
                                      capture_output=True, stdin=subprocess.DEVNULL, env=env)
             if derived.returncode or derived.stdout.decode().strip() != recipient:
-                raise PublishError("The renders decryption key does not match the committed renders public key")
+                raise PublishError("The renders decryption key does not match MAY_RENDERS_RECIPIENT")
             write_private(plain, b"")
             if subprocess.run([toolchain.tool_path("age", "age"), "-d", "-i", str(key), "-o", str(plain),
                                str(sealed)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -174,8 +180,8 @@ def open_renders(sha):
         raise PublishError("The renders are not a readable archive") from None
     finally:
         plain.unlink(missing_ok=True)
-    pngs = sum(1 for _ in (tree / "parity" / folder).rglob("*.png"))
-    print(f"May iOS renders decrypted and checked: run folder parity/{folder}/ with {pngs} images")
+    pngs = sum(1 for _ in (tree / folder).rglob("*.png"))
+    print(f"May iOS renders decrypted and checked: run folder {folder}/ with {pngs} images")
 
 
 def git(argv, log, env, cwd, capture=False):
@@ -189,12 +195,12 @@ def git(argv, log, env, cwd, capture=False):
         with log.open("ab") as output:
             result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output)
     if result.returncode:
-        raise PublishError("The parity/renders branch could not be updated; inspect protected runner diagnostics")
+        raise PublishError("may-renders could not be updated; inspect protected runner diagnostics")
     return result.stdout
 
 
 def runs_after(existing, entry):
-    """parity/runs.json after adding entry first: (the list kept, the folders to remove)."""
+    """runs.json after adding entry first: (the list kept, the folders to remove)."""
     runs = [run for run in existing if isinstance(run, dict) and isinstance(run.get("folder"), str) and
             re.fullmatch(r"[0-9a-f]{12}", run["folder"]) and run["folder"] != entry["folder"]]
     runs.insert(0, entry)
@@ -206,7 +212,7 @@ def push(sha, pr=None, run_git=git):
     folder = folder_of(sha)
     key_text = os.environ.pop(WRITE_KEY, "").strip()
     root = runner_root()
-    tree = root / TREE / "parity" / folder
+    tree = root / TREE / folder
     if not tree.is_dir():
         print("May iOS renders: nothing was decrypted, so nothing was pushed")
         return
@@ -214,7 +220,7 @@ def push(sha, pr=None, run_git=git):
         print("May iOS renders: MAY_APP_RENDERS_WRITE_KEY is not set in may-ios-renders; nothing was pushed")
         return
     if not SSH_KEY.fullmatch(key_text):
-        raise PublishError("The may-app write key is malformed (MAY_APP_RENDERS_WRITE_KEY); nothing was pushed")
+        raise PublishError("The may-renders write key is malformed (MAY_APP_RENDERS_WRITE_KEY); nothing was pushed")
     number = pull_number(pr) if pr is not None else None
     private = root / "may-private"
     private.mkdir(mode=0o700, exist_ok=True)
@@ -229,7 +235,7 @@ def push(sha, pr=None, run_git=git):
         write_private(key, (key_text + "\n").encode())
         write_private(known, (GITHUB_HOST_KEY + "\n").encode())
         run_git(["init", "-q", str(work)], log, env, root)
-        run_git(["remote", "add", "origin", APP], log, env, work)
+        run_git(["remote", "add", "origin", REMOTE], log, env, work)
         heads = run_git(["ls-remote", "--heads", "origin", "refs/heads/" + BRANCH], log, env, work, capture=True)
         if heads.strip():
             run_git(["fetch", "--quiet", "--no-tags", "--depth", "1", "origin",
@@ -237,7 +243,7 @@ def push(sha, pr=None, run_git=git):
             run_git(["checkout", "-q", "-B", "renders", "refs/remotes/origin/" + BRANCH], log, env, work)
         else:
             run_git(["checkout", "-q", "--orphan", "renders"], log, env, work)
-        index = work / "parity" / "runs.json"
+        index = work / "runs.json"
         try:
             existing = json.loads(index.read_text()) if index.is_file() and not index.is_symlink() else []
         except (OSError, ValueError):
@@ -247,21 +253,20 @@ def push(sha, pr=None, run_git=git):
                                                                          os.environ.get("GITHUB_RUN_ID", "")) else None}
         kept, removed = runs_after(existing if isinstance(existing, list) else [], entry)
         for old in removed + [folder]:
-            if (work / "parity" / old).exists():
-                run_git(["rm", "-r", "-q", "--ignore-unmatch", "parity/" + old], log, env, work)
-                shutil.rmtree(work / "parity" / old, ignore_errors=True)
-        (work / "parity").mkdir(exist_ok=True)
-        shutil.copytree(tree, work / "parity" / folder, symlinks=False)
+            if (work / old).exists():
+                run_git(["rm", "-r", "-q", "--ignore-unmatch", "--", old], log, env, work)
+                shutil.rmtree(work / old, ignore_errors=True)
+        shutil.copytree(tree, work / folder, symlinks=False)
         index.write_text(json.dumps(kept, indent=2) + "\n")
         (work / "README.md").write_text(README)
-        run_git(["add", "-A", "--", "parity", "README.md"], log, env, work)
+        run_git(["add", "-A", "--", "."], log, env, work)
         run_git([*AUTHOR, "commit", "-q", "-m", f"Renders of may-app {sha}"], log, env, work)
         run_git(["push", "--quiet", "origin", "HEAD:refs/heads/" + BRANCH], log, env, work)
     finally:
         key.unlink(missing_ok=True)
         known.unlink(missing_ok=True)
-    print(f"May iOS renders published to may-app's {BRANCH} branch as parity/{folder}/ "
-          f"({len(kept)} run folders kept, {len(removed)} removed)")
+    print(f"May iOS renders published to may-renders as {folder}/ ({len(kept)} run folders kept, "
+          f"{len(removed)} removed)")
 
 
 _PR = r"/repos/" + re.escape(APP_REPO) + r"/{}/[1-9][0-9]{{0,6}}"
@@ -279,11 +284,12 @@ def github(method, path, payload, token):
 
 
 def comment_body(sha, folder, images, url):
-    base = f"https://github.com/{APP_REPO}/tree/{BRANCH}/parity/{folder}"
+    base = f"https://github.com/{RENDERS_REPO}/tree/{BRANCH}/{folder}"
     lines = [f"**iOS renders** for {sha}: {images} images (iPhone 16 Pro, light and dark).", "",
              f"- Run folder: {base}", f"- Contact sheet (Android | iOS): "
-             f"https://github.com/{APP_REPO}/blob/{BRANCH}/parity/{folder}/index.html",
-             f"- Side by side, one PNG per screen and mode: {base}/sheet"]
+             f"https://github.com/{RENDERS_REPO}/blob/{BRANCH}/{folder}/index.html",
+             f"- Side by side, one PNG per screen and mode: {base}/sheet",
+             f"- Build and test log: https://github.com/{RENDERS_REPO}/blob/{BRANCH}/{folder}/build.log"]
     if url:
         lines += ["", f"Run: {url}"]
     return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
@@ -297,7 +303,7 @@ def comment(sha, pr, call_api=github):
         print("May iOS renders: not a pull request's renders; no comment posted")
         return
     number = pull_number(pr)
-    tree = runner_root() / TREE / "parity" / folder
+    tree = runner_root() / TREE / folder
     if not tree.is_dir():
         print("May iOS renders: nothing was published, so no comment posted")
         return
