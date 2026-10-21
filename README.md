@@ -664,14 +664,14 @@ This repository is public and may-app is private, and anyone signed in to GitHub
 2. **render**, on macOS, holds no secret once may-app's code runs:
    - `prepare.py` fetches the commit with the two read-only deploy keys, which only that step holds.
    - `renders.py run` builds with the pinned XcodeGen and runs `xcodebuild test` of `MayPlaygroundSnapshots`, with `TEST_RUNNER_MAY_SNAPSHOT_DIR` set to a private folder. Each test writes `<id>-light.png` and `<id>-dark.png`, at 1179 × 2556.
-   - `check` compares the PNGs with may-app's `docs/evidence/parity/screens.json`, an array of `{id, title, spec, android: {light, dark}, ios: {light, dark}}` with paths relative to `docs/evidence/parity/`. Every row is expected in light and dark. It prints rendered against expected, per mode, and how many renders are not the 1179 × 2556 frame.
+   - `check` compares the PNGs with may-app's `docs/evidence/parity/screens.json`, an array of `{id, title, spec, android: {light, dark}, ios: {light, dark}}` with paths relative to `docs/evidence/parity/`. Every row is expected in light and dark. It prints rendered against expected, per mode, and how many renders are not the 1179 × 2556 frame. If the commit has no usable manifest (not there yet, or malformed), it says so, and the `<id>-<mode>.png` renders in the snapshot folder stand in for its rows. The run still publishes them and the build log, without an Android column or `screens.json`, and `verdict` fails.
    - `sheet` builds the run folder:
      - `index.html`, with Android and iOS side by side per row and mode;
      - one stitched PNG per row and mode, from `stitch.swift`;
      - the manifest;
      - `build.log`, the last 8 MB of the build and test log, for the may-app lane.
    - `seal` age-encrypts the run folder to the environment variable `MAY_RENDERS_RECIPIENT`. Only that encrypted file is uploaded, kept for one day.
-   - `verdict` then fails the job if the build or tests failed or a render is missing. A failed build is still published first, with its log.
+   - `verdict` then fails the job if the build or tests failed, the manifest was not usable, or a render is missing. A failed build is still published first, with its log.
 3. **publish**, on a fresh Linux runner that runs no may-app code, has three steps, each holding one secret:
    - `publish.py open` decrypts with `MAY_RENDERS_DECRYPT_KEY`, after checking it against `MAY_RENDERS_RECIPIENT`, and accepts only the run folder's fixed layout.
    - `push` adds `<may-app short sha>/` to may-renders' `main` with `MAY_APP_RENDERS_WRITE_KEY`, a deploy key on may-renders alone. It lists the run folders in `runs.json` and keeps the newest 10, and it never force-pushes.
