@@ -357,6 +357,57 @@ class SheetSealVerdictTests(unittest.TestCase):
             self.assertEqual(refused.exception.args[0], "Some expected renders are missing")
 
 
+class NoManifestTests(unittest.TestCase):
+    """A commit without a usable manifest still publishes its renders and build log, and the verdict fails."""
+
+    def setUp(self):
+        self.work = Workspace()
+        self.work.snapshot("chat-reply-light.png", "chat-reply-dark.png", "sign-in-light.png", "stray.png",
+                           "Upper-light.png")
+        (self.work.private / "ios-renders.log").write_text("Compiling MayPlaygroundSnapshots\n")
+        (self.work.private / renders.OUTCOME).write_text(json.dumps({"tests": "passed"}))
+
+    def tearDown(self):
+        self.work.directory.cleanup()
+
+    def run_steps(self, manifest_text):
+        path = self.work.source / renders.MANIFEST
+        if manifest_text is None:
+            path.unlink()
+        else:
+            path.write_text(manifest_text)
+        with patch.dict(os.environ, self.work.env, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
+            renders.check(SHA)
+            renders.sheet(SHA, None, build_stitcher=lambda private, log: None)
+            with self.assertRaises(RendersError) as refused:
+                renders.verdict(SHA)
+        return self.work.root / renders.OUT / FOLDER, out.getvalue(), refused.exception.args[0]
+
+    def test_missing_or_malformed_manifest(self):
+        for label, text in (("missing", None), ("not json", "{"), ("bad row", json.dumps([{"id": "Bad Id"}]))):
+            with self.subTest(label=label):
+                shutil.rmtree(self.work.root / renders.OUT, ignore_errors=True)
+                (self.work.private / renders.CHECKED).unlink(missing_ok=True)
+                out, printed, refusal = self.run_steps(text)
+                self.assertEqual(printed.splitlines()[:2], [
+                    "May iOS renders: may-app's screens manifest is missing or malformed; the renders in the snapshot "
+                    "folder are published without it, and the verdict fails",
+                    "May iOS renders: 3 of 4 expected renders made (light 2 of 2, dark 1 of 2); 3 not the 1179 x 2556 "
+                    "frame; 2 other files in the snapshot folder, not published; Android renders found for 0 of 4"])
+                self.assertEqual(sorted(p.relative_to(out).as_posix() for p in out.rglob("*.png")), [
+                    "ios/chat-reply-dark.png", "ios/chat-reply-light.png", "ios/sign-in-light.png"])
+                self.assertEqual((out / "build.log").read_text(), "Compiling MayPlaygroundSnapshots\n")
+                self.assertFalse((out / "screens.json").exists(), "no stand-in manifest is published as may-app's")
+                self.assertIn("screens manifest was missing or malformed", (out / "index.html").read_text())
+                self.assertEqual(refusal, "may-app's screens manifest is missing or malformed")
+
+    def test_a_usable_manifest_is_not_flagged(self):
+        with patch.dict(os.environ, self.work.env, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
+            renders.check(SHA)
+        self.assertNotIn("manifest", out.getvalue())
+        self.assertIs(json.loads((self.work.private / renders.CHECKED).read_text())["manifest"], True)
+
+
 def tar_of(entries):
     """A tar of (name, data or None for a folder, type) entries, as bytes."""
     stream = io.BytesIO()

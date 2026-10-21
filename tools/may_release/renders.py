@@ -16,13 +16,16 @@ code, so this runner never holds a write key or a decrypt key):
   published, and `verdict` fails the job afterwards.
 - check: reads may-app's manifest (MANIFEST: rows of {id, title, spec, android: {light, dark}, ios: {light, dark}},
   paths relative to EVIDENCE), checks it and every PNG against fixed shapes, and prints rendered against expected
-  (every row in light and dark), per mode, and how many are not the 1179 x 2556 frame.
+  (every row in light and dark), per mode, and how many are not the 1179 x 2556 frame. Without a usable manifest
+  (not yet in the commit, or malformed) the renders in the snapshot folder named <id>-<mode>.png stand in for its
+  rows, so the run still publishes them and the build log, and `verdict` fails the job.
 - sheet: the run folder: the contact sheet (one HTML page, Android | iOS per row and mode), one stitched PNG per row
   and mode where both renders exist (stitch.swift, CoreGraphics, compiled here with the pinned Xcode), the manifest,
   and the tail of the build log.
 - seal: one tar of the run folder (<may-app short sha>/), encrypted to MAY_RENDERS_RECIPIENT. Without that variable it
   seals nothing, says so, and the publish job has nothing to publish.
-- verdict: fails the job if the build or the snapshot tests failed or any expected render is missing.
+- verdict: fails the job if the build or the snapshot tests failed, the manifest was not usable, or any expected
+  render is missing.
 
 Interface with may-app (N's snapshot target, M's manifest): each expected render is <snapshot folder>/<id>-<mode>.png;
 each row's Android render is EVIDENCE/<android[mode]>. Both are checked; nothing else in the snapshot folder is
@@ -263,12 +266,29 @@ def android_render(source, row, mode):
     return resolved
 
 
+def snapshot_rows(snapshots):
+    """Rows for the renders in the snapshot folder named <id>-<mode>.png, when may-app's manifest is not usable."""
+    try:
+        names = sorted(path.name for path in snapshots.iterdir()) if snapshots.is_dir() else []
+    except OSError:
+        names = []
+    pattern = re.compile(f"({SCREEN_ID.pattern})-(?:{'|'.join(MODES)})\\.png")
+    ids = list(dict.fromkeys(m.group(1) for m in map(pattern.fullmatch, names) if m))[:MAX_SCREENS]
+    return [{"id": screen, "title": screen, "spec": "", "android": {mode: None for mode in MODES},
+             "ios": {mode: None for mode in MODES}} for screen in ids]
+
+
 def check(sha):
     require_step_secrets(())
     short(sha)
     root, source, private = root_dirs()
-    rows = manifest_rows(source)
     snapshots = root / SNAPSHOTS
+    try:
+        rows, manifest = manifest_rows(source), True
+    except RendersError:
+        rows, manifest = snapshot_rows(snapshots), False
+        print("May iOS renders: may-app's screens manifest is missing or malformed; the renders in the snapshot "
+              "folder are published without it, and the verdict fails")
     expected, rendered, android, wrong, per_mode = [], [], 0, 0, {mode: [0, 0] for mode in MODES}
     for row in rows:
         for mode in MODES:
@@ -290,7 +310,7 @@ def check(sha):
         others = sum(1 for path in snapshots.iterdir() if path.name not in names) if snapshots.is_dir() else 0
     except OSError:
         others = 0
-    write_private(private / CHECKED, json.dumps({"rows": rows, "expected": expected}).encode())
+    write_private(private / CHECKED, json.dumps({"rows": rows, "expected": expected, "manifest": manifest}).encode())
     modes = ", ".join(f"{mode} {per_mode[mode][0]} of {per_mode[mode][1]}" for mode in MODES)
     print(f"May iOS renders: {len(rendered)} of {len(expected)} expected renders made ({modes}); "
           f"{wrong} not the 1179 x 2556 frame; {others} other files in the snapshot folder, not published; "
@@ -307,7 +327,7 @@ def checked_record(private):
     return record
 
 
-def page(sha, ds_sha, rows, expected, stitched):
+def page(sha, ds_sha, rows, expected, stitched, manifest=True):
     """The contact sheet's HTML: every value from may-app escaped, every image a relative path in the run folder."""
     by_row = {}
     for entry in expected:
@@ -319,6 +339,8 @@ def page(sha, ds_sha, rows, expected, stitched):
              f"<p>Design system: {html.escape(ds_sha) if ds_sha else 'may-app pin'}. "
              f"Device: {DEVICE}, light and dark.</p>",
              '<p><a href="build.log">Build and test log</a> (its last 8 MB).</p>',
+             "" if manifest else "<p><b>may-app's screens manifest was missing or malformed in this commit</b>: "
+                                 "these are the renders the snapshot tests made, with no Android column.</p>",
              "<table><tr><th>Screen</th><th>Mode</th><th>Android</th><th>iOS</th></tr>"]
     for row in rows:
         for entry in by_row.get(row["id"], []):
@@ -379,7 +401,9 @@ def sheet(sha, ds_sha=None, build_stitcher=stitcher, tool=quiet):
                 stitched.add(key)
             else:
                 (out / "sheet" / (key + ".png")).unlink(missing_ok=True)
-    (out / "screens.json").write_text(json.dumps(record["rows"], indent=2) + "\n")
+    manifest = record.get("manifest") is not False
+    if manifest:
+        (out / "screens.json").write_text(json.dumps(record["rows"], indent=2) + "\n")
     # The build and test log's tail, for the may-app lane (the first runs of a new target are read there).
     build_log = private / "ios-renders.log"
     try:
@@ -389,7 +413,7 @@ def sheet(sha, ds_sha=None, build_stitcher=stitcher, tool=quiet):
             (out / "build.log").write_bytes(stream.read(MAX_LOG))
     except OSError:
         (out / "build.log").write_bytes(b"")
-    (out / "index.html").write_text(page(sha, ds_sha, record["rows"], record["expected"], stitched))
+    (out / "index.html").write_text(page(sha, ds_sha, record["rows"], record["expected"], stitched, manifest))
     rows = len(record["expected"])
     if binary is None:
         print(f"May iOS renders: contact sheet of {rows} rows; the stitcher did not build, so none were stitched")
@@ -443,6 +467,8 @@ def verdict(sha):
     missing = sum(1 for entry in record["expected"] if not entry.get("rendered"))
     if not isinstance(outcome, dict) or outcome.get("tests") != "passed":
         raise RendersError("The snapshot tests failed")
+    if record.get("manifest") is False:
+        raise RendersError("may-app's screens manifest is missing or malformed")
     if missing:
         raise RendersError("Some expected renders are missing")
     print("May iOS renders: snapshot tests passed and every expected render was made")
