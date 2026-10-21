@@ -154,16 +154,13 @@ def simulator(log, env, tool=quiet):
     return udid
 
 
-def run_snapshots(sha):
-    """XcodeGen, then the snapshot tests on the simulator; the outcome is recorded privately, never printed."""
-    require_step_secrets(())
-    short(sha)
-    root, source, private = root_dirs()
+def xcode_env(private, log):
+    """The pinned Xcode (checked) and XcodeGen (hash-checked) for a build, refused while a read key is on disk:
+    (environment, XcodeGen's path). Shared with device_ios.py, which builds May Playground the same way."""
     if native.credentials_left(private):
-        raise RendersError("A read key or host file is still on disk; nothing was rendered")
+        raise RendersError("A read key or host file is still on disk; nothing was built")
     if not XCODE.is_dir():
         raise RendersError("Pinned Xcode 26.3 is unavailable")
-    log = private / "ios-renders.log"
     env = os.environ.copy()
     env["DEVELOPER_DIR"] = str(XCODE)
     version = quiet(["xcodebuild", "-version"], log, env=env, capture=True)
@@ -175,6 +172,16 @@ def run_snapshots(sha):
         raise RendersError("Pinned XcodeGen download hash differs")
     binary = native.extract_generator(archive, private / "xcodegen")
     env["PATH"] = str(binary.parent) + os.pathsep + env.get("PATH", "")
+    return env, binary
+
+
+def run_snapshots(sha):
+    """XcodeGen, then the snapshot tests on the simulator; the outcome is recorded privately, never printed."""
+    require_step_secrets(())
+    short(sha)
+    root, source, private = root_dirs()
+    log = private / "ios-renders.log"
+    env, binary = xcode_env(private, log)
     snapshots = root / SNAPSHOTS
     snapshots.mkdir(mode=0o700)
     env["MAY_SNAPSHOT_DIR"] = env["TEST_RUNNER_MAY_SNAPSHOT_DIR"] = str(snapshots)

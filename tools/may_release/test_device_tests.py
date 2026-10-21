@@ -606,8 +606,9 @@ class WorkflowPinTests(unittest.TestCase):
     def test_the_sign_in_secret_stays_in_the_scenarios_step(self):
         line = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"
         step = "      - name: Encrypt the report to the renders public key\n        env:\n"
-        self.assertEqual(self.text.count(step), 1)
-        self.flagged(self.text.replace(line, "").replace(step, step + line), "a secret, variable or env entry")
+        self.assertEqual((self.text.count(step), self.text.count(line)), (2, 2), "one of each per device job")
+        self.flagged(self.text.replace(line, "", 1).replace(step, step + line, 1), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, "", 2).replace(step, step + line), "a secret, variable or env entry")
         build = "      - name: Build May Playground for the emulator without secrets\n"
         self.flagged(self.text.replace(build, build + "        env:\n" + line.replace("MAY_TEST", "MAY_TEST", 1)),
                      "a secret, variable or env entry")
@@ -636,9 +637,25 @@ class WorkflowPinTests(unittest.TestCase):
     def test_variables_stay_in_their_steps(self):
         line = "          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}\n"
         build = "      - name: Build May Playground for the emulator without secrets\n"
-        self.assertEqual(self.text.count(line), 1)
-        self.flagged(self.text.replace(line, "").replace(build, build + "        env:\n" + line),
+        self.assertEqual(self.text.count(line), 2)
+        self.flagged(self.text.replace(line, "", 1).replace(build, build + "        env:\n" + line),
                      "a secret, variable or env entry")
+
+    def test_the_ios_job_holds_no_claude_token_and_its_own_sealed_report(self):
+        ios = self.text.partition("\n  ios:\n")[2].partition("\n  publish:\n")[0]
+        scenarios = "        run: python3 -I -S -B tools/may_release/device_tests.py run --platform ios"
+        token = "          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n"
+        self.assertIn(scenarios, ios)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", ios)
+        self.flagged(self.text.replace(scenarios, token.rstrip("\n").replace("          ", "          ", 1) + "\n" +
+                                       scenarios), "a secret, variable or env entry")
+        self.flagged(self.text.replace("may-device-sealed/ios.age", "may-device-out"), "hands over something")
+        self.flagged(self.text.replace("name: may-device-ios-${{ github.run_attempt }}\n          path: "
+                                       "${{ runner.temp }}/may-device-download", "name: x\n          path: "
+                                       "${{ runner.temp }}/may-device-download"), "hands over something")
+        self.flagged(self.text.replace("    needs: [admission, android, ios]\n", "    needs: [admission, android]\n"),
+                     "after both")
+        self.flagged(self.text.replace("    runs-on: macos-15\n", "    runs-on: macos-latest\n"), "on macOS")
 
     def test_only_the_encrypted_report_and_the_nightly_schedule(self):
         self.flagged(self.text.replace("may-device-sealed/android.age", "may-device-out"), "hands over something")

@@ -479,22 +479,23 @@ def combined(entry, record, judged):
     return {"verdict": "fail", "reason": NO_TRUTH}
 
 
-def judge_scenarios(judged_by=device_agent.judge):
-    """Each agent scenario judged, then every verdict printed; the report and the recorded verdicts updated."""
+def judge_scenarios(judged_by=device_agent.judge, platform="android"):
+    """Each agent scenario judged, then every verdict printed; the report and the recorded verdicts updated. The iOS job
+    runs it too, with nothing to judge (agent scenarios are Android's), for its verdict lines."""
     require_step_secrets((device_agent.OAUTH,))
     root = runner_root()
     private = root / "may-private"
     runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
-    if len(runs) != 1 or not (runs[0] / "android" / "report.json").is_file():
+    if len(runs) != 1 or not (runs[0] / platform / "report.json").is_file():
         raise DeviceTestsError("There is no report to judge")
-    path = runs[0] / "android" / "report.json"
+    path = runs[0] / platform / "report.json"
     report = json.loads(path.read_text())
     try:
         stored = json.loads((private / AGENTS).read_text())
     except (OSError, ValueError):
         stored = {}
     records = stored.get("agents", {}) if isinstance(stored, dict) else {}
-    goals = {row["id"]: row["goal"] for row in scenarios("all", "android") if row["driver"] == "agent"}
+    goals = {row["id"]: row["goal"] for row in scenarios("all", platform) if row["driver"] == "agent"}
     pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
     token = model = None
     if pending:
@@ -524,21 +525,21 @@ def judge_scenarios(judged_by=device_agent.judge):
     write_private(private / VERDICTS, json.dumps([entry["verdict"] for entry in report["scenarios"]]).encode())
     for entry in report["scenarios"]:
         scenario, word = entry["id"], entry["verdict"]
-        print(f"May device tests (android): {scenario}: {word}")
+        print(f"May device tests ({platform}): {scenario}: {word}")
     counts = {word: sum(1 for entry in report["scenarios"] if entry["verdict"] == word)
               for word in ("pass", "ui-pass", "fail", "skipped")}
     passed, ui_passed, failed, skipped = counts["pass"], counts["ui-pass"], counts["fail"], counts["skipped"]
-    print(f"May device tests (android): {passed} passed, {ui_passed} passed on screen alone (server checks not "
+    print(f"May device tests ({platform}): {passed} passed, {ui_passed} passed on screen alone (server checks not "
           f"configured), {failed} failed, {skipped} skipped")
 
 
-def seal():
+def seal(platform="android"):
     """One tar of the run folder, encrypted to MAY_RENDERS_RECIPIENT; nothing in the clear leaves the runner."""
     require_step_secrets(())
     root = runner_root()
     out = root / OUT
     runs = [path for path in out.iterdir() if path.is_dir()] if out.is_dir() else []
-    if len(runs) != 1 or not (runs[0] / "android" / "report.json").is_file():
+    if len(runs) != 1 or not (runs[0] / platform / "report.json").is_file():
         raise DeviceTestsError("There is no report to seal")
     recipient = os.environ.get(RECIPIENT, "").strip()
     if not recipient:
@@ -549,24 +550,24 @@ def seal():
         raise DeviceTestsError("MAY_RENDERS_RECIPIENT is not an age public key")
     sealed = root / SEALED
     sealed.mkdir(mode=0o700)
-    plain = sealed / "android.tar"
+    plain = sealed / (platform + ".tar")
     try:
         with tarfile.open(plain, "w") as archive:
             for path in sorted(out.rglob("*")):
                 if path.is_symlink() or not (path.is_file() or path.is_dir()):
                     raise DeviceTestsError("The run folder holds something other than files and folders")
                 archive.add(path, arcname=path.relative_to(out).as_posix(), recursive=False)
-        result = subprocess.run([toolchain.tool_path("age", "age"), "-r", recipient, "-o", str(sealed / "android.age"),
+        result = subprocess.run([toolchain.tool_path("age", "age"), "-r", recipient, "-o", str(sealed / (platform + ".age")),
                                  str(plain)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 stdin=subprocess.DEVNULL, env=child_env())
         if result.returncode:
             raise DeviceTestsError("The report could not be encrypted")
     finally:
         plain.unlink(missing_ok=True)
-    print("May device tests: the android report encrypted for the publish job")
+    print(f"May device tests: the {platform} report encrypted for the publish job")
 
 
-def verdict():
+def verdict(platform="android"):
     require_step_secrets(())
     try:
         verdicts = json.loads((runner_root() / "may-private" / VERDICTS).read_text())
@@ -574,19 +575,27 @@ def verdict():
         raise DeviceTestsError("No scenario verdicts are recorded") from None
     if not isinstance(verdicts, list) or "fail" in verdicts:
         raise DeviceTestsError("A scenario failed")
-    print("May device tests (android): no scenario failed")
+    print(f"May device tests ({platform}): no scenario failed")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("build", "run", "judge", "seal", "verdict"))
     parser.add_argument("--scenarios", default="all")
+    parser.add_argument("--platform", choices=PLATFORMS, default="android")
     args = parser.parse_args()
     try:
-        if args.command == "run":
+        if args.platform == "ios" and args.command in ("build", "run"):
+            # Imported here: device_ios builds on this module.
+            import device_ios
+            device_ios.run_scenarios(args.scenarios or "all") if args.command == "run" else device_ios.build()
+        elif args.command == "run":
             run_scenarios(args.scenarios or "all")
+        elif args.command == "build":
+            build()
         else:
-            {"build": build, "judge": judge_scenarios, "seal": seal, "verdict": verdict}[args.command]()
+            {"judge": lambda: judge_scenarios(platform=args.platform), "seal": lambda: seal(args.platform),
+             "verdict": lambda: verdict(args.platform)}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None
     except Exception:
