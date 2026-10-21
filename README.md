@@ -693,7 +693,7 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
    - the fetch (`prepare.py`, read keys) admits may-app main commits only, never a pull request, because the run step holds the sign-in secret;
    - `device_tests.py build` builds the Playground debug APK without secrets;
    - `run`:
-     - installs the app and the pinned Maestro CLI 2.8.0, its zip checked against a SHA-256, and, when an agent scenario is chosen, review.py's pinned Claude Code, checked against its sha512;
+     - installs the app and the pinned Maestro CLI 2.8.0, its zip checked against a SHA-256, and, when an agent scenario is chosen, review.py's pinned Claude Code release, checked against its sha512 (npm's linux-x64 package on the Android runner, the same release's darwin-arm64 package on the iOS job's macOS runner);
      - for each scenario in `device_scenarios.json`, mints a fresh staging session for the test account (`POST /v1/auth/test-session` with `{"secret": MAY_TEST_SIGNIN_SECRET}` in the body; staging fixes the account and replies `{token, expires_at, user_id}`, of which only the token is kept; it lasts 30 minutes, with no refresh) and restarts the app with it through a Playground-debug-only intent extra (`may_test_session`);
      - records the screen (about 720p, about 1 Mbps, 3-minute parts) and runs the scenario: a Maestro scenario runs its flow from may-app's `tools/device-tests/flows/`; an agent scenario runs Claude Code headless (`device_agent.py`) with the scenario's goal;
      - takes a screenshot and reads the server: a Maestro scenario's status checks, and for an agent scenario whether K's reads (approvals, inbox, commitments, event notes, routines) list an item carrying the run's tag, `qa-<run id>`;
@@ -722,6 +722,8 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
 - runs the agent once with a read-only goal (take a screenshot, read the hierarchy, call done), then its judge;
 - records, seals and publishes as usual.
 Its verdict is "smoke-pass" or "fail" ("Maestro did not drive the app" when the flow fails), never "pass": it checks the harness, not May. Nothing is cleaned up, since nothing was created.
+
+**When the run step fails unexpectedly**, its public log names where, in one line: the stage (for instance `smoke: the agent`, from fixed words and this repository's scenario ids), the exception's class and, for an OS error, its errno. It never prints the exception's text, which may hold private paths or tool output.
 
 **Switching a scenario off:** the variable `MAY_DEVICE_TESTS_SKIP` lists scenario ids, comma-separated, that both jobs skip ("switched off"), for instance one whose server side is merged but not yet deployed. The test session's cleanup also expires the pending approvals test sessions asked for since the run began (`approvals_expired`, counted with the removed items).
 

@@ -116,6 +116,23 @@ class DeviceTestsError(ValueError):
     pass
 
 
+# Where the run step is, for the public failure line: fixed words and this repository's scenario ids alone.
+STAGE = ["starting"]
+
+
+def at(stage):
+    STAGE[0] = stage
+
+
+def failure_line(error):
+    """Prints the public line for an unexpected failure: the stage, the exception's class and, for an OS error, its
+    errno (a number). Never the exception's text, which may hold private paths or output."""
+    stage, detail = STAGE[0], type(error).__name__
+    if isinstance(error, OSError) and type(error.errno) is int:
+        detail += f", errno {error.errno}"
+    print(f"May device tests failed at {stage} ({detail})")
+
+
 def scenarios(selection="all", platform="android"):
     """SCENARIOS, checked, for one platform; "all" (every scenario but the smoke one) or a comma-separated list of
     ids."""
@@ -347,9 +364,10 @@ def boot(root, log):
     adb = flows.sdk_tool(home, "platform-tools/adb")
     (root / "may-avd").mkdir(mode=0o700, exist_ok=True)
     with log.open("ab") as output:
-        subprocess.run([flows.sdk_tool(home, "cmdline-tools/latest/bin/avdmanager"), "create", "avd", "--force",
-                        "-n", AVD, "-k", flows.SYSTEM_IMAGE, "-d", flows.DEVICE], input=b"no\n", stdout=output,
-                       stderr=output, env=env, check=True)
+        if subprocess.run([flows.sdk_tool(home, "cmdline-tools/latest/bin/avdmanager"), "create", "avd", "--force",
+                           "-n", AVD, "-k", flows.SYSTEM_IMAGE, "-d", flows.DEVICE], input=b"no\n", stdout=output,
+                          stderr=output, env=env).returncode:
+            raise DeviceTestsError("The emulator's virtual device could not be created; no scenario ran")
         emulator = subprocess.Popen([flows.sdk_tool(home, "emulator/emulator"), "-avd", AVD, "-no-window", "-no-audio",
                                      "-no-boot-anim", "-no-snapshot", "-gpu", "swiftshader_indirect"],
                                     stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=env)
@@ -445,12 +463,16 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     folder = root / OUT / run_folder(source) / "android"
     folder.mkdir(parents=True, mode=0o700)
     log = private / "device-run.log"
+    at("downloading Maestro")
     launcher = maestro(root, private, log)
+    at("installing Claude Code")
     cli = install(root) if agents else None
     tag, since = run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    at("booting the emulator")
     adb, emulator, env = boot(root, log)
     results, records, cleaned_count = [], {}, None
     try:
+        at("installing the app")
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()))
@@ -470,11 +492,13 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 continue
             # A fresh session per scenario: one lasts 30 minutes and has no refresh. The smoke scenario has none.
             token = minted(base, secret) if row["driver"] != SMOKE else ""
+            at(f"{row['id']}: launching the app")
             launch(adb, env, token, log)
             recorder = Recorder(adb, env, row["id"], log)
             recorder.start()
             started = time.monotonic()
             if flow is not None:
+                at(f"{row['id']}: Maestro")
                 try:
                     passed = not flows.run_private(
                         [str(launcher), "--device", SERIAL, "test", str(flow), "--format", "junit", "--output",
@@ -482,10 +506,12 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 except subprocess.TimeoutExpired:
                     passed = False
             if row["driver"] != "maestro":
+                at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL}
                 records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"],
                                            claude[0], claude[1])
             entry["seconds"] = int(time.monotonic() - started)
+            at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
             entry["videos"] = recorder.stop(folder)
@@ -501,6 +527,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             settle(entry, row, passed if flow is not None else None)
             token = ""
         if any(row["driver"] == "agent" for row in chosen):
+            at("cleanup")
             token = minted(base, secret)
             cleaned_count = cleaned(base, token, since, tag)
     finally:
@@ -510,6 +537,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             emulator.wait(timeout=60)
         except subprocess.TimeoutExpired:
             emulator.kill()
+    at("writing the report")
     report = {"run": folder.parent.name, "device": "android", "scenarios": results}
     (folder / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     write_private(private / AGENTS, json.dumps({"tag": tag, "agents": records}).encode())
@@ -678,5 +706,6 @@ if __name__ == "__main__":
              "verdict": lambda: verdict(args.platform)}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None
-    except Exception:
+    except Exception as error:
+        failure_line(error)
         raise SystemExit("May device tests failed; private logs and evidence were not published") from None

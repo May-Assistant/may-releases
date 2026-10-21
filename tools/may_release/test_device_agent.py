@@ -296,7 +296,7 @@ class AgentRunnerTests(unittest.TestCase):
     def test_install_checks_the_pinned_sha512(self):
         package = fake_cli_package()
         digest = "sha512-" + base64.b64encode(hashlib.sha512(package).digest()).decode()
-        with patch("review.CLI_SHA512", digest):
+        with patch("device_agent.CLI_SHA512", digest):
             binary = device_agent.install(self.root, fetch=lambda url: package)
         self.assertEqual(binary.read_bytes(), b"\x7fELF fake")
         binary.unlink()
