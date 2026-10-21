@@ -291,8 +291,10 @@ def pick(token, get, poster):
     return None
 
 
-def checked_cli(data):
-    if "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode() != CLI_SHA512:
+def checked_cli(data, integrity=None):
+    """The binary inside a pinned Claude Code package, once it matches its sha512 (CLI_SHA512, or another platform's
+    pin)."""
+    if "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode() != (integrity or CLI_SHA512):
         raise ReviewError("The Claude Code download does not match its pinned sha512")
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
         member = archive.getmember(CLI_MEMBER)

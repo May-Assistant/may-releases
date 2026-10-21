@@ -25,7 +25,7 @@ import time
 
 import device_agent
 import device_tests
-from device_tests import DeviceTestsError
+from device_tests import DeviceTestsError, at
 import renders
 from store import child_env, require_step_secrets, runner_root, write_private
 
@@ -146,13 +146,17 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
     folder.mkdir(parents=True, mode=0o700)
     log = private / "device-run.log"
+    at("downloading Maestro")
     launcher = device_tests.maestro(root, private, log)
+    at("installing Claude Code")
     cli = install(root) if agents else None
     tag, since = device_tests.run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     env = xcode()
+    at("booting the simulator")
     udid = boot(log, env)
     results, records, cleaned_count = [], {}, None
     try:
+        at("installing the app")
         if renders.quiet(["xcrun", "simctl", "install", udid, str(root / APP)], log, env=env).returncode:
             raise DeviceTestsError("May Playground did not install on the simulator; no scenario ran")
         for row in chosen:
@@ -170,11 +174,13 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
                 continue
             token = minted(base, secret) if row["driver"] != device_tests.SMOKE else ""
+            at(f"{row['id']}: launching the app")
             launch(udid, env, token, log)
             recorder = Recorder(udid, env, row["id"], private, log)
             recorder.start()
             started = time.monotonic()
             if flow is not None:
+                at(f"{row['id']}: Maestro")
                 try:
                     passed = not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format",
                                                 "junit", "--output", str(folder / (row["id"] + ".xml"))], log,
@@ -183,12 +189,14 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 except subprocess.SubprocessError:
                     passed = False
             if row["driver"] != "maestro":
+                at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {})}
                 records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"], claude[0],
                                            claude[1], seconds=device_agent.IOS_AGENT_SECONDS)
             entry["seconds"] = int(time.monotonic() - started)
+            at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
             entry["videos"] = recorder.stop(folder)
@@ -204,11 +212,13 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             token = ""
             device_tests.settle(entry, row, passed if flow is not None else None)
         if any(row["driver"] == "agent" for row in chosen):
+            at("cleanup")
             token = minted(base, secret)
             cleaned_count = cleaned(base, token, since, tag)
     finally:
         token = secret = ""
         renders.quiet(["xcrun", "simctl", "shutdown", udid], log, env=env)
+    at("writing the report")
     report = {"run": folder.parent.name, "device": "ios", "scenarios": results}
     (folder / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     write_private(private / device_tests.AGENTS, json.dumps({"tag": tag, "agents": records}).encode())

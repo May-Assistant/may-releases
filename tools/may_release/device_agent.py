@@ -2,7 +2,8 @@
 CLAUDE_CODE_OAUTH_TOKEN, as review.py runs it.
 
 - The CLI is review.py's pinned release (CLI_URL, checked against CLI_SHA512 before the binary is written), installed
-  once per job under $RUNNER_TEMP/may-claude.
+  once per job under $RUNNER_TEMP/may-claude. The iOS job's macOS runner takes the same release's darwin-arm64 package
+  (DARWIN_URL, DARWIN_SHA512): the linux-x64 binary cannot run there.
 - The model is the variable MAY_DEVICE_TESTS_MODEL, never this repository.
 - The agent has no built-in tool (--tools ""), user settings only from a fresh, empty HOME, only the device server
   (device_mcp.py, --strict-mcp-config) and permission mode dontAsk with only mcp__device allowed: it can look at and
@@ -25,8 +26,12 @@ import subprocess
 import sys
 import urllib.request
 
-from review import CLI_MAX_BYTES, CLI_URL, checked_cli, header_safe, outcome
+from review import CLI_MAX_BYTES, CLI_SHA512, CLI_URL, checked_cli, header_safe, outcome
 
+# review.py's pinned release for macOS on Apple silicon (macos-15): npm's darwin-arm64 platform package, a single
+# Mach-O binary; DARWIN_SHA512 is the registry's dist.integrity.
+DARWIN_URL = CLI_URL.replace("linux-x64", "darwin-arm64")
+DARWIN_SHA512 = "sha512-vqtx3kS3r1hNLMk+N8JMG5J4kcLHIbI3t/NSIdcFQZrRVCFA6NtcxJyn/B+Sf3GxJaFJOCEfoBQXsFo10+Oj9A=="
 OAUTH, MODEL_VAR = "CLAUDE_CODE_OAUTH_TOKEN", "MAY_DEVICE_TESTS_MODEL"
 MODEL = re.compile(r"claude-[a-z0-9][a-z0-9.-]{0,60}")
 SERVER = Path(__file__).resolve().parent / "device_mcp.py"
@@ -55,20 +60,27 @@ class AgentError(ValueError):
     pass
 
 
-def install(root, fetch=None):
-    """review.py's pinned Claude Code under root/may-claude, once per job: the binary's path."""
+def package(system=sys.platform):
+    """(URL, sha512) of the pinned Claude Code package for this runner: darwin-arm64 on macOS, linux-x64 otherwise."""
+    return (DARWIN_URL, DARWIN_SHA512) if system == "darwin" else (CLI_URL, CLI_SHA512)
+
+
+def install(root, fetch=None, system=sys.platform):
+    """review.py's pinned Claude Code release, for this runner's platform, under root/may-claude, once per job: the
+    binary's path."""
     binary = root / "may-claude" / "claude"
     if binary.is_file() and not binary.is_symlink():
         return binary
+    url, integrity = package(system)
     if fetch is None:
-        with urllib.request.urlopen(CLI_URL, timeout=300) as response:
+        with urllib.request.urlopen(url, timeout=300) as response:
             data = response.read(CLI_MAX_BYTES + 1)
     else:
-        data = fetch(CLI_URL)
+        data = fetch(url)
     if len(data) > CLI_MAX_BYTES:
         raise AgentError("The Claude Code download is larger than expected")
     try:
-        cli = checked_cli(data)
+        cli = checked_cli(data, integrity)
     except Exception:
         raise AgentError("The Claude Code download does not match its pinned sha512") from None
     binary.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
