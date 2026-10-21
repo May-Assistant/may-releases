@@ -77,6 +77,8 @@ MAX_CHATS = 10
 MAX_GOAL = 1500
 PLATFORMS = ("android", "ios")
 APP_ID = "io.github.mayassistant.may.playground"
+# May Playground's launcher activity (may-app's namespace, not its application ID) and the pause before a second start.
+ACTIVITY, LAUNCH_RETRY_SECONDS = "io.github.mayassistant.may.MainActivity", 10
 APK = "android/app/build/outputs/apk/playground/debug/app-playground-debug.apk"
 AVD = "may-device-tests"
 MAESTRO_URL = "https://github.com/mobile-dev-inc/maestro/releases/download/cli-2.8.0/maestro.zip"
@@ -303,11 +305,19 @@ def run_tag():
 
 
 def launch(adb, env, token, log):
-    """The app, stopped and started again with a fresh test session (signed out, with no token: the smoke scenario)."""
+    """The app, stopped and started again with a fresh test session (signed out, with no token: the smoke scenario).
+    It names MainActivity, as may-app's hook documents (TestSession.kt), rather than resolving the launcher: smoke run
+    39677407348 failed at this start. One retry after LAUNCH_RETRY_SECONDS, for an activity manager still settling
+    just after boot; a second failure stops the run."""
     flows.run_private([adb, "shell", "am", "force-stop", APP_ID], log, env=env, check=False)
-    flows.run_private([adb, "shell", "am", "start", "-W", "-a", "android.intent.action.MAIN", "-c",
-                       "android.intent.category.LAUNCHER", "-p", APP_ID] +
-                      (["--es", "may_test_session", token] if token else []), log, env=env)
+    start = [adb, "shell", "am", "start", "-W", "-n", APP_ID + "/" + ACTIVITY] + \
+        (["--es", "may_test_session", token] if token else [])
+    for attempt in range(2):
+        if not flows.run_private(start, log, env=env, check=False):
+            return
+        if not attempt:
+            flows.sleep(LAUNCH_RETRY_SECONDS)
+    raise DeviceTestsError("May Playground did not start on the emulator after one retry")
 
 
 class Recorder:
