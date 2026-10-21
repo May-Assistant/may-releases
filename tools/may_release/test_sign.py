@@ -36,11 +36,13 @@ def unsigned_aab(path):
         archive.writestr("base/manifest/AndroidManifest.xml", b"fixture manifest")
 
 
-def fixture_ipa(path, build="9"):
+def fixture_ipa(path, build="9", icon=True):
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("Payload/May.app/embedded.mobileprovision", fx.PROFILE_BER)
         archive.writestr("Payload/May.app/Info.plist", plistlib.dumps(
-            {"CFBundleIdentifier": PLAYGROUND, "CFBundleVersion": build, "CFBundleShortVersionString": "1.0"}))
+            dict({"CFBundleIdentifier": PLAYGROUND, "CFBundleVersion": build, "CFBundleShortVersionString": "1.0"},
+                 **({"CFBundleIcons": {"CFBundlePrimaryIcon": {"CFBundleIconName": "AppIcon"}}} if icon else {}))))
+        archive.writestr("Payload/May.app/Assets.car", b"BOMStore fixture ... AppIcon ... renditions")
 
 
 class Workspace:
@@ -235,8 +237,8 @@ class IosSigningTests(unittest.TestCase):
     def tearDown(self):
         self.work.directory.cleanup()
 
-    def run_signing(self, build="9"):
-        """Run sign_ios for build 9; the faked export produces an IPA for `build`."""
+    def run_signing(self, build="9", icon=True):
+        """Run sign_ios for build 9; the faked export produces an IPA for `build` (with an icon unless not `icon`)."""
         calls = []
 
         def fake_tool(argv, cwd, log, env):
@@ -244,7 +246,7 @@ class IosSigningTests(unittest.TestCase):
             if argv[:2] == [sign.XCODEBUILD, "-exportArchive"]:
                 exported = Path(argv[argv.index("-exportPath") + 1])
                 exported.mkdir()
-                fixture_ipa(exported / "May.ipa", build)
+                fixture_ipa(exported / "May.ipa", build, icon)
                 options = plistlib.loads(Path(argv[argv.index("-exportOptionsPlist") + 1]).read_bytes())
                 calls.append(("options", options))
 
@@ -270,6 +272,22 @@ class IosSigningTests(unittest.TestCase):
             if argv != "options":
                 self.assertFalse(set(env or {}) & set(SECRET_NAMES))
         self.assertEqual(self.work.files(), ["may-release/May.ipa"])
+
+    def test_signing_names_the_verified_icon(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.run_signing()
+        self.assertEqual(output.getvalue().splitlines()[-2:], [
+            "May iOS IPA signed for internal TestFlight and its profile verified",
+            "IPA app icon: Info.plist names CFBundleIconName AppIcon, and Assets.car names AppIcon"])
+
+    def test_export_without_an_icon_is_refused_and_removed(self):
+        """TestFlight build 7 had no icon in App Store Connect: an IPA without one never reaches the upload."""
+        with self.assertRaises(verify.VerifyError) as refused:
+            self.run_signing(icon=False)
+        self.assertEqual(refused.exception.args[0],
+                         "IPA Info.plist names no CFBundleIconName AppIcon (App Store Connect shows no icon)")
+        self.assertFalse((self.work.root / "may-release/May.ipa").exists())
+        self.assertEqual(self.work.files(), [])
 
     def test_export_with_wrong_build_is_removed(self):
         with self.assertRaises(verify.VerifyError):

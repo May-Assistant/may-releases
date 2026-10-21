@@ -171,10 +171,12 @@ def sign_ios(target, source_sha, build_number):
         shutil.rmtree(work, ignore_errors=True)
     try:
         verify.ipa_identity(ipa, APPLE_TEAM, app_id, build_number)
+        verify.ipa_icon(ipa)
     except BaseException:
         ipa.unlink(missing_ok=True)
         raise
     print("May iOS IPA signed for internal TestFlight and its profile verified")
+    print("IPA app icon: Info.plist names CFBundleIconName AppIcon, and Assets.car names AppIcon")
 
 
 if __name__ == "__main__":

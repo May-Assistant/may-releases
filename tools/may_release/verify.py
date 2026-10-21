@@ -423,3 +423,35 @@ def ipa_identity(path, team, bundle_id, build_number):
         raise VerifyError("IPA bundle ID differs")
     if info.get("CFBundleVersion") != build_number:
         raise VerifyError("IPA build number differs")
+
+
+APP_ICON = "AppIcon"
+
+
+def ipa_icon(path):
+    """Check the IPA's app has its icon: Info.plist names CFBundleIconName AppIcon (at the top level, as actool's
+    partial plist can write it, or in CFBundleIcons' primary icon), and the app's compiled asset catalog
+    (Assets.car) exists and names AppIcon. TestFlight build 7 showed no icon in App Store Connect; this makes a
+    missing one fail the job before the upload, with a fixed message saying which part is missing."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            apps = {n.split("/")[1] for n in names
+                    if n.startswith("Payload/") and n.count("/") >= 2 and n.split("/")[1].endswith(".app")}
+            if len(apps) != 1:
+                raise VerifyError("IPA must contain exactly one app")
+            app = "Payload/" + apps.pop() + "/"
+            info = plistlib.loads(archive.read(app + "Info.plist"))
+            catalog = archive.read(app + "Assets.car") if app + "Assets.car" in names else None
+    except (zipfile.BadZipFile, KeyError, plistlib.InvalidFileException):
+        raise VerifyError("IPA is not a complete app archive") from None
+    icons = info.get("CFBundleIcons") if isinstance(info, dict) else None
+    primary = icons.get("CFBundlePrimaryIcon") if isinstance(icons, dict) else None
+    named = (isinstance(info, dict) and info.get("CFBundleIconName") == APP_ICON) or \
+        (isinstance(primary, dict) and primary.get("CFBundleIconName") == APP_ICON)
+    if not named:
+        raise VerifyError("IPA Info.plist names no CFBundleIconName AppIcon (App Store Connect shows no icon)")
+    if catalog is None:
+        raise VerifyError("IPA app has no compiled asset catalog (Assets.car), so no icon")
+    if APP_ICON.encode() not in catalog:
+        raise VerifyError("IPA asset catalog (Assets.car) names no AppIcon")
