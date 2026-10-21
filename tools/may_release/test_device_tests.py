@@ -398,14 +398,17 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertIn("## sign-in: Sign in with a staging test session", readme)
         self.assertIn("**android: ui-pass** (server checks not configured)", readme)
         self.assertIn('<img src="android/sign-in-end.png" width="300">', readme)
-        self.assertIn("Recording: `sign-in.mp4`", readme)
+        self.assertIn("[Recording: sign-in.mp4](https://github.com/May-Assistant/may-renders/releases/download/device-tests-" + RUN + "/android-sign-in.mp4)", readme)
         self.assertIn("encrypted artifact may-device-<device>-2 of "
-                      "https://github.com/May-Assistant/may-releases/actions/runs/9, kept 7 days", readme)
+                      "https://github.com/May-Assistant/may-releases/actions/runs/9 holds them for 7 days", readme)
         self.assertEqual(list(tree.rglob("*.mp4")), [], "recordings never enter may-renders history")
+        moved = self.root / "may-private" / publish.VIDEOS / RUN / "android" / "sign-in.mp4"
+        self.assertTrue(moved.is_file() and moved.read_bytes() == MP4, "moved aside for device-release")
         self.assertIn("GET /v1/connections: 500", readme)
         self.assertNotIn("<script>", readme + (tree / "index.html").read_text())
         page = (tree / "index.html").read_text()
-        self.assertIn("Recording: <code>sign-in.mp4</code>", page)
+        self.assertIn('<a href="https://github.com/May-Assistant/may-renders/releases/download/device-tests-' + RUN +
+                      '/android-sign-in.mp4">Recording: sign-in.mp4</a>', page)
         self.assertIn("may-device-&lt;device&gt;-2", page)
         self.assertNotIn("<video", page)
 
@@ -478,6 +481,102 @@ class PublishDeviceTests(unittest.TestCase):
             "May device tests: nothing was decrypted, so nothing was pushed"])
 
 
+class FakeRenders:
+    """may-renders' release API as device-release sees it, recording every call."""
+
+    def __init__(self, existing=(), create=201, assets=(), upload=201):
+        self.calls, self.existing, self.create, self.assets, self.upload = [], list(existing), create, list(assets), upload
+
+    def __call__(self, method, host, path, token, payload=None, data=None):
+        self.calls.append((method, host, path, payload, data))
+        base = "/repos/May-Assistant/may-renders"
+        if method == "POST" and path == base + "/releases":
+            return self.create, ({"id": 77} if self.create == 201 else None)
+        if method == "GET" and path.startswith(base + "/releases/tags/"):
+            return 200, {"id": 77}
+        if method == "GET" and path == base + "/releases/77/assets?per_page=100":
+            return 200, [{"name": name} for name in self.assets]
+        if method == "POST" and host == publish.UPLOADS:
+            return self.upload, {}
+        if method == "GET" and path == base + "/releases?per_page=100":
+            return 200, self.existing
+        if method == "DELETE":
+            return 204, None
+        raise AssertionError("unexpected call " + method + " " + path)
+
+
+class ReleaseDeviceTests(unittest.TestCase):
+    TOKEN = "github_pat_" + "x" * 30
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.videos = self.root / "may-private" / publish.VIDEOS / RUN / "android"
+        self.videos.mkdir(parents=True)
+        for name in ("sign-in.mp4", "connections-part1.mp4", "connections-part2.mp4"):
+            (self.videos / name).write_bytes(MP4)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def release(self, api, token=TOKEN):
+        environ = {"RUNNER_TEMP": str(self.root)}
+        if token is not None:
+            environ["MAY_RENDERS_RELEASE_TOKEN"] = token
+        with patch.dict(os.environ, environ, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
+            publish.release_device(api=api)
+            self.assertNotIn("MAY_RENDERS_RELEASE_TOKEN", os.environ)
+        return out.getvalue().strip()
+
+    def test_uploads_each_recording_to_this_runs_release_and_keeps_ten(self):
+        existing = [{"id": n, "tag_name": "device-tests-202610%02d-%012x" % (n, n), "created_at": "x"}
+                    for n in range(1, 12)] + [{"id": 500, "tag_name": "v1.0"}]
+        api = FakeRenders(existing=existing)
+        self.assertEqual(self.release(api), f"May device tests: 3 recordings uploaded to the may-renders release for "
+                                            f"device-tests/{RUN}/ (10 releases kept, 1 removed)")
+        create = api.calls[0]
+        self.assertEqual(create[:3], ("POST", publish.API, "/repos/May-Assistant/may-renders/releases"))
+        self.assertEqual((create[3]["tag_name"], create[3]["target_commitish"], create[3]["make_latest"]),
+                         ("device-tests-" + RUN, "main", "false"))
+        uploads = [c for c in api.calls if c[1] == publish.UPLOADS]
+        self.assertEqual([c[2].rsplit("=", 1)[1] for c in uploads],
+                         ["android-connections-part1.mp4", "android-connections-part2.mp4", "android-sign-in.mp4"])
+        self.assertTrue(all(c[4] == MP4 for c in uploads))
+        deleted = [c[2] for c in api.calls if c[0] == "DELETE"]
+        self.assertEqual(deleted, ["/repos/May-Assistant/may-renders/releases/1",
+                                   "/repos/May-Assistant/may-renders/git/refs/tags/device-tests-20261001-000000000001"],
+                         "only the oldest device-tests release goes; other releases are never touched")
+
+    def test_a_re_run_reuses_the_release_and_skips_assets_already_there(self):
+        api = FakeRenders(create=422, assets=["android-sign-in.mp4"])
+        self.assertIn("2 recordings uploaded", self.release(api))
+        self.assertIn(("GET", publish.API, f"/repos/May-Assistant/may-renders/releases/tags/device-tests-{RUN}", None,
+                       None), api.calls)
+
+    def test_a_failed_upload_stops_the_step(self):
+        with self.assertRaises(PublishError):
+            self.release(FakeRenders(upload=500))
+
+    def test_without_the_token_or_recordings_nothing_is_called(self):
+        def refuse(*args, **kwargs):
+            raise AssertionError("called may-renders")
+
+        self.assertEqual(self.release(refuse, token=None), "May device tests: MAY_RENDERS_RELEASE_TOKEN is not set in "
+                                                           "may-device-tests; recordings stay only in the encrypted artifact")
+        shutil.rmtree(self.root / "may-private")
+        self.assertEqual(self.release(refuse), "May device tests: no recordings were decrypted, so none were uploaded")
+
+    def test_only_may_renders_device_tests_releases_are_reachable(self):
+        for method, host, path in (("GET", publish.API, "/repos/May-Assistant/may-app/releases?per_page=100"),
+                                   ("DELETE", publish.API, "/repos/May-Assistant/may-renders/git/refs/heads/main"),
+                                   ("DELETE", publish.API, "/repos/May-Assistant/may-renders/git/refs/tags/v1.0"),
+                                   ("POST", "https://evil.example", "/repos/May-Assistant/may-renders/releases"),
+                                   ("POST", publish.UPLOADS, "/repos/May-Assistant/may-renders/releases/7/assets?name=x.sh")):
+            with self.subTest(path=path), patch("urllib.request.urlopen", side_effect=AssertionError("network")), \
+                    self.assertRaises(PublishError):
+                publish.renders_api(method, host, path, self.TOKEN)
+
+
 class WorkflowPinTests(unittest.TestCase):
     def setUp(self):
         self.text = (ROOT / WORKFLOW).read_text()
@@ -498,6 +597,13 @@ class WorkflowPinTests(unittest.TestCase):
         build = "      - name: Build May Playground for the emulator without secrets\n"
         self.flagged(self.text.replace(build, build + "        env:\n" + line.replace("MAY_TEST", "MAY_TEST", 1)),
                      "a secret, variable or env entry")
+
+    def test_the_release_token_stays_in_the_release_step(self):
+        line = "          MAY_RENDERS_RELEASE_TOKEN: ${{ secrets.MAY_RENDERS_RELEASE_TOKEN }}\n"
+        push = "          MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}\n"
+        self.assertEqual(self.text.count(line), 1)
+        self.flagged(self.text.replace(line, "").replace(push, push + line), "a secret, variable or env entry")
+        self.flagged(self.text.replace("publish.py device-release", "publish.py device-push"), "runs something other")
 
     def test_variables_stay_in_their_steps(self):
         line = "          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}\n"
@@ -527,6 +633,11 @@ class SecretNameTests(unittest.TestCase):
         self.assertIn("MAY_TEST_SIGNIN_SECRET", store.SECRET_NAMES)
         with patch.dict(os.environ, {"MAY_TEST_SIGNIN_SECRET": "x"}, clear=True), self.assertRaises(store.StoreError):
             store.require_step_secrets(store.SOURCE_READ_SECRETS)
+
+    def test_the_release_token_is_refused_by_every_other_step(self):
+        self.assertIn("MAY_RENDERS_RELEASE_TOKEN", store.SECRET_NAMES)
+        with patch.dict(os.environ, {"MAY_RENDERS_RELEASE_TOKEN": "x"}, clear=True), self.assertRaises(store.StoreError):
+            store.require_step_secrets(("MAY_APP_RENDERS_WRITE_KEY",))
 
 
 if __name__ == "__main__":

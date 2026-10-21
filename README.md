@@ -686,7 +686,7 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
 
 ### Device tests of May Playground against staging
 
-`device-tests.yml` runs May Playground on an Android emulator against live staging, signed in as the staging test account, and drives it with may-app's Maestro flows. It runs on dispatch (`source_sha`, empty for main's head, and `scenarios`) and nightly at 03:17 UTC on may-app main's head. iOS follows in a later change. This repository is public, so the log shows scenario ids, verdicts and counts only. Screenshots, recordings and reports go age-encrypted to the private `May-Assistant/may-renders`, under `device-tests/<UTC date>-<may-app short sha>/`.
+`device-tests.yml` runs May Playground on an Android emulator against live staging, signed in as the staging test account, and drives it with may-app's Maestro flows. It runs on dispatch (`source_sha`, empty for main's head, and `scenarios`) and nightly at 03:17 UTC on may-app main's head. iOS follows in a later change. This repository is public, so the log shows scenario ids, verdicts and counts only. Screenshots, recordings and reports leave the runner age-encrypted. Screenshots and reports go to the private `May-Assistant/may-renders`, under `device-tests/<UTC date>-<may-app short sha>/`, and recordings go to that run's may-renders release.
 
 1. **admission** (`gate.py --action device-tests`) checks the inputs and the environment `may-device-tests`, which allows main only and has no required reviewer, because the nightly run can't wait for one. Only this action may start from a schedule.
 2. **android**, on Linux with KVM:
@@ -694,24 +694,23 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
    - `device_tests.py build` builds the Playground debug APK without secrets;
    - `run`:
      - installs the app and the pinned Maestro CLI 2.8.0, its zip checked against a SHA-256;
-     - mints a short-lived staging session for the test account (`POST /v1/auth/test-session` with `MAY_TEST_SIGNIN_SECRET`);
+     - mints a short-lived staging session for the test account (`POST /v1/auth/test-session` with `{"secret": MAY_TEST_SIGNIN_SECRET}` in the body; staging fixes the account and replies `{token, expires_at, user_id}`, of which only the token is kept);
      - hands it to the app through a Playground-debug-only intent extra (`may_test_session`);
      - for each scenario in `device_scenarios.json`, records the screen (about 720p, about 1 Mbps, 3-minute parts), runs the scenario's flow from may-app's `tools/device-tests/flows/`, takes a screenshot and runs its read-only server checks.
 
      A scenario with no server checks configured passes on screen alone ("ui-pass").
-   - `seal` age-encrypts the run folder to `MAY_RENDERS_RECIPIENT`. Only that file is uploaded, kept for one day.
+   - `seal` age-encrypts the run folder to `MAY_RENDERS_RECIPIENT`. Only that file is uploaded, kept for 7 days, as the recordings' fallback.
    - `verdict` fails the job if any scenario failed.
 3. **publish**, on a fresh Linux runner that runs no may-app code:
-   - `publish.py device-open` decrypts with `MAY_RENDERS_DECRYPT_KEY` and accepts only the fixed layout: `report.json`, MP4s, end screenshots and Maestro reports. It builds the run folder's `README.md`, which GitHub shows when the folder is opened, and `index.html`, both from the checked reports and this repository's own scenario titles.
+   - `publish.py device-open` decrypts with `MAY_RENDERS_DECRYPT_KEY` and accepts only the fixed layout: `report.json`, MP4s, end screenshots and Maestro reports. It builds the run folder's `README.md`, which GitHub shows when the folder is opened, and `index.html`, both from the checked reports and this repository's own scenario titles. It moves the checked MP4s out of the folder, so they never enter git history.
    - `device-push` adds the folder under `device-tests/` with `MAY_APP_RENDERS_WRITE_KEY`, keeping the newest 10 in `device-tests/runs.json`, and never force-pushes.
+   - `device-release` uploads the MP4s, as `<device>-<file>.mp4`, to the may-renders release `device-tests-<run>` with `MAY_RENDERS_RELEASE_TOKEN`. On a re-run it reuses the release and skips assets already there. It keeps the newest 10 `device-tests-*` releases and deletes older ones with their tags, never touching other releases. Its only calls are those releases on may-renders. Without the token, it uploads nothing and says so, and the recordings stay in the encrypted artifact.
 
 **Outward actions:** a scenario marked `"outward": true` runs unless `MAY_DEVICE_TESTS_OUTWARD` is `off`. So far only the self-addressed Gmail send to harlahke@gmail.com is planned to use this. Samuel approved it directly on 21 Oct, conditional on staging's guard for test sessions.
 
 **Setup** in the environment `may-device-tests`:
-- secrets: `MAY_TEST_SIGNIN_SECRET`, plus copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_RENDERS_DECRYPT_KEY` and `MAY_APP_RENDERS_WRITE_KEY`;
+- secrets: `MAY_TEST_SIGNIN_SECRET`, `MAY_RENDERS_RELEASE_TOKEN` (fine-grained, may-renders only, Contents read and write), plus copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_RENDERS_DECRYPT_KEY` and `MAY_APP_RENDERS_WRITE_KEY`;
 - variables: `MAY_STAGING_API_URL`, `MAY_RENDERS_RECIPIENT` and, optionally, `MAY_DEVICE_TESTS_OUTWARD`.
-
-**Recordings:** they are currently kept in git. Pruning to 10 runs doesn't shrink git history, so they may move to release assets on may-renders, which would need a token with may-renders contents access.
 
 ### Prerequisites that remain
 

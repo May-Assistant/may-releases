@@ -34,12 +34,14 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import urllib.error
+import urllib.request
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from ds_compile import DsCompileError, MAX_BODY, post_once, request, run_url
+from ds_compile import API, DsCompileError, MAX_BODY, post_once, request, run_url
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import GITHUB_HOST_KEY
 import device_tests
@@ -67,8 +69,21 @@ DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped")
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
            "server checks not configured")
-# The sealed device artifact's retention (device-tests.yml): the only home of the recordings until release assets.
+# The sealed device artifact's retention (device-tests.yml): the recordings' fallback when the release upload fails.
 VIDEO_DAYS = 7
+# The recordings go to one may-renders release per run (tag device-tests-<run>), never into its git history; the
+# newest KEEP such releases are kept. Only device-release holds the token, a fine-grained token on may-renders alone.
+RELEASE_TOKEN, RENDERS_REPO = "MAY_RENDERS_RELEASE_TOKEN", "May-Assistant/may-renders"
+UPLOADS = "https://uploads.github.com"
+VIDEOS = "may-device-videos"
+RELEASE_TAG = re.compile(r"device-tests-[0-9]{8}-[0-9a-f]{12}")
+_RELEASES = r"/repos/" + re.escape(RENDERS_REPO) + r"/releases"
+RELEASE_CALLS = (("POST", API, _RELEASES), ("GET", API, _RELEASES + r"/tags/" + RELEASE_TAG.pattern),
+                 ("GET", API, _RELEASES + r"\?per_page=100"),
+                 ("GET", API, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?per_page=100"),
+                 ("POST", UPLOADS, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?name=(?:android|ios)-[a-z0-9][a-z0-9-]{0,60}\.mp4"),
+                 ("DELETE", API, _RELEASES + r"/[1-9][0-9]{0,15}"),
+                 ("DELETE", API, r"/repos/" + re.escape(RENDERS_REPO) + r"/git/refs/tags/" + RELEASE_TAG.pattern))
 MAX_FILES = 2000
 MAX_FILE = 40 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
@@ -81,8 +96,9 @@ README = ("# May parity renders and device tests\n\nWritten by may-releases, nev
           "sheet/ (the two side by side), ios/, android/, the manifest copy and build.log.\n"
           "- device-tests.yml: device-tests/<UTC date>-<may-app short sha>/, the newest " + str(KEEP) + " kept "
           "(device-tests/runs.json). Each holds README.md (open the folder: verdicts and screenshots), index.html, and "
-          "per device the screenshots, Maestro reports and report.json. Recordings are never committed: they stay in "
-          "the run's encrypted workflow artifact for " + str(VIDEO_DAYS) + " days.\n")
+          "per device the screenshots, Maestro reports and report.json. Recordings are never committed: they are assets "
+          "of the release device-tests-<folder> (the newest " + str(KEEP) + " kept), and the run's encrypted workflow "
+          "artifact holds them for " + str(VIDEO_DAYS) + " days.\n")
 
 
 class PublishError(ValueError):
@@ -351,10 +367,19 @@ def device_report(path, files, titles):
 
 
 def recordings_note(url, attempt):
-    """Where the recordings are: never in git, only in the run's encrypted artifact (sealed to the renders key)."""
-    return (f"Recordings are not committed. They are in the encrypted artifact may-device-<device>-{attempt} of {url or 'the workflow run'}, "
-            f"kept {VIDEO_DAYS} days: download it and decrypt with the renders key "
-            "(age -d -i key.txt android.age | tar -x).")
+    """Where the recordings are: never in git; assets of this run's may-renders release, and the encrypted artifact."""
+    return (f"Recordings are not committed: each links to an asset of this run's may-renders release (the newest {KEEP} "
+            f"are kept). If a link is missing, the upload did not happen; the encrypted artifact "
+            f"may-device-<device>-{attempt} of {url or 'the workflow run'} holds them for {VIDEO_DAYS} days: download it "
+            "and decrypt with the renders key (age -d -i key.txt android.age | tar -x).")
+
+
+def asset_name(device, video):
+    return f"{device}-{video}"
+
+
+def asset_url(run, device, video):
+    return f"https://github.com/{RENDERS_REPO}/releases/download/device-tests-{run}/{asset_name(device, video)}"
 
 
 def device_pages(run, reports, note):
@@ -362,7 +387,7 @@ def device_pages(run, reports, note):
     order = [row["id"] for rows in reports.values() for row in rows]
     ids = list(dict.fromkeys(order))
     lines = [f"# May device tests: {run}", "", "Each scenario on each device: its verdict, the last screenshot and the "
-             "names of its recordings.", "", note, ""]
+             "link to each recording.", "", note, ""]
     html_parts = ["<!doctype html>", '<meta charset="utf-8">', f"<title>May device tests {run}</title>",
                   "<style>body{font:14px system-ui;margin:24px}img{max-width:360px}td{vertical-align:top;"
                   "padding:8px;border:1px solid #ccc}table{border-collapse:collapse}</style>",
@@ -379,10 +404,10 @@ def device_pages(run, reports, note):
             server = "; ".join(f"GET {path}: {status}" for path, status in row["server"])
             lines.append(f"**{device}: {row['verdict']}**{note}" + (f". Server: {server}" if server else ""))
             lines += [f'<img src="{device}/{shot}" width="300">' for shot in row["screenshots"]]
-            lines += [f"Recording: `{video}`" for video in row["videos"]]
+            lines += [f"[Recording: {video}]({asset_url(run, device, video)})" for video in row["videos"]]
             lines.append("")
             media = "".join(f'<img src="{device}/{shot}" alt="screenshot">' for shot in row["screenshots"]) + \
-                "".join(f"<br>Recording: <code>{video}</code>" for video in row["videos"])
+                "".join(f'<br><a href="{asset_url(run, device, video)}">Recording: {video}</a>' for video in row["videos"])
             html_parts.append(f"<td><b>{device}: {row['verdict']}</b>{note}<br>{server}<br>{media}</td>")
         html_parts.append("</tr>")
     html_parts.append("</table>")
@@ -434,9 +459,12 @@ def open_device():
             folder = tree / run / device
             reports[device] = device_report(folder / "report.json", {p.name for p in folder.iterdir()}, titles)[1]
         run = runs.pop()
-        # Checked as MP4s above, then dropped: recordings never enter may-renders history.
-        for video in (tree / run).glob("*/*.mp4"):
-            video.unlink()
+        # Checked as MP4s above, then moved out of the tree: recordings never enter may-renders history; device-release
+        # uploads them from here.
+        videos = private / VIDEOS / run
+        for video in sorted((tree / run).glob("*/*.mp4")):
+            (videos / video.parent.name).mkdir(mode=0o700, parents=True, exist_ok=True)
+            video.rename(videos / video.parent.name / video.name)
         attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
         readme, page = device_pages(run, reports, recordings_note(
             run_url(os.environ), attempt if re.fullmatch(r"[1-9][0-9]{0,3}", attempt) else "<attempt>"))
@@ -467,6 +495,97 @@ def push_device(run_git=git):
     kept, removed = publish_tree(runs[0], DEVICE_PREFIX, folder, entry, f"Device tests {folder}", key_text, run_git)
     print(f"May device tests published to may-renders as device-tests/{folder}/ ({len(kept)} run folders kept, "
           f"{len(removed)} removed)")
+
+
+def renders_api(method, host, path, token, payload=None, data=None):
+    """One may-renders release call. Only RELEASE_CALLS are made; nothing from a reply is printed."""
+    if not any(method == allowed and host == base and re.fullmatch(pattern, path)
+               for allowed, base, pattern in RELEASE_CALLS):
+        raise PublishError("Only may-renders' device-tests releases are reachable")
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28",
+               "Content-Type": "video/mp4" if data is not None else "application/json"}
+    body = data if data is not None else None if payload is None else json.dumps(payload).encode()
+    call = urllib.request.Request(host + path, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(call, timeout=300) as response:
+            return response.status, json.loads(response.read() or b"null")
+    except urllib.error.HTTPError as error:
+        return error.code, None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return 0, None
+
+
+def release_for(run, token, api):
+    """This run's release, created (or found, on a re-run) at may-renders' main: its id and its asset names."""
+    tag = "device-tests-" + run
+    status, release = api("POST", API, f"/repos/{RENDERS_REPO}/releases", token, {
+        "tag_name": tag, "target_commitish": "main", "name": "Device tests " + run, "make_latest": "false",
+        "body": f"Recordings of device-tests/{run}/, written by may-releases. Never edited by hand."})
+    if status == 422:
+        status, release = api("GET", API, f"/repos/{RENDERS_REPO}/releases/tags/{tag}", token)
+    if status not in (200, 201) or not isinstance(release, dict) or type(release.get("id")) is not int:
+        raise PublishError("The may-renders release for this run could not be created or read")
+    status, assets = api("GET", API, f"/repos/{RENDERS_REPO}/releases/{release['id']}/assets?per_page=100", token)
+    if status != 200 or not isinstance(assets, list):
+        raise PublishError("The may-renders release's assets could not be read")
+    return release["id"], {a.get("name") for a in assets if isinstance(a, dict)}
+
+
+def prune_releases(token, api):
+    """The newest KEEP device-tests releases (by tag: <UTC date>-<sha>, then creation) kept; the rest and their tags
+    deleted. Other releases are never touched."""
+    status, releases = api("GET", API, f"/repos/{RENDERS_REPO}/releases?per_page=100", token)
+    if status != 200 or not isinstance(releases, list):
+        raise PublishError("may-renders' releases could not be listed")
+    ours = [r for r in releases if isinstance(r, dict) and type(r.get("id")) is int and
+            isinstance(r.get("tag_name"), str) and RELEASE_TAG.fullmatch(r["tag_name"])]
+    ours.sort(key=lambda r: (r["tag_name"][len("device-tests-"):][:8], str(r.get("created_at", ""))), reverse=True)
+    removed = 0
+    for release in ours[KEEP:]:
+        status, _ = api("DELETE", API, f"/repos/{RENDERS_REPO}/releases/{release['id']}", token)
+        if status not in (204, 404):
+            raise PublishError("An old may-renders release could not be deleted")
+        api("DELETE", API, f"/repos/{RENDERS_REPO}/git/refs/tags/{release['tag_name']}", token)
+        removed += 1
+    return min(len(ours), KEEP), removed
+
+
+def release_device(api=renders_api):
+    """The recordings device-open moved aside, uploaded as assets of this run's may-renders release."""
+    require_step_secrets((RELEASE_TOKEN,))
+    # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
+    token = os.environ.pop(RELEASE_TOKEN, "").strip()
+    root = runner_root()
+    folders = [p for p in (root / "may-private" / VIDEOS).iterdir() if p.is_dir()] \
+        if (root / "may-private" / VIDEOS).is_dir() else []
+    if len(folders) != 1 or not DEVICE_RUN.fullmatch(folders[0].name):
+        print("May device tests: no recordings were decrypted, so none were uploaded")
+        return
+    if len(token) < 20:
+        print("May device tests: MAY_RENDERS_RELEASE_TOKEN is not set in may-device-tests; recordings stay only in "
+              "the encrypted artifact")
+        return
+    run = folders[0].name
+    videos = [(device.name, video) for device in sorted(folders[0].iterdir())
+              if device.name in DEVICES and device.is_dir() and not device.is_symlink()
+              for video in sorted(device.iterdir())
+              if DEVICE_FILE.fullmatch(video.name) and video.suffix == ".mp4" and video.is_file()
+              and not video.is_symlink()]
+    release, present = release_for(run, token, api)
+    uploaded = 0
+    for device, video in videos:
+        name = asset_name(device, video.name)
+        if name in present:
+            continue
+        status, _ = api("POST", UPLOADS, f"/repos/{RENDERS_REPO}/releases/{release}/assets?name={name}", token,
+                        data=video.read_bytes())
+        if status != 201:
+            raise PublishError("A recording could not be uploaded to the may-renders release")
+        uploaded += 1
+    kept, removed = prune_releases(token, api)
+    print(f"May device tests: {uploaded} recordings uploaded to the may-renders release for device-tests/{run}/ "
+          f"({kept} releases kept, {removed} removed)")
 
 
 _PR = r"/repos/" + re.escape(APP_REPO) + r"/{}/[1-9][0-9]{{0,6}}"
@@ -530,7 +649,7 @@ def comment(sha, pr, call_api=github):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("open", "push", "comment", "device-open", "device-push"))
+    parser.add_argument("command", choices=("open", "push", "comment", "device-open", "device-push", "device-release"))
     parser.add_argument("--source-sha")
     parser.add_argument("--pr-number")
     args = parser.parse_args()
@@ -539,6 +658,8 @@ if __name__ == "__main__":
             open_device()
         elif args.command == "device-push":
             push_device()
+        elif args.command == "device-release":
+            release_device()
         elif args.command == "open":
             open_renders(args.source_sha)
         elif args.command == "push":

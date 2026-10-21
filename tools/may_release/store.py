@@ -134,6 +134,9 @@ SECRET_NAMES = (
     "MAY_APP_RENDERS_WRITE_KEY", "MAY_RENDERS_DECRYPT_KEY",
     # device-tests.yml: the staging secret that mints the test account's session (device_tests.py run alone).
     "MAY_TEST_SIGNIN_SECRET",
+    # device-tests.yml: the fine-grained token on may-renders alone that uploads recordings as release assets
+    # (publish.py device-release alone).
+    "MAY_RENDERS_RELEASE_TOKEN",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
 # Crash reports (PostHog): each platform's build step alone may hold its project key, and

@@ -95,7 +95,8 @@ jobs:
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"
   publish:
-    # A fresh runner that runs no may-app code: the decrypt key and the may-renders write key each live in one step.
+    # A fresh runner that runs no may-app code: the decrypt key, the may-renders write key and its release token each
+    # live in one step. Recordings never enter may-renders' git history: they are assets of the run's release.
     # It publishes whatever the device jobs sealed, even when one then failed its verdict.
     needs: [admission, android]
     if: ${{ !cancelled() && needs.admission.result == 'success' }}
@@ -126,6 +127,10 @@ jobs:
         env:
           MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}
         run: python3 -I -S -B tools/may_release/publish.py device-push
+      - name: Upload the recordings as may-renders release assets
+        env:
+          MAY_RENDERS_RELEASE_TOKEN: ${{ secrets.MAY_RENDERS_RELEASE_TOKEN }}
+        run: python3 -I -S -B tools/may_release/publish.py device-release
       - name: Remove the decrypted reports and the branch checkout
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-device-download" "$RUNNER_TEMP/may-publish-tree" "$RUNNER_TEMP/may-publish-git"
