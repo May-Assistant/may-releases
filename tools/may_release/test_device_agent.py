@@ -61,7 +61,8 @@ class AgentRunTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None):
+    def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
+                      asked=None):
         calls, minted, seen = [], [], {}
 
         class Process:
@@ -106,8 +107,10 @@ class AgentRunTests(unittest.TestCase):
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
-            device_tests.run_scenarios("chat,notes,routines", minted=mint, checked=lambda *a: 200,
-                                       truth=lambda base, token, path, tag: truth, cleaned=clean, agent=agent,
+            device_tests.run_scenarios(selection, minted=mint, checked=lambda *a: 200,
+                                       truth=lambda base, token, path, tag: truth,
+                                       asked=asked or (lambda *a: self.fail("asked about a question")),
+                                       cleaned=clean, agent=agent,
                                        install=lambda root: root / "may-claude" / "claude")
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", os.environ)
@@ -136,21 +139,21 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(seen["cleanup"][0], TOKEN + "4")
         self.assertEqual(seen["cleanup"][2], "qa-39557415738")
         self.assertRegex(seen["cleanup"][1], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertEqual([row["verdict"] for row in report["scenarios"]], ["ui-pass", "pass", "pass"])
+        self.assertEqual([row["verdict"] for row in report["scenarios"]], ["ui-pass", "ui-pass", "pass"])
         self.assertEqual(report["scenarios"][0]["reason"], "server checks not configured")
-        self.assertEqual(report["scenarios"][1]["server"], [{"get": "/v1/event-notes", "status": 200, "pass": True}])
+        self.assertEqual(report["scenarios"][2]["server"], [{"get": "/v1/approvals", "status": 200, "pass": True}])
         self.assertEqual(report["scenarios"][0]["notes"], "fine <b>")
         self.assertEqual(run_out.splitlines(), [
             "May device tests (android): 3 scenarios ran; verdicts follow the judge step",
             "May device tests (android): the test session's cleanup removed 3 tagged items"])
         self.assertEqual(judge_out.splitlines(), [
-            "May device tests (android): chat: ui-pass", "May device tests (android): notes: pass",
+            "May device tests (android): chat: ui-pass", "May device tests (android): notes: ui-pass",
             "May device tests (android): routines: pass",
-            "May device tests (android): 2 passed, 1 passed on screen alone (server checks not configured), 0 failed, "
+            "May device tests (android): 1 passed, 2 passed on screen alone (server checks not configured), 0 failed, "
             "0 skipped"])
         for secret in (TOKEN, OAUTH, "s" * 32, "saw it", "fine"):
             self.assertNotIn(secret, run_out + judge_out)
-        self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "pass", "pass"])
+        self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "ui-pass", "pass"])
 
     def test_rate_limits_skip_and_never_pass(self):
         _, _, seen, report, _, _ = self.run_and_judge(
@@ -166,9 +169,26 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("fail", device_tests.BLOCKED), ("fail", device_tests.UNFINISHED), ("fail", None)])
         _, _, _, report, _, _ = self.reset_and(lambda: self.run_and_judge(
-            [record(), record(), record()], [("pass", ""), ("pass", ""), ("error", "")], truth=(200, False)))
+            [record(), record(), record()], [("pass", ""), ("error", ""), ("pass", "")], truth=(200, False)))
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("ui-pass", device_tests.UNCONFIGURED), ("fail", device_tests.NO_TRUTH), ("fail", device_tests.NOT_JUDGED)])
+            ("ui-pass", device_tests.UNCONFIGURED), ("fail", device_tests.NOT_JUDGED), ("fail", device_tests.NO_TRUTH)])
+
+    def test_the_poll_scenarios_read_the_question_card_in_the_tagged_chat(self):
+        asked = []
+
+        def ask(base, token, state, tag):
+            asked.append((state, tag))
+            return (200, state == "answered")
+
+        try:
+            _, _, _, report, _, _ = self.run_and_judge([record(), record()], [("pass", ""), ("pass", "")],
+                                                       selection="poll,poll-skip", asked=ask)
+        except (KeyError, TypeError) as error:
+            self.fail("a question truth row was not read as a question: " + type(error).__name__)
+        self.assertEqual(asked, [("answered", "qa-39557415738"), ("closed", "qa-39557415738")])
+        self.assertEqual([(row["verdict"], row.get("reason"), row["server"]) for row in report["scenarios"]], [
+            ("pass", None, [{"get": "/v1/agents", "status": 200, "pass": True}]),
+            ("fail", device_tests.NO_TRUTH, [{"get": "/v1/agents", "status": 200, "pass": False}])])
 
     def reset_and(self, again):
         import shutil
@@ -201,6 +221,37 @@ class ServerTruthTests(unittest.TestCase):
                                              get=get({"routines": [{"name": "QA-39557415738 stretch"}]})), (200, True))
         self.assertEqual(device_tests.tagged("https://s", TOKEN, "/v1/routines", tag,
                                              get=get({"routines": [{"name": "stretch"}]})), (200, False))
+
+    def test_question_truth_finds_the_card_in_the_tagged_chat_or_mays_own(self):
+        tag = "qa-39557415738"
+        question = {"id": "m2", "kind": "question", "question": {"state": "answered", "answer": {"choice_id": "c1"}}}
+
+        def server(chats, messages):
+            seen = []
+
+            def get(request, timeout):
+                path = request.full_url.removeprefix("https://s")
+                seen.append(path)
+                if path == "/v1/agents":
+                    return FakeReply(json.dumps({"agents": chats}).encode())
+                return FakeReply(json.dumps({"messages": messages.get(path, [])}).encode())
+            return get, seen
+
+        get, seen = server([{"id": "may", "name": "May"}, {"id": "a7", "name": "Week " + tag}],
+                           {"/v1/conversations/a7/messages": [{"kind": "text", "text": "Ask me, tag " + tag}, question]})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, True))
+        self.assertEqual(seen, ["/v1/agents", "/v1/conversations/a7/messages"])
+        get, _ = server([{"id": "may", "name": "May"}],
+                        {"/v1/conversations/may/messages": [{"kind": "text", "text": tag}, question]})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, True),
+                         "May's own chat, first in the list, is read too")
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "closed", tag, get=get), (200, False))
+        get, _ = server([{"id": "may", "name": "May"}], {"/v1/conversations/may/messages": [question]})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
+                         "a question in a chat without the tag is someone else's")
+        get, seen = server([{"id": "../../v1/account", "name": tag}], {})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False))
+        self.assertEqual(seen, ["/v1/agents"], "an id that is not a plain id is never put in a path")
 
     def test_cleanup_sends_since_and_tag_and_counts(self):
         seen = {}

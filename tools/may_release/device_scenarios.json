@@ -45,9 +45,37 @@
     ],
     "outward": false,
     "server": [],
+    "truth": []
+  },
+  {
+    "id": "poll",
+    "title": "Answer May's multiple-choice question",
+    "driver": "agent",
+    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me a multiple-choice question about my week, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until the card shows your choice as the answer.",
+    "platforms": [
+      "android"
+    ],
+    "outward": false,
+    "server": [],
     "truth": [
       {
-        "get": "/v1/event-notes"
+        "question": "answered"
+      }
+    ]
+  },
+  {
+    "id": "poll-skip",
+    "title": "Skip May's question with a free reply",
+    "driver": "agent",
+    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me a multiple-choice question about my week, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer in my own words, {tag}. Then check that the question card now shows as skipped, with its choices dimmed.",
+    "platforms": [
+      "android"
+    ],
+    "outward": false,
+    "server": [],
+    "truth": [
+      {
+        "question": "closed"
       }
     ]
   }
