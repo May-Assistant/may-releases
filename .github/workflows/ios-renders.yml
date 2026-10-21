@@ -1,0 +1,157 @@
+name: May iOS renders of a may-app commit (MayPlaygroundSnapshots, simulator, published only to the private may-renders)
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: may-app commit to render (a main commit, or the current head of pr_number)
+        required: true
+        type: string
+      pr_number:
+        description: Open May-Assistant/may-app pull request whose head is source_sha (empty for a main commit)
+        required: false
+        type: string
+        default: ""
+      ds_sha:
+        description: Optional may-design-system commit (in main or claude/may-integration) to render with instead of may-app's pin
+        required: false
+        type: string
+        default: ""
+permissions:
+  contents: read
+concurrency:
+  group: may-ios-renders
+  cancel-in-progress: false
+jobs:
+  admission:
+    # Simulator renders of May Playground (may-app's MayPlaygroundSnapshots, iPhone 16 Pro, light and dark) on the
+    # same runner and pinned Xcode 26.3 as the iOS compile, in their own environment, may-ios-renders (no required
+    # reviewer, main only). This repository is public and may-app is private: the render job holds no secret beyond
+    # the two read-only deploy keys, which its fetch step alone binds and removes before may-app's code runs; it prints
+    # counts alone and hands over one age-encrypted file (renders.py). The publish job, on a fresh runner that runs no
+    # may-app code, decrypts it and pushes it to the private repository May-Assistant/may-renders (publish.py). Nothing
+    # derived from may-app is printed, summarised or uploaded here in the clear.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+        run: python3 -I -S -B tools/may_release/gate.py --action renders --source-sha "$MAY_SOURCE_SHA" ${MAY_PR_NUMBER:+--pr-number "$MAY_PR_NUMBER"} ${MAY_DS_SHA:+--ds-sha "$MAY_DS_SHA"}
+  render:
+    needs: admission
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check the pull request head and environment before fetching
+        if: inputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+        run: python3 -I -S -B tools/may_release/gate.py --action renders --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" ${MAY_DS_SHA:+--ds-sha "$MAY_DS_SHA"} --check-pull
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the may-app commit and its design system quietly
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" ${MAY_PR_NUMBER:+--pr-number "$MAY_PR_NUMBER"} ${MAY_DS_SHA:+--ds-sha "$MAY_DS_SHA"}
+      - name: Run the snapshot tests in the simulator without any credential
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/renders.py run --source-sha "$MAY_SOURCE_SHA"
+      - name: Count the renders against may-app's manifest
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/renders.py check --source-sha "$MAY_SOURCE_SHA"
+      - name: Build the contact sheet
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+        run: python3 -I -S -B tools/may_release/renders.py sheet --source-sha "$MAY_SOURCE_SHA" ${MAY_DS_SHA:+--ds-sha "$MAY_DS_SHA"}
+      - name: Encrypt the run folder to the renders public key
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/renders.py seal --source-sha "$MAY_SOURCE_SHA"
+      - name: Hand over only the encrypted renders
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-ios-renders-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-renders-sealed/renders.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail unless the snapshot tests passed and every expected render was made
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/renders.py verdict --source-sha "$MAY_SOURCE_SHA"
+      - name: Remove private source, logs, renders and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-renders-snapshots" "$RUNNER_TEMP/may-renders-out" "$RUNNER_TEMP/may-renders-sealed"
+  publish:
+    # A fresh runner that runs no may-app code: the decrypt key, the may-renders write key and the comment token each live
+    # in one step of this job alone. It publishes whatever the render job sealed, even when that job then failed its
+    # verdict, so the renders that were made can be seen.
+    needs: [admission, render]
+    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Nothing to download (the key still a placeholder, or the render job stopped first) is reported by the next step.
+        continue-on-error: true
+        with:
+          name: may-ios-renders-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-renders-download
+      - name: Decrypt and check the renders
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
+        run: python3 -I -S -B tools/may_release/publish.py open --source-sha "$MAY_SOURCE_SHA"
+      - name: Push the run folder to may-renders
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}
+        run: python3 -I -S -B tools/may_release/publish.py push --source-sha "$MAY_SOURCE_SHA" ${MAY_PR_NUMBER:+--pr-number "$MAY_PR_NUMBER"}
+      - name: Link the renders on the may-app pull request
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}
+        run: python3 -I -S -B tools/may_release/publish.py comment --source-sha "$MAY_SOURCE_SHA" ${MAY_PR_NUMBER:+--pr-number "$MAY_PR_NUMBER"}
+      - name: Remove the decrypted renders and the branch checkout
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-renders-download" "$RUNNER_TEMP/may-publish-tree" "$RUNNER_TEMP/may-publish-git"

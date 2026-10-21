@@ -13,6 +13,12 @@ A pull-request compile (--pr-number, native-compile-pr.yml) fetches may-app's
 refs/pull/<number>/head instead of main and requires it to be exactly the source
 SHA; gate.py has already checked, through the API, that it is an open pull request
 against main from may-app itself. Nothing else differs.
+
+The iOS renders (--ds-sha, ios-renders.yml alone, --platform ios --target playground)
+may render with a may-design-system commit other than may-app's pin. That commit
+must be in the history of may-design-system's main or claude/may-integration
+(DS_BASES); project.yml is pointed at a checkout of it, and the record names it as
+the iOS revision. Renders are evidence for a review, never a store build.
 """
 
 import argparse
@@ -35,6 +41,8 @@ from store import (DESIGN_SYSTEM_RECORD, SOURCE_READ_SECRETS, StoreError, child_
 APP = "git@github.com:May-Assistant/may-app.git"
 DS = "git@github.com:May-Assistant/may-design-system.git"
 DS_URL = "https://github.com/May-Assistant/may-design-system"
+# The may-design-system branches whose history a renders override (--ds-sha) must be in (as gate.DS_BASES).
+DS_BASES = ("claude/may-integration", "main")
 GITHUB_HOST_KEY = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
 
 
@@ -118,10 +126,10 @@ def pull_ref(value):
     return f"refs/pull/{value}/head"
 
 
-def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pull=None):
+def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pull=None, bases=()):
     exact_sha(sha)
-    if main_history and pull is not None:
-        raise PrepareError("Main history and a pull request head are exclusive")
+    if sum((bool(main_history), pull is not None, bool(bases))) > 1:
+        raise PrepareError("Main history, a pull request head and base branches are exclusive")
     pull_head = pull_ref(pull) if pull is not None else None
     if dest.exists() or not key_text.strip():
         raise PrepareError("Private checkout path or scoped read key is unavailable")
@@ -143,10 +151,11 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pu
         known.chmod(0o600)
         quiet(["git", "init", "-q", str(dest)], log, env=env)
         quiet(["git", "-C", str(dest), "remote", "add", "origin", remote], log, env=env)
-        ref = ("+refs/heads/main:refs/remotes/origin/main" if main_history else
-               "+" + pull_head + ":refs/remotes/origin/pull-head" if pull_head else sha)
+        refs = (["+refs/heads/main:refs/remotes/origin/main"] if main_history else
+                ["+" + pull_head + ":refs/remotes/origin/pull-head"] if pull_head else
+                [f"+refs/heads/{base}:refs/remotes/origin/{base}" for base in bases] if bases else [sha])
         quiet(["git", "-C", str(dest), "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
-               "origin", ref], log, env=env)
+               "origin", *refs], log, env=env)
     finally:
         key.unlink(missing_ok=True)
         known.unlink(missing_ok=True)
@@ -157,6 +166,9 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pu
         raise PrepareError("May app source SHA is not in main history")
     if pull_head and head_of(dest, "refs/remotes/origin/pull-head", env) != sha:
         raise PrepareError("May app source SHA is not the pull request's head")
+    if bases and all(git_status(["git", "-C", str(dest), "merge-base", "--is-ancestor", sha,
+                                 f"refs/remotes/origin/{base}"], env=env) for base in bases):
+        raise PrepareError("Design-system SHA is not in main or claude/may-integration history")
     quiet(["git", "-C", str(dest), "-c", "advice.detachedHead=false", "checkout", "--quiet",
            "--detach", sha], log, env=env)
     if git_status(["git", "-C", str(dest), "diff", "--quiet", "HEAD", "--"], env=env):
@@ -169,7 +181,7 @@ def head_of(checkout, ref, env):
     return result.stdout.decode().strip() if not result.returncode else ""
 
 
-def prepare(source_sha, platform=None, target=None, pull=None):
+def prepare(source_sha, platform=None, target=None, pull=None, ds_sha=None):
     """Fetch the exact app commit and the design system pinned for `platform`.
 
     With a platform and target (a store build), only that platform's pin is
@@ -180,6 +192,8 @@ def prepare(source_sha, platform=None, target=None, pull=None):
     require_step_secrets(SOURCE_READ_SECRETS)
     if (platform is None) != (target is None):
         raise PrepareError("Platform and target must be given together")
+    if ds_sha is not None and (platform, target) != ("ios", "playground"):
+        raise PrepareError("A design-system override is for the iOS Playground renders only")
     root = private_runner_root()
     private = root / "may-private"
     private.mkdir(mode=0o700)
@@ -194,7 +208,11 @@ def prepare(source_sha, platform=None, target=None, pull=None):
     record, old_spec = pins(project_path.read_text(), lock_path.read_text(), platform, target)
     revision = record[platform or "ios"]
     ds_checkout = root / "may-design-system"
-    fetch(ds_checkout, DS, revision, os.environ.get("MAY_DS_READ_KEY", ""), private, "ds")
+    if ds_sha is not None:
+        revision = record["ios"] = exact_sha(ds_sha)
+        fetch(ds_checkout, DS, revision, os.environ.get("MAY_DS_READ_KEY", ""), private, "ds", bases=DS_BASES)
+    else:
+        fetch(ds_checkout, DS, revision, os.environ.get("MAY_DS_READ_KEY", ""), private, "ds")
     ds_local = source / "android/build-deps/may-design-system"
     if ds_local.exists():
         raise PrepareError("Design-system build path already exists")
@@ -225,8 +243,10 @@ if __name__ == "__main__":
     parser.add_argument("--target", choices=("production", "playground"))
     # A pull-request compile names the may-app pull request whose head is --source-sha.
     parser.add_argument("--pr-number")
+    # The iOS renders alone: a may-design-system commit to render with instead of may-app's iOS pin.
+    parser.add_argument("--ds-sha")
     args = parser.parse_args()
     try:
-        prepare(args.source_sha, args.platform, args.target, args.pr_number)
+        prepare(args.source_sha, args.platform, args.target, args.pr_number, args.ds_sha or None)
     except (PrepareError, StoreError, OSError, subprocess.SubprocessError):
         raise SystemExit("Private May source preparation failed; no source or credential was printed") from None

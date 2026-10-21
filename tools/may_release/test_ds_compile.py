@@ -196,7 +196,7 @@ class GateTests(unittest.TestCase):
     def test_ds_compile_has_its_own_environment_with_no_reviewer(self):
         self.assertEqual(validate_run(REPO, MAIN, DISPATCH, SHA, "ds-compile"), "may-ds-renders")
         self.assertNotIn("may-ds-renders", {v for k, v in gate.ENVIRONMENTS.items() if k != "ds-compile"})
-        self.assertEqual(gate.NO_REVIEWER_ACTIONS, {"compile-pr", "ds-compile"})
+        self.assertEqual(gate.NO_REVIEWER_ACTIONS, {"compile-pr", "ds-compile", "renders"})
         for repo, ref, event in (("May-Assistant/may-design-system", MAIN, DISPATCH), (REPO, "refs/heads/x", DISPATCH),
                                  (REPO, MAIN, "push")):
             with self.subTest(repo=repo, ref=ref, event=event), self.assertRaises(GateDenial):
@@ -894,8 +894,8 @@ class ShapeTests(unittest.TestCase):
                      "printed error message is not one string literal")
 
     def test_no_other_action_joins_the_no_reviewer_policy(self):
-        self.flagged("tools/may_release/gate.py", 'NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile"}',
-                     'NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "ios"}', "NO_REVIEWER_ACTIONS is not exactly")
+        self.flagged("tools/may_release/gate.py", 'NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders"}',
+                     'NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders", "ios"}', "NO_REVIEWER_ACTIONS is not exactly")
 
 
 if __name__ == "__main__":

@@ -193,7 +193,7 @@ class AdmissionCommandTests(unittest.TestCase):
 
     def test_only_compile_pr_runs_without_a_reviewer(self):
         # And the design-system Swift compile (ds-compile), which compiles and comments only (test_ds_compile.py).
-        self.assertEqual(gate.NO_REVIEWER_ACTIONS, {"compile-pr", "ds-compile"})
+        self.assertEqual(gate.NO_REVIEWER_ACTIONS, {"compile-pr", "ds-compile", "renders"})
         # The existing compile still requires Samuel as the sole reviewer.
         with self.assertRaises(GateDenial):
             gate.validate_environment(ENVIRONMENT, POLICIES)
@@ -201,7 +201,7 @@ class AdmissionCommandTests(unittest.TestCase):
     def test_the_pull_request_number_comes_with_compile_pr_and_only_then(self):
         for args, message in ((["--action", "compile-pr", "--source-sha", SHA], "given with compile-pr or ds-compile and only then"),
                               (["--action", "compile", "--source-sha", SHA, "--pr-number", "42"], "given with compile-pr or ds-compile and only then"),
-                              (["--action", "compile", "--source-sha", SHA, "--check-pull"], "Only compile-pr and ds-compile read a pull request")):
+                              (["--action", "compile", "--source-sha", SHA, "--check-pull"], "Only compile-pr, ds-compile and renders read a pull request")):
             with self.subTest(args=args):
                 denial, seen, _ = self.run_gate(args, self.answers(pull()))
                 self.assertIn(message, denial)
@@ -352,9 +352,9 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
     def test_no_other_action_may_join_the_no_reviewer_policy(self):
         path = self.root / "tools/may_release/gate.py"
         text = path.read_text()
-        self.assertIn('NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile"}', text)
-        path.write_text(text.replace('NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile"}',
-                                     'NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "ios"}', 1))
+        self.assertIn('NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders"}', text)
+        path.write_text(text.replace('NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders"}',
+                                     'NO_REVIEWER_ACTIONS = {"compile-pr", "ds-compile", "renders", "ios"}', 1))
         self.assertTrue(any("NO_REVIEWER_ACTIONS is not exactly" in p for p in static_check.problems(self.root)))
 
 

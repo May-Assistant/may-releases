@@ -129,6 +129,9 @@ SECRET_NAMES = (
     # native-compile-pr.yml: the token that comments a compile's errors on the may-app pull request
     # (compile_pr_errors.py alone). No other step may hold it.
     "MAY_APP_PR_COMMENT_TOKEN",
+    # ios-renders.yml: the may-renders deploy key with write access (publish.py push alone) and the renders handoff's
+    # age identity (publish.py open alone), both on the publish job's fresh runner. No other step may hold either.
+    "MAY_APP_RENDERS_WRITE_KEY", "MAY_RENDERS_DECRYPT_KEY",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
 # Crash reports (PostHog): each platform's build step alone may hold its project key, and
