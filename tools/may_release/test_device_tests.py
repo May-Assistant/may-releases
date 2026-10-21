@@ -80,7 +80,7 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "connections", "chat", "notes"])
+        self.assertEqual(ids, ["sign-in", "connections", "chat", "notes", "poll", "poll-skip"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ["sign-in", "connections"],
                          "agent scenarios are Android's until the iOS job")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
@@ -100,6 +100,8 @@ class ScenarioTests(unittest.TestCase):
         agent = device_tests.scenarios("notes")[0]
         for change in ({"goal": "no tag here"}, {"goal": "{tag} " + "x" * 1500}, {"flow": "notes.yaml"},
                        {"truth": [{"get": "/v1/account/devices"}]}, {"truth": [{"get": "/v1/routines", "x": 1}]},
+                       {"truth": [{"get": "/v1/event-notes"}]}, {"truth": [{"question": "pending"}]},
+                       {"truth": [{"question": "answered", "get": "/v1/routines"}]},
                        {"truth": "/v1/routines"}):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "s.json"

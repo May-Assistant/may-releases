@@ -16,7 +16,7 @@ Commands, one per workflow step:
            with it (a Playground-debug-only intent extra), record the screen, run its Maestro flow (may-app's
            FLOWS_DIR) or its agent (device_agent.py: Claude Code driving the emulator through device_mcp.py), take a
            screenshot and read the server: status checks, and for an agent scenario whether K's read endpoints show
-           an item carrying the run's tag (qa-<run id>). Last, the test session's cleanup removes what the run
+           an item carrying the run's tag (qa-<run id>), or a question card in the tagged chat in a given state. Last, the test session's cleanup removes what the run
            created (POST /v1/auth/test-session/cleanup with the tag). A failed scenario does not fail this step, so
            its evidence is still published; `verdict` fails the job afterwards.
   judge    Claude Code, with no tool, judges each agent run from its goal, the agent's report and the last screen's
@@ -62,8 +62,13 @@ FLOWS_DIR = "tools/device-tests/flows"
 SCENARIO_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
 FLOW_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\.yaml")
 SERVER_PATH = re.compile(r"/v1/[a-z0-9/_-]{1,120}")
-# K's reads that list what a test session's run created (server truth for agent scenarios), 21 Oct.
-TRUTH_PATHS = ("/v1/approvals", "/v1/inbox", "/v1/commitments", "/v1/event-notes", "/v1/routines")
+# K's reads that list what a test session's run created (server truth for agent scenarios), 21 Oct. Event notes are
+# read only by the phone's own event keys, so they are judged on screen. A question card's truth is read through the
+# chat that holds it (question_truth).
+TRUTH_PATHS = ("/v1/approvals", "/v1/inbox", "/v1/commitments", "/v1/routines")
+QUESTION_STATES = ("answered", "closed")
+AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
+MAX_CHATS = 10
 MAX_GOAL = 1500
 PLATFORMS = ("android", "ios")
 APP_ID = "io.github.mayassistant.may.playground"
@@ -109,7 +114,9 @@ def scenarios(selection="all", platform="android"):
                     "goal" not in row and "truth" not in row or
                     driver == "agent" and "flow" not in row and isinstance(row.get("goal"), str) and
                     "{tag}" in row["goal"] and len(row["goal"]) <= MAX_GOAL and isinstance(row.get("truth"), list) and
-                    all(isinstance(c, dict) and set(c) == {"get"} and c["get"] in TRUTH_PATHS for c in row["truth"]))
+                    all(isinstance(c, dict) and (set(c) == {"get"} and c["get"] in TRUTH_PATHS or
+                                                 set(c) == {"question"} and c["question"] in QUESTION_STATES)
+                        for c in row["truth"]))
                 and isinstance(row.get("title"), str) and
                 isinstance(row.get("platforms"), list) and set(row["platforms"]) <= set(PLATFORMS) and
                 isinstance(row.get("outward"), bool) and isinstance(row.get("server"), list) and
@@ -193,16 +200,46 @@ def holds(data, tag, depth=0):
     return False
 
 
-def tagged(base, token, path, tag, get=urllib.request.urlopen):
-    """Server truth: (HTTP status, whether the read lists an item carrying the run's tag). Nothing is printed."""
+def read_json(base, token, path, get):
+    """One read with the test session: (HTTP status, its JSON or None). Nothing is printed."""
     request = urllib.request.Request(base + path, headers={"Authorization": "Bearer " + token})
     try:
         with get(request, timeout=30) as reply:
-            return reply.status, holds(json.loads(reply.read(8 * 1024 * 1024)), tag)
+            return reply.status, json.loads(reply.read(8 * 1024 * 1024))
     except urllib.error.HTTPError as error:
-        return error.code, False
+        return error.code, None
     except (urllib.error.URLError, TimeoutError, ValueError, RecursionError):
-        return 0, False
+        return 0, None
+
+
+def tagged(base, token, path, tag, get=urllib.request.urlopen):
+    """Server truth: (HTTP status, whether the read lists an item carrying the run's tag)."""
+    status, data = read_json(base, token, path, get)
+    return status, status == 200 and holds(data, tag)
+
+
+def listed(data, key):
+    """A reply's list, bare or under key."""
+    rows = data.get(key) if isinstance(data, dict) else data
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def question_truth(base, token, state, tag, get=urllib.request.urlopen):
+    """K's route to a question card (21 Oct): every chat is an agent (GET /v1/agents, May's own first), and a chat's
+    id is its conversation's. True when a chat named with the tag, or May's own, holds the tag and a question
+    message whose state is state (answered, or closed: the app's Skipped)."""
+    status, data = read_json(base, token, "/v1/agents", get)
+    if status != 200:
+        return status, False
+    agents = [row for row in listed(data, "agents") if isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
+    chosen = [row for row in agents if holds(row.get("name"), tag)] + agents[:1]
+    for agent in list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]:
+        status, data = read_json(base, token, f"/v1/conversations/{agent['id']}/messages", get)
+        messages = listed(data, "messages") if status == 200 else []
+        if holds(messages, tag) and any(message.get("kind") == "question" and isinstance(message.get("question"), dict)
+                                        and message["question"].get("state") == state for message in messages):
+            return 200, True
+    return 200, False
 
 
 def cleanup(base, token, since, tag, post=urllib.request.urlopen):
@@ -325,7 +362,7 @@ def maestro(root, private, log):
     return launcher
 
 
-def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, cleaned=cleanup,
+def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install):
     chosen = scenarios(selection, "android")
     agents = any(row["driver"] == "agent" for row in chosen)
@@ -390,8 +427,11 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, cl
                 status = checked(base, token, check["get"])
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
             for check in row.get("truth", []):
-                status, found = truth(base, token, check["get"], tag)
-                entry["server"].append({"get": check["get"], "status": status, "pass": status == 200 and found})
+                if "question" in check:
+                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], tag)
+                else:
+                    path, (status, found) = check["get"], truth(base, token, check["get"], tag)
+                entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
             if flow is not None:
                 server_ok = all(check["pass"] for check in entry["server"])
                 entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
