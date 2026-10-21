@@ -258,7 +258,9 @@ def manifest_rows(source):
                 not (spec is None or isinstance(spec, str) and len(spec) <= 300):
             raise RendersError("A screens manifest title or spec is malformed")
         ids.add(screen)
+        note = row.get("note")
         checked.append({"id": screen, "title": title, "spec": spec or "",
+                        "note": note if isinstance(note, str) and len(note) <= 300 else "",
                         "android": evidence_paths(row.get("android"), "Android"),
                         "ios": evidence_paths(row.get("ios", {}), "iOS")})
     return checked
@@ -286,8 +288,8 @@ def snapshot_rows(snapshots):
         names = []
     pattern = re.compile(f"({SCREEN_ID.pattern})-(?:{'|'.join(MODES)})\\.png")
     ids = list(dict.fromkeys(m.group(1) for m in map(pattern.fullmatch, names) if m))[:MAX_SCREENS]
-    return [{"id": screen, "title": screen, "spec": "", "android": {mode: None for mode in MODES},
-             "ios": {mode: None for mode in MODES}} for screen in ids]
+    return [{"id": screen, "title": screen, "spec": "", "note": "", "android": {mode: None for mode in MODES},
+             "ios": {mode: f"ios/{screen}-{mode}.png" for mode in MODES}} for screen in ids]
 
 
 def check(sha):
@@ -301,16 +303,22 @@ def check(sha):
         rows, manifest = snapshot_rows(snapshots), False
         print("May iOS renders: may-app's screens manifest is missing or malformed; the renders in the snapshot "
               "folder are published without it, and the verdict fails")
-    expected, rendered, android, wrong, per_mode = [], [], 0, 0, {mode: [0, 0] for mode in MODES}
+    entries, expected, rendered, android, wrong, per_mode = [], [], [], 0, 0, {mode: [0, 0] for mode in MODES}
     for row in rows:
         for mode in MODES:
             name = f"{row['id']}-{mode}.png"
-            size = png_size(snapshots / name)
-            entry = {"id": row["id"], "mode": mode, "ios": name, "rendered": size is not None, "android": None}
+            # A null iOS path (the row's or the mode's) is a screen iOS doesn't draw yet: shown, never expected.
+            on_ios = row["ios"][mode] is not None
+            size = png_size(snapshots / name) if on_ios else None
+            entry = {"id": row["id"], "mode": mode, "ios": name, "rendered": size is not None, "android": None,
+                     "on_ios": on_ios}
             found = android_render(source, row, mode)
             if found is not None:
                 entry["android"] = str(found)
                 android += 1
+            entries.append(entry)
+            if not on_ios:
+                continue
             expected.append(entry)
             per_mode[mode][1] += 1
             if size is not None:
@@ -318,15 +326,17 @@ def check(sha):
                 per_mode[mode][0] += 1
                 wrong += size != FRAME
     names = {entry["ios"] for entry in expected}
+    not_ios = len(entries) - len(expected)
     try:
         others = sum(1 for path in snapshots.iterdir() if path.name not in names) if snapshots.is_dir() else 0
     except OSError:
         others = 0
-    write_private(private / CHECKED, json.dumps({"rows": rows, "expected": expected, "manifest": manifest}).encode())
+    write_private(private / CHECKED, json.dumps({"rows": rows, "expected": entries, "manifest": manifest}).encode())
     modes = ", ".join(f"{mode} {per_mode[mode][0]} of {per_mode[mode][1]}" for mode in MODES)
     print(f"May iOS renders: {len(rendered)} of {len(expected)} expected renders made ({modes}); "
           f"{wrong} not the 1179 x 2556 frame; {others} other files in the snapshot folder, not published; "
-          f"Android renders found for {android} of {len(expected)}")
+          f"{not_ios} not drawn on iOS yet (null iOS paths); "
+          f"Android renders found for {android} of {len(entries)}")
 
 
 def checked_record(private):
@@ -361,7 +371,9 @@ def page(sha, ds_sha, rows, expected, stitched, manifest=True):
         for entry in by_row.get(row["id"], []):
             key = f"{entry['id']}-{entry['mode']}"
             android = f'<img src="android/{key}.png" alt="Android">' if entry["android"] else "missing"
-            ios = f'<img src="ios/{key}.png" alt="iOS">' if entry["rendered"] else "missing"
+            ios = f'<img src="ios/{key}.png" alt="iOS">' if entry["rendered"] else "missing" \
+                if entry.get("on_ios", True) else "not on iOS yet" + (f": {html.escape(row['note'])}"
+                                                                      if row.get("note") else "")
             sheet = f'<br><a href="sheet/{key}.png">side by side</a>' if key in stitched else ""
             # GitHub sizes README images by attribute only (it drops style), so each carries width="300".
             android, ios = android.replace(' alt=', ' width="300" alt='), ios.replace(' alt=', ' width="300" alt=')
@@ -483,7 +495,7 @@ def verdict(sha):
     except (OSError, ValueError):
         raise RendersError("No snapshot outcome is recorded") from None
     record = checked_record(private)
-    missing = sum(1 for entry in record["expected"] if not entry.get("rendered"))
+    missing = sum(1 for entry in record["expected"] if entry.get("on_ios", True) and not entry.get("rendered"))
     if not isinstance(outcome, dict) or outcome.get("tests") != "passed":
         raise RendersError("The snapshot tests failed")
     if record.get("manifest") is False:
