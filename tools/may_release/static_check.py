@@ -1070,11 +1070,11 @@ DEVICE_RUNS = [
     'python3 -I -S -B tools/may_release/gate.py --action device-tests --source-sha "$MAY_SOURCE_SHA"',
     "python3 -I -S -B tools/may_release/toolchain.py age",
     'python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"',
-    DEVICE_TOOL + "build", "|", DEVICE_TOOL + 'run --scenarios "$MAY_SCENARIOS"', DEVICE_TOOL + "seal",
-    DEVICE_TOOL + "verdict",
+    DEVICE_TOOL + "build", "|", DEVICE_TOOL + 'run --scenarios "$MAY_SCENARIOS"', DEVICE_TOOL + "judge",
+    DEVICE_TOOL + "seal", DEVICE_TOOL + "verdict",
     'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
-    '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" '
-    '"$RUNNER_TEMP/may-device-sealed"',
+    '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
+    '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
     "python3 -I -S -B tools/may_release/toolchain.py age",
     "python3 -I -S -B tools/may_release/publish.py device-open", "python3 -I -S -B tools/may_release/publish.py device-push",
     "python3 -I -S -B tools/may_release/publish.py device-release",
@@ -1093,9 +1093,13 @@ DEVICE_DOWNLOAD = ("name: may-device-android-${{ github.run_attempt }}\n"
 DEVICE_CONDITIONS = ["if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
 DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"
-DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", DEVICE_RELEASE}
+# The repository's Claude token (as claude-code-review.yml's): the agent (in the scenarios step) and the judge alone.
+DEVICE_CLAUDE = "CLAUDE_CODE_OAUTH_TOKEN"
+DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", DEVICE_RELEASE,
+                                         DEVICE_CLAUDE}
 DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
                ("MAY_DEVICE_TESTS_OUTWARD", "${{ vars.MAY_DEVICE_TESTS_OUTWARD }}"),
+               ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}"),
                ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")}
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
               ("GH_TOKEN", "${{ github.token }}")} | DEVICE_VARS | \
@@ -1151,29 +1155,38 @@ def device_tests_workflow_problems(text):
     decrypt = steps["publish"].get("Decrypt and check the reports", "")
     push = steps["publish"].get("Push the run folder to may-renders", "")
     release = steps["publish"].get("Upload the recordings as may-renders release assets", "")
+    judge = steps["android"].get("Judge the agent scenarios", "")
     others = [chunk for job in ("android", "publish") for chunk in steps[job].values()
-              if chunk not in (fetch, scenarios, seal, decrypt, push, release)]
+              if chunk not in (fetch, scenarios, judge, seal, decrypt, push, release)]
+    model = ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}")
     recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
-    if secrets_in(text) != DEVICE_SECRETS or any(text.count("secrets." + n) != 1 for n in DEVICE_SECRETS) or \
-            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(scenarios) != {DEVICE_SIGNIN} or \
+    if secrets_in(text) != DEVICE_SECRETS or \
+            any(text.count("secrets." + n) != (2 if n == DEVICE_CLAUDE else 1) for n in DEVICE_SECRETS) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(scenarios) != {DEVICE_SIGNIN, DEVICE_CLAUDE} or \
+            model not in env_entries(scenarios) or \
+            model not in env_entries(judge) or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             secrets_in(seal) or any(secrets_in(chunk) or "vars." in chunk for chunk in others) or \
             recipient not in env_entries(seal) or recipient not in env_entries(decrypt) or \
-            text.count("vars.") != 4 or text.count("GH_TOKEN") != 1 or \
+            text.count("vars.") != 6 or text.count("GH_TOKEN") != 1 or \
             any(e not in DEVICE_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret, variable or env entry other than the fetch's two source-read keys, the sign-in "
-                     "secret in the scenarios step, the decrypt and write keys and the release token (each in its one step) and "
-                     "the inputs")
+                     "secret and the Claude token in the scenarios step, the Claude token in the judge step, the decrypt and "
+                     "write keys and the release token (each in its one step) and the inputs")
     if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
         found.append(name + "writes a step summary or carries a value between steps")
     return found
 
 
-DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped"}
+DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count"}
 
 
 def device_tests_print_problems(root):
-    return quiet_tool_problems(root, "device_tests.py", DEVICE_PRINT_VALUES, {"DeviceTestsError", "StoreError"})
+    """device_tests.py, and the agent runner it imports (which prints nothing at all). device_mcp.py is Claude Code's
+    stdio server, like review_mcp.py: its stdout is the protocol, read by Claude Code, never this log."""
+    return quiet_tool_problems(root, "device_tests.py", DEVICE_PRINT_VALUES,
+                               {"DeviceTestsError", "StoreError", "AgentError"}) + \
+        quiet_tool_problems(root, "device_agent.py", set(), set())
 
 
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same

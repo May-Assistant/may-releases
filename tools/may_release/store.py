@@ -137,6 +137,9 @@ SECRET_NAMES = (
     # device-tests.yml: the fine-grained token on may-renders alone that uploads recordings as release assets
     # (publish.py device-release alone).
     "MAY_RENDERS_RELEASE_TOKEN",
+    # device-tests.yml: the repository's Claude token, for the device agent (device_tests.py run) and its judge
+    # (device_tests.py judge) alone.
+    "CLAUDE_CODE_OAUTH_TOKEN",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
 # Crash reports (PostHog): each platform's build step alone may hold its project key, and

@@ -22,7 +22,9 @@ concurrency:
 jobs:
   admission:
     # May Playground on an Android emulator against live staging, signed in as the staging test account through a
-    # short-lived session (POST /v1/auth/test-session, MAY_TEST_SIGNIN_SECRET), driven by may-app's Maestro flows.
+    # short-lived session (POST /v1/auth/test-session, MAY_TEST_SIGNIN_SECRET), driven by may-app's Maestro flows and
+    # by an agent: the pinned Claude Code with the repository's CLAUDE_CODE_OAUTH_TOKEN (in the scenarios and judge
+    # steps alone), the model from MAY_DEVICE_TESTS_MODEL, and the emulator as its only tools (device_mcp.py).
     # Environment may-device-tests: main only, no required reviewer (the nightly run cannot wait for one). Trust: v1
     # tests may-app main commits alone (prepare.py checks main history; the nightly run takes main's head), never a
     # pull request, because the run step holds the sign-in secret. This repository is public and may-app private:
@@ -77,7 +79,14 @@ jobs:
           MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}
           MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
           MAY_DEVICE_TESTS_OUTWARD: ${{ vars.MAY_DEVICE_TESTS_OUTWARD }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}
         run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"
+      - name: Judge the agent scenarios
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}
+        run: python3 -I -S -B tools/may_release/device_tests.py judge
       - name: Encrypt the report to the renders public key
         env:
           MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
@@ -93,7 +102,7 @@ jobs:
         run: python3 -I -S -B tools/may_release/device_tests.py verdict
       - name: Remove private source, logs, recordings and products
         if: always()
-        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" "$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"
   publish:
     # A fresh runner that runs no may-app code: the decrypt key, the may-renders write key and its release token each
     # live in one step. Recordings never enter may-renders' git history: they are assets of the run's release.

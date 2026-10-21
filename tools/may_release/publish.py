@@ -68,7 +68,9 @@ DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped")
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
-           "server checks not configured")
+           device_tests.UNCONFIGURED, device_tests.RATE_LIMITED, device_tests.UNFINISHED, device_tests.BLOCKED,
+           device_tests.NO_TRUTH, device_tests.NOT_JUDGED)
+MAX_NOTES = 600
 # The sealed device artifact's retention (device-tests.yml): the recordings' fallback when the release upload fails.
 VIDEO_DAYS = 7
 # The recordings go to one may-renders release per run (tag device-tests-<run>), never into its git history; the
@@ -358,13 +360,15 @@ def device_report(path, files, titles):
                 row.get("reason", REASONS[0]) in REASONS and
                 all(isinstance(name, str) and name in files for name in row.get("videos", []) + row.get("screenshots", []))
                 and all(isinstance(c, dict) and isinstance(c.get("get"), str) and re.fullmatch(r"/v1/[a-z0-9/_-]{1,120}", c["get"])
-                        and type(c.get("status")) is int for c in row.get("server", []))):
+                        and type(c.get("status")) is int for c in row.get("server", [])) and
+                (isinstance(row.get("notes", ""), str) and len(row.get("notes", "")) <= MAX_NOTES)):
             raise PublishError("A device report row is malformed")
         checked.append({"id": row["id"], "title": titles[row["id"]], "verdict": row["verdict"],
                         "reason": row.get("reason"), "videos": row.get("videos", []),
                         "screenshots": row.get("screenshots", []),
                         "server": [(c["get"], c["status"]) for c in row.get("server", [])],
-                        "seconds": row.get("seconds") if type(row.get("seconds")) is int else None})
+                        "seconds": row.get("seconds") if type(row.get("seconds")) is int else None,
+                        "notes": row.get("notes", "")})
     return report["device"], checked
 
 
@@ -405,12 +409,16 @@ def device_pages(run, reports, note):
             note = f" ({row['reason']})" if row["reason"] else ""
             server = "; ".join(f"GET {path}: {status}" for path, status in row["server"])
             lines.append(f"**{device}: {row['verdict']}**{note}" + (f". Server: {server}" if server else ""))
+            # The judge's note is model text: escaped, inside an HTML block, where GitHub reads no Markdown.
+            judged = f"<blockquote>Judge: {html.escape(row['notes'])}</blockquote>" if row["notes"] else ""
+            if judged:
+                lines += ["", judged, ""]
             lines += [f'<img src="{device}/{shot}" width="300">' for shot in row["screenshots"]]
             lines += [f"[Recording: {video}]({asset_url(run, device, video)})" for video in row["videos"]]
             lines.append("")
             media = "".join(f'<img src="{device}/{shot}" alt="screenshot">' for shot in row["screenshots"]) + \
                 "".join(f'<br><a href="{asset_url(run, device, video)}">Recording: {video}</a>' for video in row["videos"])
-            html_parts.append(f"<td><b>{device}: {row['verdict']}</b>{note}<br>{server}<br>{media}</td>")
+            html_parts.append(f"<td><b>{device}: {row['verdict']}</b>{note}<br>{server}<br>{judged}{media}</td>")
         html_parts.append("</tr>")
     html_parts.append("</table>")
     return "\n".join(lines) + "\n", "\n".join(html_parts) + "\n"
