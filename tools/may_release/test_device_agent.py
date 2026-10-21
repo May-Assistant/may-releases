@@ -71,7 +71,7 @@ class AgentRunTests(unittest.TestCase):
             minted.append(secret)
             return TOKEN + str(len(minted))
 
-        def agent(cli, goal, tag, adb, serial, work, token, model):
+        def agent(cli, goal, tag, device, work, token, model):
             # The agent's process never sees the staging secret or the OAuth token in this step's environment.
             seen.setdefault("environ", set(os.environ))
             seen.setdefault("goals", []).append((goal, tag, token, model, cli))
@@ -318,8 +318,9 @@ class AgentRunnerTests(unittest.TestCase):
         with patch.dict(os.environ, {"PATH": "/usr/bin", "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                                      "GITHUB_TOKEN": "g" * 20}, clear=True), \
                 patch("device_agent.subprocess.run", side_effect=run):
-            found = device_agent.run_agent(Path("/cli/claude"), "Do {tag} now", "qa-12345678", "/sdk/adb",
-                                           "emulator-5554", self.root / "agent", OAUTH, MODEL)
+            found = device_agent.run_agent(Path("/cli/claude"), "Do {tag} now", "qa-12345678",
+                                           {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": "/sdk/adb",
+                                            "MAY_DEVICE_SERIAL": "emulator-5554"}, self.root / "agent", OAUTH, MODEL)
         return found, seen
 
     def test_the_agent_has_only_the_device_server_and_only_the_oauth_token(self):
@@ -345,7 +346,8 @@ class AgentRunnerTests(unittest.TestCase):
         config = json.loads(Path(command[command.index("--mcp-config") + 1]).read_text())
         server = config["mcpServers"]["device"]
         self.assertEqual(server["args"][-1], str(device_agent.SERVER))
-        self.assertEqual(set(server["env"]), {"MAY_DEVICE_ADB", "MAY_DEVICE_SERIAL", "MAY_DEVICE_AGENT_RESULT"})
+        self.assertEqual(set(server["env"]), {"MAY_DEVICE_PLATFORM", "MAY_DEVICE_ADB", "MAY_DEVICE_SERIAL",
+                                              "MAY_DEVICE_AGENT_RESULT"})
 
     def test_rate_and_usage_limits_are_rate_limited(self):
         for result in ({"is_error": True, "api_error_status": 429}, {"is_error": True, "api_error": "usage_limit_reached"},
@@ -464,6 +466,78 @@ class DeviceServerTests(unittest.TestCase):
     def test_settings_need_an_emulator_serial(self):
         self.assertIsNone(device_mcp.settings({"MAY_DEVICE_ADB": "/sdk/adb", "MAY_DEVICE_SERIAL": "192.168.0.2:5555",
                                                "MAY_DEVICE_AGENT_RESULT": "/r"}))
+
+
+IOS_UDID = "0A1B2C3D-0000-4000-8000-000000000001"
+IOS_TREE = {"attributes": {"bounds": "[0,0][393,852]"}, "children": [
+    {"attributes": {"text": "Chats", "resource-id": "tab", "clickable": "true", "bounds": "[10,20][110,60]"}},
+    {"attributes": {"accessibilityText": "New chat", "bounds": "[300,780][380,840]"}}]}
+
+
+class IosDeviceServerTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.work = Path(self.directory.name)
+        self.config = device_mcp.settings({"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID,
+                                           "MAY_DEVICE_MAESTRO": "/m/maestro",
+                                           "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground",
+                                           "MAY_DEVICE_AGENT_RESULT": str(self.work / "result.json"),
+                                           "PATH": "/usr/bin", "JAVA_HOME": "/java", "SECRET_THING": "x"})
+        self.calls, self.flows = [], []
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def call(self, name, **args):
+        def run(argv, capture_output, stdin, timeout, env):
+            self.calls.append((argv, env))
+            if "screenshot" in argv:
+                Path(argv[-1]).write_bytes(png(1179, 2556))
+            if argv[-1].endswith("act.yaml"):
+                self.flows.append(Path(argv[-1]).read_text())
+            out = json.dumps(IOS_TREE).encode() if argv[-1] == "hierarchy" else b""
+            return subprocess.CompletedProcess(argv, 0, out, b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            return device_mcp.call(name, args, self.config)
+
+    def test_each_act_is_one_fixed_maestro_command_in_points(self):
+        self.call("tap", x=180, y=120)
+        self.assertEqual(self.flows[-1], 'appId: io.github.mayassistant.may.playground\n---\n- tapOn:\n'
+                                         '    point: "60,40"\n', "screenshot pixels become points (3x)")
+        self.call("type", text="Hello May, tag qa-123")
+        self.assertEqual(self.flows[-1].splitlines()[-1], '- inputText: "Hello May, tag qa-123"')
+        self.call("swipe", x1=600, y1=1800, x2=600, y2=600, ms=500)
+        self.assertEqual(self.flows[-1].splitlines()[2:], ['- swipe:', '    start: "200,600"', '    end: "200,200"',
+                                                           '    duration: 500'])
+        self.call("back")
+        self.assertIn('start: "1%,50%"', self.flows[-1])
+        acts = [argv for argv, _ in self.calls if argv[0] == "/m/maestro" and argv[-2] == "test"]
+        self.assertEqual(acts[0][:4], ["/m/maestro", "--device", IOS_UDID, "test"])
+        self.assertTrue(all(env.get("JAVA_HOME") == "/java" and "SECRET_THING" not in env for _, env in self.calls))
+
+    def test_the_hierarchy_is_in_screenshot_pixels(self):
+        failed, content = self.call("hierarchy")
+        self.assertFalse(failed)
+        self.assertEqual(content[0]["text"].splitlines(), ["text='Chats' | id=tab | clickable | (180, 120)",
+                                                           "desc='New chat' | (1020, 2430)"])
+        failed, content = self.call("screenshot")
+        self.assertEqual((failed, content[0]["type"]), (False, "image"))
+
+    def test_no_yaml_or_odd_text_reaches_maestro(self):
+        for text in ('a"\n- runScript: x', "a\\b", "x: y\n- openLink: z", "it's"):
+            with self.subTest(text=text):
+                self.assertTrue(self.call("type", text=text)[0])
+        self.assertEqual(self.flows, [])
+
+    def test_settings_refuse_an_odd_simulator_or_bundle(self):
+        good = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID, "MAY_DEVICE_MAESTRO": "/m",
+                "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground", "MAY_DEVICE_AGENT_RESULT": "/r"}
+        self.assertIsNotNone(device_mcp.settings(good))
+        for change in ({"MAY_DEVICE_UDID": "booted"}, {"MAY_DEVICE_BUNDLE": "com.apple.mobilesafari; x"},
+                       {"MAY_DEVICE_PLATFORM": "web"}, {"MAY_DEVICE_MAESTRO": ""}):
+            with self.subTest(change=change):
+                self.assertIsNone(device_mcp.settings(dict(good, **change)))
 
 
 HIERARCHY = (b'<?xml version="1.0"?><hierarchy><node text="" content-desc="" resource-id="" clickable="false" '

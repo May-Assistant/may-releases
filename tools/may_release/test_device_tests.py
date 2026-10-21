@@ -81,8 +81,7 @@ class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
         self.assertEqual(ids, ["sign-in", "connections", "chat", "notes", "poll", "poll-skip", "routines"])
-        self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ["sign-in", "connections"],
-                         "agent scenarios are Android's until the iOS job")
+        self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ids, "both devices run all")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
             device_tests.scenarios("sign-in,unknown")
@@ -625,12 +624,18 @@ class WorkflowPinTests(unittest.TestCase):
         model = "          MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}\n"
         judge = "      - name: Judge the agent scenarios\n        env:\n"
         seal = "      - name: Encrypt the report to the renders public key\n        env:\n"
-        self.assertEqual((self.text.count(line), self.text.count(model), self.text.count(judge)), (2, 2, 1))
-        moved = self.text.replace(judge + line, judge).replace(seal, seal + line)
+        self.assertEqual((self.text.count(line), self.text.count(model), self.text.count(judge)), (4, 4, 2))
+        moved = self.text.replace(judge + line, judge, 1).replace(seal, seal + line, 1)
         self.flagged(moved, "a secret, variable or env entry")
+        self.flagged(self.text.replace(judge + line + model, judge + line, 1).replace(seal, seal + model, 1),
+                     "a secret, variable or env entry")
         self.flagged(self.text.replace(judge + line + model, judge + line).replace(seal, seal + model),
                      "a secret, variable or env entry")
         self.flagged(self.text.replace(model, "", 1).replace(seal, seal + model), "a secret, variable or env entry")
+        ios = self.text.index("\n  ios:\n")
+        head, tail = self.text[:ios], self.text[ios:]
+        self.flagged(head + tail.replace(judge + line + model, judge + line).replace(seal, seal + model),
+                     "a secret, variable or env entry")
         self.flagged(self.text.replace(line, "", 1), "a secret, variable or env entry")
         self.flagged(self.text.replace("device_tests.py judge", "device_tests.py seal"), "runs something other")
 
@@ -641,14 +646,19 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(line, "", 1).replace(build, build + "        env:\n" + line),
                      "a secret, variable or env entry")
 
-    def test_the_ios_job_holds_no_claude_token_and_its_own_sealed_report(self):
+    def test_the_ios_job_holds_the_claude_token_in_its_agent_and_judge_steps_alone(self):
         ios = self.text.partition("\n  ios:\n")[2].partition("\n  publish:\n")[0]
-        scenarios = "        run: python3 -I -S -B tools/may_release/device_tests.py run --platform ios"
         token = "          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n"
-        self.assertIn(scenarios, ios)
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", ios)
-        self.flagged(self.text.replace(scenarios, token.rstrip("\n").replace("          ", "          ", 1) + "\n" +
-                                       scenarios), "a secret, variable or env entry")
+        build = "      - name: Build May Playground for the simulator without secrets\n"
+        self.assertEqual(ios.count(token), 2)
+        self.flagged(self.text.replace(build, build + "        env:\n" + token), "a secret, variable or env entry")
+        ios_judge = ios.partition("      - name: Judge the agent scenarios\n        env:\n")[2].partition("        run:")[0]
+        self.flagged(self.text.replace("      - name: Judge the agent scenarios\n        env:\n" + ios_judge +
+                                       "        run: python3 -I -S -B tools/may_release/device_tests.py judge --platform ios",
+                                       "      - name: Judge the agent scenarios\n        env:\n" +
+                                       ios_judge.replace(token, "") +
+                                       "        run: python3 -I -S -B tools/may_release/device_tests.py judge --platform ios"),
+                     "a secret, variable or env entry")
         self.flagged(self.text.replace("may-device-sealed/ios.age", "may-device-out"), "hands over something")
         self.flagged(self.text.replace("name: may-device-ios-${{ github.run_attempt }}\n          path: "
                                        "${{ runner.temp }}/may-device-download", "name: x\n          path: "

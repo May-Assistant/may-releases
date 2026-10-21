@@ -29,7 +29,8 @@
     "driver": "agent",
     "goal": "In May Playground, open Chats and start a new chat with May. Send this message: This is device test {tag}. Reply with one short sentence. Then wait until May's reply appears under your message.",
     "platforms": [
-      "android"
+      "android",
+      "ios"
     ],
     "outward": false,
     "server": [],
@@ -41,7 +42,8 @@
     "driver": "agent",
     "goal": "In May Playground, open Agenda and open the first item you see. Open its Notes tab and add a note that says: {tag} note from the device test. Make sure the note is saved and shown.",
     "platforms": [
-      "android"
+      "android",
+      "ios"
     ],
     "outward": false,
     "server": [],
@@ -53,7 +55,8 @@
     "driver": "agent",
     "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me a multiple-choice question about my week, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until the card shows your choice as the answer.",
     "platforms": [
-      "android"
+      "android",
+      "ios"
     ],
     "outward": false,
     "server": [],
@@ -69,7 +72,8 @@
     "driver": "agent",
     "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me a multiple-choice question about my week, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer in my own words, {tag}. Then check that the question card now shows as skipped, with its choices dimmed.",
     "platforms": [
-      "android"
+      "android",
+      "ios"
     ],
     "outward": false,
     "server": [],
@@ -85,7 +89,8 @@
     "driver": "agent",
     "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Make a daily routine called {tag} stretch that reminds me to stretch at 9am. When May shows a question card asking whether to create the routine, tap Create it. Then wait until May confirms the routine is made.",
     "platforms": [
-      "android"
+      "android",
+      "ios"
     ],
     "outward": false,
     "server": [],

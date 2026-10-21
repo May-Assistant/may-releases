@@ -30,7 +30,8 @@ from review import CLI_MAX_BYTES, CLI_URL, checked_cli, header_safe, outcome
 OAUTH, MODEL_VAR = "CLAUDE_CODE_OAUTH_TOKEN", "MAY_DEVICE_TESTS_MODEL"
 MODEL = re.compile(r"claude-[a-z0-9][a-z0-9.-]{0,60}")
 SERVER = Path(__file__).resolve().parent / "device_mcp.py"
-AGENT_SECONDS, JUDGE_SECONDS = 15 * 60, 5 * 60
+# iOS acts are a Maestro run each, several seconds apiece, so its agent has longer.
+AGENT_SECONDS, IOS_AGENT_SECONDS, JUDGE_SECONDS = 15 * 60, 25 * 60, 5 * 60
 RATE_LIMITED = ("blocking_limit", "rapid_refill_breaker")
 AGENT_PROMPT = (
     "You are testing the May Playground app on an Android emulator, signed in to a staging test account. You have "
@@ -115,14 +116,14 @@ def finished(stdout_path):
     return "error" if not found or found.get("is_error") else "ok"
 
 
-def run_agent(cli, goal, tag, adb, serial, work, token, model):
-    """One scenario's agent run: {"state": ok|rate_limited|error|timeout, and the device server's record}."""
+def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS):
+    """One scenario's agent run: {"state": ok|rate_limited|error|timeout, and the device server's record}. device is the
+    device server's settings (MAY_DEVICE_PLATFORM and the emulator's or the simulator's handles), never a secret."""
     work = fresh(work)
     result = work / "result.json"
     config = {"mcpServers": {"device": {"type": "stdio", "command": sys.executable,
                                         "args": ["-I", "-S", "-B", str(SERVER)],
-                                        "env": {"MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": serial,
-                                                "MAY_DEVICE_AGENT_RESULT": str(result)}}}}
+                                        "env": dict(device, MAY_DEVICE_AGENT_RESULT=str(result))}}}
     (work / "mcp.json").write_text(json.dumps(config))
     command = base_command(cli, goal.replace("{tag}", tag), model) + [
         "--mcp-config", str(work / "mcp.json"), "--allowedTools", "mcp__device",
@@ -130,7 +131,7 @@ def run_agent(cli, goal, tag, adb, serial, work, token, model):
     try:
         with (work / "agent.json").open("wb") as out, (work / "agent.err").open("wb") as err:
             subprocess.run(command, cwd=fresh(work / "cwd"), env=claude_env(work, token), stdout=out, stderr=err,
-                           stdin=subprocess.DEVNULL, timeout=AGENT_SECONDS)
+                           stdin=subprocess.DEVNULL, timeout=seconds)
     except subprocess.TimeoutExpired:
         state = "timeout"
     else:

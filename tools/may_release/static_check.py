@@ -1083,8 +1083,8 @@ DEVICE_RUNS = [
     IOS_TOOL.format("build"), DEVICE_TOOL + 'run --platform ios --scenarios "$MAY_SCENARIOS"',
     IOS_TOOL.format("judge"), IOS_TOOL.format("seal"), IOS_TOOL.format("verdict"),
     'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
-    '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-device-out" '
-    '"$RUNNER_TEMP/may-device-sealed"',
+    '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
+    '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
     # publish
     "python3 -I -S -B tools/may_release/toolchain.py age",
     "python3 -I -S -B tools/may_release/publish.py device-open", "python3 -I -S -B tools/may_release/publish.py device-push",
@@ -1105,14 +1105,14 @@ DEVICE_CONDITIONS = ["if: always()", "if: always()", "if: ${{ !cancelled() && ne
                      "if: always()"]
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
 DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"
-# The repository's Claude token (as claude-code-review.yml's): the agent (in Android's scenarios step) and the judge
-# alone; never in the iOS job.
+# The repository's Claude token (as claude-code-review.yml's): each device job's agent (its scenarios step) and judge
+# alone.
 DEVICE_CLAUDE = "CLAUDE_CODE_OAUTH_TOKEN"
 DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", DEVICE_RELEASE,
                                          DEVICE_CLAUDE}
 # How often each secret is named: the read keys in each fetch, the sign-in secret in each scenarios step, the Claude
-# token in Android's scenarios and judge steps.
-DEVICE_SECRET_COUNTS = {name: 2 for name in (*COMPILE_SECRETS, DEVICE_SIGNIN, DEVICE_CLAUDE)}
+# token in each job's scenarios and judge steps.
+DEVICE_SECRET_COUNTS = dict({name: 2 for name in (*COMPILE_SECRETS, DEVICE_SIGNIN)}, **{DEVICE_CLAUDE: 4})
 DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
                ("MAY_DEVICE_TESTS_OUTWARD", "${{ vars.MAY_DEVICE_TESTS_OUTWARD }}"),
                ("MAY_DEVICE_TESTS_SKIP", "${{ vars.MAY_DEVICE_TESTS_SKIP }}"),
@@ -1181,8 +1181,8 @@ def device_tests_workflow_problems(text):
     decrypt = steps["publish"].get("Decrypt and check the reports", "")
     push = steps["publish"].get("Push the run folder to may-renders", "")
     release = steps["publish"].get("Upload the recordings as may-renders release assets", "")
-    judge = steps["android"].get("Judge the agent scenarios", "")
-    named = (*fetches, scenarios, ios_scenarios, judge, *seals, decrypt, push, release)
+    judge, ios_judge = (steps[job].get("Judge the agent scenarios", "") for job in ("android", "ios"))
+    named = (*fetches, scenarios, ios_scenarios, judge, ios_judge, *seals, decrypt, push, release)
     others = [chunk for job in ("android", "ios", "publish") for chunk in steps[job].values() if chunk not in named]
     model = ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}")
     recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
@@ -1190,16 +1190,16 @@ def device_tests_workflow_problems(text):
     if secrets_in(text) != DEVICE_SECRETS or \
             any(text.count("secrets." + n) != DEVICE_SECRET_COUNTS.get(n, 1) for n in DEVICE_SECRETS) or \
             any(secrets_in(fetch) != set(COMPILE_SECRETS) for fetch in fetches) or \
-            secrets_in(scenarios) != {DEVICE_SIGNIN, DEVICE_CLAUDE} or secrets_in(ios_scenarios) != {DEVICE_SIGNIN} or \
-            model not in env_entries(scenarios) or model not in env_entries(judge) or \
+            any(secrets_in(chunk) != {DEVICE_SIGNIN, DEVICE_CLAUDE} for chunk in (scenarios, ios_scenarios)) or \
+            any(model not in env_entries(chunk) for chunk in (scenarios, judge, ios_scenarios, ios_judge)) or \
             staging not in env_entries(ios_scenarios) or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
-            text.count("vars.") != 11 or text.count("GH_TOKEN") != 1 or \
+            text.count("vars.") != 13 or text.count("GH_TOKEN") != 1 or \
             any(e not in DEVICE_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret, variable or env entry other than each fetch's two source-read keys, the sign-in "
-                     "secret in each scenarios step, the Claude token in Android's scenarios and judge steps alone, the "
+                     "secret in each scenarios step, the Claude token in each job's scenarios and judge steps alone, the "
                      "decrypt and write keys and the release token (each in its one step) and the inputs")
     if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
         found.append(name + "writes a step summary or carries a value between steps")
@@ -1215,7 +1215,7 @@ def device_tests_print_problems(root):
     return quiet_tool_problems(root, "device_tests.py", DEVICE_PRINT_VALUES,
                                {"DeviceTestsError", "StoreError", "AgentError"}) + \
         quiet_tool_problems(root, "device_agent.py", set(), set()) + \
-        quiet_tool_problems(root, "device_ios.py", {"ran"}, set())
+        quiet_tool_problems(root, "device_ios.py", {"ran", "cleaned_count"}, set())
 
 
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same
