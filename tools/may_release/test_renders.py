@@ -230,6 +230,37 @@ class ManifestAndCountTests(unittest.TestCase):
         with self.assertRaises(RendersError):
             renders.manifest_rows(self.work.source)
 
+    def test_a_platform_without_renders_and_a_sibling_evidence_folder_are_accepted(self):
+        good = dict(self.work.rows[0])
+        rows = [dict(good, id="no-android", android=None, note="to add"),
+                dict(good, id="sibling", android={"light": "../other-check/sibling-light.png", "dark": None})]
+        (self.work.source / renders.MANIFEST).write_text(json.dumps({"frame": {}, "screens": rows}))
+        try:
+            checked = renders.manifest_rows(self.work.source)
+        except RendersError as error:
+            self.fail("a valid manifest was refused: " + error.args[0])
+        self.assertEqual(checked[0]["android"], {"light": None, "dark": None})
+        self.assertEqual(checked[1]["android"]["light"], "../other-check/sibling-light.png")
+        sibling = self.work.source / "docs/evidence/other-check"
+        sibling.mkdir(parents=True)
+        (sibling / "sibling-light.png").write_bytes(png())
+        self.assertIsNotNone(renders.android_render(self.work.source, checked[1], "light"))
+        for path in ("../../design/x.png", "../other-check/../../x.png", "../x.png", "../other-check/a/../../../x.png"):
+            with self.subTest(path=path):
+                (self.work.source / renders.MANIFEST).write_text(json.dumps([dict(good, android={"light": path})]))
+                with self.assertRaises(RendersError):
+                    renders.manifest_rows(self.work.source)
+
+    def test_a_sibling_path_that_resolves_outside_docs_evidence_is_not_used(self):
+        outside = self.work.source / "docs/design"
+        outside.mkdir(parents=True)
+        (outside / "x.png").write_bytes(png())
+        link = self.work.source / "docs/evidence/other-check"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(outside)
+        row = {"id": "x", "android": {"light": "../other-check/x.png", "dark": None}}
+        self.assertIsNone(renders.android_render(self.work.source, row, "light"))
+
     def test_counts_are_printed_and_nothing_from_may_app(self):
         self.work.snapshot("chat-reply-light.png", "sign-in-light.png", "stray.png")
         (self.work.snapshots / "sign-in-light.png").write_bytes(png(*FRAME))
