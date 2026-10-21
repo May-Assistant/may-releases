@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import device_agent
 import device_ios
 import device_tests
 from device_tests import DeviceTestsError
@@ -98,7 +99,7 @@ class FakeRecorder:
 
 
 class RunTests(Workspace):
-    def run_it(self, selection="all", env=None, maestro_fails=False):
+    def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None):
         calls, minted = [], []
         self.built()
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
@@ -121,9 +122,16 @@ class RunTests(Workspace):
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.head_revision", return_value=SHA), patch("device_ios.Recorder", FakeRecorder), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
-            device_ios.run_scenarios(selection, minted=mint, checked=lambda base, token, path: 200)
+            device_ios.run_scenarios(selection, minted=mint, checked=lambda base, token, path: 200,
+                                     truth=lambda base, token, path, tag: (200, True),
+                                     asked=lambda base, token, state, tag: (200, True),
+                                     cleaned=lambda base, token, since, tag: 2,
+                                     agent=agent or (lambda *a, **k: self.fail("an agent ran")),
+                                     install=lambda root: root / "may-claude" / "claude")
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
-            device_tests.judge_scenarios(judged_by=lambda *a: self.fail("judged on iOS"), platform="ios")
+            if "CLAUDE_CODE_OAUTH_TOKEN" in environ:
+                os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = environ["CLAUDE_CODE_OAUTH_TOKEN"]
+            device_tests.judge_scenarios(judged_by=lambda *a: ("pass", "fine"), platform="ios")
         runs = list((self.root / device_tests.OUT).iterdir())
         report = json.loads((runs[0] / "ios" / "report.json").read_text())
         return calls, minted, report, out.getvalue(), runs[0]
@@ -164,14 +172,34 @@ class RunTests(Workspace):
                          ("sign-in", "skipped", device_tests.SWITCHED_OFF))
         self.assertEqual(len(minted), 0, "connections has no flow, sign-in is switched off: no session minted")
 
-    def test_a_selection_of_android_scenarios_runs_none_here(self):
-        _, minted, report, _, _ = self.run_it(selection="chat,notes")
-        self.assertEqual((report["scenarios"], minted), ([], []))
+    def test_agent_scenarios_drive_the_simulator_through_maestro(self):
+        seen = []
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            seen.append((device, token, model, seconds, tag))
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        calls, minted, report, out, _ = self.run_it(
+            selection="chat,poll", agent=agent,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5",
+                 "GITHUB_RUN_ID": "39557415738"})
+        device, token, model, seconds, tag = seen[0]
+        self.assertEqual({key: device[key] for key in ("MAY_DEVICE_PLATFORM", "MAY_DEVICE_UDID", "MAY_DEVICE_MAESTRO",
+                                                        "MAY_DEVICE_BUNDLE")},
+                         {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": UDID, "MAY_DEVICE_MAESTRO": "/fake/maestro",
+                          "MAY_DEVICE_BUNDLE": device_ios.BUNDLE})
+        self.assertNotIn(TOKEN, json.dumps(device), "the staging session never reaches the agent")
+        self.assertEqual((token[:13], model, seconds, tag), ("sk-ant-oat01-", "claude-sonnet-5-5",
+                                                             device_agent.IOS_AGENT_SECONDS, "qa-39557415738"))
+        self.assertEqual(len(minted), 3, "one session per scenario and one for the cleanup")
+        self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("chat", "ui-pass"),
+                                                                                         ("poll", "pass")])
+        self.assertIn("May device tests (ios): the test session's cleanup removed 2 tagged items", out)
 
     def test_refusals(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),
                              ({"MAY_STAGING_API_URL": "http://staging.example"}, "MAY_STAGING_API_URL is not an https"),
-                             ({"CLAUDE_CODE_OAUTH_TOKEN": "x"}, "A secret for another release step")):
+                             ({"MAY_APP_RENDERS_WRITE_KEY": "x"}, "A secret for another release step")):
             with self.subTest(message=message):
                 with self.assertRaises(Exception) as refused:
                     self.run_it(env=env)

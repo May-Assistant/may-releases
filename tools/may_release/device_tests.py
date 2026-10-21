@@ -429,7 +429,8 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 except subprocess.TimeoutExpired:
                     passed = False
             else:
-                records[row["id"]] = agent(cli, row["goal"], tag, adb, SERIAL, private / "agent" / row["id"],
+                device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL}
+                records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"],
                                            claude[0], claude[1])
             entry["seconds"] = int(time.monotonic() - started)
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)

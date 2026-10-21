@@ -10,10 +10,12 @@ Android job, with the same scenario list, verdicts, report and seal.
   publish.py's 40 MB a file), the scenario's Maestro flow (the same flows as Android: one bundle id), a screenshot and
   its read-only server checks.
 
-Agent scenarios are Android's alone for now: the simulator has no adb, and an input tool for it (idb or Maestro's
-driver) is a later decision. The public log carries scenario ids, verdict words and counts only.
+Agent scenarios run here too: device_agent.py with device_mcp.py's iOS backend, which acts through the pinned
+Maestro's driver (one fixed command a flow), with the same tag, server truth, judge and cleanup as Android. The public
+log carries scenario ids, verdict words and counts only.
 """
 
+import datetime
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,7 @@ import signal
 import subprocess
 import time
 
+import device_agent
 import device_tests
 from device_tests import DeviceTestsError
 import renders
@@ -123,11 +126,15 @@ def launch(udid, env, token, log):
         raise DeviceTestsError("May Playground did not launch on the simulator")
 
 
-def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check):
-    # A selection may name Android's agent scenarios too; this job runs only the iOS ones among them.
+def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check, truth=device_tests.tagged,
+                  asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
+                  install=device_agent.install):
+    # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
-    require_step_secrets((device_tests.SIGNIN_SECRET,))
+    agents = any(row["driver"] == "agent" for row in chosen)
+    require_step_secrets((device_tests.SIGNIN_SECRET, device_agent.OAUTH))
     secret = os.environ.pop(device_tests.SIGNIN_SECRET, "")
+    claude = device_agent.settings(os.environ) if agents else (os.environ.pop(device_agent.OAUTH, ""), None)
     root = runner_root()
     source, private = root / "may-source", root / "may-private"
     if not (root / APP / "Info.plist").is_file():
@@ -143,9 +150,11 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     folder.mkdir(parents=True, mode=0o700)
     log = private / "device-run.log"
     launcher = device_tests.maestro(root, private, log)
+    cli = install(root) if agents else None
+    tag, since = device_tests.run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     env = xcode()
     udid = boot(log, env)
-    results = []
+    results, records, cleaned_count = [], {}, None
     try:
         if renders.quiet(["xcrun", "simctl", "install", udid, str(root / APP)], log, env=env).returncode:
             raise DeviceTestsError("May Playground did not install on the simulator; no scenario ran")
@@ -159,8 +168,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if row["id"] in skipped:
                 entry["reason"] = device_tests.SWITCHED_OFF
                 continue
-            flow = source / device_tests.FLOWS_DIR / row["flow"]
-            if not flow.is_file() or flow.is_symlink():
+            flow = source / device_tests.FLOWS_DIR / row["flow"] if row["driver"] == "maestro" else None
+            if flow is not None and (not flow.is_file() or flow.is_symlink()):
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
                 continue
             token = minted(base, secret)
@@ -168,13 +177,20 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             recorder = Recorder(udid, env, row["id"], private, log)
             recorder.start()
             started = time.monotonic()
-            try:
-                passed = not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format", "junit",
-                                            "--output", str(folder / (row["id"] + ".xml"))], log,
-                                           env=dict(env, MAESTRO_CLI_NO_ANALYTICS="1",
-                                                    MAESTRO_DISABLE_UPDATE_CHECK="true")).returncode
-            except subprocess.SubprocessError:
-                passed = False
+            if flow is not None:
+                try:
+                    passed = not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format",
+                                                "junit", "--output", str(folder / (row["id"] + ".xml"))], log,
+                                               env=dict(env, MAESTRO_CLI_NO_ANALYTICS="1",
+                                                        MAESTRO_DISABLE_UPDATE_CHECK="true")).returncode
+                except subprocess.SubprocessError:
+                    passed = False
+            else:
+                device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
+                          "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
+                          **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {})}
+                records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"], claude[0],
+                                           claude[1], seconds=device_agent.IOS_AGENT_SECONDS)
             entry["seconds"] = int(time.monotonic() - started)
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
@@ -182,16 +198,33 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             for check in row["server"]:
                 status = checked(base, token, check["get"])
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
+            for check in row.get("truth", []):
+                if "question" in check:
+                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], tag)
+                else:
+                    path, (status, found) = check["get"], truth(base, token, check["get"], tag)
+                entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
             token = ""
-            server_ok = all(check["pass"] for check in entry["server"])
-            entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
-            if entry["verdict"] == "ui-pass":
-                entry["reason"] = device_tests.UNCONFIGURED
+            if flow is not None:
+                server_ok = all(check["pass"] for check in entry["server"])
+                entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
+                if entry["verdict"] == "ui-pass":
+                    entry["reason"] = device_tests.UNCONFIGURED
+            else:
+                entry.update(verdict="fail", reason=device_tests.NOT_JUDGED)
+        if agents:
+            token = minted(base, secret)
+            cleaned_count = cleaned(base, token, since, tag)
     finally:
         token = secret = ""
         renders.quiet(["xcrun", "simctl", "shutdown", udid], log, env=env)
     report = {"run": folder.parent.name, "device": "ios", "scenarios": results}
     (folder / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    write_private(private / device_tests.AGENTS, json.dumps({"tag": tag, "agents": records}).encode())
     write_private(private / device_tests.VERDICTS, json.dumps([entry["verdict"] for entry in results]).encode())
     ran = sum(1 for entry in results if entry["verdict"] != "skipped")
     print(f"May device tests (ios): {ran} scenarios ran; verdicts follow the judge step")
+    if cleaned_count is not None:
+        print(f"May device tests (ios): the test session's cleanup removed {cleaned_count} tagged items")
+    elif agents:
+        print("May device tests (ios): the test session's cleanup did not answer; tagged items may remain")
