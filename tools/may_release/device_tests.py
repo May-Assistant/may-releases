@@ -24,6 +24,11 @@ Commands, one per workflow step:
   seal     one tar of the run folder (<UTC date>-<may-app short sha>/android/), encrypted to MAY_RENDERS_RECIPIENT
   verdict  fails the job if any scenario failed
 
+The "smoke" scenario checks the harness itself, and runs only when it is selected by name (never in "all"): it needs
+no staging and no sign-in secret. The app starts signed out; the harness's own Maestro flow (SMOKE_FLOW, never
+may-app's) launches it; then the agent, with a read-only goal, looks at the screen; the screen is recorded, sealed and
+published as usual. Its verdict is "smoke-pass" or "fail", never "pass".
+
 Scenarios with "outward": true (one action outside staging: the self-addressed Gmail send) run only while
 MAY_DEVICE_TESTS_OUTWARD is not "off". Samuel's go (21 Oct, in session) covers that one scenario alone, with the
 server's guard for test sessions as the backstop.
@@ -93,6 +98,10 @@ BLOCKED = "the agent reported it was blocked"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
 UNCONFIGURED = "server checks not configured"
+SMOKE_MAESTRO = "Maestro did not drive the app"
+SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
+# The smoke scenario's flow: this repository's own, written to the private folder at run time.
+SMOKE_FLOW = "appId: " + APP_ID + "\n---\n- launchApp\n- waitForAnimationToEnd\n"
 SWITCHED_OFF = "switched off (MAY_DEVICE_TESTS_SKIP)"
 SKIP = "MAY_DEVICE_TESTS_SKIP"
 
@@ -108,7 +117,8 @@ class DeviceTestsError(ValueError):
 
 
 def scenarios(selection="all", platform="android"):
-    """SCENARIOS, checked, for one platform; "all" or a comma-separated list of ids."""
+    """SCENARIOS, checked, for one platform; "all" (every scenario but the smoke one) or a comma-separated list of
+    ids."""
     try:
         rows = json.loads(SCENARIOS.read_text())
     except (OSError, ValueError):
@@ -124,7 +134,9 @@ def scenarios(selection="all", platform="android"):
                     "{tag}" in row["goal"] and len(row["goal"]) <= MAX_GOAL and isinstance(row.get("truth"), list) and
                     all(isinstance(c, dict) and (set(c) == {"get"} and c["get"] in TRUTH_PATHS or
                                                  set(c) == {"question"} and c["question"] in QUESTION_STATES)
-                        for c in row["truth"]))
+                        for c in row["truth"]) or
+                    driver == SMOKE and "flow" not in row and "truth" not in row and
+                    isinstance(row.get("goal"), str) and len(row["goal"]) <= MAX_GOAL and row.get("server") == [])
                 and isinstance(row.get("title"), str) and
                 isinstance(row.get("platforms"), list) and set(row["platforms"]) <= set(PLATFORMS) and
                 isinstance(row.get("outward"), bool) and isinstance(row.get("server"), list) and
@@ -138,7 +150,8 @@ def scenarios(selection="all", platform="android"):
     wanted = None if selection == "all" else selection.split(",")
     if wanted is not None and not set(wanted) <= ids:
         raise DeviceTestsError("A selected scenario is not in the scenario list")
-    return [row for row in checked if platform in row["platforms"] and (wanted is None or row["id"] in wanted)]
+    return [row for row in checked if platform in row["platforms"] and
+            (row["id"] in wanted if wanted is not None else row["driver"] != SMOKE)]
 
 
 def run_folder(source):
@@ -273,11 +286,11 @@ def run_tag():
 
 
 def launch(adb, env, token, log):
-    """The app, stopped and started again with a fresh test session."""
+    """The app, stopped and started again with a fresh test session (signed out, with no token: the smoke scenario)."""
     flows.run_private([adb, "shell", "am", "force-stop", APP_ID], log, env=env, check=False)
     flows.run_private([adb, "shell", "am", "start", "-W", "-a", "android.intent.action.MAIN", "-c",
-                       "android.intent.category.LAUNCHER", "-p", APP_ID, "--es", "may_test_session", token],
-                      log, env=env)
+                       "android.intent.category.LAUNCHER", "-p", APP_ID] +
+                      (["--es", "may_test_session", token] if token else []), log, env=env)
 
 
 class Recorder:
@@ -370,10 +383,54 @@ def maestro(root, private, log):
     return launcher
 
 
+def uses(chosen):
+    """(any scenario needs the agent, any needs staging): the smoke scenario needs the agent and no staging."""
+    return (any(row["driver"] in ("agent", SMOKE) for row in chosen),
+            any(row["driver"] != SMOKE for row in chosen))
+
+
+def staging(secret, staged):
+    """The staging API's base URL, checked with the sign-in secret, when a chosen scenario needs staging; "" when none
+    does (the smoke scenario alone), and then neither is needed."""
+    if not staged:
+        return ""
+    base = os.environ.get(STAGING, "").strip().rstrip("/")
+    if not STAGING_URL.fullmatch(base):
+        raise DeviceTestsError("MAY_STAGING_API_URL is not an https host in may-device-tests")
+    if not secret:
+        raise DeviceTestsError("MAY_TEST_SIGNIN_SECRET is not set in may-device-tests; no scenario ran")
+    return base
+
+
+def scenario_flow(row, source, private):
+    """The Maestro flow a scenario runs: may-app's for a Maestro row, SMOKE_FLOW for the smoke row, none for an agent."""
+    if row["driver"] == "maestro":
+        return source / FLOWS_DIR / row["flow"]
+    if row["driver"] == SMOKE:
+        path = private / "smoke-flow.yaml"
+        path.write_text(SMOKE_FLOW)
+        return path
+    return None
+
+
+def settle(entry, row, passed):
+    """A scenario's verdict after its run: a Maestro row's from its flow and server checks; an agent or smoke row waits
+    for the judge (a smoke row keeps whether Maestro drove the app)."""
+    if row["driver"] == "maestro":
+        server_ok = all(check["pass"] for check in entry["server"])
+        entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
+        if entry["verdict"] == "ui-pass":
+            entry["reason"] = UNCONFIGURED
+        return
+    entry.update(verdict="fail", reason=NOT_JUDGED)
+    if row["driver"] == SMOKE:
+        entry["maestro"] = bool(passed)
+
+
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install):
     chosen = scenarios(selection, "android")
-    agents = any(row["driver"] == "agent" for row in chosen)
+    agents, staged = uses(chosen)
     require_step_secrets((SIGNIN_SECRET, device_agent.OAUTH))
     secret = os.environ.pop(SIGNIN_SECRET, "")
     # The OAuth token is popped (held in memory, for the agent's environment alone) whether or not it is used.
@@ -382,11 +439,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     source, private = root / "may-source", root / "may-private"
     if not source.is_dir() or not (source / APK).is_file():
         raise DeviceTestsError("The Playground app is not built")
-    base = os.environ.get(STAGING, "").strip().rstrip("/")
-    if not STAGING_URL.fullmatch(base):
-        raise DeviceTestsError("MAY_STAGING_API_URL is not an https host in may-device-tests")
-    if not secret:
-        raise DeviceTestsError("MAY_TEST_SIGNIN_SECRET is not set in may-device-tests; no scenario ran")
+    base = staging(secret, staged)
     outward = os.environ.get(OUTWARD, "").strip() != "off"
     skipped = switched_off()
     folder = root / OUT / run_folder(source) / "android"
@@ -411,12 +464,12 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             if row["id"] in skipped:
                 entry["reason"] = SWITCHED_OFF
                 continue
-            flow = source / FLOWS_DIR / row["flow"] if row["driver"] == "maestro" else None
+            flow = scenario_flow(row, source, private)
             if flow is not None and (not flow.is_file() or flow.is_symlink()):
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
                 continue
-            # A fresh session per scenario: one lasts 30 minutes and has no refresh.
-            token = minted(base, secret)
+            # A fresh session per scenario: one lasts 30 minutes and has no refresh. The smoke scenario has none.
+            token = minted(base, secret) if row["driver"] != SMOKE else ""
             launch(adb, env, token, log)
             recorder = Recorder(adb, env, row["id"], log)
             recorder.start()
@@ -428,7 +481,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                          str(folder / (row["id"] + ".xml"))], log, env=maestro_env, check=False, timeout=FLOW_SECONDS)
                 except subprocess.TimeoutExpired:
                     passed = False
-            else:
+            if row["driver"] != "maestro":
                 device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL}
                 records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"],
                                            claude[0], claude[1])
@@ -445,13 +498,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 else:
                     path, (status, found) = check["get"], truth(base, token, check["get"], tag)
                 entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
-            if flow is not None:
-                server_ok = all(check["pass"] for check in entry["server"])
-                entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
-                if entry["verdict"] == "ui-pass":
-                    entry["reason"] = UNCONFIGURED
-            else:
-                entry.update(verdict="fail", reason=NOT_JUDGED)
+            settle(entry, row, passed if flow is not None else None)
             token = ""
         if any(row["driver"] == "agent" for row in chosen):
             token = minted(base, secret)
@@ -471,12 +518,15 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     print(f"May device tests (android): {ran} scenarios ran; verdicts follow the judge step")
     if cleaned_count is not None:
         print(f"May device tests (android): the test session's cleanup removed {cleaned_count} tagged items")
-    elif agents:
+    elif any(row["driver"] == "agent" for row in chosen):
         print("May device tests (android): the test session's cleanup did not answer; tagged items may remain")
 
 
 def combined(entry, record, judged):
-    """An agent scenario's verdict from its run, the judge and the server truth."""
+    """An agent scenario's verdict from its run, the judge and the server truth; the smoke scenario's from Maestro, its
+    agent run and the judge, never "pass"."""
+    if entry.get("maestro") is False:
+        return {"verdict": "fail", "reason": SMOKE_MAESTRO}
     if record.get("state") == "rate_limited" or judged[0] == "rate_limited":
         return {"verdict": "skipped", "reason": RATE_LIMITED}
     if record.get("outcome") == "blocked":
@@ -485,6 +535,8 @@ def combined(entry, record, judged):
         return {"verdict": "fail", "reason": UNFINISHED}
     if judged[0] != "pass":
         return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
+    if "maestro" in entry:
+        return {"verdict": SMOKE_PASS, "reason": None}
     if not entry["server"]:
         return {"verdict": "ui-pass", "reason": UNCONFIGURED}
     if all(check["pass"] for check in entry["server"]):
@@ -509,6 +561,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         stored = {}
     records = stored.get("agents", {}) if isinstance(stored, dict) else {}
     goals = {row["id"]: row["goal"] for row in scenarios("all", platform) if row["driver"] == "agent"}
+    goals.update((row["id"], row["goal"]) for row in smoke_rows(platform))
     pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
     token = model = None
     if pending:
@@ -540,10 +593,24 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         scenario, word = entry["id"], entry["verdict"]
         print(f"May device tests ({platform}): {scenario}: {word}")
     counts = {word: sum(1 for entry in report["scenarios"] if entry["verdict"] == word)
-              for word in ("pass", "ui-pass", "fail", "skipped")}
+              for word in ("pass", "ui-pass", "fail", "skipped", SMOKE_PASS)}
     passed, ui_passed, failed, skipped = counts["pass"], counts["ui-pass"], counts["fail"], counts["skipped"]
     print(f"May device tests ({platform}): {passed} passed, {ui_passed} passed on screen alone (server checks not "
           f"configured), {failed} failed, {skipped} skipped")
+    smoke_passed = counts[SMOKE_PASS]
+    if smoke_passed:
+        print(f"May device tests ({platform}): {smoke_passed} passed the harness smoke check (not a test of May)")
+
+
+def smoke_rows(platform):
+    """The smoke scenario rows for one platform (scenarios("all") leaves them out)."""
+    try:
+        rows = json.loads(SCENARIOS.read_text())
+    except (OSError, ValueError):
+        raise DeviceTestsError("The scenario list is unreadable") from None
+    ids = [row["id"] for row in rows if isinstance(row, dict) and row.get("driver") == SMOKE and
+           isinstance(row.get("id"), str)]
+    return scenarios(",".join(ids), platform) if ids else []
 
 
 def seal(platform="android"):

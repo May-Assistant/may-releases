@@ -102,5 +102,17 @@
         "question": "answered"
       }
     ]
+  },
+  {
+    "id": "smoke",
+    "title": "Harness smoke check: the app starts signed out and the agent can see it",
+    "driver": "smoke",
+    "goal": "May Playground has just started, signed out. Take one screenshot and read the hierarchy. Do not tap, type, swipe or go back. Then call done with outcome completed, and in the summary name the screen you see.",
+    "platforms": [
+      "android",
+      "ios"
+    ],
+    "outward": false,
+    "server": []
   }
 ]

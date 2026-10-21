@@ -715,6 +715,14 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
    - `device-push` adds the folder under `device-tests/` with `MAY_APP_RENDERS_WRITE_KEY`, keeping the newest 10 in `device-tests/runs.json`, and never force-pushes.
    - `device-release` uploads the MP4s, as `<device>-<file>.mp4`, to the may-renders release `device-tests-<run>` with `MAY_RENDERS_RELEASE_TOKEN`. On a re-run it reuses the release and skips assets already there. It keeps the newest 10 `device-tests-*` releases and deletes older ones with their tags, never touching other releases. Its only calls are those releases on may-renders. Without the token, it uploads nothing and says so, and the recordings stay in the encrypted artifact.
 
+**The harness smoke check:** dispatch with `scenarios: smoke` to check the harness itself before staging or the sign-in secret exist. It is never part of `all` and needs neither `MAY_STAGING_API_URL` nor `MAY_TEST_SIGNIN_SECRET`. On each device it:
+- boots the emulator or the simulator and installs the build;
+- starts the app signed out, with no test session minted;
+- runs this repository's own two-line Maestro flow (launch the app, wait), never one of may-app's;
+- runs the agent once with a read-only goal (take a screenshot, read the hierarchy, call done), then its judge;
+- records, seals and publishes as usual.
+Its verdict is "smoke-pass" or "fail" ("Maestro did not drive the app" when the flow fails), never "pass": it checks the harness, not May. Nothing is cleaned up, since nothing was created.
+
 **Switching a scenario off:** the variable `MAY_DEVICE_TESTS_SKIP` lists scenario ids, comma-separated, that both jobs skip ("switched off"), for instance one whose server side is merged but not yet deployed. The test session's cleanup also expires the pending approvals test sessions asked for since the run began (`approvals_expired`, counted with the removed items).
 
 **Outward actions:** a scenario marked `"outward": true` runs unless `MAY_DEVICE_TESTS_OUTWARD` is `off`. So far only the self-addressed Gmail send to harlahke@gmail.com is planned to use this. Samuel approved it directly on 21 Oct, conditional on staging's guard for test sessions.
