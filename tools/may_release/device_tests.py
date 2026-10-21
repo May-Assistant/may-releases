@@ -62,7 +62,6 @@ MAESTRO_URL = "https://github.com/mobile-dev-inc/maestro/releases/download/cli-2
 MAESTRO_SHA256 = "b3e561161904fb391875ca5834d5b22cf0b01c052dd1b408ad83e30d8f8951b3"
 SIGNIN_SECRET, OUTWARD, STAGING, RECIPIENT = ("MAY_TEST_SIGNIN_SECRET", "MAY_DEVICE_TESTS_OUTWARD",
                                               "MAY_STAGING_API_URL", "MAY_RENDERS_RECIPIENT")
-TEST_EMAIL = "harlahke@gmail.com"
 STAGING_URL = re.compile(r"https://[a-z0-9][a-z0-9.-]{0,200}")
 TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{20,4096}")
 # Recordings: about 720p at about 1 Mbps, in screenrecord's 3-minute chunks: under 25 MB a chunk.
@@ -126,11 +125,12 @@ def build():
 
 
 def mint(base, secret, post=urllib.request.urlopen):
-    """A short-lived staging session for the test account: POST <staging>/v1/auth/test-session. The token is held in
-    memory alone; nothing from the reply is printed."""
+    """A short-lived staging session for the test account: POST <staging>/v1/auth/test-session {secret}. Staging fixes
+    the account itself (MAY_TEST_SIGNIN_EMAIL) and replies {token, expires_at, user_id}. The token is held in memory
+    alone; nothing from the reply is printed."""
     request = urllib.request.Request(base + "/v1/auth/test-session", method="POST",
-                                     data=json.dumps({"email": TEST_EMAIL}).encode(),
-                                     headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"})
+                                     data=json.dumps({"secret": secret}).encode(),
+                                     headers={"Content-Type": "application/json"})
     try:
         with post(request, timeout=30) as reply:
             data = json.loads(reply.read())
