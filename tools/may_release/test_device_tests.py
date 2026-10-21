@@ -108,16 +108,17 @@ class FakeReply(io.BytesIO):
 
 
 class MintTests(unittest.TestCase):
-    def test_mints_with_the_secret_as_a_bearer_and_returns_only_a_token(self):
+    def test_mints_with_the_secret_in_the_body_and_returns_only_a_token(self):
         seen = {}
 
         def post(request, timeout):
             seen.update(url=request.full_url, auth=request.headers.get("Authorization"), body=json.loads(request.data))
-            return FakeReply(json.dumps({"token": TOKEN, "expires_at": "2026-10-21T06:00:00Z"}).encode())
+            return FakeReply(json.dumps({"token": TOKEN, "expires_at": "2026-10-21T06:00:00Z",
+                                         "user_id": "u_1"}).encode())
 
         self.assertEqual(device_tests.mint("https://staging.example", "s" * 32, post), TOKEN)
-        self.assertEqual(seen, {"url": "https://staging.example/v1/auth/test-session", "auth": "Bearer " + "s" * 32,
-                                "body": {"email": "harlahke@gmail.com"}})
+        self.assertEqual(seen, {"url": "https://staging.example/v1/auth/test-session", "auth": None,
+                                "body": {"secret": "s" * 32}})
 
     def test_a_bad_reply_is_refused(self):
         for reply in (b"not json", b"{}", json.dumps({"token": "short"}).encode()):
