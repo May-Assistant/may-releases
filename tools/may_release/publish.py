@@ -308,7 +308,7 @@ def comment(sha, pr, call_api=github):
         print("May iOS renders: nothing was published, so no comment posted")
         return
     if not token:
-        print("May iOS renders: MAY_APP_PR_COMMENT_TOKEN is not set in may-ios-renders; no comment posted")
+        print("May iOS renders: comment skipped: no token (MAY_APP_PR_COMMENT_TOKEN is not set in may-ios-renders)")
         return
     if len(token) < 20:
         raise PublishError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")

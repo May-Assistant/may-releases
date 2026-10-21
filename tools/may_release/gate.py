@@ -363,14 +363,17 @@ def main():
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise GateDenial("GitHub metadata token unavailable")
-    author = None
+    author, pull_read = None, True
     if args.action == "renders" and args.pr_number is not None:
         number = pull_number(args.pr_number)
         if args.check_pull:
+            # Without the token (not yet created for may-ios-renders) the pull request is not read: prepare.py's fetch
+            # of refs/pull/<number>/head still requires that head to be exactly the source SHA.
             pull_token = os.environ.get("MAY_APP_PR_READ_TOKEN")
-            if not pull_token:
-                raise GateDenial("Pull-request read token unavailable")
-            validate_pull_request(get_app_pull(number, pull_token), number, args.source_sha)
+            if pull_token:
+                validate_pull_request(get_app_pull(number, pull_token), number, args.source_sha)
+            else:
+                pull_read = False
     if args.action == "compile-pr":
         number = pull_number(args.pr_number)
         if args.check_pull:
@@ -410,6 +413,10 @@ def main():
         dispatcher = login_or_unknown(os.environ.get("GITHUB_TRIGGERING_ACTOR"))
         subject = f"may-app #{int(args.pr_number)}" if args.pr_number is not None else "a may-app main commit"
         design = "; design system " + args.ds_sha if args.ds_sha else ""
+        if not pull_read:
+            print(f"May renders pull request check skipped: no MAY_APP_PR_READ_TOKEN in may-ios-renders; the fetch "
+                  f"still requires the head of may-app #{int(args.pr_number)} to be {args.source_sha}")
+            return
         print(f"May renders {'pull request check' if args.check_pull else 'admission'} passed for {args.source_sha} "
               f"({subject}{design}; dispatched by {dispatcher})")
         return

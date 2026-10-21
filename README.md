@@ -682,7 +682,7 @@ This repository is public and may-app is private, and anyone signed in to GitHub
 - `MAY_RENDERS_DECRYPT_KEY`, and the variable `MAY_RENDERS_RECIPIENT`: its age key pair;
 - copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_APP_PR_READ_TOKEN` and `MAY_APP_PR_COMMENT_TOKEN`.
 
-Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing and publishes nothing, and says so. Without the write key it pushes nothing, and without the comment token it posts nothing.
+Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing and publishes nothing, and says so. Without the write key it pushes nothing. Without `MAY_APP_PR_COMMENT_TOKEN`, it still publishes to may-renders and logs "comment skipped: no token". Without `MAY_APP_PR_READ_TOKEN`, a pull request's renders skip the API read of the pull request, so nothing checks that it is open, against main and not from a fork. The fetch still requires `refs/pull/<number>/head` to be exactly `source_sha`, which means the commit is still the pull request's current head.
 
 ### Prerequisites that remain
 

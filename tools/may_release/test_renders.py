@@ -72,7 +72,7 @@ class Workspace:
 
 
 class GateTests(unittest.TestCase):
-    def run_gate(self, args, pr=None):
+    def run_gate(self, args, pr=None, token="p" * 20):
         answers = {"May-Assistant/may-releases/environments/may-ios-renders": ENVIRONMENT,
                    "May-Assistant/may-releases/environments/may-ios-renders/deployment-branch-policies?per_page=100": POLICIES,
                    "May-Assistant/may-app/pulls/42": pr or pull()}
@@ -86,7 +86,8 @@ class GateTests(unittest.TestCase):
             return FakeResponse(json.dumps(answer).encode())
 
         environ = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": DISPATCH, "GH_TOKEN": "t" * 20,
-                   "MAY_APP_PR_READ_TOKEN": "p" * 20, "GITHUB_TRIGGERING_ACTOR": "samuelalake"}
+                   "MAY_APP_PR_READ_TOKEN": token, "GITHUB_TRIGGERING_ACTOR": "samuelalake"}
+        environ = {k: v for k, v in environ.items() if v is not None}
         with patch.dict(os.environ, environ, clear=True), patch("urllib.request.urlopen", urlopen), \
                 patch.object(sys, "argv", ["gate.py"] + args), patch("sys.stdout", new_callable=io.StringIO) as out:
             try:
@@ -108,6 +109,14 @@ class GateTests(unittest.TestCase):
         self.assertIn("https://api.github.com/repos/May-Assistant/may-app/pulls/42", seen)
         self.assertEqual(out.strip(), f"May renders pull request check passed for {SHA} (may-app #42; design system "
                                       f"{DS}; dispatched by samuelalake)")
+
+    def test_without_the_pull_request_token_the_check_is_skipped_and_the_fetch_still_pins_the_head(self):
+        denial, seen, out = self.run_gate(["--action", "renders", "--source-sha", SHA, "--pr-number", "42",
+                                           "--check-pull"], token=None)
+        self.assertIsNone(denial)
+        self.assertNotIn("https://api.github.com/repos/May-Assistant/may-app/pulls/42", seen)
+        self.assertEqual(out.strip(), "May renders pull request check skipped: no MAY_APP_PR_READ_TOKEN in "
+                                      f"may-ios-renders; the fetch still requires the head of may-app #42 to be {SHA}")
 
     def test_refusals(self):
         cases = ((["--check-pull"], "Only a pull request's renders read a pull request"),
@@ -568,6 +577,18 @@ class PublishCommentTests(unittest.TestCase):
         calls, out, _ = self.comment(comments=[{"body": f"<!-- may-ios-renders head={SHA} -->"}])
         self.assertFalse(any(method == "POST" for method, _, _ in calls))
         self.assertIn("already linked", out)
+
+    def test_without_the_comment_token_the_comment_is_skipped_and_nothing_fails(self):
+        calls = []
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            try:
+                publish.comment(SHA, "42", call_api=lambda *a: calls.append(a))
+            except PublishError as error:
+                self.fail("a missing comment token failed the step: " + error.args[0])
+        self.assertEqual(calls, [])
+        self.assertEqual(out.getvalue().strip(), "May iOS renders: comment skipped: no token "
+                                                 "(MAY_APP_PR_COMMENT_TOKEN is not set in may-ios-renders)")
 
     def test_only_the_pull_request_and_its_comments_are_reachable(self):
         with self.assertRaises(PublishError):
