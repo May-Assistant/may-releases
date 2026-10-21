@@ -66,10 +66,10 @@ DEVICE_RUN = re.compile(r"[0-9]{8}-[0-9a-f]{12}")
 DEVICES = ("android", "ios")
 DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.xml)|report\.json")
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
-VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped")
+VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS)
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
            device_tests.UNCONFIGURED, device_tests.RATE_LIMITED, device_tests.UNFINISHED, device_tests.BLOCKED,
-           device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF)
+           device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO)
 MAX_NOTES = 600
 # The sealed device artifact's retention (device-tests.yml): the recordings' fallback when the release upload fails.
 VIDEO_DAYS = 7
@@ -440,8 +440,8 @@ def open_device():
         raise PublishError("MAY_RENDERS_RECIPIENT is not set to an age public key in may-device-tests")
     if len(lines) != 1 or not AGE_IDENTITY.fullmatch(lines[0]):
         raise PublishError("The renders decryption key is malformed (MAY_RENDERS_DECRYPT_KEY in may-device-tests)")
-    titles = {row["id"]: row["title"] for row in device_tests.scenarios("all", "android") +
-              device_tests.scenarios("all", "ios")}
+    titles = {row["id"]: row["title"] for platform in DEVICES for row in
+              device_tests.scenarios("all", platform) + device_tests.smoke_rows(platform)}
     private, tree = root / "may-private", root / TREE
     private.mkdir(mode=0o700, exist_ok=True)
     tree.mkdir(mode=0o700)

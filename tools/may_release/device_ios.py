@@ -118,10 +118,11 @@ def boot(log, env):
 
 
 def launch(udid, env, token, log):
-    """The app, stopped and started again with a fresh test session in its launch environment (never an argument)."""
+    """The app, stopped and started again with a fresh test session in its launch environment (never an argument);
+    signed out, with no token (the smoke scenario)."""
     renders.quiet(["xcrun", "simctl", "terminate", udid, BUNDLE], log, env=env)
     launched = renders.quiet(["xcrun", "simctl", "launch", udid, BUNDLE], log,
-                             env=dict(env, SIMCTL_CHILD_MAY_TEST_SESSION=token))
+                             env=dict(env, SIMCTL_CHILD_MAY_TEST_SESSION=token) if token else env)
     if launched.returncode:
         raise DeviceTestsError("May Playground did not launch on the simulator")
 
@@ -131,7 +132,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                   install=device_agent.install):
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
-    agents = any(row["driver"] == "agent" for row in chosen)
+    agents, staged = device_tests.uses(chosen)
     require_step_secrets((device_tests.SIGNIN_SECRET, device_agent.OAUTH))
     secret = os.environ.pop(device_tests.SIGNIN_SECRET, "")
     claude = device_agent.settings(os.environ) if agents else (os.environ.pop(device_agent.OAUTH, ""), None)
@@ -139,11 +140,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     source, private = root / "may-source", root / "may-private"
     if not (root / APP / "Info.plist").is_file():
         raise DeviceTestsError("The Playground app is not built")
-    base = os.environ.get(device_tests.STAGING, "").strip().rstrip("/")
-    if not device_tests.STAGING_URL.fullmatch(base):
-        raise DeviceTestsError("MAY_STAGING_API_URL is not an https host in may-device-tests")
-    if not secret:
-        raise DeviceTestsError("MAY_TEST_SIGNIN_SECRET is not set in may-device-tests; no scenario ran")
+    base = device_tests.staging(secret, staged)
     outward = os.environ.get(device_tests.OUTWARD, "").strip() != "off"
     skipped = device_tests.switched_off()
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
@@ -168,11 +165,11 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if row["id"] in skipped:
                 entry["reason"] = device_tests.SWITCHED_OFF
                 continue
-            flow = source / device_tests.FLOWS_DIR / row["flow"] if row["driver"] == "maestro" else None
+            flow = device_tests.scenario_flow(row, source, private)
             if flow is not None and (not flow.is_file() or flow.is_symlink()):
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
                 continue
-            token = minted(base, secret)
+            token = minted(base, secret) if row["driver"] != device_tests.SMOKE else ""
             launch(udid, env, token, log)
             recorder = Recorder(udid, env, row["id"], private, log)
             recorder.start()
@@ -185,7 +182,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                                                         MAESTRO_DISABLE_UPDATE_CHECK="true")).returncode
                 except subprocess.SubprocessError:
                     passed = False
-            else:
+            if row["driver"] != "maestro":
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {})}
@@ -205,14 +202,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                     path, (status, found) = check["get"], truth(base, token, check["get"], tag)
                 entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
             token = ""
-            if flow is not None:
-                server_ok = all(check["pass"] for check in entry["server"])
-                entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
-                if entry["verdict"] == "ui-pass":
-                    entry["reason"] = device_tests.UNCONFIGURED
-            else:
-                entry.update(verdict="fail", reason=device_tests.NOT_JUDGED)
-        if agents:
+            device_tests.settle(entry, row, passed if flow is not None else None)
+        if any(row["driver"] == "agent" for row in chosen):
             token = minted(base, secret)
             cleaned_count = cleaned(base, token, since, tag)
     finally:
@@ -226,5 +217,5 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     print(f"May device tests (ios): {ran} scenarios ran; verdicts follow the judge step")
     if cleaned_count is not None:
         print(f"May device tests (ios): the test session's cleanup removed {cleaned_count} tagged items")
-    elif agents:
+    elif any(row["driver"] == "agent" for row in chosen):
         print("May device tests (ios): the test session's cleanup did not answer; tagged items may remain")
