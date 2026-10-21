@@ -6,7 +6,7 @@ Android job, with the same scenario list, verdicts, report and seal.
 - run_scenarios: an iPhone 16 Pro simulator on the newest iOS runtime (renders.simulator), booted, the app installed, and each
   of the platform's scenarios: a fresh staging test session (device_tests.mint), the app launched with it in
   SIMCTL_CHILD_MAY_TEST_SESSION (N's hook, may-app #921: the debug Playground reads MAY_TEST_SESSION at launch, never
-  as an argument), the screen recorded (simctl recordVideo, then avconvert to 720p so a recording stays well under
+  as an argument), the screen recorded (simctl recordVideo, then avconvert, CONVERSIONS, so a recording stays well under
   publish.py's 40 MB a file), the scenario's Maestro flow (the same flows as Android: one bundle id), a screenshot and
   its read-only server checks.
 
@@ -33,6 +33,9 @@ SCHEME = "MayPlayground"
 APP = "may-derived/Build/Products/Debug-iphonesimulator/MayPlayground.app"
 BUNDLE = device_tests.APP_ID
 MAX_RECORDING = 38 * 1024 * 1024
+# avconvert's presets in the order tried, each with the file type it writes: 720p HD as M4V, then the plain H.264
+# presets as MPEG-4 at 720p and 540p.
+CONVERSIONS = (("PresetAppleM4V720pHD", ".m4v"), ("Preset1280x720", ".mp4"), ("Preset960x540", ".mp4"))
 STOP_SECONDS = 30
 
 
@@ -67,14 +70,17 @@ def xcode():
 
 
 class Recorder:
-    """The simulator's screen for one scenario (simctl recordVideo until SIGINT), then made 720p for publishing."""
+    """The simulator's screen for one scenario (simctl recordVideo until SIGINT), then converted (CONVERSIONS) for
+    publishing under MAX_RECORDING, or kept as recorded when no conversion works and it fits."""
 
     def __init__(self, udid, env, scenario, private, log):
         self.udid, self.env, self.scenario, self.log = udid, env, scenario, log
         self.raw = private / (scenario + "-recording.mov")
         self.process = None
-        # Why stop() kept no recording, in fixed words and a size in MB, for the public log (None when one was kept).
-        self.dropped = None
+        # Why stop() kept no recording, in fixed words and a size in MB, for the public log (None when one was kept),
+        # and how a recording was kept when it is not the usual conversion.
+        self.dropped = self.kept = None
+        self.private = private
 
     def start(self):
         with self.log.open("ab") as output:
@@ -93,20 +99,28 @@ class Recorder:
             self.dropped = "the recorder did not stop"
             return []
         out = folder / (self.scenario + ".mp4")
-        with self.log.open("ab") as output:
-            converted = subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(out), "--preset",
-                                        "PresetAppleM4V720pHD", "--replace"], stdout=output, stderr=output,
-                                       stdin=subprocess.DEVNULL, env=self.env)
+        # Smoke run 39683880243: the M4V preset's conversion to .mp4 failed. Each preset writes the file type it
+        # supports, in the private folder; the first one that works and fits the cap is published as .mp4 (an M4V is
+        # an MPEG-4 file). When none does, the original H.264 recording is published if it fits.
+        for preset, suffix in CONVERSIONS:
+            converted = self.private / (self.scenario + "-converted" + suffix)
+            with self.log.open("ab") as output:
+                failed = subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted),
+                                         "--preset", preset, "--replace"], stdout=output, stderr=output,
+                                        stdin=subprocess.DEVNULL, env=self.env).returncode
+            if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
+                converted.replace(out)
+                self.raw.unlink(missing_ok=True)
+                return [out.name]
+            converted.unlink(missing_ok=True)
+        if self.raw.is_file() and self.raw.stat().st_size <= MAX_RECORDING:
+            self.raw.replace(out)
+            self.kept = "unconverted: no conversion worked"
+            return [out.name]
+        size = self.raw.stat().st_size // (1024 * 1024) if self.raw.is_file() else 0
         self.raw.unlink(missing_ok=True)
-        if converted.returncode or not out.is_file():
-            out.unlink(missing_ok=True)
-            self.dropped = "the 720p conversion failed"
-            return []
-        if out.stat().st_size > MAX_RECORDING:
-            self.dropped = f"over the cap at {out.stat().st_size // (1024 * 1024)} MB"
-            out.unlink(missing_ok=True)
-            return []
-        return [out.name]
+        self.dropped = f"no conversion worked and the original is {size} MB, over the cap"
+        return []
 
 
 def screenshot(udid, env, path, log):
@@ -211,6 +225,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if recorder.dropped:
                 scenario, why = row["id"], recorder.dropped
                 print(f"May device tests (ios): {scenario}: its recording was dropped ({why})")
+            elif recorder.kept:
+                scenario, why = row["id"], recorder.kept
+                print(f"May device tests (ios): {scenario}: its recording was kept {why}")
             for check in row["server"]:
                 status = checked(base, token, check["get"])
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})

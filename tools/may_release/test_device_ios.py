@@ -87,7 +87,7 @@ class BuildTests(Workspace):
 
 
 class FakeRecorder:
-    dropped = None
+    dropped = kept = None
 
     def __init__(self, udid, env, scenario, private, log):
         self.scenario = scenario
@@ -209,8 +209,11 @@ class RunTests(Workspace):
 
 
 class RecorderTests(Workspace):
-    def recorder(self, size, converted=0):
-        sent, argv_seen = [], []
+    BIG = device_ios.MAX_RECORDING + 1
+
+    def recorder(self, outcomes, raw=b"raw"):
+        """stop() with each preset's (exit code, output size) from outcomes; a preset not listed fails."""
+        sent, presets = [], []
 
         class Process:
             def send_signal(self, number):
@@ -220,33 +223,51 @@ class RecorderTests(Workspace):
                 return 0
 
         def run(argv, stdout, stderr, stdin, env):
-            argv_seen.append(argv)
-            Path(argv[argv.index("--output") + 1]).write_bytes(b"\0" * size)
-            return Done(converted)
+            preset = argv[argv.index("--preset") + 1]
+            presets.append((preset, Path(argv[argv.index("--output") + 1]).suffix))
+            code, size = outcomes.get(preset, (1, 0))
+            if size:
+                Path(argv[argv.index("--output") + 1]).write_bytes(b"\0" * size)
+            return Done(code)
 
         folder = self.root / "out"
-        folder.mkdir(exist_ok=True)
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir()
         recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
         recorder.process = Process()
-        recorder.raw.write_bytes(b"raw")
+        recorder.raw.write_bytes(raw)
         with patch("device_ios.subprocess.run", side_effect=run):
             names = recorder.stop(folder)
-        return names, sent, argv_seen, folder, recorder
+        leftovers = [path.name for path in self.private.iterdir() if path.name.startswith("sign-in-")]
+        return names, sent, presets, folder, recorder, leftovers
 
-    def test_a_recording_is_stopped_made_720p_and_kept_under_the_cap(self):
-        names, sent, argv, folder, recorder = self.recorder(1000)
+    def test_the_first_conversion_that_works_is_published_as_mp4(self):
+        names, sent, presets, folder, recorder, leftovers = self.recorder({"PresetAppleM4V720pHD": (0, 1000)})
         self.assertEqual((names, sent), (["sign-in.mp4"], [signal.SIGINT]))
-        self.assertEqual(argv[0][argv[0].index("--preset") + 1], "PresetAppleM4V720pHD")
-        self.assertFalse(recorder.raw.exists(), "the raw recording is not kept")
+        self.assertEqual(presets, [("PresetAppleM4V720pHD", ".m4v")], "each preset writes its own file type")
+        self.assertEqual((folder / "sign-in.mp4").stat().st_size, 1000)
+        self.assertEqual((leftovers, recorder.dropped, recorder.kept), ([], None, None))
 
-    def test_too_large_or_failed_is_dropped_and_says_why(self):
-        for size, code, why in ((device_ios.MAX_RECORDING + 1, 0, "over the cap at 38 MB"),
-                                (10, 1, "the 720p conversion failed")):
-            with self.subTest(size=size, code=code):
-                names, _, _, folder, recorder = self.recorder(size, code)
-                self.assertEqual((names, list(folder.iterdir()), recorder.dropped), ([], [], why))
-        _, _, _, _, recorder = self.recorder(1000)
-        self.assertIsNone(recorder.dropped, "a kept recording gives no reason")
+    def test_a_failed_or_oversized_conversion_falls_through_to_the_next_preset(self):
+        names, _, presets, folder, recorder, leftovers = self.recorder(
+            {"PresetAppleM4V720pHD": (1, 0), "Preset1280x720": (0, self.BIG), "Preset960x540": (0, 2000)})
+        self.assertEqual(presets, [("PresetAppleM4V720pHD", ".m4v"), ("Preset1280x720", ".mp4"),
+                                   ("Preset960x540", ".mp4")])
+        self.assertEqual(names, ["sign-in.mp4"], "no preset's recording was kept")
+        self.assertEqual((folder / "sign-in.mp4").stat().st_size, 2000)
+        self.assertEqual((leftovers, recorder.dropped, recorder.kept), ([], None, None))
+
+    def test_no_conversion_keeps_the_original_when_it_fits(self):
+        names, _, presets, folder, recorder, leftovers = self.recorder({}, raw=b"h264" * 10)
+        self.assertEqual(len(presets), len(device_ios.CONVERSIONS))
+        self.assertEqual(names, ["sign-in.mp4"], "the original was not kept")
+        self.assertEqual((folder / "sign-in.mp4").read_bytes(), b"h264" * 10)
+        self.assertEqual((leftovers, recorder.dropped, recorder.kept), ([], None, "unconverted: no conversion worked"))
+
+    def test_nothing_that_fits_is_dropped_and_says_why(self):
+        names, _, _, folder, recorder, leftovers = self.recorder({"Preset960x540": (0, self.BIG)}, raw=b"\0" * self.BIG)
+        self.assertEqual((names, list(folder.iterdir()), leftovers), ([], [], []))
+        self.assertEqual(recorder.dropped, "no conversion worked and the original is 38 MB, over the cap")
 
     def test_a_recorder_that_does_not_stop_is_dropped_and_says_why(self):
         class Stuck:
@@ -263,6 +284,15 @@ class RecorderTests(Workspace):
         recorder.process = Stuck()
         self.assertEqual(recorder.stop(self.root), [])
         self.assertEqual(recorder.dropped, "the recorder did not stop")
+
+    def test_the_run_prints_how_a_recording_was_kept(self):
+        class Keeping(FakeRecorder):
+            kept = "unconverted: no conversion worked"
+
+        with patch("test_device_ios.FakeRecorder", Keeping):
+            _, _, report, out, _ = RunTests.run_it(self)
+        self.assertIn("May device tests (ios): sign-in: its recording was kept unconverted: no conversion worked", out)
+        self.assertEqual(report["scenarios"][0]["videos"], ["sign-in.mp4"])
 
     def test_the_run_prints_why_a_recording_was_dropped(self):
         class Dropping(FakeRecorder):
