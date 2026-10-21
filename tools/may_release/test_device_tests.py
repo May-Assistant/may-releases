@@ -80,7 +80,7 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "connections", "chat", "notes"])
+        self.assertEqual(ids, ["sign-in", "connections", "chat", "notes", "poll", "poll-skip"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ["sign-in", "connections"],
                          "agent scenarios are Android's until the iOS job")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
