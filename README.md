@@ -379,6 +379,13 @@ Only GETs are sent. Every value is printed only if it matches a fixed shape (dig
   - the message is cut to 300 characters, and printed only if what remains is plain text (otherwise "?").
 - before the upload, `xcrun altool --validate-app -f <ipa> -t ios --apiKey … --apiIssuer … --output-format json` runs, and its output gets the same excerpt, headed "altool validation". Its product errors stop the step with nothing uploaded. If the validation can't run (an option refused, a non-zero exit), that is printed and the upload goes ahead, because the upload validates again.
 
+**The IPA's icon (21 Oct).** Build 7 (run 39517516246) uploaded cleanly and was `PROCESSING`, but Samuel saw no app icon on it in App Store Connect. The encrypted IPA can't be inspected outside the release job, so `sign.py` now checks it there with `verify.ipa_icon`, right after the signed IPA's identity check. The check passes only if both of these hold:
+
+- the app's `Info.plist` names `CFBundleIconName` `AppIcon`, either at the top level or in `CFBundleIcons` › `CFBundlePrimaryIcon`;
+- the app's compiled asset catalog, `Assets.car`, exists and names `AppIcon`.
+
+If either is missing, signing fails with a fixed message naming the missing part, and the IPA is deleted before any upload. When both hold, the log says so in one fixed line. Nothing from the IPA itself is printed.
+
 TestFlight processing (the build itself) and the internal group's testers are still checked in App Store Connect.
 
 ### What Samuel does

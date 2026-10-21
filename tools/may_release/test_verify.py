@@ -142,6 +142,59 @@ class IosVerificationTests(unittest.TestCase):
 
 
 
+class IpaIconTests(unittest.TestCase):
+    """verify.ipa_icon: TestFlight build 7 showed no icon in App Store Connect; a missing icon now fails signing."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def build(self, name, info, catalog=b"BOMStore ... AppIcon ..."):
+        path = self.root / (name + ".ipa")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("Payload/May.app/Info.plist", plistlib.dumps(
+                dict({"CFBundleIdentifier": PLAYGROUND, "CFBundleVersion": "9"}, **info), fmt=plistlib.FMT_BINARY))
+            if catalog is not None:
+                archive.writestr("Payload/May.app/Assets.car", catalog)
+        return path
+
+    def test_an_icon_named_at_the_top_level_or_in_the_primary_icon_passes(self):
+        for name, info in (("top", {"CFBundleIconName": "AppIcon"}),
+                           ("primary", {"CFBundleIcons": {"CFBundlePrimaryIcon": {
+                               "CFBundleIconFiles": ["AppIcon60x60"], "CFBundleIconName": "AppIcon"}}})):
+            with self.subTest(name=name):
+                try:
+                    verify.ipa_icon(self.build(name, info))
+                except VerifyError as error:
+                    self.fail("refused: " + error.args[0])
+
+    def test_each_missing_part_fails_with_its_own_message(self):
+        named = {"CFBundleIconName": "AppIcon"}
+        no_name = "IPA Info.plist names no CFBundleIconName AppIcon (App Store Connect shows no icon)"
+        cases = {
+            "no-icon-keys": ({}, b"AppIcon", no_name),
+            "other-name": ({"CFBundleIconName": "Icon"}, b"AppIcon", no_name),
+            "primary-without-name": ({"CFBundleIcons": {"CFBundlePrimaryIcon": {"CFBundleIconFiles": ["X"]}}},
+                                     b"AppIcon", no_name),
+            "odd-shapes": ({"CFBundleIconName": ["AppIcon"], "CFBundleIcons": "AppIcon"}, b"AppIcon", no_name),
+            "no-catalog": (named, None, "IPA app has no compiled asset catalog (Assets.car), so no icon"),
+            "catalog-without-icon": (named, b"BOMStore ... AccentColor ...",
+                                     "IPA asset catalog (Assets.car) names no AppIcon"),
+        }
+        for name, (info, catalog, message) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(VerifyError) as refused:
+                    verify.ipa_icon(self.build(name, info, catalog))
+                self.assertEqual(refused.exception.args[0], message)
+        broken = self.root / "broken.ipa"
+        broken.write_bytes(b"not a zip")
+        with self.assertRaises(VerifyError):
+            verify.ipa_icon(broken)
+
+
 class AabManifestTests(unittest.TestCase):
     """verify.manifest_identity: the bundle's own package and versionCode, read on the release side."""
 
