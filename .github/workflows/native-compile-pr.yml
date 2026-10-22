@@ -43,7 +43,8 @@ jobs:
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
         run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
   native:
-    needs: admission
+    # The Mac compile starts only after may-app's Linux Swift checks pass (swift-checks, below).
+    needs: [admission, swift-checks]
     runs-on: macos-15
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 90
@@ -79,3 +80,46 @@ jobs:
       - name: Remove private source, logs and products
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"
+  swift-checks:
+    # may-app's tools/ios/test_swift_*.py (may-app #1050) on Linux, before the macOS compile: an init's labels out of order
+    # or a missing import fails here in a minute, and native never starts. The same check and fetch as native, with the
+    # same secrets bound to the same steps; the checks run with none and print one fixed line, and the post alone holds
+    # MAY_APP_PR_COMMENT_TOKEN and puts the failing checks on the may-app pull request (swift_checks.py).
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check the pull request head and environment before fetching
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
+      - name: Fetch the pull request head and pinned design system quietly
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+      - name: Run the Swift checks without any credential, printing only pass or fail and a count
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/swift_checks.py run --source-sha "$MAY_SOURCE_SHA"
+      - name: Post the failing Swift checks on the may-app pull request, never in this log
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}
+        run: python3 -I -S -B tools/may_release/swift_checks.py post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+      - name: Remove private source and logs
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private"
