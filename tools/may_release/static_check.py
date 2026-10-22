@@ -738,12 +738,24 @@ PREPARE_IOS_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform ios 
 COMPILE_IOS_PR = COMPILE_IOS + " --record-outcome"
 POST_PR = ('python3 -I -S -B tools/may_release/compile_pr_errors.py --source-sha "$MAY_SOURCE_SHA" '
            '--pr-number "$MAY_PR_NUMBER"')
-COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL, PREPARE_IOS_PR, COMPILE_IOS_PR, POST_PR, COMPILE_CLEANUP]
+# may-app's Linux Swift checks (swift_checks.py) run first, in their own job: the same recheck and fetch with the same
+# secrets bound to the same steps, the checks with none, the post with the comment token alone. native needs it.
+SWIFT_RUN = 'python3 -I -S -B tools/may_release/swift_checks.py run --source-sha "$MAY_SOURCE_SHA"'
+SWIFT_POST = ('python3 -I -S -B tools/may_release/swift_checks.py post --source-sha "$MAY_SOURCE_SHA" '
+              '--pr-number "$MAY_PR_NUMBER"')
+SWIFT_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private"'
+COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL, PREPARE_IOS_PR, COMPILE_IOS_PR, POST_PR, COMPILE_CLEANUP,
+                   GATE_CHECK_PULL, PREPARE_IOS_PR, SWIFT_RUN, SWIFT_POST, SWIFT_CLEANUP]
 COMPILE_PR_STEP_NAMES = ["Check the pull request head and environment before fetching",
                          "Fetch the pull request head and pinned design system quietly",
                          "Compile without signing, store access or any credential",
                          "Post the errors on the may-app pull request, never in this log",
                          "Remove private source, logs and products"]
+SWIFT_STEP_NAMES = ["Check the pull request head and environment before fetching",
+                    "Fetch the pull request head and pinned design system quietly",
+                    "Run the Swift checks without any credential, printing only pass or fail and a count",
+                    "Post the failing Swift checks on the may-app pull request, never in this log",
+                    "Remove private source and logs"]
 PR_READ_SECRET, PR_COMMENT_SECRET = "MAY_APP_PR_READ_TOKEN", "MAY_APP_PR_COMMENT_TOKEN"
 COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
                   ("MAY_PR_NUMBER", "${{ inputs.pr_number }}")} | \
@@ -751,14 +763,17 @@ COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ i
 
 
 def compile_pr_workflow_problems(text):
-    """The pull-request compile is exactly: dispatch with a pull request number and its head, read-only, admission then
-    native in its own environment, the PR token in the gates alone, the source-read keys in the fetch alone, nothing
-    on the compile, the comment token in the post alone, and nothing run but its six commands."""
+    """The pull-request compile is exactly: dispatch with a pull request number and its head, read-only, admission, then
+    swift-checks and then native in its own environment; in each job the PR token in the recheck alone, the source-read
+    keys in the fetch alone, nothing on the checks or the compile, the comment token in the post alone; and nothing run
+    but its eleven commands."""
     name = "native-compile-pr.yml"
     found = []
     if "toolchain.py jdk" in text or "--platform android" in text or "upload-artifact" in text or \
             "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or \
-            "    runs-on: macos-15\n" not in job_text(text, "native") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission"):
+            "    runs-on: macos-15\n" not in job_text(text, "native") or \
+            "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission") or \
+            "    runs-on: ubuntu-24.04\n" not in job_text(text, "swift-checks"):
         found.append(name + ": is not the iOS-only May Playground compile with no artifact")
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
@@ -768,39 +783,49 @@ def compile_pr_workflow_problems(text):
         found.append(name + ": is not dispatched with exactly pr_number and source_sha")
     if "\nconcurrency:\n  group: may-native-compile-pr\n" not in text:
         found.append(name + ": does not run one at a time in its own concurrency group")
+    jobs = ("admission", "native", "swift-checks")
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
-            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "native")] != [1, 1] or \
-            text.count("permissions:") != 3:
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1] or \
+            text.count("permissions:") != 4:
         found.append(name + ": permissions are not exactly read-only (contents, and actions in each job)")
-    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "native"]:
-        found.append(name + ": jobs are not exactly admission and native")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs):
+        found.append(name + ": jobs are not exactly admission, native and swift-checks")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
     if runs != COMPILE_PR_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
         found.append(name + ": runs something other than the gate, the fetch, the compile, the post and the cleanup")
-    steps = {job: job_steps(text, job)[1] for job in ("admission", "native")}
+    steps = {job: job_steps(text, job)[1] for job in jobs}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
-    names = [step for step, _ in steps["native"]]
-    cleanup = steps["native"][-1][1] if steps["native"] else ""
-    if leading != {"admission": ["uses", "id"], "native": ["uses"] + ["name"] * len(COMPILE_PR_STEP_NAMES)} or \
-            names != [""] + COMPILE_PR_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
-            uses_in(text) != [CHECKOUT, CHECKOUT]:
+    names = {job: [step for step, _ in steps[job]] for job in ("native", "swift-checks")}
+    cleanups = [steps[job][-1][1] if steps[job] else "" for job in ("native", "swift-checks")]
+    if leading != {"admission": ["uses", "id"], "native": ["uses"] + ["name"] * len(COMPILE_PR_STEP_NAMES),
+                   "swift-checks": ["uses"] + ["name"] * len(SWIFT_STEP_NAMES)} or \
+            names != {"native": [""] + COMPILE_PR_STEP_NAMES, "swift-checks": [""] + SWIFT_STEP_NAMES} or \
+            any("\n        if: always()\n" not in cleanup for cleanup in cleanups) or \
+            uses_in(text) != [CHECKOUT, CHECKOUT, CHECKOUT]:
         found.append(name + ": native's steps are not exactly the recheck, fetch, compile, post and an always-run cleanup")
-    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 90\n" not in job_text(text, "native"):
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 2)) or \
+            text.count("timeout-minutes:") != 2 or "    timeout-minutes: 90\n" not in job_text(text, "native") or \
+            "    timeout-minutes: 20\n" not in job_text(text, "swift-checks"):
         found.append(name + ": sets a shell, defaults, a condition or a timeout other than native's 90 minutes")
-    native = job_text(text, "native")
-    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in native or \
-            "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+    native, swift = job_text(text, "native"), job_text(text, "swift-checks")
+    if any("    environment: ${{ needs.admission.outputs.environment }}\n" not in job for job in (native, swift)) or \
+            "    needs: [admission, swift-checks]\n" not in native or "    needs: admission\n" not in swift or \
+            re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + ": native's environment is not the one admission chose, after admission")
-    by_name = dict(steps["native"])
+    by_name, swift_by_name = dict(steps["native"]), dict(steps["swift-checks"])
     recheck, fetch, build, post, clean = (by_name.get(n, "") for n in COMPILE_PR_STEP_NAMES)
-    later = build + clean
-    # Each secret is bound exactly once: the PR token in the pull request check, so never in admission too (review of
-    # #18, M2); the comment token in the post alone, which runs after the pull request's build code.
+    swift_recheck, swift_fetch, checks, swift_post, swift_clean = (swift_by_name.get(n, "") for n in SWIFT_STEP_NAMES)
+    later = build + clean + swift_clean
+    # In each job each secret is bound exactly once: the PR token in the pull request check, so never in admission too
+    # (review of #18, M2); the comment token in the post alone, which runs after the pull request's own code.
     if secrets_in(text) != set(COMPILE_SECRETS) | {PR_READ_SECRET, PR_COMMENT_SECRET} or \
-            any(text.count("secrets." + n) != 1 for n in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)) or \
-            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(post) != {PR_COMMENT_SECRET} or \
-            secrets_in(recheck) != {PR_READ_SECRET} or secrets_in(later) or "env:" in later or "GH_TOKEN" in post or \
+            any(text.count("secrets." + n) != 2 or native.count("secrets." + n) != 1
+                for n in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)) or \
+            any(secrets_in(f) != set(COMPILE_SECRETS) for f in (fetch, swift_fetch)) or \
+            any(secrets_in(p) != {PR_COMMENT_SECRET} or "GH_TOKEN" in p for p in (post, swift_post)) or \
+            any(secrets_in(r) != {PR_READ_SECRET} for r in (recheck, swift_recheck)) or secrets_in(later) or \
+            "env:" in later or secrets_in(checks) or \
+            set(env_entries(checks)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")} or \
             any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + ": a secret or env entry other than the pull request check's PR token, the fetch step's two "
                      "source-read keys and the post's comment token")
@@ -1591,6 +1616,17 @@ def compile_pr_errors_print_problems(root):
     return quiet_tool_problems(root, COMPILE_PR_ERRORS, COMPILE_PR_PRINT_VALUES, COMPILE_PR_EXIT_CLASSES)
 
 
+# swift_checks.py (native-compile-pr.yml's swift-checks job) prints only fixed lines, the pull request number and the
+# number of failing checks, like compile_pr_errors.py.
+SWIFT_CHECKS = "swift_checks.py"
+SWIFT_CHECKS_PRINT_VALUES = {"number", "int(total)", "int(problems)"}
+SWIFT_CHECKS_EXIT_CLASSES = {"GateDenial", "SwiftChecksError", "CompilePrError", "DsCompileError", "StoreError"}
+
+
+def swift_checks_print_problems(root):
+    return quiet_tool_problems(root, SWIFT_CHECKS, SWIFT_CHECKS_PRINT_VALUES, SWIFT_CHECKS_EXIT_CLASSES)
+
+
 def quiet_tool_problems(root, filename, print_values, exit_classes, files=None):
     """The output lint above, for one tool that handles private source in this public log. files names, for each
     GitHub Actions file a tool may write (GITHUB_OUTPUT, GITHUB_STEP_SUMMARY), the one function that may name it."""
@@ -1840,6 +1876,7 @@ def control_problems(root):
     found += ds_compile_workflow_problems((flows / DS_COMPILE).read_text())
     found += ds_compile_print_problems(root)
     found += compile_pr_errors_print_problems(root)
+    found += swift_checks_print_problems(root)
     found += ios_rehearsal_workflow_problems((flows / REHEARSAL).read_text())
     found += ios_rehearsal_print_problems(root)
     found += android_unit_workflow_problems((flows / UNIT).read_text())
