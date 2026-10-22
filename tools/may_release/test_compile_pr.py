@@ -209,7 +209,7 @@ class AdmissionCommandTests(unittest.TestCase):
 
 
 class PullRequestFetchTests(unittest.TestCase):
-    def fetch_pull(self, head):
+    def fetch_pull(self, head, say_ref=True):
         with tempfile.TemporaryDirectory() as directory:
             private = Path(directory) / "may-private"
             private.mkdir()
@@ -218,7 +218,7 @@ class PullRequestFetchTests(unittest.TestCase):
                     patch("prepare.git_status", return_value=0), patch("prepare.head_of", return_value=head):
                 try:
                     fetch(Path(directory) / "may-source", "git@example.invalid:x.git", SHA, "fixture read key",
-                          private, "app", pull="42")
+                          private, "app", pull="42", say_ref=say_ref)
                     error = None
                 except PrepareError as raised:
                     error = raised.args[0]
@@ -243,8 +243,25 @@ class PullRequestFetchTests(unittest.TestCase):
             self.fetch_pull("fatal: not a ref /private/path")
         self.assertEqual(out.getvalue().strip(),
                          f"May source preparation: the pull request ref is at missing, expected {SHA}")
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            error, _, _ = self.fetch_pull(OTHER, say_ref=False)
+        self.assertEqual((error, out.getvalue()), ("May app source SHA is not the pull request's head", ""),
+                         "without say_ref (ds_compile) nothing is printed")
         self.assertFalse(any("checkout" in argv for argv in calls), "nothing is checked out")
         self.assertEqual([n for n in left if n.endswith(".key") or n == "known_hosts"], [])
+
+    def test_only_the_may_app_pull_request_fetch_says_where_its_ref_is(self):
+        seen = []
+
+        def stop(*args, **kwargs):
+            seen.append((args[1], kwargs))
+            raise PrepareError("stop")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"RUNNER_TEMP": directory, "PATH": "/usr/bin"}, clear=True), \
+                patch("prepare.fetch", side_effect=stop), self.assertRaises(PrepareError):
+            prepare.prepare(SHA, "android", "playground", pull="877")
+        self.assertEqual(seen, [(prepare.APP, {"pull": "877", "say_ref": True})])
 
     def test_a_pull_request_number_is_exact_and_excludes_main_history(self):
         for value in ("0", "x", "1/2", "../main"):

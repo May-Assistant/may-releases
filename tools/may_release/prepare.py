@@ -126,9 +126,10 @@ def pull_ref(value):
     return f"refs/pull/{value}/head"
 
 
-def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pull=None, bases=()):
+def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pull=None, bases=(), say_ref=False):
     """Fetch and check out exactly sha; returns it. With main_history, sha may be "main": main's head when fetched
-    (device-tests.yml's nightly run)."""
+    (device-tests.yml's nightly run). With say_ref (may-app pull requests alone; ds_compile prints nothing here), a
+    pull ref that is not sha is printed as commit SHAs."""
     if not (main_history and sha == "main"):
         exact_sha(sha)
     if sum((bool(main_history), pull is not None, bool(bases))) > 1:
@@ -171,11 +172,12 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pu
         raise PrepareError("May app source SHA is not in main history")
     if pull_head:
         found = head_of(dest, "refs/remotes/origin/pull-head", env)
-        if found != sha:
+        if found != sha and say_ref:
             # Commit SHAs alone (both are 40 hex characters or "missing"): GitHub's pull ref can lag the branch
             # (may-app #877, 22 Oct), and this line tells that apart from a moved head.
             at = found if re.fullmatch(r"[0-9a-f]{40}", found) else "missing"
             print(f"May source preparation: the pull request ref is at {at}, expected {sha}")
+        if found != sha:
             raise PrepareError("May app source SHA is not the pull request's head")
     if bases and all(git_status(["git", "-C", str(dest), "merge-base", "--is-ancestor", sha,
                                  f"refs/remotes/origin/{base}"], env=env) for base in bases):
@@ -218,7 +220,7 @@ def prepare(source_sha, platform=None, target=None, pull=None, ds_sha=None):
             source_sha = fetched
     else:
         fetch(source, APP, exact_sha(source_sha), os.environ.get("MAY_APP_READ_KEY", ""),
-              private, "app", pull=pull)
+              private, "app", pull=pull, say_ref=True)
     project_path, lock_path = source / "ios/project.yml", source / "android/design-system.lock"
     record, old_spec = pins(project_path.read_text(), lock_path.read_text(), platform, target)
     revision = record[platform or "ios"]
