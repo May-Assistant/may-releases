@@ -234,8 +234,15 @@ class PullRequestFetchTests(unittest.TestCase):
         self.assertEqual([n for n in left if n.endswith(".key") or n == "known_hosts"], [], "the key is removed")
 
     def test_refuses_when_the_pull_request_head_moved(self):
-        error, calls, left = self.fetch_pull(OTHER)
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            error, calls, left = self.fetch_pull(OTHER)
         self.assertEqual(error, "May app source SHA is not the pull request's head")
+        self.assertEqual(out.getvalue().strip(),
+                         f"May source preparation: the pull request ref is at {OTHER}, expected {SHA}")
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.fetch_pull("fatal: not a ref /private/path")
+        self.assertEqual(out.getvalue().strip(),
+                         f"May source preparation: the pull request ref is at missing, expected {SHA}")
         self.assertFalse(any("checkout" in argv for argv in calls), "nothing is checked out")
         self.assertEqual([n for n in left if n.endswith(".key") or n == "known_hosts"], [])
 

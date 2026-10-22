@@ -169,8 +169,14 @@ def fetch(dest, remote, sha, key_text, private, label, *, main_history=False, pu
     if main_history and git_status(["git", "-C", str(dest), "merge-base", "--is-ancestor", sha,
                                     "refs/remotes/origin/main"], env=env):
         raise PrepareError("May app source SHA is not in main history")
-    if pull_head and head_of(dest, "refs/remotes/origin/pull-head", env) != sha:
-        raise PrepareError("May app source SHA is not the pull request's head")
+    if pull_head:
+        found = head_of(dest, "refs/remotes/origin/pull-head", env)
+        if found != sha:
+            # Commit SHAs alone (both are 40 hex characters or "missing"): GitHub's pull ref can lag the branch
+            # (may-app #877, 22 Oct), and this line tells that apart from a moved head.
+            at = found if re.fullmatch(r"[0-9a-f]{40}", found) else "missing"
+            print(f"May source preparation: the pull request ref is at {at}, expected {sha}")
+            raise PrepareError("May app source SHA is not the pull request's head")
     if bases and all(git_status(["git", "-C", str(dest), "merge-base", "--is-ancestor", sha,
                                  f"refs/remotes/origin/{base}"], env=env) for base in bases):
         raise PrepareError("Design-system SHA is not in main or claude/may-integration history")
