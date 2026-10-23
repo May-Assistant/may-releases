@@ -176,6 +176,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Mint the May Renders token for MAY_RENDERS_RELEASE_TOKEN, before any pull request code
+        id: renders-release
+        if: vars.MAY_RENDERS_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_RENDERS_APP_ID }}
+          private-key: ${{ secrets.MAY_RENDERS_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-renders
+          permission-contents: write
       - name: Install pinned age
         run: python3 -I -S -B tools/may_release/toolchain.py age
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -200,7 +210,7 @@ jobs:
         run: python3 -I -S -B tools/may_release/publish.py device-push
       - name: Upload the recordings as may-renders release assets
         env:
-          MAY_RENDERS_RELEASE_TOKEN: ${{ secrets.MAY_RENDERS_RELEASE_TOKEN }}
+          MAY_RENDERS_RELEASE_TOKEN: ${{ steps.renders-release.outputs.token || secrets.MAY_RENDERS_RELEASE_TOKEN }}
         run: python3 -I -S -B tools/may_release/publish.py device-release
       - name: Remove the decrypted reports and the branch checkout
         if: always()

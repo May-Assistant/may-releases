@@ -16,9 +16,11 @@ CHECKERS = {
     "ios-renders.yml": static_check.renders_workflow_problems,
     "ds-swift-compile.yml": static_check.ds_compile_workflow_problems,
     "may-app-review.yml": static_check.review_workflow_problems,
+    "device-tests.yml": static_check.device_tests_workflow_problems,
 }
 SCHEDULE = "android-ci-schedule.yml"
 REVIEW = "may-app-review.yml"
+DEVICE = "device-tests.yml"
 READ_CONSUMER = "MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}\n"
 
 
@@ -119,6 +121,21 @@ class MintMutationTests(unittest.TestCase):
         at = admission_checkout + len(static_check.FIRST_CHECKOUT)
         extra = text[:at] + static_check.mint_step("ci-read").replace("id: ci-read", "id: ci-read-2") + text[at:]
         self.assertTrue(static_check.android_ci_schedule_workflow_problems(extra))
+
+    def test_the_renders_release_is_minted_by_the_may_renders_app_alone(self):
+        step = static_check.mint_step("renders-release")
+        self.assertIn("        if: vars.MAY_RENDERS_APP_ID != ''\n", step)
+        self.assertIn("          private-key: ${{ secrets.MAY_RENDERS_APP_PRIVATE_KEY }}\n", step)
+        self.assertTrue(step.endswith("          repositories: may-renders\n          permission-contents: write\n"))
+        self.assertNotIn("MAY_CI_APP", step)
+        for old, new in (("${{ vars.MAY_RENDERS_APP_ID }}", "${{ vars.MAY_CI_APP_ID }}"),
+                         ("${{ secrets.MAY_RENDERS_APP_PRIVATE_KEY }}", "${{ secrets.MAY_CI_APP_PRIVATE_KEY }}"),
+                         ("repositories: may-renders\n", "repositories: may-app\n"),
+                         ("permission-contents: write\n", "permission-contents: write\n          permission-pull-requests: write\n")):
+            with self.subTest(new=new.strip()):
+                self.assert_refused(DEVICE, old, new)
+        release = "MAY_RENDERS_RELEASE_TOKEN: ${{ steps.renders-release.outputs.token || secrets.MAY_RENDERS_RELEASE_TOKEN }}\n"
+        self.assert_refused(DEVICE, release, "MAY_RENDERS_RELEASE_TOKEN: ${{ steps.renders-release.outputs.token }}\n")
 
     def test_the_review_slug_goes_to_the_fetch_step_alone(self):
         slug = static_check.REVIEW_SLUG

@@ -214,18 +214,23 @@ def job_steps(workflow, job):
 
 # GitHub App tokens in place of Samuel's fine-grained PATs (may-app #104; the coordinator's decisions, 23 Oct). The org's
 # May CI app (may-app and may-design-system: contents read, pull requests write) is minted into a one-hour installation
-# token by the pinned actions/create-github-app-token. Each mint:
+# token by the pinned actions/create-github-app-token, and so is the May Renders app (may-renders: contents write), in
+# device-tests' publish job alone (APPS: a mint's id names its app). Each mint:
 #   - is a step of exactly MINT_STEP's form, narrowed by repositories: and permission-*: to what the PAT it replaces needs
 #     (CI_MINTS: the calls each tool makes, allowlisted in the tool itself);
 #   - comes right after the job's first checkout, before any other step, so the private key never reaches a runner that
 #     has run pull request code (it is in the mint step's inputs alone: never a job env, a file or another step);
-#   - runs only when the variable MAY_CI_APP_ID is set, and fails the job if it can't mint (no continue-on-error). Until
-#     the app exists, the step is skipped and its consumers read the PAT: `steps.<id>.outputs.token || secrets.<PAT>`.
+#   - runs only when its app's ID variable (MAY_CI_APP_ID, MAY_RENDERS_APP_ID) is set, and fails the job if it can't
+#     mint (no continue-on-error). Until the app exists, the step is skipped and its consumers read the PAT:
+#     `steps.<id>.outputs.token || secrets.<PAT>`.
 #     A follow-up drops the `||` once the PATs are deleted.
 # unminted() checks every mint of a workflow and hands its own checker the workflow as it was with the PATs alone, so
 # every other pin stays exactly as it was.
 CREATE_APP_TOKEN = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
 CI_APP_ID, CI_APP_KEY = "MAY_CI_APP_ID", "MAY_CI_APP_PRIVATE_KEY"
+RENDERS_APP_ID, RENDERS_APP_KEY = "MAY_RENDERS_APP_ID", "MAY_RENDERS_APP_PRIVATE_KEY"
+# app: (its name in the step, its ID variable, its private-key secret)
+APPS = {"ci": ("May CI", CI_APP_ID, CI_APP_KEY), "renders": ("May Renders", RENDERS_APP_ID, RENDERS_APP_KEY)}
 # step id: (the PAT it replaces, the one repository it reaches, its permissions)
 CI_MINTS = {
     "ci-read": ("MAY_APP_PR_READ_TOKEN", "may-app", (("pull-requests", "read"),)),
@@ -234,6 +239,8 @@ CI_MINTS = {
     "ci-ds-comment": ("MAY_DS_PR_COMMENT_TOKEN", "may-design-system", (("pull-requests", "write"),)),
     # review.py fetches the head over HTTPS (contents) and posts its review and STARTED marker (pull requests).
     "ci-review": ("MAY_APP_REVIEW_TOKEN", "may-app", (("contents", "read"), ("pull-requests", "write"))),
+    # publish.py device-release creates the run's may-renders release and uploads its assets (contents).
+    "renders-release": ("MAY_RENDERS_RELEASE_TOKEN", "may-renders", (("contents", "write"),)),
 }
 # workflow: {job: its mints, in order}
 WORKFLOW_MINTS = {
@@ -244,23 +251,26 @@ WORKFLOW_MINTS = {
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
     "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
     "may-app-review.yml": {"review": ("ci-review",)},
+    "device-tests.yml": {"publish": ("renders-release",)},
 }
 FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          persist-credentials: false\n"
 # review.py's schedule passes over heads whose STARTED marker is the token's own user's; an installation token has no
 # user (GET /user), so the fetch step, where the schedule picks, is told the app's slug: the marker is the app bot's.
 REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n"
-APP_TOKEN_TRACES = ("create-github-app-token", CI_APP_ID, CI_APP_KEY, "steps.ci-", "MAY_REVIEW_APP_SLUG")
+APP_TOKEN_TRACES = ("create-github-app-token", CI_APP_ID, CI_APP_KEY, RENDERS_APP_ID, RENDERS_APP_KEY, "steps.ci-",
+                    "steps.renders-", "MAY_REVIEW_APP_SLUG")
 
 
 def mint_step(step_id):
     secret, repository, permissions = CI_MINTS[step_id]
-    return (f"      - name: Mint the May CI token for {secret}, before any pull request code\n"
+    app, app_id, app_key = APPS[step_id.split("-", 1)[0]]
+    return (f"      - name: Mint the {app} token for {secret}, before any pull request code\n"
             f"        id: {step_id}\n"
-            f"        if: vars.{CI_APP_ID} != ''\n"
+            f"        if: vars.{app_id} != ''\n"
             f"        uses: {CREATE_APP_TOKEN} # v3.2.0\n"
             "        with:\n"
-            f"          app-id: ${{{{ vars.{CI_APP_ID} }}}}\n"
-            f"          private-key: ${{{{ secrets.{CI_APP_KEY} }}}}\n"
+            f"          app-id: ${{{{ vars.{app_id} }}}}\n"
+            f"          private-key: ${{{{ secrets.{app_key} }}}}\n"
             "          owner: May-Assistant\n"
             f"          repositories: {repository}\n" +
             "".join(f"          permission-{name}: {level}\n" for name, level in permissions))
@@ -282,13 +292,13 @@ def unminted(workflow_name, text):
     for job, mints in WORKFLOW_MINTS.get(workflow_name, {}).items():
         span = job_span(text, job)
         if span is None:
-            found.append(name + f"job {job} is missing, so its May CI token mint is too")
+            found.append(name + f"job {job} is missing, so its GitHub App token mint is too")
             continue
         body = text[span[0]:span[1]]
         expected = FIRST_CHECKOUT + "".join(mint_step(step_id) for step_id in mints)
         first = body.find("      - uses: ")
         if first < 0 or body[first:first + len(expected)] != expected:
-            found.append(name + f"job {job}'s May CI token mints are not exactly the pinned, narrowed steps right "
+            found.append(name + f"job {job}'s GitHub App token mints are not exactly the pinned, narrowed steps right "
                          "after its first checkout")
             continue
         body = body[:first] + FIRST_CHECKOUT + body[first + len(expected):]
@@ -312,7 +322,7 @@ def unminted(workflow_name, text):
 
 
 def with_app_tokens(workflow_name):
-    """A workflow checker that first checks the workflow's May CI mints (unminted) and then checks it as it was."""
+    """A workflow checker that first checks the workflow's GitHub App mints (unminted) and then checks it as it was."""
     def wrap(check):
         def checked(text):
             plain, found = unminted(workflow_name, text)
@@ -1262,6 +1272,7 @@ DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SC
     {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
 
 
+@with_app_tokens("device-tests.yml")
 def device_tests_workflow_problems(text):
     name = DEVICE_TESTS + ": "
     found = []

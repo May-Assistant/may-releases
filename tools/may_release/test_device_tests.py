@@ -648,7 +648,7 @@ class WorkflowPinTests(unittest.TestCase):
                      "a secret, variable or env entry")
 
     def test_the_release_token_stays_in_the_release_step(self):
-        line = "          MAY_RENDERS_RELEASE_TOKEN: ${{ secrets.MAY_RENDERS_RELEASE_TOKEN }}\n"
+        line = "          MAY_RENDERS_RELEASE_TOKEN: ${{ steps.renders-release.outputs.token || secrets.MAY_RENDERS_RELEASE_TOKEN }}\n"
         push = "          MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}\n"
         self.assertEqual(self.text.count(line), 1)
         self.flagged(self.text.replace(line, "").replace(push, push + line), "a secret, variable or env entry")
