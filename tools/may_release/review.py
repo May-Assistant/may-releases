@@ -59,6 +59,8 @@ from gate import APP_REPO, CONTROL_REPO, GateDenial, get_app_pull, get_json, log
 ENVIRONMENT = "may-claude-review"
 REVIEW_TOKEN = "MAY_APP_REVIEW_TOKEN"
 CLAUDE_TOKEN = "MAY_REVIEW_CLAUDE_TOKEN"
+# The May CI app's slug (actions/create-github-app-token's app-slug output), when the review token is the app's.
+APP_SLUG, APP_SLUG_FORM = "MAY_REVIEW_APP_SLUG", re.compile(r"[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?")
 # The release claude-code-action 1d6de8cb (v1, pinned in claude-code-review.yml) installs, as npm's linux-x64
 # platform package: a single binary, so no install script runs. CLI_SHA512 is the registry's dist.integrity.
 CLI_VERSION = "2.1.296"
@@ -232,7 +234,7 @@ def fetch(pr, view=VIEW, get=None):
         token = os.environ.get(REVIEW_TOKEN)
         if not token:
             raise GateDenial("Review token unavailable (MAY_APP_REVIEW_TOKEN in may-claude-review)")
-        number = pick(token, get or app_get, token_user(token))
+        number = pick(token, get or app_get, marker_poster(token))
         if number is None:
             print("May app review: no may-app pull request is waiting for a review")
             return
@@ -257,6 +259,17 @@ def token_user(token, opener=None):
     if not isinstance(found, str) or not found:
         raise ReviewError("The review token's user could not be read")
     return found
+
+
+def marker_poster(token, opener=None):
+    """Who posts the STARTED marker: the May CI app's bot, `<slug>[bot]`, when the token is the app's (the mint step's
+    app-slug output, MAY_REVIEW_APP_SLUG: an installation token has no user to read), else the token's own user."""
+    slug = os.environ.get(APP_SLUG, "").strip()
+    if slug:
+        if not APP_SLUG_FORM.fullmatch(slug):
+            raise ReviewError("The May CI app's slug is malformed")
+        return slug + "[bot]"
+    return token_user(token, opener)
 
 
 def started_on(comments, head, poster):

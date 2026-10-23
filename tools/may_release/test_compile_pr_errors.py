@@ -471,7 +471,7 @@ class ShapeTests(unittest.TestCase):
         runs = name + "runs something other than"
         build = "      - name: Compile without signing, store access or any credential\n"
         post = "      - name: Post the errors on the may-app pull request, never in this log\n"
-        comment = "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
+        comment = "          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
         fetch_key = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
         cases = {
             "the comment token on the compile": (build, build + "        env:\n" + comment, secret),

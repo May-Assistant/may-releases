@@ -786,7 +786,7 @@ class ShapeTests(unittest.TestCase):
         runs = name + "runs something other than"
         build = "      - name: Compile the Swift package without signing or any credential\n"
         fetch_key = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
-        comment = "          MAY_DS_PR_COMMENT_TOKEN: ${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}\n"
+        comment = "          MAY_DS_PR_COMMENT_TOKEN: ${{ steps.ci-ds-comment.outputs.token || secrets.MAY_DS_PR_COMMENT_TOKEN }}\n"
         cases = {
             "the read key on the compile": (build, build + "        env:\n          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n", secret),
             "any env on the compile": (build, build + "        env:\n          MAY_DS_SHA: ${{ inputs.ds_sha }}\n", secret),

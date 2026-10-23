@@ -59,12 +59,32 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code
+        id: ci-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: read
+      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code
+        id: ci-comment
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: write
       - name: Install the pinned, checksum-verified JDK
         run: python3 -I -S -B tools/may_release/toolchain.py jdk
       - name: Check the pull request head and environment before fetching
         env:
           GH_TOKEN: ${{ github.token }}
-          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}
+          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
         run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
@@ -84,7 +104,7 @@ jobs:
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
-          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}
+          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
         run: python3 -I -S -B tools/may_release/android_unit_post.py --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
       - name: Remove private source, logs, build outputs and the pinned JDK
         if: always()
