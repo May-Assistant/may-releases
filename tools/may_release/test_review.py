@@ -686,12 +686,12 @@ class ReviewWorkflowShapeTests(unittest.TestCase):
             "a write permission": ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: read\n  pull-requests: write\nconcurrency:", "read-only"),
             "an OIDC token": (review_permissions, review_permissions.replace("read\n", "read\n      id-token: write\n"), "read-only"),
             "actions: read in review": (review_permissions, review_permissions.replace("read\n", "read\n      actions: read\n"), "read-only"),
-            "a GitHub token in the fetch": ("        env:\n          MAY_PR_NUMBER: ${{ inputs.pr_number }}\n          MAY_APP_REVIEW_TOKEN: ${{ secrets.MAY_APP_REVIEW_TOKEN }}\n        run: python3 -I -S -B tools/may_release/review.py fetch",
-                                            "        env:\n          GH_TOKEN: ${{ github.token }}\n          MAY_PR_NUMBER: ${{ inputs.pr_number }}\n          MAY_APP_REVIEW_TOKEN: ${{ secrets.MAY_APP_REVIEW_TOKEN }}\n        run: python3 -I -S -B tools/may_release/review.py fetch", "secret or env"),
+            "a GitHub token in the fetch": ("        env:\n          MAY_PR_NUMBER: ${{ inputs.pr_number }}\n          MAY_APP_REVIEW_TOKEN: ${{ steps.ci-review.outputs.token || secrets.MAY_APP_REVIEW_TOKEN }}\n          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n        run: python3 -I -S -B tools/may_release/review.py fetch",
+                                            "        env:\n          GH_TOKEN: ${{ github.token }}\n          MAY_PR_NUMBER: ${{ inputs.pr_number }}\n          MAY_APP_REVIEW_TOKEN: ${{ steps.ci-review.outputs.token || secrets.MAY_APP_REVIEW_TOKEN }}\n          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n        run: python3 -I -S -B tools/may_release/review.py fetch", "secret or env"),
             "another secret": ("          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}\n",
                                "          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}\n          X: ${{ secrets.MAY_APP_READ_KEY }}\n", "secret or env"),
-            "the Claude token in the fetch": ("          MAY_APP_REVIEW_TOKEN: ${{ secrets.MAY_APP_REVIEW_TOKEN }}\n        run: python3 -I -S -B tools/may_release/review.py fetch",
-                                              "          MAY_APP_REVIEW_TOKEN: ${{ secrets.MAY_APP_REVIEW_TOKEN }}\n          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}\n"
+            "the Claude token in the fetch": ("          MAY_APP_REVIEW_TOKEN: ${{ steps.ci-review.outputs.token || secrets.MAY_APP_REVIEW_TOKEN }}\n          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n        run: python3 -I -S -B tools/may_release/review.py fetch",
+                                              "          MAY_APP_REVIEW_TOKEN: ${{ steps.ci-review.outputs.token || secrets.MAY_APP_REVIEW_TOKEN }}\n          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}\n"
                                               "        run: python3 -I -S -B tools/may_release/review.py fetch", "secret or env"),
             "an input in shell": ('review.py review --pr-number "$MAY_PR_NUMBER"', "review.py review --pr-number '${{ inputs.pr_number }}'", "runs something other"),
             "another command": ("run: python3 -I -S -B tools/may_release/review.py install", "run: cat \"$RUNNER_TEMP/may-review/output/stdout.json\"", "runs something other"),
@@ -852,6 +852,40 @@ class TokenUserTests(unittest.TestCase):
         for body in (b"{}", b'{"login": ""}', b'{"login": 7}', b"[]", b"not json"):
             with self.subTest(body=body), self.assertRaises(ReviewError):
                 review.token_user(TOKEN, lambda request, timeout: Answer(body))
+
+
+class MarkerPosterTests(unittest.TestCase):
+    """An installation token has no user (GET /user): with the May CI app's slug, the marker's poster is its bot."""
+
+    def test_the_apps_slug_names_its_bot_without_reading_the_tokens_user(self):
+        with patch.dict(os.environ, {"MAY_REVIEW_APP_SLUG": "may-ci"}, clear=True), \
+                patch.object(review, "token_user", side_effect=AssertionError("GET /user is not read")):
+            self.assertEqual(review.marker_poster(TOKEN), "may-ci[bot]")
+
+    def test_without_a_slug_the_tokens_own_user_posts_the_marker(self):
+        for environment in ({}, {"MAY_REVIEW_APP_SLUG": ""}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True), \
+                    patch.object(review, "token_user", return_value=POSTER) as read:
+                self.assertEqual(review.marker_poster(TOKEN), POSTER)
+            read.assert_called_once_with(TOKEN, None)
+
+    def test_a_malformed_slug_stops_the_run(self):
+        for slug in ("May-CI", "may-ci[bot]", "-may", "may ci", "a" * 101, "may/ci"):
+            with self.subTest(slug=slug), patch.dict(os.environ, {"MAY_REVIEW_APP_SLUG": slug}, clear=True), \
+                    patch.object(review, "token_user", side_effect=AssertionError("GET /user is not read")), \
+                    self.assertRaises(ReviewError):
+                review.marker_poster(TOKEN)
+
+    def test_the_schedule_passes_over_a_head_the_apps_bot_already_started(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {**SCHEDULE, "RUNNER_TEMP": temp, "MAY_APP_REVIEW_TOKEN": TOKEN,
+                                        "MAY_REVIEW_APP_SLUG": "may-ci"}, clear=True), \
+                patch.object(review, "token_user", side_effect=AssertionError("GET /user is not read")), \
+                patch.object(review, "fetch_head", side_effect=AssertionError("nothing is fetched")), \
+                patch("sys.stdout", new_callable=io.StringIO) as printed:
+            review.fetch("", view=Path(temp) / "view",
+                         get=pick_answers([candidate(42)], {42: [marker(by="may-ci[bot]")]})[0])
+        self.assertEqual(printed.getvalue(), "May app review: no may-app pull request is waiting for a review\n")
 
 
 class ScheduledFetchTests(unittest.TestCase):

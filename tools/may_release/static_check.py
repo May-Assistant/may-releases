@@ -212,6 +212,116 @@ def job_steps(workflow, job):
     return header, steps
 
 
+# GitHub App tokens in place of Samuel's fine-grained PATs (may-app #104; the coordinator's decisions, 23 Oct). The org's
+# May CI app (may-app and may-design-system: contents read, pull requests write) is minted into a one-hour installation
+# token by the pinned actions/create-github-app-token. Each mint:
+#   - is a step of exactly MINT_STEP's form, narrowed by repositories: and permission-*: to what the PAT it replaces needs
+#     (CI_MINTS: the calls each tool makes, allowlisted in the tool itself);
+#   - comes right after the job's first checkout, before any other step, so the private key never reaches a runner that
+#     has run pull request code (it is in the mint step's inputs alone: never a job env, a file or another step);
+#   - runs only when the variable MAY_CI_APP_ID is set, and fails the job if it can't mint (no continue-on-error). Until
+#     the app exists, the step is skipped and its consumers read the PAT: `steps.<id>.outputs.token || secrets.<PAT>`.
+#     A follow-up drops the `||` once the PATs are deleted.
+# unminted() checks every mint of a workflow and hands its own checker the workflow as it was with the PATs alone, so
+# every other pin stays exactly as it was.
+CREATE_APP_TOKEN = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
+CI_APP_ID, CI_APP_KEY = "MAY_CI_APP_ID", "MAY_CI_APP_PRIVATE_KEY"
+# step id: (the PAT it replaces, the one repository it reaches, its permissions)
+CI_MINTS = {
+    "ci-read": ("MAY_APP_PR_READ_TOKEN", "may-app", (("pull-requests", "read"),)),
+    "ci-comment": ("MAY_APP_PR_COMMENT_TOKEN", "may-app", (("pull-requests", "write"),)),
+    "ci-ds-read": ("MAY_DS_PR_READ_TOKEN", "may-design-system", (("pull-requests", "read"),)),
+    "ci-ds-comment": ("MAY_DS_PR_COMMENT_TOKEN", "may-design-system", (("pull-requests", "write"),)),
+    # review.py fetches the head over HTTPS (contents) and posts its review and STARTED marker (pull requests).
+    "ci-review": ("MAY_APP_REVIEW_TOKEN", "may-app", (("contents", "read"), ("pull-requests", "write"))),
+}
+# workflow: {job: its mints, in order}
+WORKFLOW_MINTS = {
+    "native-compile-pr.yml": {"native": ("ci-read", "ci-comment"), "swift-checks": ("ci-read", "ci-comment")},
+    "android-unit-pr.yml": {"unit": ("ci-read", "ci-comment")},
+    "ios-archive-rehearsal.yml": {"rehearsal": ("ci-read",)},
+    "android-ci-schedule.yml": {"pick": ("ci-read",)},
+    "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
+    "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
+    "may-app-review.yml": {"review": ("ci-review",)},
+}
+FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          persist-credentials: false\n"
+# review.py's schedule passes over heads whose STARTED marker is the token's own user's; an installation token has no
+# user (GET /user), so the fetch step, where the schedule picks, is told the app's slug: the marker is the app bot's.
+REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n"
+APP_TOKEN_TRACES = ("create-github-app-token", CI_APP_ID, CI_APP_KEY, "steps.ci-", "MAY_REVIEW_APP_SLUG")
+
+
+def mint_step(step_id):
+    secret, repository, permissions = CI_MINTS[step_id]
+    return (f"      - name: Mint the May CI token for {secret}, before any pull request code\n"
+            f"        id: {step_id}\n"
+            f"        if: vars.{CI_APP_ID} != ''\n"
+            f"        uses: {CREATE_APP_TOKEN} # v3.2.0\n"
+            "        with:\n"
+            f"          app-id: ${{{{ vars.{CI_APP_ID} }}}}\n"
+            f"          private-key: ${{{{ secrets.{CI_APP_KEY} }}}}\n"
+            "          owner: May-Assistant\n"
+            f"          repositories: {repository}\n" +
+            "".join(f"          permission-{name}: {level}\n" for name, level in permissions))
+
+
+def job_span(workflow, job):
+    """(start, end) of one job's text in the workflow, or None."""
+    jobs_at = workflow.find("\njobs:\n")
+    match = re.search(r"(?ms)^  " + re.escape(job) + r":\n.*?(?=^  [\w-]+:\n|\Z)", workflow[jobs_at:]) \
+        if jobs_at >= 0 else None
+    return (jobs_at + match.start(), jobs_at + match.end()) if match else None
+
+
+def unminted(workflow_name, text):
+    """(the workflow as it was with the PATs alone, problems): each expected mint, exactly MINT_STEP's form, right after
+    its job's first checkout, taken out, and each consumer's `steps.<id>.outputs.token || secrets.<PAT>` read as the
+    PAT. Any other trace of the app (its action, key, variable, outputs) is refused."""
+    found, name = [], workflow_name + ": "
+    for job, mints in WORKFLOW_MINTS.get(workflow_name, {}).items():
+        span = job_span(text, job)
+        if span is None:
+            found.append(name + f"job {job} is missing, so its May CI token mint is too")
+            continue
+        body = text[span[0]:span[1]]
+        expected = FIRST_CHECKOUT + "".join(mint_step(step_id) for step_id in mints)
+        first = body.find("      - uses: ")
+        if first < 0 or body[first:first + len(expected)] != expected:
+            found.append(name + f"job {job}'s May CI token mints are not exactly the pinned, narrowed steps right "
+                         "after its first checkout")
+            continue
+        body = body[:first] + FIRST_CHECKOUT + body[first + len(expected):]
+        for step_id in mints:
+            secret = CI_MINTS[step_id][0]
+            either = f"${{{{ steps.{step_id}.outputs.token || secrets.{secret} }}}}"
+            if f": {either}\n" not in body:
+                found.append(name + f"job {job} mints {step_id} but never hands its token on in place of {secret}")
+            body = body.replace(f": {either}\n", f": ${{{{ secrets.{secret} }}}}\n")
+            if step_id == "ci-review":
+                fetch_step = 'review.py fetch --pr-number "$MAY_PR_NUMBER"\n'
+                if body.count(REVIEW_SLUG) != 1 or REVIEW_SLUG + "        run: python3 -I -S -B tools/may_release/" + \
+                        fetch_step not in body:
+                    found.append(name + "the fetch step is not told the May CI app's slug exactly once")
+                body = body.replace(REVIEW_SLUG, "")
+        text = text[:span[0]] + body + text[span[1]:]
+    if any(trace in text for trace in APP_TOKEN_TRACES):
+        found.append(name + "a GitHub App token is minted or used other than by its pinned, narrowed step right after "
+                     "checkout, or its key, variable or output reaches another step")
+    return text, found
+
+
+def with_app_tokens(workflow_name):
+    """A workflow checker that first checks the workflow's May CI mints (unminted) and then checks it as it was."""
+    def wrap(check):
+        def checked(text):
+            plain, found = unminted(workflow_name, text)
+            return found + check(plain)
+        checked.__doc__ = check.__doc__
+        return checked
+    return wrap
+
+
 def step_condition(step):
     """The step's `if:` expression, or None. It may be on the step's dash line, like name:."""
     match = re.search(r"(?m)^(?:        )?if: (.+)$", step)
@@ -762,6 +872,7 @@ COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ i
     {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)}
 
 
+@with_app_tokens("native-compile-pr.yml")
 def compile_pr_workflow_problems(text):
     """The pull-request compile is exactly: dispatch with a pull request number and its head, read-only, admission, then
     swift-checks and then native in its own environment; in each job the PR token in the recheck alone, the source-read
@@ -804,9 +915,9 @@ def compile_pr_workflow_problems(text):
             uses_in(text) != [CHECKOUT, CHECKOUT, CHECKOUT]:
         found.append(name + ": native's steps are not exactly the recheck, fetch, compile, post and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 2)) or \
-            text.count("timeout-minutes:") != 2 or "    timeout-minutes: 90\n" not in job_text(text, "native") or \
+            text.count("timeout-minutes:") != 2 or "    timeout-minutes: 55\n" not in job_text(text, "native") or \
             "    timeout-minutes: 20\n" not in job_text(text, "swift-checks"):
-        found.append(name + ": sets a shell, defaults, a condition or a timeout other than native's 90 minutes")
+        found.append(name + ": sets a shell, defaults, a condition or a timeout other than native's 55 minutes")
     native, swift = job_text(text, "native"), job_text(text, "swift-checks")
     if any("    environment: ${{ needs.admission.outputs.environment }}\n" not in job for job in (native, swift)) or \
             "    needs: [admission, swift-checks]\n" not in native or "    needs: admission\n" not in swift or \
@@ -877,6 +988,7 @@ REHEARSAL_ENV = REHEARSAL_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
     {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET,)}
 
 
+@with_app_tokens("ios-archive-rehearsal.yml")
 def ios_rehearsal_workflow_problems(text):
     name = REHEARSAL + ": "
     found = []
@@ -1002,6 +1114,7 @@ RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}"), RENDERS_REC
     {(name, "${{ secrets." + name + " }}") for name in RENDERS_SECRETS}
 
 
+@with_app_tokens("ios-renders.yml")
 def renders_workflow_problems(text):
     name = RENDERS + ": "
     found = []
@@ -1281,6 +1394,7 @@ UNIT_SECRETS = COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)
 UNIT_RUN_NAME = "\nrun-name: 'May Android unit suites for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
 
 
+@with_app_tokens("android-unit-pr.yml")
 def android_unit_workflow_problems(text):
     name = UNIT + ": "
     found = []
@@ -1320,8 +1434,8 @@ def android_unit_workflow_problems(text):
             uses_in(text) != [CHECKOUT, CHECKOUT]:
         found.append(name + "unit's steps are not exactly the JDK install, check, fetch, suites, post and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 75\n" not in job_text(text, "unit"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than unit's 75 minutes")
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 55\n" not in job_text(text, "unit"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than unit's 55 minutes")
     job = job_text(text, "unit")
     if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
             "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
@@ -1397,6 +1511,7 @@ SCHEDULE_EXIT_CLASSES = {"GateDenial", "ScheduleError"}
 SCHEDULE_DISPATCH = "actions/workflows/android-unit-pr.yml/dispatches"
 
 
+@with_app_tokens("android-ci-schedule.yml")
 def android_ci_schedule_workflow_problems(text):
     name = SCHEDULE + ": "
     found = []
@@ -1499,6 +1614,7 @@ DS_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_DS_SHA", "${{ inputs.ds_sha
     {(n, "${{ secrets." + n + " }}") for n in (DS_PR_READ, DS_READ_KEY, DS_COMMENT)}
 
 
+@with_app_tokens("ds-swift-compile.yml")
 def ds_compile_workflow_problems(text):
     name = DS_COMPILE + ": "
     found = []
@@ -1533,8 +1649,8 @@ def ds_compile_workflow_problems(text):
             uses_in(text) != [CHECKOUT, CHECKOUT]:
         found.append(name + "native's steps are not exactly the check, fetch, compile, post and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "")) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 60\n" not in job_text(text, "native"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than native's 60 minutes")
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 55\n" not in job_text(text, "native"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than native's 55 minutes")
     native = job_text(text, "native")
     if "    environment: ${{ needs.admission.outputs.environment }}\n" not in native or \
             "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
@@ -1750,6 +1866,7 @@ REVIEW_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_PR_NUMBER", "${{ inputs
               (REVIEW_TOKEN, "${{ secrets." + REVIEW_TOKEN + " }}"), (REVIEW_CLAUDE_TOKEN, "${{ secrets." + REVIEW_CLAUDE_TOKEN + " }}")}
 
 
+@with_app_tokens("may-app-review.yml")
 def review_workflow_problems(text):
     name = "may-app-review.yml"
     found = []

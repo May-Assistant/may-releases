@@ -488,7 +488,7 @@ class WorkflowTests(unittest.TestCase):
         secret = name + "a secret or env entry other than"
         runs = name + "runs something other than the gate"
         suites = "--source-sha \"$MAY_SOURCE_SHA\" --record-outcome --core-breakdown \"$MAY_CORE_BREAKDOWN\"\n"
-        post_env = "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
+        post_env = "          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
         suites_step = "      - name: Run the unit suites without any credential, printing only pass or fail and counts\n        env:\n"
         cases = {
             "the comment token on the suites": (suites_step, suites_step + post_env, secret),
@@ -512,7 +512,7 @@ class WorkflowTests(unittest.TestCase):
         dispatch = name + "is not dispatched with exactly pr_number, source_sha and an optional core_breakdown boolean"
         secret = name + "a secret or env entry other than"
         breakdown_env = "          MAY_CORE_BREAKDOWN: ${{ inputs.core_breakdown }}\n"
-        post_env = "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
+        post_env = "          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
         cases = {
             "a string input (names)": ("        type: boolean\n", "        type: string\n", dispatch),
             "on by default": ("        default: false\n", "        default: true\n", dispatch),

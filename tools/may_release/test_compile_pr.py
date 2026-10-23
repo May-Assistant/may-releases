@@ -326,7 +326,7 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
             "an allowed entry on the compile step": (compile_step, compile_step +
                 "        env:\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n", secret),
             "a store secret anywhere": (fetch_env, fetch_env + "          MAY_ASC_KEY_BASE64: ${{ secrets.MAY_ASC_KEY_BASE64 }}\n", secret),
-            "a job-level env": ("    timeout-minutes: 90\n", "    timeout-minutes: 90\n    env:\n      CI: '1'\n", secret),
+            "a job-level env": ("    timeout-minutes: 55\n", "    timeout-minutes: 55\n    env:\n      CI: '1'\n", secret),
             "the main-history fetch instead": ('--source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"\n      - name: Compile',
                 '--source-sha "$MAY_SOURCE_SHA"\n      - name: Compile', runs),
             "an input interpolated into shell": ('--pr-number "$MAY_PR_NUMBER"\n  native:', "--pr-number '${{ inputs.pr_number }}'\n  native:", runs),

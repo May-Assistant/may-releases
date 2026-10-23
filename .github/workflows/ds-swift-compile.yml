@@ -44,7 +44,7 @@ jobs:
     needs: admission
     runs-on: macos-15
     environment: ${{ needs.admission.outputs.environment }}
-    timeout-minutes: 60
+    timeout-minutes: 55
     permissions:
       contents: read
       actions: read
@@ -52,10 +52,30 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Mint the May CI token for MAY_DS_PR_READ_TOKEN, before any pull request code
+        id: ci-ds-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-design-system
+          permission-pull-requests: read
+      - name: Mint the May CI token for MAY_DS_PR_COMMENT_TOKEN, before any pull request code
+        id: ci-ds-comment
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-design-system
+          permission-pull-requests: write
       - name: Check the design-system pull request head and environment before fetching
         env:
           GH_TOKEN: ${{ github.token }}
-          MAY_DS_PR_READ_TOKEN: ${{ secrets.MAY_DS_PR_READ_TOKEN }}
+          MAY_DS_PR_READ_TOKEN: ${{ steps.ci-ds-read.outputs.token || secrets.MAY_DS_PR_READ_TOKEN }}
           MAY_DS_SHA: ${{ inputs.ds_sha }}
           MAY_DS_PR: ${{ inputs.ds_pr }}
         run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR" --check-pull
@@ -71,7 +91,7 @@ jobs:
         env:
           MAY_DS_SHA: ${{ inputs.ds_sha }}
           MAY_DS_PR: ${{ inputs.ds_pr }}
-          MAY_DS_PR_COMMENT_TOKEN: ${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}
+          MAY_DS_PR_COMMENT_TOKEN: ${{ steps.ci-ds-comment.outputs.token || secrets.MAY_DS_PR_COMMENT_TOKEN }}
         run: python3 -I -S -B tools/may_release/ds_compile.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
       - name: Remove the design-system checkout, logs and products
         if: always()

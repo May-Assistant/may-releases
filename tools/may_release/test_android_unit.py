@@ -315,7 +315,7 @@ class WorkflowTests(unittest.TestCase):
             "a read key on the JDK install": (jdk_step, jdk_step + "        env:\n          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n", secret),
             "the PR token in the fetch": (fetch_env, fetch_env + "          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n", secret),
             "a comment token anywhere": (fetch_env, fetch_env + "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n", secret),
-            "a job-level env": ("    timeout-minutes: 75\n", "    timeout-minutes: 75\n    env:\n      CI: '1'\n", secret),
+            "a job-level env": ("    timeout-minutes: 55\n", "    timeout-minutes: 55\n    env:\n      CI: '1'\n", secret),
             "the JDK exported": ("tools/may_release/toolchain.py jdk\n", "tools/may_release/toolchain.py jdk --export\n", shape),
             "an artifact": ("        if: always()\n", "        if: always()\n      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
                             "        with:\n          name: log\n          path: ${{ runner.temp }}/may-private/\n", shape),
@@ -342,7 +342,7 @@ class WorkflowTests(unittest.TestCase):
                                  name + "permissions are not exactly read-only"),
             "a shared concurrency group": ("  group: may-android-unit-pr\n", "  group: may-native-compile-pr\n",
                                            name + "does not run one at a time in its own concurrency group"),
-            "a longer timeout": ("    timeout-minutes: 75\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
+            "a longer timeout": ("    timeout-minutes: 55\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
             "a macOS runner": ("  unit:\n    needs: admission\n    runs-on: ubuntu-24.04\n",
                                "  unit:\n    needs: admission\n    runs-on: macos-15\n", shape),
         }

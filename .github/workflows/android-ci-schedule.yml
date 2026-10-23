@@ -45,13 +45,23 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code
+        id: ci-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: read
       - name: List the unit runs of the last 30 days, with no may-app credential
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I -S -B tools/may_release/android_ci_schedule.py runs
       - name: Pick the oldest may-app head touching Android with no run yet, with no GitHub token
         env:
-          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}
+          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
         run: python3 -I -S -B tools/may_release/android_ci_schedule.py pick
       - name: Dispatch the unit suites for the picked head, with no may-app credential
         env:

@@ -320,7 +320,7 @@ class WorkflowTests(unittest.TestCase):
         name = "android-ci-schedule.yml: "
         secret = name + "a step holds a credential other than"
         permissions = name + "permissions are not read-only but for actions: write in pick alone"
-        read = "          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n"
+        read = "          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}\n"
         token = "          GH_TOKEN: ${{ github.token }}\n"
         listed = "      - name: List the unit runs of the last 30 days, with no may-app credential\n        env:\n"
         cleanup = "        if: always()\n"
