@@ -96,6 +96,15 @@ class FailureLineTests(Workspace):
         self.assertNotIn("private/path", done.stdout + done.stderr)
 
 
+    def test_an_ios_refusal_prints_its_fixed_line_like_android(self):
+        """Runs 39749763794 and 39926037739: the iOS job printed only "failed at starting (DeviceTestsError)"."""
+        with tempfile.TemporaryDirectory() as directory:
+            done = subprocess.run([sys.executable, "-I", "-S", "-B", str(TOOL), "build", "--platform", "ios"],
+                                  capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": directory})
+        self.assertEqual(done.stderr.strip(), "May device tests stopped: Exact private source is not prepared")
+        self.assertEqual(done.stdout, "")
+        self.assertEqual(done.returncode, 1)
+
 
 class AndroidLaunchTests(unittest.TestCase):
     """Smoke run 39677407348 failed at "smoke: launching the app": the start now names MainActivity, retries once."""

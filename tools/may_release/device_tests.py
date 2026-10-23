@@ -704,7 +704,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         if args.platform == "ios" and args.command in ("build", "run"):
-            # Imported here: device_ios builds on this module.
+            # Imported here: device_ios builds on this module. Run as a script this module is __main__, and
+            # device_ios's own `import device_tests` would load a second copy: its DeviceTestsError would escape the
+            # handler below and its stage would never reach failure_line (runs 39749763794, 39926037739 printed
+            # "failed at starting (DeviceTestsError)" for an unset sign-in secret). So it gets this module.
+            sys.modules.setdefault("device_tests", sys.modules[__name__])
             import device_ios
             device_ios.run_scenarios(args.scenarios or "all") if args.command == "run" else device_ios.build()
         elif args.command == "run":
