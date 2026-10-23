@@ -92,6 +92,13 @@ TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{20,4096}")
 # Recordings: about 720p at about 1 Mbps, in screenrecord's 3-minute chunks: under 25 MB a chunk.
 RECORD_SIZE, RECORD_BITRATE, RECORD_SECONDS = "720x1600", "1000000", 180
 FLOW_SECONDS = 600
+# Each device job has 120 minutes (device-tests.yml). Its build takes about 7, and after the scenarios come the judge
+# (up to device_agent.JUDGE_SECONDS for each agent scenario that ran), the seal and the handover. The scenarios and
+# their judging get RUN_BUDGET_SECONDS from the run step's start, so the job always seals and publishes what ran
+# (run 40035089599: four iOS agent scenarios at up to 25 minutes each could outlast the job). A scenario that would
+# not fit is not started.
+RUN_BUDGET_SECONDS = 100 * 60
+BUDGET = "skipped: the run's time budget left no room for it (RUN_BUDGET_SECONDS)"
 OUT, SEALED, VERDICTS = "may-device-out", "may-device-sealed", "device-verdicts.json"
 AGENTS = "device-agents.json"
 SERIAL = "emulator-5554"
@@ -443,6 +450,26 @@ def scenario_flow(row, source, private):
     return None
 
 
+class Budget:
+    """RUN_BUDGET_SECONDS from the run's start: a scenario starts only when its own cap, the judging of every agent
+    scenario started so far and its own judging still fit."""
+
+    def __init__(self, total=RUN_BUDGET_SECONDS, clock=time.monotonic):
+        self.total, self.clock, self.start, self.judging = total, clock, clock(), 0
+
+    def fits(self, row, cap):
+        judge = device_agent.JUDGE_SECONDS if row["driver"] == "agent" else 0
+        if self.clock() - self.start + cap + self.judging + judge > self.total:
+            return False
+        self.judging += judge
+        return True
+
+
+def cap(row, agent_seconds=device_agent.AGENT_SECONDS):
+    """The longest a scenario may take: its Maestro flow's timeout, or the agent's."""
+    return FLOW_SECONDS if row["driver"] == "maestro" else agent_seconds
+
+
 def settle(entry, row, passed):
     """A scenario's verdict after its run: a Maestro row's from its flow and server checks; an agent or smoke row waits
     for the judge (a smoke row keeps whether Maestro drove the app)."""
@@ -458,7 +485,7 @@ def settle(entry, row, passed):
 
 
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
-                  agent=device_agent.run_agent, install=device_agent.install):
+                  agent=device_agent.run_agent, install=device_agent.install, budgeted=None):
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
     require_step_secrets((SIGNIN_SECRET, device_agent.OAUTH))
@@ -488,6 +515,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()))
+        budget = (budgeted or Budget)()
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
                      "server": []}
@@ -497,6 +525,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 continue
             if row["id"] in skipped:
                 entry["reason"] = SWITCHED_OFF
+                continue
+            if not budget.fits(row, cap(row)):
+                entry["reason"] = BUDGET
                 continue
             flow = scenario_flow(row, source, private)
             if flow is not None and (not flow.is_file() or flow.is_symlink()):

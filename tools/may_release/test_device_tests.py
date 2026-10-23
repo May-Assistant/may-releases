@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import unittest
 from unittest.mock import patch
 import urllib.error
 
+import device_agent
 import device_tests
 from device_tests import DeviceTestsError
 import gate
@@ -198,6 +200,41 @@ class FakeRecorder:
         return [self.scenario + ".mp4"]
 
 
+def ticking_budget():
+    """A budget of one Maestro flow on a clock that has used it up by the second scenario."""
+    ticks = iter([0, 0, device_tests.FLOW_SECONDS])
+    return device_tests.Budget(total=device_tests.FLOW_SECONDS + 1, clock=lambda: next(ticks))
+
+
+class BudgetTests(unittest.TestCase):
+    def test_a_scenario_starts_only_when_its_cap_and_all_judging_still_fit(self):
+        now = [0]
+        budget = device_tests.Budget(total=3600, clock=lambda: now[0])
+        agent, maestro = {"driver": "agent"}, {"driver": "maestro"}
+        judge = device_agent.JUDGE_SECONDS
+        self.assertTrue(budget.fits(agent, 1200))
+        self.assertEqual(budget.judging, judge)
+        now[0] = 1200
+        self.assertFalse(budget.fits(agent, 3600 - 1200 - judge), "its own judging no longer fits")
+        self.assertEqual(budget.judging, judge, "a scenario not started reserves nothing")
+        self.assertTrue(budget.fits(maestro, 3600 - 1200 - judge))
+        now[0] = 3600 - judge
+        self.assertFalse(budget.fits(maestro, 1))
+
+    def test_each_platform_caps_a_scenario_by_its_own_timeout(self):
+        self.assertEqual(device_tests.cap({"driver": "maestro"}), device_tests.FLOW_SECONDS)
+        self.assertEqual(device_tests.cap({"driver": "agent"}), device_agent.AGENT_SECONDS)
+        self.assertEqual(device_tests.cap({"driver": "agent"}, device_agent.IOS_AGENT_SECONDS),
+                         device_agent.IOS_AGENT_SECONDS)
+
+    def test_the_budget_leaves_the_job_time_to_build_seal_and_publish(self):
+        workflow = (Path(device_tests.__file__).parent.parent.parent / ".github/workflows/device-tests.yml").read_text()
+        timeouts = re.findall(r"(?m)^    timeout-minutes: (\d+)$", workflow)
+        job = min(int(minutes) for minutes in timeouts[:2]) * 60
+        self.assertLessEqual(device_tests.RUN_BUDGET_SECONDS + 10 * 60 + 8 * 60, job,
+                             "the build (about 8 minutes) and 10 minutes to seal and hand over must fit too")
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -214,7 +251,7 @@ class RunTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200):
+    def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None):
         calls = []
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
@@ -245,12 +282,23 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.head_revision", return_value=SHA), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             device_tests.run_scenarios(selection, minted=lambda base, secret: TOKEN,
-                                       checked=lambda base, token, path: status)
+                                       checked=lambda base, token, path: status, budgeted=budgeted)
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             device_tests.judge_scenarios(judged_by=lambda *args: self.fail("judged a Maestro scenario"))
         runs = list((self.root / device_tests.OUT).iterdir())
         report = json.loads((runs[0] / "android" / "report.json").read_text())
         return calls, report, out.getvalue(), runs[0]
+
+    def test_a_scenario_the_budget_cannot_fit_is_not_started_and_the_rest_is_still_reported(self):
+        """Run 40035089599: iOS agent scenarios could outlast the job, losing every report."""
+        calls, report, out, _ = self.run_it(budgeted=ticking_budget)
+        sign_in, connections = report["scenarios"]
+        self.assertEqual(sign_in["verdict"], "ui-pass")
+        self.assertEqual((connections["verdict"], connections["reason"]), ("skipped", device_tests.BUDGET))
+        self.assertEqual(len([argv for argv in calls if "start" in argv]), 1, "the second scenario never launched")
+        self.assertIn("May device tests (android): 1 scenarios ran; verdicts follow the judge step", out)
+        self.assertIn("May device tests (android): connections: skipped", out)
+        self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "skipped"])
 
     def test_signs_in_runs_each_flow_records_and_reports(self):
         calls, report, out, run = self.run_it()

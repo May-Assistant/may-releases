@@ -101,7 +101,7 @@ def short(sha):
     return sha[:12]
 
 
-def quiet(argv, log, cwd=None, env=None, capture=False):
+def quiet(argv, log, cwd=None, env=None, capture=False, timeout=None):
     """Run a tool with its output in the private log (or its stdout captured, for JSON the caller parses, and its
     stderr in the log); nothing is printed."""
     if capture:
@@ -110,7 +110,8 @@ def quiet(argv, log, cwd=None, env=None, capture=False):
             output.write(result.stderr)
         return result
     with log.open("ab") as output:
-        return subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=output, stdin=subprocess.DEVNULL)
+        return subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=output, stdin=subprocess.DEVNULL,
+                              timeout=timeout)
 
 
 def build(argv, log, cwd=None, env=None):
