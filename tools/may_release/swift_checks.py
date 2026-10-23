@@ -5,8 +5,9 @@ ios/App, MayCore/Sources and the pinned May DS prepare.py places at android/buil
 init's labels out of order or a missing import without a Mac. The swift-checks job runs them on a Linux runner and the
 macOS compile needs it, so a slip they catch fails in a minute instead of after the Mac build.
 
-  run   (no secret) runs `python3 -I -m unittest discover -s tools/ios -p 'test_swift_*.py'` in the checkout, every
-        line it prints going to a private log. The outcome (passed, failed, skipped: no such check in this commit, or
+  run   (no secret) runs `python3 -I -m unittest discover -s tools/ios -p 'test_swift_*.py'` and then the same with
+        -p 'test_parity_*.py' (may-app's parity checks: a screens.json row iOS doesn't draw) in the checkout, each
+        pattern with a file, every line they print going to a private log. The outcome (passed, failed, skipped: no such check in this commit, or
         timeout) and each failing check (its test id and the lines of its assertion, repo-relative, cleaned as
         android_unit.py cleans) go to private files. Public output is one fixed line and a count. It never fails the
         step: post does.
@@ -42,7 +43,10 @@ from review_mcp import FOOTER, holds
 from store import StoreError, child_env, prepared, require_step_secrets, runner_root
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
-CHECKS_DIR, PATTERN = "tools/ios", "test_swift_*.py"
+# The Swift checks, then the parity checks (a screens.json row iOS does not draw fails the pull request, not main:
+# may-app's test_parity_snapshots was red on main from #1144 to #1153 and nothing ran it). One discovery each.
+CHECKS_DIR, PATTERNS = "tools/ios", ("test_swift_*.py", "test_parity_*.py")
+COMMANDS = " and ".join(f"`python3 -I -m unittest discover -s tools/ios -p '{p}'`" for p in PATTERNS)
 LOG, OUTCOME, FAILURES = "swift-checks.log", "swift-checks-result.json", "swift-checks-failures.json"
 RESULTS = ("passed", "failed", "skipped", "timeout")
 CHECK_SECONDS = 10 * 60
@@ -103,28 +107,42 @@ def run_checks(source_sha):
     source, private = prepared(runner_root(), source_sha)
     log = private / LOG
     checks = source / CHECKS_DIR
-    if not checks.is_dir() or checks.is_symlink() or not any(p.is_file() for p in checks.glob(PATTERN)):
-        result, code = "skipped", NO_TESTS
-    else:
-        try:
-            with log.open("wb") as output:
-                code = subprocess.run([sys.executable, "-I", "-m", "unittest", "discover", "-s", CHECKS_DIR, "-p",
-                                       PATTERN], cwd=source, env=child_env(), stdout=output, stderr=subprocess.STDOUT,
-                                      stdin=subprocess.DEVNULL, timeout=CHECK_SECONDS).returncode
-            result = "passed" if code == 0 else "skipped" if code == NO_TESTS else "failed"
-        except subprocess.TimeoutExpired:
-            result, code = "timeout", None
-    text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() and not log.is_symlink() else ""
+    present = [pattern for pattern in PATTERNS if checks.is_dir() and not checks.is_symlink() and
+               any(p.is_file() for p in checks.glob(pattern))]
     roots = [str(source), str(source.resolve())]
-    entries, blocks = failing_checks(text, roots) if result == "failed" else ([], 0)
-    problems = problem_count(text, blocks) if result == "failed" else 0
+    codes, entries, problems = [], [], 0
+    log.write_bytes(b"")
+    # Each pattern's own discovery, one after the other into the log; each run's part is read on its own, since
+    # unittest's summary line counts that run alone.
+    for pattern in present:
+        start = log.stat().st_size
+        try:
+            with log.open("ab") as output:
+                codes.append(subprocess.run([sys.executable, "-I", "-m", "unittest", "discover", "-s", CHECKS_DIR,
+                                             "-p", pattern], cwd=source, env=child_env(), stdout=output,
+                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                            timeout=CHECK_SECONDS).returncode)
+        except subprocess.TimeoutExpired:
+            codes.append(None)
+            break
+        if codes[-1] not in (0, NO_TESTS):
+            with log.open("rb") as written:
+                written.seek(start)
+                text = written.read().decode("utf-8", errors="replace")
+            found, blocks = failing_checks(text, roots)
+            entries += found
+            problems += problem_count(text, blocks)
+    result = ("timeout" if None in codes else "failed" if any(code not in (0, NO_TESTS) for code in codes)
+              else "passed" if 0 in codes else "skipped")
+    entries = entries[:MAX_FAILURES] if result == "failed" else []
+    problems = problems if result == "failed" else 0
     (private / FAILURES).write_text(json.dumps({"failures": [{"kind": k, "test": t, "lines": l} for k, t, l in entries],
                                                 "total": problems}))
     (private / OUTCOME).write_text(json.dumps({"result": result, "problems": problems}))
     if result == "passed":
         print("May Swift checks passed")
     elif result == "skipped":
-        print("May Swift checks: this commit has none (tools/ios/test_swift_*.py); skipped")
+        print("May Swift checks: this commit has none (tools/ios/test_swift_*.py, test_parity_*.py); skipped")
     elif result == "timeout":
         print("May Swift checks did not finish within 10 minutes")
     else:
@@ -156,7 +174,7 @@ def comment_body(sha, url, outcome, failed, shown=None):
     if not SHA.fullmatch(sha or ""):
         raise SwiftChecksError("The checked commit is not an exact SHA")
     lines = ["### May Swift checks: failed", "",
-             f"`{sha}`: `python3 -I -m unittest discover -s {CHECKS_DIR} -p '{PATTERN}'` on ubuntu-24.04, with the pinned "
+             f"`{sha}`: {COMMANDS} on ubuntu-24.04, with the pinned "
              "May DS checked out. The iOS compile did not run."]
     if outcome["result"] == "timeout":
         lines += ["", "The checks did not finish within 10 minutes. Nothing else from the log is posted."]

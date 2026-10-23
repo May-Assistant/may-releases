@@ -94,6 +94,40 @@ class RunTests(unittest.TestCase):
                 self.assertIn("skipped", out)
                 self.assertEqual(failures, {"failures": [], "total": 0})
 
+    def test_a_parity_check_that_fails_fails_the_job_with_the_swift_checks_passing(self):
+        """may-app's test_parity_snapshots was red on main from #1144 to #1153 and nothing ran it."""
+        parity = FAILING.replace("class Inits", "class Snapshots")
+        out, outcome, failures = self.run_it(self.commit({"test_swift_inits.py": PASSING,
+                                                          "test_parity_snapshots.py": parity}))
+        self.assertEqual(outcome, {"result": "failed", "problems": 2})
+        self.assertEqual({entry["test"] for entry in failures["failures"]},
+                         {"test_parity_snapshots.Snapshots.test_labels", "test_parity_snapshots.Snapshots.test_import"})
+        self.assertEqual(out, "May Swift checks failed: 2 failing checks, which go to the may-app pull request only\n")
+
+    def test_both_patterns_run_in_turn_and_their_failures_add_up(self):
+        seen = []
+        real = subprocess.run
+
+        def spy(argv, **kwargs):
+            if "unittest" in argv:
+                seen.append(argv[-1])
+            return real(argv, **kwargs)
+
+        sha = self.commit({"test_swift_inits.py": FAILING, "test_parity_snapshots.py": FAILING.replace("Inits", "Rows")})
+        with patch("swift_checks.subprocess.run", side_effect=spy):
+            out, outcome, failures = self.run_it(sha)
+        self.assertEqual(seen, ["test_swift_*.py", "test_parity_*.py"])
+        self.assertEqual((outcome, failures["total"]), ({"result": "failed", "problems": 4}, 4))
+        self.assertEqual(len(failures["failures"]), 4)
+
+    def test_parity_checks_alone_still_run_and_none_at_all_is_skipped(self):
+        out, outcome, _ = self.run_it(self.commit({"test_parity_snapshots.py": PASSING}))
+        self.assertEqual((out, outcome), ("May Swift checks passed\n", {"result": "passed", "problems": 0}))
+        out, outcome, _ = self.run_it(self.commit({"test_other.py": PASSING}))
+        self.assertEqual(outcome, {"result": "skipped", "problems": 0})
+        self.assertEqual(out, "May Swift checks: this commit has none (tools/ios/test_swift_*.py, test_parity_*.py); "
+                              "skipped\n")
+
     def test_the_checks_run_from_tools_ios_with_no_secret(self):
         seen = {}
         real = subprocess.run
