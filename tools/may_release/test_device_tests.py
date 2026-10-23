@@ -209,7 +209,7 @@ class RunTests(unittest.TestCase):
         (self.source / device_tests.FLOWS_DIR / "sign-in.yaml").write_text("appId: x\n")
         self.private.mkdir()
         self.env = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
-                    "MAY_STAGING_API_URL": "https://staging.example", "PATH": "/usr/bin:/bin"}
+                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin:/bin"}
 
     def tearDown(self):
         self.directory.cleanup()
@@ -299,12 +299,38 @@ class RunTests(unittest.TestCase):
 
     def test_refusals_before_anything_runs(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),
-                             ({"MAY_STAGING_API_URL": "http://staging.example"}, "MAY_STAGING_API_URL is not an https"),
+                             ({"MAY_STAGING_API_URL": "http://staging.example"}, "MAY_STAGING_API_URL is not https://staging-api.usemay.co"),
                              ({"MAY_APP_READ_KEY": "x"}, "A secret for another release step")):
             with self.subTest(message=message):
                 with self.assertRaises((DeviceTestsError, store.StoreError)) as refused:
                     self.run_it(env=env)
                 self.assertIn(message, refused.exception.args[0])
+
+
+class StagingHostTests(unittest.TestCase):
+    """23 Oct (may-app #104): staging moves to staging-api.usemay.co and api.usemay.co becomes production."""
+
+    def staging(self, value):
+        with patch.dict(os.environ, {"MAY_STAGING_API_URL": value} if value is not None else {}, clear=True):
+            return device_tests.staging("s" * 32, True)
+
+    def test_staging_alone_is_driven(self):
+        for value in ("https://staging-api.usemay.co", "https://staging-api.usemay.co/", " https://staging-api.usemay.co\n"):
+            with self.subTest(value=value):
+                self.assertEqual(self.staging(value), "https://staging-api.usemay.co")
+
+    def test_production_and_any_other_host_are_refused(self):
+        for value in ("https://api.usemay.co", "https://api.usemay.co/", "http://staging-api.usemay.co",
+                      "https://staging-api.usemay.co.example", "https://staging-api.usemay.co/v1",
+                      "https://STAGING-API.usemay.co", "https://staging.example", "", None):
+            with self.subTest(value=value), self.assertRaises(DeviceTestsError) as refused:
+                self.staging(value)
+            self.assertEqual(refused.exception.args[0],
+                             "MAY_STAGING_API_URL is not https://staging-api.usemay.co in may-device-tests")
+
+    def test_the_smoke_scenario_needs_no_staging(self):
+        with patch.dict(os.environ, {"MAY_STAGING_API_URL": "https://api.usemay.co"}, clear=True):
+            self.assertEqual(device_tests.staging("", False), "")
 
 
 class ToolTests(unittest.TestCase):
