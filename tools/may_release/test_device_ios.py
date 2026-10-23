@@ -118,7 +118,7 @@ class RunTests(Workspace):
             return TOKEN + str(len(minted))
 
         environ = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
-                   "MAY_STAGING_API_URL": "https://staging.example", "PATH": "/usr/bin", **(env or {})}
+                   "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin", **(env or {})}
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
                 patch("renders.quiet", side_effect=quiet), patch("renders.simulator", return_value=UDID), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
@@ -200,7 +200,7 @@ class RunTests(Workspace):
 
     def test_refusals(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),
-                             ({"MAY_STAGING_API_URL": "http://staging.example"}, "MAY_STAGING_API_URL is not an https"),
+                             ({"MAY_STAGING_API_URL": "http://staging.example"}, "MAY_STAGING_API_URL is not https://staging-api.usemay.co"),
                              ({"MAY_APP_RENDERS_WRITE_KEY": "x"}, "A secret for another release step")):
             with self.subTest(message=message):
                 with self.assertRaises(Exception) as refused:

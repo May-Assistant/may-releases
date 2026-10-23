@@ -153,7 +153,7 @@ class AndroidSmokeTests(Workspace):
         self.assertEqual([row["id"] for row in device_tests.smoke_rows("ios")], ["smoke"])
         with self.assertRaises(DeviceTestsError) as refused:
             self.android(selection="smoke,sign-in", env=NO_STAGING)
-        self.assertIn("MAY_STAGING_API_URL is not an https host", refused.exception.args[0])
+        self.assertIn("MAY_STAGING_API_URL is not https://staging-api.usemay.co", refused.exception.args[0])
 
     def test_malformed_smoke_rows_are_refused(self):
         good = device_tests.scenarios("smoke")[0]

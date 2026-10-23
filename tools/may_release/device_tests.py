@@ -85,7 +85,9 @@ MAESTRO_URL = "https://github.com/mobile-dev-inc/maestro/releases/download/cli-2
 MAESTRO_SHA256 = "b3e561161904fb391875ca5834d5b22cf0b01c052dd1b408ad83e30d8f8951b3"
 SIGNIN_SECRET, OUTWARD, STAGING, RECIPIENT = ("MAY_TEST_SIGNIN_SECRET", "MAY_DEVICE_TESTS_OUTWARD",
                                               "MAY_STAGING_API_URL", "MAY_RENDERS_RECIPIENT")
-STAGING_URL = re.compile(r"https://[a-z0-9][a-z0-9.-]{0,200}")
+# Staging alone (Samuel, may-app #104, 23 Oct): api.usemay.co becomes production at launch, and the agent must never
+# drive production, so any other host is refused, production included.
+STAGING_BASE = "https://staging-api.usemay.co"
 TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{20,4096}")
 # Recordings: about 720p at about 1 Mbps, in screenrecord's 3-minute chunks: under 25 MB a chunk.
 RECORD_SIZE, RECORD_BITRATE, RECORD_SECONDS = "720x1600", "1000000", 180
@@ -423,8 +425,8 @@ def staging(secret, staged):
     if not staged:
         return ""
     base = os.environ.get(STAGING, "").strip().rstrip("/")
-    if not STAGING_URL.fullmatch(base):
-        raise DeviceTestsError("MAY_STAGING_API_URL is not an https host in may-device-tests")
+    if base != STAGING_BASE:
+        raise DeviceTestsError(f"MAY_STAGING_API_URL is not {STAGING_BASE} in may-device-tests")
     if not secret:
         raise DeviceTestsError("MAY_TEST_SIGNIN_SECRET is not set in may-device-tests; no scenario ran")
     return base

@@ -42,7 +42,7 @@ class AgentRunTests(unittest.TestCase):
         (self.source / device_tests.APK).write_bytes(b"apk")
         self.private.mkdir()
         self.env = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
-                    "MAY_STAGING_API_URL": "https://staging.example", "PATH": "/usr/bin:/bin",
+                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin:/bin",
                     "CLAUDE_CODE_OAUTH_TOKEN": OAUTH, "MAY_DEVICE_TESTS_MODEL": MODEL, "GITHUB_RUN_ID": "39557415738"}
 
     def tearDown(self):

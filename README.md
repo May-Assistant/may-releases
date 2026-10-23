@@ -750,7 +750,7 @@ Its verdict is "smoke-pass" or "fail" ("Maestro did not drive the app" when the 
 **Setup** in the environment `may-device-tests`:
 - the May Renders GitHub App, in place of `MAY_RENDERS_RELEASE_TOKEN`: variable `MAY_RENDERS_APP_ID` and secret `MAY_RENDERS_APP_PRIVATE_KEY`. Install the app on may-renders only, with Contents read and write. The `publish` job mints its token right after its checkout (`renders-release`: repository may-renders, Contents: write), and the release step gets `steps.renders-release.outputs.token || secrets.MAY_RENDERS_RELEASE_TOKEN`, as the May CI app's mints do ([Secrets and variables per environment](#secrets-and-variables-per-environment)). The PAT stays as the fallback until a follow-up drops it; the deploy key `MAY_APP_RENDERS_WRITE_KEY` stays;
 - secrets: `MAY_TEST_SIGNIN_SECRET`, `MAY_RENDERS_RELEASE_TOKEN` (fine-grained, may-renders only, Contents read and write; the fallback), plus copies of `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`, `MAY_RENDERS_DECRYPT_KEY` and `MAY_APP_RENDERS_WRITE_KEY`; `CLAUDE_CODE_OAUTH_TOKEN` is the repository secret;
-- variables: `MAY_STAGING_API_URL`, `MAY_RENDERS_RECIPIENT`, `MAY_DEVICE_TESTS_MODEL` and, optionally, `MAY_DEVICE_TESTS_OUTWARD` and `MAY_DEVICE_TESTS_SKIP`.
+- variables: `MAY_STAGING_API_URL` (exactly `https://staging-api.usemay.co`: `device_tests.STAGING_BASE` refuses any other host, so `api.usemay.co`, production from launch, is never driven), `MAY_RENDERS_RECIPIENT`, `MAY_DEVICE_TESTS_MODEL` and, optionally, `MAY_DEVICE_TESTS_OUTWARD` and `MAY_DEVICE_TESTS_SKIP`.
 
 ### Prerequisites that remain
 
