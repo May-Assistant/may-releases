@@ -693,7 +693,7 @@ This repository is public and may-app is private, and anyone signed in to GitHub
 3. **publish**, on a fresh Linux runner that runs no may-app code, has three steps, each holding one secret:
    - `publish.py open` decrypts with `MAY_RENDERS_DECRYPT_KEY`, after checking it against `MAY_RENDERS_RECIPIENT`, and accepts only the run folder's fixed layout.
    - `push` adds `<may-app short sha>/` to may-renders' `main` with `MAY_APP_RENDERS_WRITE_KEY`, a deploy key on may-renders alone. It lists the run folders in `runs.json` and keeps the newest 10, and it never force-pushes.
-   - For a pull request, `comment` links the run folder, contact sheet and log on it, using `MAY_APP_PR_COMMENT_TOKEN`.
+   - For a pull request, `comment` links the contact sheet first, as the run's `README.md` (GitHub renders it, on a phone too, where `index.html` shows as source), then the side-by-side PNGs, the run folder and the log, using `MAY_APP_PR_COMMENT_TOKEN`.
 
 **Setup** in the environment `may-ios-renders` (main only, administrator bypass off, no required reviewer):
 - `MAY_APP_RENDERS_WRITE_KEY`: the deploy key `may-ios-renders`, with write access on may-renders only;

@@ -704,6 +704,11 @@ class PublishCommentTests(unittest.TestCase):
         self.assertIsNone(error)
         body = [payload for method, _, payload in calls if method == "POST"][0]["body"]
         self.assertIn(f"https://github.com/May-Assistant/may-renders/tree/main/{FOLDER}", body)
+        links = [line for line in body.splitlines() if line.startswith("- ")]
+        self.assertEqual(links[0], "- Contact sheet (Android | iOS): "
+                                   f"https://github.com/May-Assistant/may-renders/blob/main/{FOLDER}/README.md",
+                         "the README leads: GitHub renders it on a phone (Samuel, 23 Oct)")
+        self.assertNotIn("index.html", body, "GitHub shows HTML as source")
         self.assertIn(f"https://github.com/May-Assistant/may-renders/blob/main/{FOLDER}/build.log", body)
         self.assertIn(f"<!-- may-ios-renders head={SHA} -->", body)
         self.assertIn("1 images", body)

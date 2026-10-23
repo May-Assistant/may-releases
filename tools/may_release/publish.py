@@ -614,10 +614,10 @@ def github(method, path, payload, token):
 
 def comment_body(sha, folder, images, url):
     base = f"https://github.com/{RENDERS_REPO}/tree/{BRANCH}/{folder}"
+    # The README first: GitHub renders it, on a phone too, where it shows index.html as source (Samuel, 23 Oct).
     lines = [f"**iOS renders** for {sha}: {images} images (iPhone 16 Pro, light and dark).", "",
-             f"- Run folder: {base}", f"- Contact sheet (Android | iOS): "
-             f"https://github.com/{RENDERS_REPO}/blob/{BRANCH}/{folder}/index.html",
-             f"- Side by side, one PNG per screen and mode: {base}/sheet",
+             f"- Contact sheet (Android | iOS): https://github.com/{RENDERS_REPO}/blob/{BRANCH}/{folder}/README.md",
+             f"- Side by side, one PNG per screen and mode: {base}/sheet", f"- Run folder: {base}",
              f"- Build and test log: https://github.com/{RENDERS_REPO}/blob/{BRANCH}/{folder}/build.log"]
     if url:
         lines += ["", f"Run: {url}"]
