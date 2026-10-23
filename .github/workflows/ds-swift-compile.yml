@@ -44,7 +44,7 @@ jobs:
     needs: admission
     runs-on: macos-15
     environment: ${{ needs.admission.outputs.environment }}
-    timeout-minutes: 60
+    timeout-minutes: 55
     permissions:
       contents: read
       actions: read

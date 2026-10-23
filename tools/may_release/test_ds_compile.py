@@ -793,7 +793,7 @@ class ShapeTests(unittest.TestCase):
             "the comment token in the fetch": (fetch_key, fetch_key + comment, secret),
             "the read key in the post": (comment, comment + fetch_key, secret),
             "the read token in the post": (comment, comment + "          MAY_DS_PR_READ_TOKEN: ${{ secrets.MAY_DS_PR_READ_TOKEN }}\n", secret),
-            "a job-level env": ("    timeout-minutes: 60\n", "    timeout-minutes: 60\n    env:\n      CI: '1'\n", secret),
+            "a job-level env": ("    timeout-minutes: 55\n", "    timeout-minutes: 55\n    env:\n      CI: '1'\n", secret),
             "printing the log": (build, "      - name: Show\n        run: cat \"$RUNNER_TEMP/may-ds-private/compile.log\"\n" + build, runs),
             "a step summary": (build, "      - name: Summary\n        run: echo x >> \"$GITHUB_STEP_SUMMARY\"\n" + build, name + "publishes an artifact or summary"),
             "an artifact": (build, "      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n" + build,
@@ -807,7 +807,7 @@ class ShapeTests(unittest.TestCase):
                                  name + "permissions are not exactly read-only"),
             "cleanup not always": ("        if: always()\n", "", name + "native's steps are not exactly"),
             "continue on error": (build, build + "        continue-on-error: true\n", name + "sets a shell, defaults, a condition"),
-            "a longer timeout": ("    timeout-minutes: 60\n", "    timeout-minutes: 360\n", name + "sets a shell"),
+            "a longer timeout": ("    timeout-minutes: 55\n", "    timeout-minutes: 360\n", name + "sets a shell"),
             "a shared concurrency group": ("  group: may-ds-swift-compile\n", "  group: may-native-compile-pr\n", name + "does not run one at a time"),
         }
         for case, (old, new, message) in cases.items():

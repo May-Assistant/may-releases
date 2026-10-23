@@ -915,9 +915,9 @@ def compile_pr_workflow_problems(text):
             uses_in(text) != [CHECKOUT, CHECKOUT, CHECKOUT]:
         found.append(name + ": native's steps are not exactly the recheck, fetch, compile, post and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 2)) or \
-            text.count("timeout-minutes:") != 2 or "    timeout-minutes: 90\n" not in job_text(text, "native") or \
+            text.count("timeout-minutes:") != 2 or "    timeout-minutes: 55\n" not in job_text(text, "native") or \
             "    timeout-minutes: 20\n" not in job_text(text, "swift-checks"):
-        found.append(name + ": sets a shell, defaults, a condition or a timeout other than native's 90 minutes")
+        found.append(name + ": sets a shell, defaults, a condition or a timeout other than native's 55 minutes")
     native, swift = job_text(text, "native"), job_text(text, "swift-checks")
     if any("    environment: ${{ needs.admission.outputs.environment }}\n" not in job for job in (native, swift)) or \
             "    needs: [admission, swift-checks]\n" not in native or "    needs: admission\n" not in swift or \
@@ -1434,8 +1434,8 @@ def android_unit_workflow_problems(text):
             uses_in(text) != [CHECKOUT, CHECKOUT]:
         found.append(name + "unit's steps are not exactly the JDK install, check, fetch, suites, post and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 75\n" not in job_text(text, "unit"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than unit's 75 minutes")
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 55\n" not in job_text(text, "unit"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than unit's 55 minutes")
     job = job_text(text, "unit")
     if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
             "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
@@ -1649,8 +1649,8 @@ def ds_compile_workflow_problems(text):
             uses_in(text) != [CHECKOUT, CHECKOUT]:
         found.append(name + "native's steps are not exactly the check, fetch, compile, post and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "")) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 60\n" not in job_text(text, "native"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than native's 60 minutes")
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 55\n" not in job_text(text, "native"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than native's 55 minutes")
     native = job_text(text, "native")
     if "    environment: ${{ needs.admission.outputs.environment }}\n" not in native or \
             "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
