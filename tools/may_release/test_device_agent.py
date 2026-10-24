@@ -229,6 +229,28 @@ class AgentRunTests(unittest.TestCase):
         self.assertIn("delivery codes only", prompt)
         self.assertIn("read when it finished", prompt)
 
+    def test_diagnostics_wait_until_the_server_reads_are_done(self):
+        """The security read of #108: a slow dumpsys must not spend the session the server reads still need."""
+        test = self
+
+        class Fake:
+            def __init__(self, adb, env):
+                self.kept = self.anrs = self.crashes = 0
+                self.dropped = {}
+
+            def keep(self, folder, scenario, token):
+                test.last_seen.setdefault("order", []).append(("diagnostics", token))
+
+        with patch("device_tests.Diagnostics", Fake):
+            _, _, seen, _, _, _ = self.run_and_judge([record(), record(), record()],
+                                                     [("pass", ""), ("pass", ""), ("pass", "")])
+        order = seen["order"]
+        reads = [token for step, token in order if step == "read"]
+        self.assertEqual(len([step for step in order if step[0] == "diagnostics"]), 3)
+        for token in reads:
+            self.assertLess(order.index(("read", token)), order.index(("diagnostics", token)),
+                            "each scenario's diagnostics after its own delivery read")
+
     def test_the_poll_scenarios_read_the_question_card_in_the_tagged_chat(self):
         asked = []
 
@@ -830,7 +852,7 @@ class DeviceServerTests(unittest.TestCase):
                 self.assertEqual(content[0]["text"], "Done. The focused field now reads: '(hidden)'")
         _, content = self.answer_type(b"write to sam.avery@example.com")
         self.assertEqual(content[0]["text"], "Done. The focused field now reads: 'write to ***@example.com'")
-        _, content = self.answer_type(b"x" * 400)
+        _, content = self.answer_type(b"word " * 80)
         self.assertEqual(len(content[0]["text"]), len("Done. The focused field now reads: ''") + device_mcp.MAX_FIELD)
 
     def test_the_judge_sees_the_screen_at_done_not_the_agents_last_look(self):

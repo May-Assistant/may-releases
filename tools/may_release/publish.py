@@ -184,9 +184,9 @@ def diagnostics_ok(data):
         data.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    # A masked address (***@domain) is left as it is by EMAIL; any other is refused.
-    return len(data) <= device_tests.MAX_DIAG and not device_tests.SECRET_LINE.search(data) and \
-        device_tests.EMAIL.sub(device_tests.MASKED, data) == data
+    # The very rule that wrote it, line by line: a file kept_lines would change at all (a line to drop, an address to
+    # mask) is refused, and a file it leaves alone is never refused.
+    return len(data) <= device_tests.MAX_DIAG and device_tests.kept_lines(data, "") == (data, 0)
 
 
 def extract(archive, members, destination):
