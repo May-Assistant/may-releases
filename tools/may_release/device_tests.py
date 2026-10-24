@@ -1290,10 +1290,18 @@ MAX_AGENT_SUMMARY = 300
 
 
 def sealed_agent(record):
-    # Line by line, then joined into one line and redacted again: joining could make a secret-shaped line of two
-    # harmless ones ("may_token:" and an opaque value), which publish would refuse with the whole report.
-    lines, _ = kept_lines(str(record.get("summary") or "").encode(), "")
-    summary, _ = kept_lines(" ".join(lines.decode("utf-8", "replace").split()).encode(), "")
+    # Line by line, a dropped line that ends in its key (":" or "=") taking the next non-blank line with it, its
+    # value ("may_token:" then an opaque value); then joined into one line and redacted again, since joining could
+    # make a secret-shaped line of two harmless ones, which publish would refuse with the whole report.
+    lines, after = [], False
+    for line in str(record.get("summary") or "").splitlines():
+        if not line.strip():
+            continue
+        kept, dropped = kept_lines(line.encode(), "")
+        if not dropped and not after:
+            lines.append(kept.decode("utf-8", "replace"))
+        after = bool(dropped) and line.rstrip().endswith((":", "="))
+    summary, _ = kept_lines(" ".join(" ".join(lines).split()).encode(), "")
     actions = record.get("actions")
     return {"outcome": record.get("outcome") if record.get("outcome") in ("completed", "blocked") else None,
             "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MAX_ACTIONS else 0,

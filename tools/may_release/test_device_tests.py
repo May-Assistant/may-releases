@@ -287,6 +287,10 @@ class SealedAgentTests(unittest.TestCase):
         self.assertTrue(publish.agent_ok(sealed), "publish never refuses a report for a summary the writer sealed")
         self.assertEqual(device_tests.kept_lines(sealed["summary"].encode(), ""), (sealed["summary"].encode(), 0))
         self.assertNotIn("Zm9vYmFy", sealed["summary"])
+        spaced = device_tests.sealed_agent({"summary": "Tapped send.\nmay_token:\n\n  Zm9vYmFyYmF6cXV4cXV1eHF1dXg\nNo reply."})
+        self.assertEqual(spaced["summary"], "Tapped send. No reply.", "a blank line never separates a key from its value")
+        whole = device_tests.sealed_agent({"summary": "Tapped send.\nmay_token: Zm9vYmFyYmF6cXV4cXV1eHF1dXg\nNo reply."})
+        self.assertEqual(whole["summary"], "Tapped send. No reply.", "a line holding its own value takes nothing more")
         kept = device_tests.sealed_agent({"summary": "Opened the May chat.\nTyped the message.\nTapped send."})
         self.assertEqual(kept["summary"], "Opened the May chat. Typed the message. Tapped send.")
 
