@@ -165,6 +165,7 @@ UNFINISHED = "the agent did not finish"
 BLOCKED = "the agent reported it was blocked"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
+DELIVERY_FAILED = "May's server recorded a failed reply"
 UNCONFIGURED = "server checks not configured"
 SMOKE_MAESTRO = "Maestro did not drive the app"
 SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
@@ -1254,6 +1255,9 @@ def combined(entry, record, judged):
         return {"verdict": "fail", "reason": BLOCKED}
     if record.get("outcome") != "completed":
         return {"verdict": "fail", "reason": UNFINISHED}
+    # The server's record outranks the screen: a failed reply is a fail, whatever the judge read on screen.
+    if any(code.startswith("failed") for code in entry.get("delivery", [])):
+        return {"verdict": "fail", "reason": DELIVERY_FAILED}
     if judged[0] != "pass":
         return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
     if "maestro" in entry:
@@ -1308,7 +1312,9 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         judged = ("skipped", "")
         if record.get("state") != "rate_limited" and record.get("outcome") == "completed":
             try:
-                judged = judged_by(cli, goals[entry["id"]], stored.get("tag", ""), record,
+                # Its delivery codes alone, never a message's text.
+                evidence = dict(record, delivery=[code for code in entry.get("delivery", []) if isinstance(code, str)])
+                judged = judged_by(cli, goals[entry["id"]], stored.get("tag", ""), evidence,
                                    private / "judge" / entry["id"], token, model)
             except (OSError, subprocess.SubprocessError, KeyError):
                 judged = ("error", "")

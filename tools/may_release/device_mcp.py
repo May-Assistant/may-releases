@@ -228,10 +228,21 @@ def compact(xml):
     return "\n".join(lines)[:MAX_HIERARCHY]
 
 
+def current_hierarchy(config):
+    """The screen's hierarchy now, compacted (one element per line), or "" when it could not be read."""
+    if config["platform"] == "ios":
+        return ios_hierarchy(config)
+    status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
+    return "" if status else compact(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
+
+
 def record(config, outcome, summary):
+    """The agent's result for the judge: its hierarchy through kept_lines and within MAX_HIERARCHY, as the summary is
+    redacted where it is sealed."""
+    kept, _ = kept_lines(config["hierarchy"].encode(), "")
     with open(config["result"], "w", encoding="utf-8") as output:
         json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
-                   "hierarchy": config["hierarchy"]}, output)
+                   "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY]}, output)
 
 
 def call(name, args, config):
@@ -242,6 +253,11 @@ def call(name, args, config):
         outcome, summary = args.get("outcome"), args.get("summary")
         if outcome not in ("completed", "blocked") or not isinstance(summary, str):
             return True, [{"type": "text", "text": "done needs outcome (completed or blocked) and a summary"}]
+        # The judge's evidence is the screen as the agent leaves it, taken here (proof run 40123018291: the judge
+        # read the agent's last look, from before it sent the message, and failed a delivered chat).
+        fresh = current_hierarchy(config)
+        config["hierarchy"] = fresh or ("(no fresh hierarchy at done; the agent's last look follows)\n" +
+                                        config["hierarchy"] if config["hierarchy"] else "")
         record(config, outcome, summary)
         return False, [{"type": "text", "text": "Recorded. Stop now."}]
     if name not in {tool["name"] for tool in TOOLS}:
@@ -260,12 +276,8 @@ def call(name, args, config):
             return True, [{"type": "text", "text": "No screenshot this time; try again"}]
         return False, [{"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}]
     if name == "hierarchy":
-        if ios:
-            status, text = 0, ios_hierarchy(config)
-        else:
-            status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
-            text = compact(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
-        if status or not text:
+        text = current_hierarchy(config)
+        if not text:
             return True, [{"type": "text", "text": "No hierarchy this time; take a screenshot instead"}]
         config["hierarchy"] = text
         return False, [{"type": "text", "text": text}]

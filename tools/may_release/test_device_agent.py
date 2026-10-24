@@ -68,7 +68,7 @@ class AgentRunTests(unittest.TestCase):
         def deliver(base, token, tag):
             seen.setdefault("delivered", []).append((token, tag))
             seen.setdefault("order", []).append(("read", token))
-            return ["failed (model_cap_reached)"]
+            return ["succeeded"]
 
         class Process:
             def terminate(self):
@@ -117,6 +117,7 @@ class AgentRunTests(unittest.TestCase):
 
         def judge(cli, goal, tag, agent_record, work, token, model):
             seen.setdefault("judged", []).append((goal, tag, token, model))
+            seen.setdefault("evidence", []).append(agent_record)
             return judged.pop(0)
 
         environ = dict(self.env, **(env or {}))
@@ -177,7 +178,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738"), (TOKEN + "3", "qa-39557415738")],
                          "chat and routines send May a message: their messages are read with their own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
-                         [["failed (model_cap_reached)"], None, ["failed (model_cap_reached)"]])
+                         [["succeeded"], None, ["succeeded"]])
         self.assertEqual(run_out.splitlines(), [
             # This may-app fixture has no onboarding subflow, so each agent starts from launch and the log says so.
             *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"
@@ -210,6 +211,23 @@ class AgentRunTests(unittest.TestCase):
             [record(), record(), record()], [("pass", ""), ("error", ""), ("pass", "")], truth=(200, False)))
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("ui-pass", device_tests.UNCONFIGURED), ("fail", device_tests.NOT_JUDGED), ("fail", device_tests.NO_TRUTH)])
+
+    def test_the_judge_sees_delivery_codes_alone_and_a_failed_reply_is_never_a_pass(self):
+        """Coordinator, 24 Oct: the server's record outranks the screen; a failed code can't be judged into a pass."""
+        codes = iter([["failed (model_rejected_request)"], ["succeeded"]])
+        _, _, seen, report, _, judge_out = self.run_and_judge(
+            [record(), record(), record()], [("pass", "it replied"), ("pass", ""), ("pass", "")],
+            delivered=lambda base, token, tag: next(codes))
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("fail", device_tests.DELIVERY_FAILED), ("ui-pass", device_tests.UNCONFIGURED), ("pass", None)])
+        self.assertEqual([evidence.get("delivery") for evidence in seen["evidence"]],
+                         [["failed (model_rejected_request)"], [], ["succeeded"]],
+                         "each scenario's own codes, and nothing for one that sends no message")
+        self.assertIn("May device tests (android): chat: fail", judge_out)
+        prompt = device_agent.JUDGE_PROMPT.format(goal="g", outcome="completed", actions=1, summary="s",
+                                                  hierarchy="h", delivery="succeeded")
+        self.assertIn("delivery codes only", prompt)
+        self.assertIn("read when it finished", prompt)
 
     def test_the_poll_scenarios_read_the_question_card_in_the_tagged_chat(self):
         asked = []
@@ -703,6 +721,24 @@ class AgentRunnerTests(unittest.TestCase):
         found, _ = self.run_agent({"type": "result", "is_error": True, "api_error_status": 500})
         self.assertEqual(found["state"], "error")
 
+    def test_the_judges_prompt_carries_the_delivery_codes_and_no_message_text(self):
+        seen = {}
+
+        def run(command, cwd, env, stdout, stderr, stdin, timeout):
+            seen["prompt"] = command[command.index("-p") + 1]
+            stdout.write(json.dumps({"is_error": False, "structured_output": {"verdict": "pass", "note": ""}}).encode())
+
+        evidence = dict(record(), delivery=["failed (model_rejected_request)", "succeeded"])
+        with patch("device_agent.subprocess.run", side_effect=run):
+            device_agent.judge(Path("/cli/claude"), "Do {tag}", "qa-12345678", evidence, self.root / "judge", OAUTH,
+                               MODEL)
+        self.assertIn("(delivery codes only; none when the goal sends nothing): failed (model_rejected_request), "
+                      "succeeded", seen["prompt"])
+        with patch("device_agent.subprocess.run", side_effect=run):
+            device_agent.judge(Path("/cli/claude"), "Do {tag}", "qa-12345678", record(), self.root / "judge", OAUTH,
+                               MODEL)
+        self.assertIn("sends nothing): none", seen["prompt"])
+
     def test_the_judge_has_no_tool_and_answers_in_the_schema(self):
         seen = {}
 
@@ -796,6 +832,44 @@ class DeviceServerTests(unittest.TestCase):
         self.assertEqual(content[0]["text"], "Done. The focused field now reads: 'write to ***@example.com'")
         _, content = self.answer_type(b"x" * 400)
         self.assertEqual(len(content[0]["text"]), len("Done. The focused field now reads: ''") + device_mcp.MAX_FIELD)
+
+    def test_the_judge_sees_the_screen_at_done_not_the_agents_last_look(self):
+        """Proof run 40123018291: the judge read the agent's last hierarchy, from before it sent the message."""
+        before = (b'<hierarchy><node text="This is device test qa" resource-id="composer" focused="true" '
+                  b'bounds="[0,0][9,9]"/></hierarchy>')
+        after = (b'<hierarchy><node text="This is device test qa-1. Reply with the word received." '
+                 b'bounds="[0,0][9,9]"/><node text="Received." bounds="[0,0][9,9]"/>'
+                 b'<node text="Authorization: Bearer abc" bounds="[0,0][9,9]"/>'
+                 b'<node text="sam@example.com" bounds="[0,0][9,9]"/></hierarchy>')
+        screens = [before, after]
+
+        def run(argv, capture_output, stdin, timeout):
+            return subprocess.CompletedProcess(argv, 0, screens[0] if "uiautomator" in argv else b"", b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            device_mcp.call("hierarchy", {}, self.config)
+            screens.pop(0)
+            self.assertFalse(device_mcp.call("done", {"outcome": "completed", "summary": "sent"}, self.config)[0])
+        stored = json.loads(self.result.read_text())
+        self.assertIn("text='Received.'", stored["hierarchy"], "the screen at done")
+        self.assertNotIn("This is device test qa'", stored["hierarchy"], "not the agent's last look")
+        self.assertNotIn("Bearer", stored["hierarchy"], "through the same redaction")
+        self.assertIn("***@example.com", stored["hierarchy"])
+        self.assertNotIn("sam@", stored["hierarchy"])
+        self.assertEqual(stored["actions"], 1, "the look at done is not one of the agent's steps")
+
+    def test_with_no_fresh_screen_at_done_the_last_look_is_kept_and_said_so(self):
+        answers = [subprocess.CompletedProcess([], 0, HIERARCHY, b""), subprocess.CompletedProcess([], 1, b"", b"")]
+
+        def run(argv, capture_output, stdin, timeout):
+            return answers.pop(0)
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            device_mcp.call("hierarchy", {}, self.config)
+            device_mcp.call("done", {"outcome": "blocked", "summary": "x"}, self.config)
+        stored = json.loads(self.result.read_text())
+        self.assertTrue(stored["hierarchy"].startswith("(no fresh hierarchy at done; the agent's last look follows)"))
+        self.assertIn("text='Chats'", stored["hierarchy"])
 
     def test_type_takes_plain_text_alone(self):
         for text in ("a; reboot", "$(id)", "a`b`", "it's", "a|b", "a\nb", "x" * 201, "", "a>b", "a&b", 7):
