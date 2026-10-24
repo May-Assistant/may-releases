@@ -106,6 +106,7 @@ class Workspace(unittest.TestCase):
                 patch("device_tests.head_revision", return_value=SHA), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             device_tests.run_scenarios(selection, minted=self.mint, checked=lambda *a: 200,
+                                       revoked_by=lambda base, token: True,
                                        truth=lambda *a: (200, True), asked=lambda *a: (200, True),
                                        cleaned=lambda *a: self.fail("the smoke scenario cleaned up"),
                                        agent=self.agent(records or [record()]),

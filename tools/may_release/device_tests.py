@@ -537,15 +537,32 @@ def delete_fresh(base, token, post=urllib.request.urlopen):
     return isinstance(data, dict) and data.get("account_deleted") is True
 
 
+def revoke(base, token, post=urllib.request.urlopen):
+    """A shared-account session signed out at its end, so none outlives the run (it would last SESSION_SECONDS): POST
+    /v1/auth/logout with the session alone, never `everywhere` (the account's other sessions are not the run's). True
+    when staging answered 204, or 401: already gone."""
+    request = urllib.request.Request(base + "/v1/auth/logout", method="POST", data=b"{}",
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            return reply.status == 204
+    except urllib.error.HTTPError as error:
+        return error.code == 401
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+
+
 class Accounts:
     """Each scenario's staging session: on the shared test account, or on a fresh one of its own (wants_fresh),
     deleted at the scenario's end, or, when the run stops part-way, by the run's finally (abandon). Once staging gives no
     fresh account (the day's are used up, or its reply is not fresh), every later fresh scenario is skipped for that
     reason, never run on the shared account."""
 
-    def __init__(self, chosen, minted, deleted_by, platform="android"):
+    def __init__(self, chosen, minted, deleted_by, platform="android", revoked_by=revoke):
         self.ids, self.minted, self.deleted_by, self.platform = fresh_switch(), minted, deleted_by, platform
         self.refused, self.open, self.deleted, self.kept = None, None, 0, 0
+        # The shared account's sessions still open, each signed out at its end (or by abandon), with the counts.
+        self.revoked_by, self.live, self.revoked, self.unrevoked = revoked_by, [], 0, 0
         # What ran on the shared account is undone by tag at the run's end; a fresh account goes at its scenario's end.
         self.shared = any(row["driver"] == "agent" and not wants_fresh(row, self.ids) for row in chosen)
 
@@ -577,6 +594,8 @@ class Accounts:
                 continue
             if fresh:
                 self.open = token
+            else:
+                self.live.append(token)
             return token
         return None
 
@@ -586,12 +605,32 @@ class Accounts:
         if row["driver"] != SMOKE and wants_fresh(row, self.ids):
             at(f"{row['id']}: deleting its fresh account")
             self.delete(base, token)
+        else:
+            self.sign_out(base, token)
+
+    def track(self, token):
+        """A shared-account session minted outside a scenario (the run's cleanup), signed out like the others."""
+        self.live.append(token)
+        return token
+
+    def sign_out(self, base, token):
+        if token in self.live:
+            self.live.remove(token)
+            if self.revoked_by(base, token):
+                self.revoked += 1
+            else:
+                self.unrevoked += 1
 
     def abandon(self, base):
-        """The run's finally: a fresh account whose scenario stopped part-way is deleted all the same."""
+        """The run's finally: a fresh account whose scenario stopped part-way is deleted all the same, and every shared
+        session still open is signed out."""
         if self.open:
             at("deleting a fresh account left open")
             self.delete(base, self.open)
+        if self.live:
+            at("signing out the test sessions left open")
+        for token in list(self.live):
+            self.sign_out(base, token)
 
     def delete(self, base, token):
         self.open = None
@@ -601,7 +640,13 @@ class Accounts:
             self.kept += 1
 
     def report(self, platform):
-        """Prints the public lines on the fresh accounts the run made: counts alone."""
+        """Prints the public lines on the fresh accounts and the shared sessions the run made: counts alone."""
+        revoked, unrevoked = self.revoked, self.unrevoked
+        if revoked:
+            print(f"May device tests ({platform}): {revoked} test sessions were signed out at their end")
+        if unrevoked:
+            print(f"May device tests ({platform}): {unrevoked} test sessions' sign-out did not answer; they expire on "
+                  "their own")
         deleted, kept = self.deleted, self.kept
         if deleted:
             print(f"May device tests ({platform}): {deleted} fresh test accounts were deleted by their cleanup")
@@ -1103,7 +1148,7 @@ def settle(entry, row, passed):
 
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
-                  deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None):
+                  deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None, revoked_by=revoke):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -1118,7 +1163,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         raise DeviceTestsError("The Playground app is not built")
     base = staging(secret, staged)
     outward = os.environ.get(OUTWARD, "").strip() != "off"
-    skipped, accounts = switched_off(), Accounts(chosen, minted, deleted_by, "android")
+    skipped, accounts = switched_off(), Accounts(chosen, minted, deleted_by, "android", revoked_by)
     folder = root / OUT / run_folder(source) / "android"
     folder.mkdir(parents=True, mode=0o700)
     board_inputs(source, folder)
@@ -1219,7 +1264,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         if accounts.shared:
             at("cleanup")
             try:
-                token = minted(base, secret)
+                token = accounts.track(minted(base, secret))  # signed out by abandon, below
             except MintFailed:
                 token = ""  # read as a cleanup that did not answer: the report is kept
             cleaned_count = cleaned(base, token, since, tag) if token else None
