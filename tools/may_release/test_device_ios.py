@@ -279,12 +279,28 @@ class RecorderTests(Workspace):
         self.assertEqual(len(presets), len(device_ios.CONVERSIONS))
         self.assertEqual(names, ["sign-in.mp4"], "the original was not kept")
         self.assertEqual((folder / "sign-in.mp4").read_bytes(), b"h264" * 10)
-        self.assertEqual((leftovers, recorder.dropped, recorder.kept), ([], None, "unconverted: no conversion worked"))
+        self.assertEqual((leftovers, recorder.dropped), ([], None))
+        self.assertEqual(recorder.kept, "unconverted: no conversion fit the cap (PresetAppleM4V720pHD failed (exit 1), "
+                                        "Preset1280x720 failed (exit 1), Preset960x540 failed (exit 1))")
 
     def test_nothing_that_fits_is_dropped_and_says_why(self):
-        names, _, _, folder, recorder, leftovers = self.recorder({"Preset960x540": (0, self.BIG)}, raw=b"\0" * self.BIG)
+        names, _, _, folder, recorder, leftovers = self.recorder(
+            {"PresetAppleM4V720pHD": (0, 0), "Preset960x540": (0, self.BIG)}, raw=b"\0" * self.BIG)
         self.assertEqual((names, list(folder.iterdir()), leftovers), ([], [], []))
-        self.assertEqual(recorder.dropped, "no conversion worked and the original is 38 MB, over the cap")
+        # Each preset's outcome, so a public log tells a failed avconvert from a conversion still over the cap.
+        self.assertEqual(recorder.dropped, "no conversion fit the cap (PresetAppleM4V720pHD wrote no file, "
+                                           "Preset1280x720 failed (exit 1), Preset960x540 38 MB) and the original is "
+                                           "38 MB, over it")
+
+    def test_a_dropped_recording_says_how_long_it_ran(self):
+        """The length sets each recording's bitrate against the cap, so the public log carries it in seconds."""
+        recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
+        with patch("device_ios.subprocess.Popen"), patch("device_ios.time.monotonic", side_effect=[100.0, 820.4]), \
+                patch("device_ios.subprocess.run", return_value=Done(1)):
+            recorder.start()
+            recorder.raw.write_bytes(b"\0" * self.BIG)
+            self.assertEqual(recorder.stop(self.root), [])
+        self.assertTrue((recorder.dropped or "").endswith(" over it after 720 s of recording"), recorder.dropped)
 
     def test_a_recorder_that_does_not_stop_is_dropped_and_says_why(self):
         class Stuck:
