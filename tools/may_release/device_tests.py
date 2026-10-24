@@ -629,6 +629,40 @@ def board_inputs(source, folder):
             shutil.copyfile(path, folder / target)
 
 
+# A flow's own tags name the platforms it is written for; a scenario whose flow is not tagged for this job's platform is
+# skipped (the coordinator, 24 Oct: connections.yaml was tagged android alone and ran on iOS).
+UNTAGGED = {"android": "skipped (flow not tagged for android)", "ios": "skipped (flow not tagged for ios)"}
+FLOW_TAG = re.compile(r"[A-Za-z0-9_-]{1,40}")
+MAX_FLOW_BYTES = 64 * 1024
+
+
+def flow_tags(path):
+    """The tags a Maestro flow's header (the lines before its first ---) lists, as a block list or [a, b]."""
+    tags, listing = set(), False
+    for line in path.read_text(errors="replace")[:MAX_FLOW_BYTES].splitlines():
+        if line.strip() == "---":
+            break
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue  # a blank or comment line, inside a tag list or not, ends nothing
+        item = re.fullmatch(r"\s+-\s+(\S+)\s*", line)
+        if listing and item:
+            tags.add(item.group(1))
+            continue
+        listing = False
+        inline = re.fullmatch(r"tags:\s*(\[.*\])?\s*", line)
+        if inline and inline.group(1):
+            tags.update(part.strip() for part in inline.group(1)[1:-1].split(","))
+        elif inline:
+            listing = True
+    return {tag for tag in tags if FLOW_TAG.fullmatch(tag)}
+
+
+def untagged(row, flow, platform):
+    """Whether a Maestro scenario's flow (present) is not tagged with this job's platform: the scenario is skipped with
+    UNTAGGED[platform], and the run goes on (one bad tag never costs a whole run)."""
+    return row["driver"] == "maestro" and platform not in flow_tags(flow)
+
+
 def scenario_flow(row, source, private):
     """The Maestro flow a scenario runs: may-app's for a Maestro row, SMOKE_FLOW for the smoke row, none for an agent."""
     if row["driver"] == "maestro":
@@ -749,6 +783,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             flow = scenario_flow(row, source, private)
             if flow is not None and (not flow.is_file() or flow.is_symlink()):
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
+                continue
+            if flow is not None and untagged(row, flow, "android"):
+                entry["reason"] = UNTAGGED["android"]
                 continue
             # A fresh session per scenario: one lasts SESSION_SECONDS and has no refresh. The smoke scenario has none.
             token = accounts.session(row, base, secret, entry)

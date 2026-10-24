@@ -37,6 +37,8 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/device-tests.yml"
 RECIPIENT = "age1" + "q" * 58
 TOKEN = "session-token-" + "x" * 30
+# A flow written for both devices, as may-app tags it.
+FLOW = "appId: x\nname: A flow\ntags:\n  - android\n  - ios\n---\n- launchApp\n"
 MP4 = b"\0\0\0\x18ftypmp42" + b"\0" * 32
 
 
@@ -359,7 +361,7 @@ class RunTests(unittest.TestCase):
         (self.source / "android/app/build/outputs/apk/playground/debug").mkdir(parents=True)
         (self.source / device_tests.APK).write_bytes(b"apk")
         (self.source / device_tests.FLOWS_DIR).mkdir(parents=True)
-        (self.source / device_tests.FLOWS_DIR / "sign-in.yaml").write_text("appId: x\n")
+        (self.source / device_tests.FLOWS_DIR / "sign-in.yaml").write_text(FLOW)
         self.private.mkdir()
         self.env = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                     "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin:/bin"}
@@ -466,8 +468,35 @@ class RunTests(unittest.TestCase):
         self.assertEqual(device_tests.MAESTRO_SESSION, "MAESTRO_MAY_TEST_SESSION",
                          "Maestro's CLI passes only MAESTRO_-prefixed variables to a flow")
 
+    def test_a_flow_not_tagged_for_this_platform_is_skipped_and_the_run_goes_on(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        flow = self.source / device_tests.FLOWS_DIR / "sign-in.yaml"
+        flow.write_text(FLOW.replace("  - ios\n", ""))
+        _, report, _, _ = self.run_it(selection="sign-in")
+        self.assertEqual([row["verdict"] for row in report["scenarios"]], ["ui-pass"], "tagged android: it runs")
+        flow.write_text(FLOW.replace("  - android\n", ""))
+        calls, report, _, _ = self.run_it()
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("sign-in", "skipped", "skipped (flow not tagged for android)"), ("connections", "ui-pass", device_tests.UNCONFIGURED)])
+        self.assertNotIn(str(flow), " ".join(" ".join(argv) for argv in calls), "the untagged flow never ran")
+
+    def test_flow_tags_reads_the_header_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "f.yaml"
+            for text, tags in ((FLOW, {"android", "ios"}),
+                               ("appId: x\ntags: [android, ios]\n---\n", {"android", "ios"}),
+                               ("appId: x\ntags:\n  - android\nname: x\n  - ios\n---\n", {"android"}),
+                               ("appId: x\ntags:\n  - android\n  # for both devices\n\n  - ios\n---\n",
+                                {"android", "ios"}),
+                               ("appId: x\n---\ntags:\n  - ios\n", set()),
+                               ("appId: x\ntags:\n  - ../x\n  - ios\n---\n", {"ios"}),
+                               ("appId: x\n", set())):
+                with self.subTest(text=text):
+                    path.write_text(text)
+                    self.assertEqual(device_tests.flow_tags(path), tags)
+
     def test_a_failing_flow_and_server_checks(self):
-        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text("appId: x\n")
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         listed = json.loads(device_tests.SCENARIOS.read_text())
         listed[1]["server"] = [{"get": "/v1/connections", "expect": 200}]
         path = self.root / "scenarios.json"
@@ -715,6 +744,9 @@ class ReasonTests(unittest.TestCase):
                 reasons.add(value.value)
             elif isinstance(value, ast.Name):
                 reasons.add(getattr(device_tests, value.id))
+            elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name) and \
+                    isinstance(value.slice, ast.Constant) and hasattr(device_tests, value.value.id):
+                reasons.add(getattr(device_tests, value.value.id)[value.slice.value])
             elif isinstance(value, ast.IfExp):
                 reasons |= {getattr(device_tests, v.id) if isinstance(v, ast.Name) else v.value
                             for v in (value.body, value.orelse)}
@@ -729,6 +761,7 @@ class ReasonTests(unittest.TestCase):
     def test_every_reason_a_device_job_writes_is_one_publish_accepts(self):
         written = self.written_reasons()
         self.assertIn(device_tests.BUDGET, written)
+        self.assertIn(device_tests.UNTAGGED["android"], written)
         self.assertEqual(written - set(publish.REASONS), set())
 
     def test_a_budget_skipped_row_passes_the_publish_check(self):
