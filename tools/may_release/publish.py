@@ -78,6 +78,9 @@ REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no
            device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO,
            device_tests.BUDGET)
 MAX_NOTES = 600
+# A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
+DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)
+                      + ")")
 # The sealed device artifact's retention (device-tests.yml): the recordings' fallback when the release upload fails.
 VIDEO_DAYS = 7
 # The recordings go to one may-renders release per run (tag device-tests-<run>), never into its git history; the
@@ -389,14 +392,16 @@ def device_report(path, files, titles):
                 all(isinstance(name, str) and name in files for name in row.get("videos", []) + row.get("screenshots", []))
                 and all(isinstance(c, dict) and isinstance(c.get("get"), str) and re.fullmatch(r"/v1/[a-z0-9/_-]{1,120}", c["get"])
                         and type(c.get("status")) is int for c in row.get("server", [])) and
-                (isinstance(row.get("notes", ""), str) and len(row.get("notes", "")) <= MAX_NOTES)):
+                (isinstance(row.get("notes", ""), str) and len(row.get("notes", "")) <= MAX_NOTES) and
+                (isinstance(row.get("delivery", []), list) and len(row.get("delivery", [])) <= device_tests.MAX_DELIVERY and
+                 all(isinstance(code, str) and DELIVERY.fullmatch(code) for code in row.get("delivery", [])))):
             raise PublishError("A device report row is malformed")
         checked.append({"id": row["id"], "title": titles[row["id"]], "verdict": row["verdict"],
                         "reason": row.get("reason"), "videos": row.get("videos", []),
                         "screenshots": row.get("screenshots", []),
                         "server": [(c["get"], c["status"]) for c in row.get("server", [])],
                         "seconds": row.get("seconds") if type(row.get("seconds")) is int else None,
-                        "notes": row.get("notes", "")})
+                        "notes": row.get("notes", ""), "delivery": row.get("delivery", [])})
     return report["device"], checked
 
 
@@ -436,6 +441,8 @@ def device_pages(run, reports, note):
                 continue
             note = f" ({row['reason']})" if row["reason"] else ""
             server = "; ".join(f"GET {path}: {status}" for path, status in row["server"])
+            if row.get("delivery"):
+                server = "; ".join(filter(None, (server, "Messages: " + board.delivery_words(row["delivery"]))))
             lines.append(f"**{device}: {row['verdict']}**{note}" + (f". Server: {server}" if server else ""))
             # The judge's note is model text: escaped, inside an HTML block, where GitHub reads no Markdown.
             judged = f"<blockquote>Judge: {html.escape(row['notes'])}</blockquote>" if row["notes"] else ""

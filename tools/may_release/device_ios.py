@@ -190,7 +190,8 @@ def launch(udid, env, token, log):
 
 def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check, truth=device_tests.tagged,
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
-                  install=device_agent.install, budgeted=None):
+                  install=device_agent.install, budgeted=None, delivered=None):
+    delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
     agents, staged = device_tests.uses(chosen)
@@ -283,6 +284,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 else:
                     path, (status, found) = check["get"], truth(base, token, check["get"], tag)
                 entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
+            if device_tests.sends_messages(row):
+                codes = delivered(base, token, tag)
+                if codes is not None:
+                    entry["delivery"] = codes
             token = ""
             device_tests.settle(entry, row, passed if flow is not None else None)
         if any(row["driver"] == "agent" for row in chosen):

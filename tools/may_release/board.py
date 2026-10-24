@@ -131,8 +131,11 @@ def entry(folder, run, reports, now, previews=frozenset()):
             if row["verdict"] not in VERDICTS:
                 continue  # the smoke scenario is not a flow's test
             shots = [s for s in row["screenshots"] if SHOT.fullmatch(s)]
+            # Why a chat scenario's messages went unanswered (its delivery codes) joins the reason the board shows.
+            reason = "; ".join(filter(None, (row["reason"], row.get("delivery") and "messages: " +
+                                             delivery_words(row["delivery"]))))[:MAX_LINE] or None
             results[f"{device}/{row['id']}"] = {
-                "verdict": VERDICTS[row["verdict"]], "reason": row["reason"] or None,
+                "verdict": VERDICTS[row["verdict"]], "reason": reason,
                 "shot": shots[0] if shots else None,
                 "videos": [v for v in row["videos"] if VIDEO.fullmatch(v)],
                 "preview": f"{device}/{row['id']}" in previews}
@@ -149,6 +152,12 @@ def valid_folder(folder):
     except ValueError:
         return False
     return True
+
+
+def delivery_words(codes):
+    """A chat scenario's message codes for a reader (device_tests.message_codes): "none stored" says what it means."""
+    return "none stored (the send was refused before the server kept anything)" if codes == ["none stored"] \
+        else ", ".join(codes)
 
 
 def history_entries(existing):

@@ -83,6 +83,14 @@ class HistoryTests(unittest.TestCase):
                                 "preview": False},
             "ios/sign-in": {"verdict": "fail", "reason": "r", "shot": "sign-in-end.png", "videos": [], "preview": False}})
 
+    def test_a_chat_scenarios_message_codes_join_its_reason(self):
+        coded = dict(row("chat", "fail", reason=device_tests.NO_TRUTH), delivery=["failed (model_cap_reached)"])
+        stored = dict(row("chat", "ui-pass"), delivery=[device_tests.NONE_STORED])
+        results = [board.entry(folder(1), "9", {"android": [chat]}, NOW)["results"]["android/chat"]["reason"]
+                   for chat in (coded, stored, row("chat", "pass"))]
+        self.assertEqual(results, [device_tests.NO_TRUTH + "; messages: failed (model_cap_reached)",
+                                   "messages: none stored (the send was refused before the server kept anything)", None])
+
     def test_history_keeps_the_newest_runs_and_drops_malformed_entries(self):
         old = [board.entry(folder(n), str(n), {"android": [row("sign-in", "pass")]}, NOW) for n in range(70, 0, -1)]
         old.insert(3, {"folder": "../../etc", "run": "1", "when": "x", "results": {}})
