@@ -48,6 +48,21 @@
     "server": []
   },
   {
+    "id": "onboarding",
+    "title": "Go through onboarding on a new account",
+    "driver": "agent",
+    "goal": "May Playground has just signed in to a new account for device test {tag} and shows its first-run onboarding. Go through onboarding until the Chats screen shows, using only each step's skip or continue button. Do not type anything, connect an account or change a setting. If the system asks for a permission, choose the option that does not allow it. Stop when Chats shows.",
+    "platforms": [
+      "android",
+      "ios"
+    ],
+    "outward": false,
+    "fresh": true,
+    "onboarding": "record",
+    "server": [],
+    "truth": []
+  },
+  {
     "id": "chat",
     "title": "Chat with May and get a reply",
     "driver": "agent",
