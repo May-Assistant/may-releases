@@ -13,7 +13,7 @@ read or write a file, or reach the network itself.
   `maestro hierarchy`. Coordinates are the screenshot's pixels, as on Android; they become iOS points by the ratio of
   the screenshot's width to the hierarchy's root. back is a swipe in from the left edge.
 
-- type takes plain text only (letters, digits, spaces and . , ? ! : - _ @), so nothing reaches adb's shell as a
+- type takes plain text only (letters, digits, spaces and . , ! : - _ @; never ? or *, a glob in the device shell), so nothing reaches adb's shell as a
   command.
 - At most MAX_ACTIONS look or act calls; after that every call but done answers that the limit is reached.
 - done records the agent's own outcome (completed or blocked) and a short summary to MAY_DEVICE_AGENT_RESULT, which
@@ -37,7 +37,27 @@ PROTOCOL = "2025-06-18"
 MAX_ACTIONS = 80
 MAX_HIERARCHY = 40_000
 MAX_SUMMARY = 1000
-TEXT = re.compile(r"[A-Za-z0-9 .,?!:@_-]{1,200}")
+MAX_FIELD = 300
+# No ? or *: the device's shell would read them as a glob in input text's argument.
+TEXT = re.compile(r"[A-Za-z0-9 .,!:@_-]{1,200}")
+# A line that could carry a session or a credential is dropped whole: an Authorization or Bearer header, a refresh
+# token, a cookie, the launch's session extra, a JWT, or any may_* key with a long opaque value.
+SECRET_LINE = re.compile(rb"(?i)authorization|bearer|refresh_token|cookie|may_test_session|"
+                         rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
+                         rb"\bmay_[a-z0-9_]+[\"']?\s*[=:]\s*[\"']?[A-Za-z0-9+/_.~-]{20,}")
+# An email address keeps its domain alone.
+EMAIL = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24})")
+MASKED = rb"***@\1"
+
+
+def kept_lines(data, token):
+    """(data without any line that could carry the session or a credential (SECRET_LINE, or the token itself), with
+    each email address masked to its domain, the number of lines dropped)."""
+    secret = token.encode() if token else None
+    lines = data.splitlines(keepends=True)
+    kept = [EMAIL.sub(MASKED, line) if b"@" in line else line
+            for line in lines if not SECRET_LINE.search(line) and not (secret and secret in line)]
+    return b"".join(kept), len(lines) - len(kept)
 COORD = {"type": "integer", "minimum": 0, "maximum": 4000}
 TOOLS = [
     {"name": "screenshot", "description": "A PNG screenshot of the emulator's screen (1080 x 2400 pixels)",
@@ -48,7 +68,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "tap", "description": "Tap the screen at pixel x, y",
      "inputSchema": {"type": "object", "required": ["x", "y"], "properties": {"x": COORD, "y": COORD}}},
-    {"name": "type", "description": ("Type text into the focused field: letters, digits, spaces and . , ? ! : - _ @ "
+    {"name": "type", "description": ("Type text into the focused field: letters, digits, spaces and . , ! : - _ @ "
                                      "only, up to 200 characters"),
      "inputSchema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}},
     {"name": "swipe", "description": "Swipe from x1, y1 to x2, y2 over ms milliseconds (scroll with this)",
@@ -209,10 +229,21 @@ def compact(xml):
     return "\n".join(lines)[:MAX_HIERARCHY]
 
 
+def current_hierarchy(config):
+    """The screen's hierarchy now, compacted (one element per line), or "" when it could not be read."""
+    if config["platform"] == "ios":
+        return ios_hierarchy(config)
+    status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
+    return "" if status else compact(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
+
+
 def record(config, outcome, summary):
+    """The agent's result for the judge: its hierarchy through kept_lines and within MAX_HIERARCHY, as the summary is
+    redacted where it is sealed."""
+    kept, _ = kept_lines(config["hierarchy"].encode(), "")
     with open(config["result"], "w", encoding="utf-8") as output:
         json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
-                   "hierarchy": config["hierarchy"]}, output)
+                   "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY]}, output)
 
 
 def call(name, args, config):
@@ -223,6 +254,11 @@ def call(name, args, config):
         outcome, summary = args.get("outcome"), args.get("summary")
         if outcome not in ("completed", "blocked") or not isinstance(summary, str):
             return True, [{"type": "text", "text": "done needs outcome (completed or blocked) and a summary"}]
+        # The judge's evidence is the screen as the agent leaves it, taken here (proof run 40123018291: the judge
+        # read the agent's last look, from before it sent the message, and failed a delivered chat).
+        fresh = current_hierarchy(config)
+        config["hierarchy"] = fresh or ("(no fresh hierarchy at done; the agent's last look follows)\n" +
+                                        config["hierarchy"] if config["hierarchy"] else "")
         record(config, outcome, summary)
         return False, [{"type": "text", "text": "Recorded. Stop now."}]
     if name not in {tool["name"] for tool in TOOLS}:
@@ -241,12 +277,8 @@ def call(name, args, config):
             return True, [{"type": "text", "text": "No screenshot this time; try again"}]
         return False, [{"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}]
     if name == "hierarchy":
-        if ios:
-            status, text = 0, ios_hierarchy(config)
-        else:
-            status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
-            text = compact(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
-        if status or not text:
+        text = current_hierarchy(config)
+        if not text:
             return True, [{"type": "text", "text": "No hierarchy this time; take a screenshot instead"}]
         config["hierarchy"] = text
         return False, [{"type": "text", "text": text}]
@@ -270,7 +302,31 @@ def call(name, args, config):
     else:
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
     status, _ = adb(config, *argv)
-    return bool(status), [{"type": "text", "text": "Done" if not status else "The device did not take it"}]
+    if status:
+        return True, [{"type": "text", "text": "The device did not take it"}]
+    if name != "type":
+        return False, [{"type": "text", "text": "Done"}]
+    # What landed, so the agent never types it again piece by piece (run 40119835677: three minutes on one sentence).
+    status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
+    landed = None if status else focused_text(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
+    if landed is None:
+        return False, [{"type": "text", "text": "Done; the focused field could not be read, so take a hierarchy"}]
+    return False, [{"type": "text", "text": f"Done. The focused field now reads: {landed!r}"}]
+
+
+def focused_text(xml):
+    """The focused field's text as the agent may see it: through kept_lines (a field that could hold a credential is
+    "(hidden)", an email address keeps its domain alone), at most MAX_FIELD characters; None when no field is focused."""
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return None
+    field = next((node for node in root.iter("node") if node.get("focused") == "true"), None)
+    if field is None:
+        return None
+    text = field.get("text", "").replace("\n", " ").replace("\r", " ")
+    kept, dropped = kept_lines(text.encode(), "")
+    return "(hidden)" if dropped else kept.decode("utf-8", "replace")[:MAX_FIELD]
 
 
 def ios_act(name, args, ints, config):

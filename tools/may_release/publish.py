@@ -79,7 +79,7 @@ REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no
            device_tests.UNCONFIGURED, device_tests.RATE_LIMITED, device_tests.UNFINISHED, device_tests.BLOCKED,
            device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO,
            device_tests.BUDGET, *device_tests.UNTAGGED.values(), device_tests.FRESH_EXHAUSTED, device_tests.NOT_FRESH,
-           device_tests.MODEL_CAP, device_tests.MINT_FAILED, device_tests.FLOW_IDS)
+           device_tests.MODEL_CAP, device_tests.MINT_FAILED, device_tests.FLOW_IDS, device_tests.DELIVERY_FAILED)
 MAX_NOTES = 600
 # A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
 DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)
@@ -400,6 +400,17 @@ def device_layout(name, run):
     return "file" if DEVICE_FILE.fullmatch(parts[2]) else None
 
 
+def agent_ok(agent):
+    """A report row's sealed agent account (device_tests.sealed_agent): its fixed shape, the summary capped and with
+    nothing kept_lines would drop or mask. It stays in report.json; the pages never show it."""
+    summary = agent.get("summary") if isinstance(agent, dict) else None
+    return (isinstance(agent, dict) and set(agent) == {"outcome", "actions", "summary"} and
+            agent["outcome"] in ("completed", "blocked", None) and type(agent["actions"]) is int and
+            0 <= agent["actions"] <= device_tests.device_mcp.MAX_ACTIONS and isinstance(summary, str) and
+            len(summary) <= device_tests.MAX_AGENT_SUMMARY and
+            device_tests.kept_lines(summary.encode(), "") == (summary.encode(), 0))
+
+
 def device_report(path, files, titles):
     """A device's report.json, every value checked against a fixed shape and the files actually extracted; titles come
     from this repository's own scenario list, never the report."""
@@ -418,6 +429,7 @@ def device_report(path, files, titles):
                 and all(isinstance(c, dict) and isinstance(c.get("get"), str) and re.fullmatch(r"/v1/[a-z0-9/_-]{1,120}", c["get"])
                         and type(c.get("status")) is int for c in row.get("server", [])) and
                 (isinstance(row.get("notes", ""), str) and len(row.get("notes", "")) <= MAX_NOTES) and
+                agent_ok(row.get("agent", {"outcome": None, "actions": 0, "summary": ""})) and
                 (isinstance(row.get("delivery", []), list) and len(row.get("delivery", [])) <= device_tests.MAX_DELIVERY and
                  all(isinstance(code, str) and DELIVERY.fullmatch(code) for code in row.get("delivery", [])))):
             raise PublishError("A device report row is malformed")

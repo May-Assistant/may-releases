@@ -66,7 +66,7 @@
     "id": "chat",
     "title": "Chat with May and get a reply",
     "driver": "agent",
-    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: This is device test {tag}. Reply with the word received. Then wait until May's reply appears under your message.",
+    "goal": "In May Playground, on the Chats screen, open the existing chat named May; do not use the + button, which makes agents, tasks and projects, not chats. Send this message: This is device test {tag}. Reply with the word received. Then wait until May's reply appears under your message.",
     "platforms": [
       "android",
       "ios"
@@ -79,7 +79,7 @@
     "id": "notes",
     "title": "Add a note to a new agenda task",
     "driver": "agent",
-    "goal": "In May Playground, open Agenda and add a new task titled {tag} task. Open that task. On its Details, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on the {tag} task.",
+    "goal": "In May Playground, tap the Agenda tab in the bottom bar (not a chat) and add a new task titled {tag} task. Open that task. On its Details tab, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on the {tag} task.",
     "platforms": [
       "android",
       "ios"
@@ -92,7 +92,7 @@
     "id": "poll",
     "title": "Answer May's multiple-choice question",
     "driver": "agent",
-    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me one multiple-choice question about which fruit I'd like as a snack, with three choices, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until the card shows your choice as the answer.",
+    "goal": "In May Playground, on the Chats screen, open the existing chat named May; do not use the + button, which makes agents, tasks and projects, not chats. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until the card shows your choice as the answer.",
     "platforms": [
       "android",
       "ios"
@@ -109,7 +109,7 @@
     "id": "poll-skip",
     "title": "Skip May's question with a free reply",
     "driver": "agent",
-    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me one multiple-choice question about which fruit I'd like as a snack, with three choices, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I'll answer myself: apples, {tag}. Then check that the question card now shows as skipped, with its choices dimmed.",
+    "goal": "In May Playground, on the Chats screen, open the existing chat named May; do not use the + button, which makes agents, tasks and projects, not chats. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer myself: apples, {tag}. Then check that the question card now shows as skipped, with its choices dimmed.",
     "platforms": [
       "android",
       "ios"
@@ -126,7 +126,7 @@
     "id": "routines",
     "title": "Make a routine from chat",
     "driver": "agent",
-    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Make a daily routine called {tag} stretch that reminds me to stretch at 9am. When May shows a question card asking whether to create the routine, tap Create it. Then wait until May confirms the routine is made.",
+    "goal": "In May Playground, on the Chats screen, open the existing chat named May; do not use the + button, which makes agents, tasks and projects, not chats. Send this message: Make a daily routine called {tag} stretch that reminds me to stretch at 9am. When May shows a question card asking whether to create the routine, tap Create it. Then wait until May confirms the routine is made.",
     "platforms": [
       "android",
       "ios"

@@ -60,6 +60,9 @@ import zipfile
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import board
+# The one redaction: the device server's (it keeps typed text out of the agent's view), the diagnostics' and publish's.
+import device_mcp
+from device_mcp import EMAIL, MASKED, SECRET_LINE, kept_lines
 import device_agent
 from device_agent import AgentError
 import device_prototypes
@@ -162,6 +165,7 @@ UNFINISHED = "the agent did not finish"
 BLOCKED = "the agent reported it was blocked"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
+DELIVERY_FAILED = "May's server did not record a succeeded reply"
 UNCONFIGURED = "server checks not configured"
 SMOKE_MAESTRO = "Maestro did not drive the app"
 SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
@@ -699,14 +703,6 @@ DIAG = ".diag.txt"
 LOGCAT_LINES, MAX_DIAG, DIAG_SECONDS = 2000, 512 * 1024, 60
 LOG_BUFFERS = "main,system,crash"
 ANR, CRASH = "data_app_anr", "data_app_crash"
-# A line that could carry a session or a credential is dropped whole: an Authorization or Bearer header, a refresh
-# token, a cookie, the launch's session extra, a JWT, or any may_* key with a long opaque value.
-SECRET_LINE = re.compile(rb"(?i)authorization|bearer|refresh_token|cookie|may_test_session|"
-                         rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
-                         rb"\bmay_[a-z0-9_]+[\"']?\s*[=:]\s*[\"']?[A-Za-z0-9+/_.~-]{20,}")
-# An email address keeps its domain alone.
-EMAIL = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24})")
-MASKED = rb"***@\1"
 
 
 def adb_output(adb, env, argv):
@@ -717,16 +713,6 @@ def adb_output(adb, env, argv):
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout if done.returncode == 0 and isinstance(done.stdout, bytes) else None
-
-
-def kept_lines(data, token):
-    """(data without any line that could carry the session or a credential (SECRET_LINE, or the token itself), with
-    each email address masked to its domain, the number of lines dropped)."""
-    secret = token.encode() if token else None
-    lines = data.splitlines(keepends=True)
-    kept = [EMAIL.sub(MASKED, line) if b"@" in line else line
-            for line in lines if not SECRET_LINE.search(line) and not (secret and secret in line)]
-    return b"".join(kept), len(lines) - len(kept)
 
 
 class Diagnostics:
@@ -1258,9 +1244,10 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     accounts.report("android")
 
 
-def combined(entry, record, judged):
+def combined(entry, record, judged, sends=False):
     """An agent scenario's verdict from its run, the judge and the server truth; the smoke scenario's from Maestro, its
-    agent run and the judge, never "pass"."""
+    agent run and the judge, never "pass". For one that sends May a message (sends), the server's delivery codes
+    outrank the screen: every code must be succeeded, and chats that could not be read leave it not judged."""
     if entry.get("maestro") is False:
         return {"verdict": "fail", "reason": SMOKE_MAESTRO}
     if record.get("state") == "rate_limited" or judged[0] == "rate_limited":
@@ -1269,6 +1256,14 @@ def combined(entry, record, judged):
         return {"verdict": "fail", "reason": BLOCKED}
     if record.get("outcome") != "completed":
         return {"verdict": "fail", "reason": UNFINISHED}
+    # The server's record outranks the screen (the May chat shows earlier runs' replies too): anything but succeeded
+    # for every tagged message, or none at all, is a fail, whatever the judge read on screen.
+    if sends:
+        codes = entry.get("delivery")
+        if codes is None:
+            return {"verdict": "fail", "reason": NOT_JUDGED}
+        if not codes or any(code != "succeeded" for code in codes):
+            return {"verdict": "fail", "reason": DELIVERY_FAILED}
     if judged[0] != "pass":
         return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
     if "maestro" in entry:
@@ -1278,6 +1273,22 @@ def combined(entry, record, judged):
     if all(check["pass"] for check in entry["server"]):
         return {"verdict": "pass", "reason": None}
     return {"verdict": "fail", "reason": NO_TRUTH}
+
+
+# The agent's own account of its run, sealed into the private report.json alone (never a log or the job summary): its
+# outcome, how many look-or-act steps it took, and its summary through kept_lines, at most MAX_AGENT_SUMMARY characters.
+MAX_AGENT_SUMMARY = 300
+
+
+def sealed_agent(record):
+    # Line by line, then joined into one line and redacted again: joining could make a secret-shaped line of two
+    # harmless ones ("may_token:" and an opaque value), which publish would refuse with the whole report.
+    lines, _ = kept_lines(str(record.get("summary") or "").encode(), "")
+    summary, _ = kept_lines(" ".join(lines.decode("utf-8", "replace").split()).encode(), "")
+    actions = record.get("actions")
+    return {"outcome": record.get("outcome") if record.get("outcome") in ("completed", "blocked") else None,
+            "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MAX_ACTIONS else 0,
+            "summary": summary.decode("utf-8", "replace").strip()[:MAX_AGENT_SUMMARY]}
 
 
 def judge_scenarios(judged_by=device_agent.judge, platform="android"):
@@ -1297,6 +1308,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         stored = {}
     records = stored.get("agents", {}) if isinstance(stored, dict) else {}
     goals = {row["id"]: row["goal"] for row in scenarios("all", platform) if row["driver"] == "agent"}
+    sending = {row["id"] for row in scenarios("all", platform) if sends_messages(row)}
     goals.update((row["id"], row["goal"]) for row in smoke_rows(platform))
     pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
     token = model = None
@@ -1310,11 +1322,14 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         judged = ("skipped", "")
         if record.get("state") != "rate_limited" and record.get("outcome") == "completed":
             try:
-                judged = judged_by(cli, goals[entry["id"]], stored.get("tag", ""), record,
+                # Its delivery codes alone, never a message's text; None when its chats could not be read.
+                evidence = dict(record, sends=entry["id"] in sending, delivery=entry.get("delivery"))
+                judged = judged_by(cli, goals[entry["id"]], stored.get("tag", ""), evidence,
                                    private / "judge" / entry["id"], token, model)
             except (OSError, subprocess.SubprocessError, KeyError):
                 judged = ("error", "")
-        verdict_reason = combined(entry, record, judged)
+        verdict_reason = combined(entry, record, judged, entry["id"] in sending)
+        entry["agent"] = sealed_agent(record)
         entry["verdict"] = verdict_reason["verdict"]
         entry.pop("reason", None)
         if verdict_reason["reason"]:
