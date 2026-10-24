@@ -52,7 +52,7 @@ class Workspace:
         manifest = self.source / renders.MANIFEST
         manifest.parent.mkdir(parents=True)
         self.rows = rows if rows is not None else [
-            {"id": "chat-reply", "title": "Chat reply <b>", "spec": "docs/design/chat.md",
+            {"id": "chat-reply", "title": "Chat reply <b>", "spec": "docs/design/chat.md", "component": "ChatPage",
              "android": {"light": "android/chat-reply-light.png", "dark": "android/chat-reply-dark.png"},
              "ios": {"light": "ios/chat-reply-light.png", "dark": "ios/chat-reply-dark.png"}},
             {"id": "sign-in", "title": "Sign in", "spec": "docs/design/sign-in.md",
@@ -222,7 +222,9 @@ class ManifestAndCountTests(unittest.TestCase):
         good = dict(self.work.rows[0])
         for change in ({"id": "Chat Reply"}, {"ios": {"light": "../x.png"}}, {"android": {"light": "../../etc/passwd.png"}},
                        {"android": {"light": "/abs/path.png"}}, {"android": {"light": "x.jpg"}},
-                       {"android": {"sepia": "a.png"}}, {"android": "a.png"}, {"title": ""}, {"spec": 7}):
+                       {"android": {"sepia": "a.png"}}, {"android": "a.png"}, {"title": ""}, {"spec": 7},
+                       {"component": 7}, {"component": "chat page"}, {"component": "<b>Chat</b>"},
+                       {"component": ""}, {"component": "C" * 65}):
             with self.subTest(change=change):
                 (self.work.source / renders.MANIFEST).write_text(json.dumps([dict(good, **change)]))
                 with self.assertRaises(RendersError):
@@ -230,6 +232,11 @@ class ManifestAndCountTests(unittest.TestCase):
         (self.work.source / renders.MANIFEST).write_text(json.dumps([good, good]))
         with self.assertRaises(RendersError):
             renders.manifest_rows(self.work.source)
+
+    def test_a_rows_component_is_kept_and_an_older_row_without_one_still_renders(self):
+        """may-app #1164 gave every screens.json row its design-system component (#1150's naming)."""
+        rows = renders.manifest_rows(self.work.source)
+        self.assertEqual([(row["id"], row["component"]) for row in rows], [("chat-reply", "ChatPage"), ("sign-in", "")])
 
     def test_a_platform_without_renders_and_a_sibling_evidence_folder_are_accepted(self):
         good = dict(self.work.rows[0])
@@ -316,6 +323,9 @@ class SheetSealVerdictTests(unittest.TestCase):
         page = (out / "index.html").read_text()
         self.assertIn("Chat reply &lt;b&gt;", page)
         self.assertNotIn("<b>", page)
+        self.assertIn("<small>chat-reply · <code>ChatPage</code> docs/design/chat.md</small>", page,
+                      "each render's component beside its id (may-app #1164)")
+        self.assertIn("<small>sign-in docs/design/sign-in.md</small>", page, "a row with no component has none")
         self.assertIn('<img src="ios/sign-in-light.png" width="300" alt="iOS">', page)
         self.assertTrue(page.startswith("<!doctype html>"))
         self.assertTrue((out / "README.md").is_file(), "the run folder has a README.md")
