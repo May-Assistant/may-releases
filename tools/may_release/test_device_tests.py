@@ -682,9 +682,31 @@ class RunTests(unittest.TestCase):
         them) under HOME/.maestro, and a later step runs may-app code on the same runner."""
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         self.run_it()
-        homes = {env.get("HOME") for env in self.maestro_envs}
-        self.assertEqual(homes, {str(self.root / "may-maestro-home")}, "every Maestro call, with or without a session")
+        home = str(self.root / "may-maestro-home")
+        isolated = {(env.get("HOME"), env.get("XDG_STATE_HOME"), env.get("MAESTRO_OPTS")) for env in self.maestro_envs}
+        self.assertEqual(isolated, {(home, home, "-Duser.home=" + home)},
+                         "every Maestro call, with or without a session: Java reads user.home from passwd, not HOME")
         self.assertFalse((self.root / "may-maestro-home").exists(), "removed at the run's end")
+
+    def test_a_maestro_tests_folder_in_the_runners_own_home_is_removed_too(self):
+        """Second security review of #104: Maestro 2.8.0 falls back to user.home/.maestro/tests."""
+        with tempfile.TemporaryDirectory() as directory:
+            root, passwd, home = (Path(directory) / name for name in ("root", "passwd", "home"))
+            for folder in (root / "may-maestro-home", passwd / ".maestro" / "tests", home / ".maestro" / "tests"):
+                folder.mkdir(parents=True)
+            (passwd / ".maestro" / "tests" / "commands.json").write_text("{}")
+            (passwd / ".maestro" / "config").write_text("kept")
+
+            class Entry:
+                pw_dir = str(passwd)
+
+            with patch("device_tests.pwd.getpwuid", return_value=Entry()), \
+                    patch("device_tests.Path.home", return_value=home):
+                device_tests.forget_maestro_home(root)
+            self.assertFalse((root / "may-maestro-home").exists())
+            self.assertFalse((passwd / ".maestro" / "tests").exists(), "the passwd home, which Java reads")
+            self.assertFalse((home / ".maestro" / "tests").exists(), "and $HOME's")
+            self.assertTrue((passwd / ".maestro" / "config").is_file(), "only the debug output goes")
 
     def test_flow_tags_reads_the_header_alone(self):
         with tempfile.TemporaryDirectory() as directory:

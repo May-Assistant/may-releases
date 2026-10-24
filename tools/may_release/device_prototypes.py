@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import time
 
@@ -137,10 +138,31 @@ def shoot(browser, stage, slug, platform, n, run=subprocess.run):
                    stdin=subprocess.DEVNULL, timeout=CALL_SECONDS)
     except (OSError, subprocess.SubprocessError):
         return None
-    if done.returncode or not shot.is_file() or shot.is_symlink() or shot.stat().st_size > MAX_SHOT:
+    if done.returncode:
         return None
-    data = shot.read_bytes()
-    return data if data.startswith(PNG) else None
+    data = read_inside(stage, ("profiles", profile.name, "shot.png"), MAX_SHOT)
+    return data if data is not None and data.startswith(PNG) else None
+
+
+def read_inside(stage, parts, limit):
+    """At most limit bytes of the regular file stage/parts..., or None. The render user owns everything in the stage,
+    so no part is followed if it is a link it put in its place: each is opened from the one before, without following
+    links. The stage's own folder sits in the runner's temporary folder, which the render user cannot change."""
+    opened = []
+    try:
+        opened.append(os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        for part in parts[:-1]:
+            opened.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=opened[-1]))
+        opened.append(os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=opened[-1]))
+        if not stat.S_ISREG(os.fstat(opened[-1]).st_mode):
+            return None
+        data = os.read(opened[-1], limit + 1)
+        return data if len(data) <= limit else None
+    except OSError:
+        return None
+    finally:
+        for handle in opened:
+            os.close(handle)
 
 
 def stage_for(source, stage, jobs, run):
@@ -148,7 +170,9 @@ def stage_for(source, stage, jobs, run):
     False when that cannot be done."""
     shutil.rmtree(stage, ignore_errors=True)
     shutil.copytree(source / PROTOTYPES, stage, symlinks=False, ignore=shutil.ignore_patterns("pages"))
-    stage.parent.chmod(0o755)  # a fresh temporary folder is the runner's alone: the render user must pass through it
+    # A fresh temporary folder is the runner's alone: the render user must pass through it. The stage is readable by
+    # every user on the runner, which is fine: it holds may-app's prototypes alone, no secret and nothing private.
+    stage.parent.chmod(0o755)
     for _, slug, platform, n in jobs:
         (stage / "profiles" / f"{slug}-{platform}-{n}").mkdir(parents=True)
     # Handed to the render user; readable by all, so the runner reads the shots back (prototypes hold no secret).
@@ -165,12 +189,35 @@ def stage_for(source, stage, jobs, run):
     return True
 
 
-def render(source, folder, stage, scratch, browser=None, run=subprocess.run, clock=time.monotonic):
+def walled_off(private, run):
+    """Whether the render user can reach none of private (the runner's temp folders holding the checkout, the Claude
+    Code install and the session, Maestro's homes, the adb keys): each folder is made the runner's alone first, then
+    checked as the render user, which must be able to run a command at all. Never assumed (second security review of
+    #104): any doubt means no render."""
+    for path in private:
+        if path.is_dir() and not path.is_symlink():
+            path.chmod(0o700)
+
+    def as_render_user(argv):
+        try:
+            return run(["sudo", "-n", "-u", RENDER_USER, "--", *argv], capture_output=True, stdin=subprocess.DEVNULL,
+                       timeout=60).returncode
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    if as_render_user(["test", "-d", "/"]) != 0:
+        return False
+    # test exits 1 for false, so anything else (an error, a refused sudo) is doubt too.
+    return all(as_render_user(["sh", "-c", 'test -r "$1" || test -x "$1"', "sh", str(path)]) == 1
+               for path in private)
+
+
+def render(source, folder, stage, scratch, browser=None, run=subprocess.run, clock=time.monotonic, private=()):
     """(made, failed): every main-path step's screen, per platform, for each path copied into folder. (None, None)
     when there is no path, or the stage, the build or Chrome is unavailable. stage is a fresh folder outside the
     runner's home (removed here at the end); scratch is the runner's own, for shots not yet whole."""
     try:
-        return render_in(source, folder, stage, scratch, browser, run, clock)
+        return render_in(source, folder, stage, scratch, browser, run, clock, private)
     finally:
         try:
             run(["sudo", "-n", "rm", "-rf", "--", str(stage)], capture_output=True, stdin=subprocess.DEVNULL,
@@ -179,7 +226,7 @@ def render(source, folder, stage, scratch, browser=None, run=subprocess.run, clo
             pass
 
 
-def render_in(source, folder, stage, scratch, browser, run, clock):
+def render_in(source, folder, stage, scratch, browser, run, clock, private):
     started = clock()
     jobs = []
     for path in sorted(folder.glob("path-*.json")):
@@ -197,7 +244,7 @@ def render_in(source, folder, stage, scratch, browser, run, clock):
     if not jobs or browser is None or not (source / PROTOTYPES / "src" / "build.py").is_file():
         return None, None
     try:
-        if not stage_for(source, stage, jobs, run):
+        if not stage_for(source, stage, jobs, run) or not walled_off(private, run):
             return None, None
         built = run(sandboxed(["python3", "-I", "-S", "-B", str(stage / "src" / "build.py")], stage), cwd=stage,
                     capture_output=True, stdin=subprocess.DEVNULL,

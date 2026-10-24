@@ -239,8 +239,10 @@ class RunTests(Workspace):
     def test_maestro_keeps_its_debug_output_out_of_the_runners_home_on_ios_too(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         calls, minted, report, _, _ = self.run_it()
-        homes = {env.get("HOME") for argv, env in calls if "test" in argv and "--device" in argv}
-        self.assertEqual(homes, {str(self.root / "may-maestro-home")})
+        home = str(self.root / "may-maestro-home")
+        isolated = {(env.get("HOME"), env.get("XDG_STATE_HOME"), env.get("MAESTRO_OPTS"))
+                    for argv, env in calls if "test" in argv and "--device" in argv}
+        self.assertEqual(isolated, {(home, home, "-Duser.home=" + home)})
         self.assertFalse((self.root / "may-maestro-home").exists(), "removed at the run's end")
 
     def test_a_switched_off_scenario_is_skipped(self):

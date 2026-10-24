@@ -271,7 +271,7 @@ class RenderTests(Fixture):
                  (OSError("boom"), "May device tests (android): no prototype screens (an error stopped them; the seal "
                                    "goes on)\n"))
         for result, line in cases:
-            def rendered(*args, result=result):
+            def rendered(*args, result=result, **kwargs):
                 if isinstance(result, Exception):
                     raise result
                 return result
@@ -282,6 +282,105 @@ class RenderTests(Fixture):
                 except TypeError as error:
                     self.fail(f"the prototypes step does not copy the paths itself: {error}")
                 self.assertEqual(printed.getvalue(), line)
+
+    def test_the_render_user_is_walled_off_from_the_runners_private_folders_or_nothing_renders(self):
+        """Second security review of #104: enforced, never assumed."""
+        self.write_path(path())
+        private = [self.root / "may-source", self.root / "may-claude", self.root / "absent"]
+        for folder in private[:2]:
+            folder.mkdir(exist_ok=True)
+            folder.chmod(0o755)
+        for answers, made in (({}, (5, 0)), ({"control": 1}, (None, None)), ({"may-claude": 0}, (None, None)),
+                              ({"may-source": 2}, (None, None))):
+            with self.subTest(answers=answers):
+                host, checked = FakeHost(), []
+
+                def run(argv, **kwargs):
+                    if argv[:4] == ["sudo", "-n", "-u", RENDER_USER] and argv[5] in ("test", "sh"):
+                        if argv[5] == "test":
+                            return subprocess.CompletedProcess(argv, answers.get("control", 0), b"", b"")
+                        name = Path(argv[-1]).name
+                        checked.append(name)
+                        return subprocess.CompletedProcess(argv, answers.get(name, 1), b"", b"")
+                    return host(argv, **kwargs)
+
+                device_prototypes.copy_paths(self.source, self.folder)
+                result = device_prototypes.render(self.source, self.folder, self.stage, self.scratch,
+                                                  browser="/usr/bin/google-chrome", run=run, private=private)
+                self.assertEqual(result, made)
+                if made == (None, None):
+                    self.assertFalse(any("python3" in argv for argv, _ in host.calls), "may-app's build never ran")
+                else:
+                    self.assertEqual(checked, ["may-source", "may-claude", "absent"])
+                for folder in private[:2]:
+                    self.assertEqual(folder.stat().st_mode & 0o777, 0o700, "made the runner's alone first")
+
+    def test_the_step_walls_off_the_checkout_claude_maestro_and_adb_keys(self):
+        out = self.root / "runner"
+        (out / device_tests.OUT / "20261024-aaaaaaaaaaaa" / "android").mkdir(parents=True)
+        seen = {}
+
+        def rendered(source, folder, stage, scratch, private=()):
+            seen.update(stage=stage, private=set(private))
+            return 1, 0
+
+        home = Path.home()
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(out)}, clear=True), patch("sys.stdout", new_callable=io.StringIO):
+            device_tests.render_prototypes(copied=lambda *a: (0, 0), rendered=rendered)
+        for folder in (out, out / "may-claude", out / "may-source", out / "may-private", out / "may-maestro-home",
+                       home / ".maestro", home / ".android"):
+            self.assertIn(folder, seen["private"])
+        self.assertFalse(seen["stage"].parent.exists(), "the stage's empty temporary folder is removed too")
+
+    def test_a_failed_handover_to_the_render_user_stops_the_render(self):
+        """The surviving mutation of the second review: a failed useradd, chown or chmod was ignorable."""
+        self.write_path(path())
+        for step, code in (("useradd", 1), ("chown", 1), ("chmod", 1)):
+            with self.subTest(step=step):
+                host = FakeHost()
+
+                def run(argv, **kwargs):
+                    if argv[:3] == ["sudo", "-n", step]:
+                        return subprocess.CompletedProcess(argv, code, b"", b"")
+                    return host(argv, **kwargs)
+
+                self.assertEqual(self.render(run), (None, None))
+                self.assertFalse(any("python3" in argv for argv, _ in host.calls))
+        host = FakeHost()
+
+        def again(argv, **kwargs):
+            if argv[:3] == ["sudo", "-n", "useradd"]:
+                return subprocess.CompletedProcess(argv, 9, b"", b"")
+            return host(argv, **kwargs)
+
+        self.assertEqual(self.render(again), (5, 0), "useradd's 9 is a user already there: a re-run")
+
+    def test_chrome_keeps_its_own_sandbox(self):
+        """Coordinator, 24 Oct: as the render user, never --no-sandbox; if Chrome's sandbox cannot start, nothing
+        renders."""
+        self.write_path(path())
+        host = FakeHost()
+        self.render(host)
+        self.assertTrue(any("/usr/bin/google-chrome" in argv for argv, _ in host.calls))
+        for argv, _ in host.calls:
+            self.assertNotIn("--no-sandbox", argv)
+        self.assertNotIn("--no-sandbox", device_prototypes.chrome_argv("chrome", Path("/p"), "ios"))
+
+    def test_a_shot_reached_through_a_link_is_never_read(self):
+        """The render user owns the stage: a link in place of the shot or a folder above it is not followed."""
+        self.stage.mkdir(parents=True)
+        secret = self.root / "secret.png"
+        secret.write_bytes(PNG)
+        (self.stage / "profiles" / "a").mkdir(parents=True)
+        (self.stage / "profiles" / "a" / "shot.png").symlink_to(secret)
+        (self.stage / "profiles" / "b").symlink_to(self.root)
+        (self.stage / "profiles" / "c").mkdir()
+        (self.stage / "profiles" / "c" / "shot.png").write_bytes(PNG)
+        read = device_prototypes.read_inside
+        self.assertIsNone(read(self.stage, ("profiles", "a", "shot.png"), 1024))
+        self.assertIsNone(read(self.stage, ("profiles", "b", "secret.png"), 1024))
+        self.assertEqual(read(self.stage, ("profiles", "c", "shot.png"), 1024), PNG)
+        self.assertIsNone(read(self.stage, ("profiles", "c", "shot.png"), len(PNG) - 1), "over the limit")
 
 
 class PublishTests(unittest.TestCase):

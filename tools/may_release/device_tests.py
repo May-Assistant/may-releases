@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shlex
 import shutil
@@ -105,9 +106,11 @@ SESSION_SECONDS = 30 * 60
 # makes each MAESTRO_-prefixed variable a flow variable, so a flow reads it as ${MAESTRO_MAY_TEST_SESSION} (run
 # 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in).
 MAESTRO_SESSION = "MAESTRO_MAY_TEST_SESSION"
-# Maestro gets a HOME of its own under the runner's temp folder, never the runner's: its debug output holds each flow's
+# Maestro gets a home of its own under the runner's temp folder, never the runner's: its debug output holds each flow's
 # evaluated commands, the test session among them, and later steps run may-app code on the same runner. It is removed
-# at the run's end; on Android it carries the runner's adb key pair, which the emulator trusts.
+# at the run's end; on Android it carries the runner's adb key pair, which the emulator trusts. Maestro writes that
+# output under $XDG_STATE_HOME/maestro, else Java's user.home, which Java reads from the passwd entry, not $HOME (second
+# security review of #104), so maestro_isolation sets all three; any ~/.maestro/tests a run leaves is removed too.
 MAESTRO_HOME = "may-maestro-home"
 
 
@@ -124,8 +127,17 @@ def maestro_home(root):
     return home
 
 
+def maestro_isolation(home):
+    """The environment that keeps Maestro's state and debug output in home: HOME, XDG_STATE_HOME and, through the
+    launcher's MAESTRO_OPTS, Java's user.home."""
+    return {"HOME": str(home), "XDG_STATE_HOME": str(home), "MAESTRO_OPTS": f"-Duser.home={home}"}
+
+
 def forget_maestro_home(root):
     shutil.rmtree(root / MAESTRO_HOME, ignore_errors=True)
+    # Java's user.home (the passwd entry) and $HOME, in case either Maestro call ever wrote there.
+    for home in {Path(pwd.getpwuid(os.getuid()).pw_dir), Path.home()}:
+        shutil.rmtree(home / ".maestro" / "tests", ignore_errors=True)
 
 
 # may-app's subflow that taps a signed-in account through onboarding ("Hi, I'm May") to Chats, run before each agent
@@ -1010,7 +1022,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
         show_touches(adb, env, log, True)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
-                                ANDROID_HOME=str(flows.sdk()), HOME=str(maestro_home(root)))
+                                ANDROID_HOME=str(flows.sdk()), **maestro_isolation(maestro_home(root)))
         budget = (budgeted or Budget)()
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
@@ -1308,9 +1320,19 @@ def render_prototypes(copied=device_prototypes.copy_paths, rendered=device_proto
             copied(root / "may-source", folder)
             scratch = root / "may-private" / "prototypes"
             scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
-            # Outside the runner's home: the render user reads only this.
-            stage = Path(tempfile.mkdtemp(prefix="may-render-")) / "prototypes"
-            made, failed = rendered(root / "may-source", folder, stage, scratch)
+            # Outside the runner's home: the render user reads only this, and none of private.
+            private = (root, *(root / name for name in ("may-claude", "may-source", "may-private", MAESTRO_HOME)),
+                       *(home / name for home in {Path(pwd.getpwuid(os.getuid()).pw_dir), Path.home()}
+                         for name in (".maestro", ".android")))
+            parent = Path(tempfile.mkdtemp(prefix="may-render-"))
+            try:
+                made, failed = rendered(root / "may-source", folder, parent / "prototypes", scratch, private=private)
+            finally:
+                # The stage itself is removed by the render; its empty temporary folder goes here.
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
     except Exception:
         print("May device tests (android): no prototype screens (an error stopped them; the seal goes on)")
         return

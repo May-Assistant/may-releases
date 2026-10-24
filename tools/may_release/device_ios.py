@@ -220,7 +220,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     tag, since = device_tests.run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     env = xcode()
     maestro_env = dict(env, MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
-                       HOME=str(device_tests.maestro_home(root)))
+                       **device_tests.maestro_isolation(device_tests.maestro_home(root)))
     at("booting the simulator")
     udid = boot(log, env)
     results, records, cleaned_count = [], {}, None
