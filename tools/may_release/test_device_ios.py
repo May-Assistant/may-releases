@@ -17,7 +17,7 @@ import device_ios
 import device_tests
 from device_tests import DeviceTestsError
 import renders
-from test_device_tests import MP4, SHA, TOKEN
+from test_device_tests import FLOW, MP4, SHA, TOKEN
 from test_renders import png
 
 UDID = "0A1B2C3D-0000-4000-8000-000000000001"
@@ -41,7 +41,7 @@ class Workspace(unittest.TestCase):
         self.source, self.private = self.root / "may-source", self.root / "may-private"
         (self.source / "ios").mkdir(parents=True)
         (self.source / device_tests.FLOWS_DIR).mkdir(parents=True)
-        (self.source / device_tests.FLOWS_DIR / "sign-in.yaml").write_text("appId: x\n")
+        (self.source / device_tests.FLOWS_DIR / "sign-in.yaml").write_text(FLOW)
         self.private.mkdir()
 
     def tearDown(self):
@@ -152,7 +152,7 @@ class RunTests(Workspace):
         return calls, minted, report, out.getvalue(), runs[0]
 
     def test_the_session_goes_in_the_launch_environment_alone_and_fresh_per_scenario(self):
-        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text("appId: x\n")
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         calls, minted, report, out, run = self.run_it()
         launches = [(argv, env) for argv, env in calls if argv[:3] == ["xcrun", "simctl", "launch"]]
         # may-app #1194's in-app touch overlay, as a launch argument (Samuel, 24 Oct); the session stays out of argv.
@@ -194,6 +194,14 @@ class RunTests(Workspace):
         _, _, report, _, _ = self.run_it(maestro_fails=True)
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("fail", None), ("fail", "may-app has no Maestro flow for this scenario")])
+
+    def test_a_flow_tagged_android_alone_is_skipped_on_ios(self):
+        """connections.yaml was tagged android alone and ran on iOS (the coordinator, 24 Oct)."""
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW.replace("  - ios\n", ""))
+        calls, minted, report, _, _ = self.run_it()
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("sign-in", "ui-pass", device_tests.UNCONFIGURED), ("connections", "skipped", "skipped (flow not tagged for ios)")])
+        self.assertEqual(len(minted), 1, "no session is minted for the skipped scenario")
 
     def test_a_switched_off_scenario_is_skipped(self):
         calls, minted, report, _, _ = self.run_it(env={"MAY_DEVICE_TESTS_SKIP": "sign-in"})
@@ -346,7 +354,7 @@ class RecorderTests(Workspace):
             def stop(self, folder):
                 return []
 
-        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text("appId: x\n")
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         with patch("test_device_ios.FakeRecorder", Dropping):
             _, _, report, out, _ = RunTests.run_it(self)
         self.assertIn("May device tests (ios): sign-in: its recording was dropped (over the cap at 51 MB)", out)

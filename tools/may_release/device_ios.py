@@ -240,6 +240,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if flow is not None and (not flow.is_file() or flow.is_symlink()):
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
                 continue
+            if flow is not None and device_tests.untagged(row, flow, "ios"):
+                entry["reason"] = device_tests.UNTAGGED["ios"]
+                continue
             token = minted(base, secret) if row["driver"] != device_tests.SMOKE else ""
             at(f"{row['id']}: launching the app")
             launch(udid, env, token, log)
