@@ -142,6 +142,26 @@ class AndroidLaunchTests(unittest.TestCase):
         starts, _, _ = self.launch("", [0])
         self.assertEqual(starts[0], "am start -W -n " + device_tests.APP_ID + "/" + device_tests.ACTIVITY + "\n")
 
+    def test_a_hung_start_is_a_failed_attempt_and_retried_once(self):
+        def run(argv, **kwargs):
+            if not hasattr(run, "hung"):
+                run.hung = True
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        slept, real = [], device_tests.adb_shell
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "log"
+            with patch("device_tests.flows.run_private", return_value=0), \
+                    patch("device_tests.flows.sleep", side_effect=slept.append), \
+                    patch("device_tests.adb_shell", side_effect=lambda adb, env, log_, line: real(adb, env, log_, line, run=run)):
+                try:
+                    device_tests.launch("/sdk/adb", {}, "token-" + "x" * 30, log)
+                except subprocess.TimeoutExpired:
+                    self.fail("a hung start stopped the run instead of counting as a failed attempt")
+            self.assertEqual(slept, [device_tests.LAUNCH_RETRY_SECONDS], "one retry after the hung attempt")
+            self.assertIn(b"adb shell timed out", log.read_bytes())
+
     def test_adb_shell_takes_the_line_on_stdin_alone(self):
         seen = {}
 

@@ -387,12 +387,20 @@ def launch(adb, env, token, log):
     raise DeviceTestsError("May Playground did not start on the emulator after one retry")
 
 
+ADB_SHELL_SECONDS = 120
+
+
 def adb_shell(adb, env, log, line, run=subprocess.run):
-    """`adb shell` running the one command line it reads on stdin: its exit status (the command's). Its output goes to
-    the private log alone."""
+    """`adb shell` running the one command line it reads on stdin: its exit status (the command's), or 1 when it did
+    not finish within ADB_SHELL_SECONDS (a hung `am start -W`: a failed attempt, never a stopped run). Its output goes
+    to the private log alone."""
     with log.open("ab") as output:
-        return run([adb, "shell"], env=env, input=line.encode(), stdout=output, stderr=subprocess.STDOUT,
-                   timeout=120).returncode
+        try:
+            return run([adb, "shell"], env=env, input=line.encode(), stdout=output, stderr=subprocess.STDOUT,
+                       timeout=ADB_SHELL_SECONDS).returncode
+        except subprocess.TimeoutExpired:
+            output.write(b"adb shell timed out\n")
+            return 1
 
 
 class Recorder:
