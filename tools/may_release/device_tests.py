@@ -95,6 +95,8 @@ TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{20,4096}")
 # Recordings: about 720p at about 1 Mbps, in screenrecord's 3-minute chunks: under 25 MB a chunk.
 RECORD_SIZE, RECORD_BITRATE, RECORD_SECONDS = "720x1600", "1000000", 180
 FLOW_SECONDS = 600
+# A staging test session's lifetime (it has no refresh): each scenario's cap must fit inside it.
+SESSION_SECONDS = 30 * 60
 # The scenario's test session, handed to its Maestro flow in Maestro's environment, never as an argument: Maestro's CLI
 # makes each MAESTRO_-prefixed variable a flow variable, so a flow reads it as ${MAESTRO_MAY_TEST_SESSION} (run
 # 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in).
@@ -564,7 +566,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             if flow is not None and (not flow.is_file() or flow.is_symlink()):
                 entry.update(verdict="fail", reason="may-app has no Maestro flow for this scenario")
                 continue
-            # A fresh session per scenario: one lasts 30 minutes and has no refresh. The smoke scenario has none.
+            # A fresh session per scenario: one lasts SESSION_SECONDS and has no refresh. The smoke scenario has none.
             token = minted(base, secret) if row["driver"] != SMOKE else ""
             at(f"{row['id']}: launching the app")
             launch(adb, env, token, log)
