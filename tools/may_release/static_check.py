@@ -21,7 +21,8 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # Messages these exceptions (and any subclass) carry may be printed by a CLI, so
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
-                  "DsCompileError", "CompilePrError", "RehearsalError", "UnitTestsError", "UnitPostError"}
+                  "DsCompileError", "CompilePrError", "RehearsalError", "UnitTestsError", "UnitPostError",
+                  "BackendTestsError", "BackendPostError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -248,6 +249,8 @@ WORKFLOW_MINTS = {
     "android-unit-pr.yml": {"unit": ("ci-read", "ci-comment")},
     "ios-archive-rehearsal.yml": {"rehearsal": ("ci-read",)},
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
+    "backend-unit-pr.yml": {"backend": ("ci-read", "ci-comment")},
+    "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
     "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
     "may-app-review.yml": {"review": ("ci-review",)},
@@ -1511,29 +1514,193 @@ def android_unit_print_problems(root):
     return found
 
 
-# The schedule (android-ci-schedule.yml, android_ci_schedule.py) dispatches android-unit-pr.yml for at most one may-app
-# head a run. Pinned whole: the schedule and a bare dispatch as its only triggers, one run at a time, admission with no
-# environment then pick in the environment admission chose, actions: write in pick alone, and no step holding both
-# credentials: GITHUB_TOKEN in runs and dispatch, the PR read token in pick alone, nothing in the cleanup. The tool's
-# one write is control_dispatch, which refuses any path but android-unit-pr.yml's dispatches before it sends anything.
-SCHEDULE = "android-ci-schedule.yml"
-SCHEDULE_TOOL = "android_ci_schedule.py"
+# May's backend checks at an open may-app pull request head (backend-unit-pr.yml, backend_unit.py, backend_unit_post.py):
+# may-app's switched-off backend-ci.yml, run here. The same admission, pull request check, fetch and environment as
+# android-unit-pr.yml (gate.py --action compile-pr, may-native-compile-pr; prepare.py's Android pull-request fetch), so
+# it holds nothing that lane does not: the PR read token in the check alone, the two source-read keys in the fetch alone,
+# the comment token in the post alone, and no secret or GitHub token on the checks' step (it runs the pull request's own
+# install scripts, typecheck, migrations and tests) or the cleanup. It is pinned whole: dispatch with exactly pr_number
+# and source_sha, read-only, Linux runners, backend-ci.yml's Postgres service exactly (BACKEND_SERVICES: 16.15 by digest,
+# trust auth on the runner's loopback, no secret), the pinned Node installed without carrying a value to later steps
+# (backend_unit.py finds it by path), nothing run but its seven commands, backend-ci.yml's 20-minute job timeout, and no
+# artifact (backend-ci.yml's log upload is dropped: this repository's artifacts are public), step summary or carried
+# value. backend_unit.py prints only fixed lines, a stage's name and verdict from its own words, and integer test counts;
+# backend_unit_post.py only fixed lines, the pull request number and two counts (backend_unit_print_problems).
+BACKEND = "backend-unit-pr.yml"
+BACKEND_NODE = "python3 -I -S -B tools/may_release/toolchain.py node"
+BACKEND_RUN = 'python3 -I -S -B tools/may_release/backend_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome'
+BACKEND_POST = ('python3 -I -S -B tools/may_release/backend_unit_post.py --source-sha "$MAY_SOURCE_SHA" '
+                '--pr-number "$MAY_PR_NUMBER"')
+BACKEND_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+                   '"$RUNNER_TEMP/may-npm" "$RUNNER_TEMP/may-tools"')
+BACKEND_RUNS = [GATE_COMPILE_PR, BACKEND_NODE, GATE_CHECK_PULL, PREPARE_ANDROID_PR, BACKEND_RUN, BACKEND_POST,
+                BACKEND_CLEANUP]
+BACKEND_STEP_NAMES = ["Install the pinned, checksum-verified Node",
+                      "Check the pull request head and environment before fetching",
+                      "Fetch the pull request head and pinned design system quietly",
+                      "Run the backend checks without any credential, printing only pass or fail and counts",
+                      "Post the backend failures on the may-app pull request, never in this log",
+                      "Remove private source, logs, dependencies and the pinned Node"]
+BACKEND_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in UNIT_SECRETS}
+BACKEND_RUN_NAME = "\nrun-name: 'May backend checks for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
+# backend-ci.yml's service container, exactly: Postgres 16.15 by digest, superuser may_admin with trust auth (nothing
+# secret), on the runner's loopback, healthy before any step runs.
+BACKEND_SERVICES = (
+    "    services:\n"
+    "      postgres:\n"
+    "        image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d\n"
+    "        env:\n"
+    "          POSTGRES_USER: may_admin\n"
+    "          POSTGRES_DB: postgres\n"
+    "          POSTGRES_HOST_AUTH_METHOD: trust\n"
+    "        ports:\n"
+    "          - 5432:5432\n"
+    "        options: >-\n"
+    "          --health-cmd \"pg_isready -h 127.0.0.1 -U may_admin -d postgres\"\n"
+    "          --health-interval 2s\n"
+    "          --health-timeout 5s\n"
+    "          --health-retries 30\n")
+
+
+@with_app_tokens("backend-unit-pr.yml")
+def backend_unit_workflow_problems(text):
+    name = BACKEND + ": "
+    found = []
+    if job_text(text, "backend").count(BACKEND_SERVICES) != 1 or text.count("services:") != 1 or \
+            text.count("image:") != 1 or text.count("options:") != 1 or text.count("ports:") != 1:
+        found.append(name + "the Postgres service is not exactly backend-ci.yml's 16.15, pinned by digest")
+    text = text.replace(BACKEND_SERVICES, "", 1)
+    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or \
+            "GITHUB_PATH" in text or "--export" in text or "--platform ios" in text or "toolchain.py jdk" in text or \
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "backend")] != [1, 1] or \
+            text.count("runs-on:") != 2:
+        found.append(name + "is not the Linux backend run with no artifact, step summary or carried value")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
+    if BACKEND_RUN_NAME not in text or text.count("run-name:") != 1:
+        found.append(name + "run-name is not exactly the pull request number and head SHA (backend_ci_schedule.py reads it)")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly pr_number and source_sha")
+    if "\nconcurrency:\n  group: may-backend-unit-pr\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "backend")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "backend"]:
+        found.append(name + "jobs are not exactly admission and backend")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != BACKEND_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the Node install, the check, the fetch, the backend "
+                     "checks, the post and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "backend")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["backend"]]
+    cleanup = steps["backend"][-1][1] if steps["backend"] else ""
+    if leading != {"admission": ["uses", "id"], "backend": ["uses"] + ["name"] * len(BACKEND_STEP_NAMES)} or \
+            names != [""] + BACKEND_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + "backend's steps are not exactly the Node install, check, fetch, checks, post and an "
+                     "always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 20\n" not in job_text(text, "backend"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than backend's 20 minutes")
+    job = job_text(text, "backend")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
+            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "backend's environment is not the one admission chose, after admission")
+    by_name = dict(steps["backend"])
+    node, check, fetch, checks, post, clean = (by_name.get(n, "") for n in BACKEND_STEP_NAMES)
+    # Each secret bound exactly once: the PR token in the pull request check, the read keys in the fetch, the comment
+    # token in the post (after the pull request's own install scripts and tests have run). The checks get the source
+    # SHA alone; the post the inputs and its token, no GitHub token; the Node install and the cleanup no env.
+    if secrets_in(text) != set(UNIT_SECRETS) or any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
+            secrets_in(post) != {PR_COMMENT_SECRET} or \
+            secrets_in(node + checks + clean) or "GH_TOKEN" in fetch + checks + post or "env:" in node + clean or \
+            env_entries(checks) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")] or \
+            sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
+            any(e not in BACKEND_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
+                     "the post's comment token and the dispatch's inputs")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    return found
+
+
+BACKEND_TOOL = "backend_unit.py"
+BACKEND_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(passed)", "int(failed)", "int(skipped)"}
+BACKEND_EXIT_CLASSES = {"BackendTestsError", "StoreError"}
+BACKEND_POST_TOOL = "backend_unit_post.py"
+BACKEND_POST_PRINT_VALUES = {"number", "int(total)", "int(errors)"}
+BACKEND_POST_EXIT_CLASSES = {"GateDenial", "BackendPostError", "CompilePrError", "DsCompileError", "StoreError"}
+# The post's step summary (backend_unit_post.summary_lines): fixed words, the stage's own name and verdict word (WORDS,
+# from a recorded verdict read_record checked), and integer counts only.
+BACKEND_SUMMARY_VALUES = {"verdict", "name", "WORDS[outcome['stages'][name]]", "int(counts[0])", "int(counts[1])",
+                          "int(counts[2])", "int(counts[3])", "int(failed['total'])", "int(failed['typecheck_total'])"}
+
+
+def backend_unit_print_problems(root):
+    found = quiet_tool_problems(root, BACKEND_TOOL, BACKEND_PRINT_VALUES, BACKEND_EXIT_CLASSES) + \
+        quiet_tool_problems(root, BACKEND_POST_TOOL, BACKEND_POST_PRINT_VALUES, BACKEND_POST_EXIT_CLASSES,
+                            {"GITHUB_STEP_SUMMARY": "write_summary"})
+    tree = ast.parse((root / "tools/may_release" / BACKEND_POST_TOOL).read_text())
+    lines, writer = function_source(tree, "summary_lines"), function_source(tree, "write_summary")
+    values = [ast.unparse(v.value) for n in ast.walk(lines) for v in getattr(n, "values", [])
+              if isinstance(n, ast.JoinedStr) and isinstance(v, ast.FormattedValue)] if lines else None
+    loop = [n for n in ast.walk(lines) if isinstance(n, ast.For)] if lines else []
+    words = assigned_literal(root / "tools/may_release" / BACKEND_POST_TOOL, "WORDS")
+    if values is None or not set(values) <= BACKEND_SUMMARY_VALUES or \
+            [ast.unparse(n.target) + " in " + ast.unparse(n.iter) for n in loop] != ["name in STAGES"] or \
+            writer is None or [a.arg for a in writer.args.args] != ["lines"] or \
+            not isinstance(words, dict) or not all(isinstance(w, str) for w in words.values()):
+        found.append(BACKEND_POST_TOOL + ": the step summary formats something other than fixed words, stage names and "
+                     "counts")
+    return found
+
+
+# The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py) each
+# dispatch their lane's workflow (android-unit-pr.yml, backend-unit-pr.yml) for at most one may-app head a run. Each is
+# pinned whole by the same rules (SCHEDULES): the schedule and a bare dispatch as its only triggers, one run at a time,
+# admission with no environment then pick in the environment admission chose, actions: write in pick alone, and no step
+# holding both credentials: GITHUB_TOKEN in runs and dispatch, the PR read token in pick alone, nothing in the cleanup.
+# Each tool's one write is control_dispatch, which refuses any path but its lane's dispatches before it sends anything.
 SCHEDULE_CRON = '  schedule:\n    - cron: "*/15 * * * *"\n  workflow_dispatch:\npermissions:'
-SCHEDULE_RUNS = ["python3 -I -S -B tools/may_release/android_ci_schedule.py " + step for step in ("admit", "runs", "pick", "dispatch")] + \
-    ['rm -rf -- "$RUNNER_TEMP/may-android-ci"']
-SCHEDULE_STEP_NAMES = ["List the unit runs of the last 30 days, with no may-app credential",
-                       "Pick the oldest may-app head touching Android with no run yet, with no GitHub token",
-                       "Dispatch the unit suites for the picked head, with no may-app credential",
-                       "Remove the carried numbers"]
 SCHEDULE_PICK_PERMISSIONS = "    permissions:\n      contents: read\n      actions: write\n    steps:\n"
 SCHEDULE_PRINT_VALUES = {"int(count)", "int(looked)", "int(number)", "sha"}
 SCHEDULE_EXIT_CLASSES = {"GateDenial", "ScheduleError"}
-SCHEDULE_DISPATCH = "actions/workflows/android-unit-pr.yml/dispatches"
+# workflow: (its tool, its concurrency group, its carried-state folder, its step names, the lane's run-name as the tool
+# formats it, the lane's dispatches endpoint)
+SCHEDULES = {
+    "android-ci-schedule.yml": (
+        "android_ci_schedule.py", "may-android-ci-schedule", "may-android-ci",
+        ["List the unit runs of the last 30 days, with no may-app credential",
+         "Pick the oldest may-app head touching Android with no run yet, with no GitHub token",
+         "Dispatch the unit suites for the picked head, with no may-app credential",
+         "Remove the carried numbers"],
+        "May Android unit suites for may-app #{number} at {sha}", "actions/workflows/android-unit-pr.yml/dispatches"),
+    "backend-ci-schedule.yml": (
+        "backend_ci_schedule.py", "may-backend-ci-schedule", "may-backend-ci",
+        ["List the backend runs of the last 30 days, with no may-app credential",
+         "Pick the oldest may-app head touching the backend with no run yet, with no GitHub token",
+         "Dispatch the backend checks for the picked head, with no may-app credential",
+         "Remove the carried numbers"],
+        "May backend checks for may-app #{number} at {sha}", "actions/workflows/backend-unit-pr.yml/dispatches"),
+}
+SCHEDULE = "android-ci-schedule.yml"
+SCHEDULE_TOOL = SCHEDULES[SCHEDULE][0]
+SCHEDULE_DISPATCH = SCHEDULES[SCHEDULE][5]
+BACKEND_SCHEDULE = "backend-ci-schedule.yml"
 
 
-@with_app_tokens("android-ci-schedule.yml")
-def android_ci_schedule_workflow_problems(text):
-    name = SCHEDULE + ": "
+def schedule_workflow_problems(workflow, text):
+    tool, group, carried, step_names, _, _ = SCHEDULES[workflow]
+    lane = SCHEDULES[workflow][5].split("/")[2]
+    name = workflow + ": "
     found = []
     if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or \
             [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "pick")] != [1, 1] or \
@@ -1545,7 +1712,7 @@ def android_ci_schedule_workflow_problems(text):
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["schedule", "workflow_dispatch"] or SCHEDULE_CRON not in text or \
             text.count("cron:") != 1 or re.search(r"(?m)^    (inputs|types|branches):", trigger):
         found.append(name + "is not scheduled every 15 minutes and dispatched with no input, only")
-    if "\nconcurrency:\n  group: may-android-ci-schedule\n  cancel-in-progress: false\n" not in text:
+    if f"\nconcurrency:\n  group: {group}\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group, never cancelling a run")
     writes = re.findall(r"(?m)^\s+[\w-]+:\s*write\b", text)
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or text.count("permissions:") != 3 or \
@@ -1555,14 +1722,16 @@ def android_ci_schedule_workflow_problems(text):
     if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "pick"]:
         found.append(name + "jobs are not exactly admission and pick")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
-    if runs != SCHEDULE_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
-        found.append(name + "runs something other than android_ci_schedule.py's admit, runs, pick and dispatch, and the cleanup")
+    expected = [f"python3 -I -S -B tools/may_release/{tool} {step}" for step in ("admit", "runs", "pick", "dispatch")] + \
+        [f'rm -rf -- "$RUNNER_TEMP/{carried}"']
+    if runs != expected or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + f"runs something other than {tool}'s admit, runs, pick and dispatch, and the cleanup")
     steps = {job: job_steps(text, job)[1] for job in ("admission", "pick")}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
     names = [step for step, _ in steps["pick"]]
     cleanup = steps["pick"][-1][1] if steps["pick"] else ""
-    if leading != {"admission": ["uses", "id"], "pick": ["uses"] + ["name"] * len(SCHEDULE_STEP_NAMES)} or \
-            names != [""] + SCHEDULE_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+    if leading != {"admission": ["uses", "id"], "pick": ["uses"] + ["name"] * len(step_names)} or \
+            names != [""] + step_names or "\n        if: always()\n" not in cleanup or \
             uses_in(text) != [CHECKOUT, CHECKOUT]:
         found.append(name + "pick's steps are not exactly runs, pick, dispatch and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
@@ -1573,7 +1742,7 @@ def android_ci_schedule_workflow_problems(text):
             "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + "pick's environment is not the one admission chose, after admission")
     by_name = dict(steps["pick"])
-    listed, picked, dispatched, clean = (by_name.get(n, "") for n in SCHEDULE_STEP_NAMES)
+    listed, picked, dispatched, clean = (by_name.get(n, "") for n in step_names)
     gate = steps["admission"][1][1] if len(steps["admission"]) > 1 else ""
     token = [("GH_TOKEN", "${{ github.token }}")]
     if secrets_in(text) != {PR_READ_SECRET} or text.count("secrets." + PR_READ_SECRET) != 1 or \
@@ -1583,17 +1752,31 @@ def android_ci_schedule_workflow_problems(text):
             "${{ inputs." in text:
         found.append(name + "a step holds a credential other than GITHUB_TOKEN in admit, runs and dispatch and the PR "
                      "read token in pick alone")
+    if lane not in text.partition("\non:\n")[0]:
+        found.append(name + f"does not name the workflow it dispatches ({lane})")
     return found
 
 
-def android_ci_schedule_tool_problems(root):
-    path = root / "tools/may_release" / SCHEDULE_TOOL
-    found = quiet_tool_problems(root, SCHEDULE_TOOL, SCHEDULE_PRINT_VALUES, SCHEDULE_EXIT_CLASSES, {"GITHUB_OUTPUT": "admit"})
+@with_app_tokens("android-ci-schedule.yml")
+def android_ci_schedule_workflow_problems(text):
+    return schedule_workflow_problems(SCHEDULE, text)
+
+
+@with_app_tokens("backend-ci-schedule.yml")
+def backend_ci_schedule_workflow_problems(text):
+    return schedule_workflow_problems(BACKEND_SCHEDULE, text)
+
+
+def schedule_tool_problems(root, workflow):
+    tool, _, _, _, run_name, dispatch_path = SCHEDULES[workflow]
+    lane = dispatch_path.split("/")[2]
+    path = root / "tools/may_release" / tool
+    found = quiet_tool_problems(root, tool, SCHEDULE_PRINT_VALUES, SCHEDULE_EXIT_CLASSES, {"GITHUB_OUTPUT": "admit"})
     tree = ast.parse(path.read_text())
-    if assigned_literal(path, "RUN_NAME") != "May Android unit suites for may-app #{number} at {sha}":
-        found.append(SCHEDULE_TOOL + ": RUN_NAME is not android-unit-pr.yml's run-name")
-    if assigned_literal(path, "DISPATCH_PATH") != SCHEDULE_DISPATCH:
-        found.append(SCHEDULE_TOOL + ": DISPATCH_PATH is not android-unit-pr.yml's dispatches endpoint")
+    if assigned_literal(path, "RUN_NAME") != run_name:
+        found.append(tool + f": RUN_NAME is not {lane}'s run-name")
+    if assigned_literal(path, "DISPATCH_PATH") != dispatch_path:
+        found.append(tool + f": DISPATCH_PATH is not {lane}'s dispatches endpoint")
     # Every request that sends a body or names a method is control_dispatch's, which compares its path first.
     dispatch = function_source(tree, "control_dispatch")
     senders = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and called_name(n.func) == "Request" and
@@ -1605,7 +1788,20 @@ def android_ci_schedule_tool_problems(root):
             "f'{API}/repos/{CONTROL_REPO}/{DISPATCH_PATH}'" not in ast.unparse(senders[0]) or \
             any(isinstance(n, ast.Call) and called_name(n.func) in ("urlopen", "Request") and n not in list(ast.walk(dispatch))
                 and any(k.arg in ("data", "method") for k in n.keywords) for n in ast.walk(tree)):
-        found.append(SCHEDULE_TOOL + ": a request writes somewhere other than control_dispatch's android-unit-pr.yml dispatch")
+        found.append(tool + f": a request writes somewhere other than control_dispatch's {lane} dispatch")
+    return found
+
+
+def android_ci_schedule_tool_problems(root):
+    return schedule_tool_problems(root, SCHEDULE)
+
+
+def backend_ci_schedule_tool_problems(root):
+    found = schedule_tool_problems(root, BACKEND_SCHEDULE)
+    # Its may-app reads go through android_ci_schedule.app_get (pinned above), never a reader of its own.
+    tree = ast.parse((root / "tools/may_release" / SCHEDULES[BACKEND_SCHEDULE][0]).read_text())
+    if function_source(tree, "app_get") is not None or "APP_REPO}/" in ast.unparse(tree):
+        found.append(SCHEDULES[BACKEND_SCHEDULE][0] + ": reads may-app other than through android_ci_schedule.app_get")
     return found
 
 
@@ -2020,6 +2216,10 @@ def control_problems(root):
     found += android_unit_print_problems(root)
     found += android_ci_schedule_workflow_problems((flows / SCHEDULE).read_text())
     found += android_ci_schedule_tool_problems(root)
+    found += backend_unit_workflow_problems((flows / BACKEND).read_text())
+    found += backend_unit_print_problems(root)
+    found += backend_ci_schedule_workflow_problems((flows / BACKEND_SCHEDULE).read_text())
+    found += backend_ci_schedule_tool_problems(root)
     found += renders_workflow_problems((flows / RENDERS).read_text())
     found += renders_print_problems(root)
     found += device_tests_workflow_problems((flows / DEVICE_TESTS).read_text())

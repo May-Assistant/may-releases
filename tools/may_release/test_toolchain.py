@@ -44,9 +44,15 @@ class ToolchainTests(unittest.TestCase):
 
     def test_pins_are_exact_https_sha256(self):
         for (name, system, machine), (url, checksum, top) in toolchain.TOOLS.items():
-            self.assertTrue(url.startswith("https://github.com/"), url)
+            # GitHub releases, or Node.js's own dist host for Node alone.
+            self.assertTrue(url.startswith("https://github.com/") or
+                            (name == "node" and url.startswith("https://nodejs.org/dist/v")), url)
             self.assertRegex(checksum, r"^[0-9a-f]{64}$")
         self.assertIn("21.0.12.1", toolchain.TOOLS[("jdk", "Linux", "x86_64")][0])
+        # may-app backend-ci.yml's Node, exactly.
+        url, _, top = toolchain.TOOLS[("node", "Linux", "x86_64")]
+        self.assertEqual((url, top), ("https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.gz",
+                                      "node-v22.22.0-linux-x64"))
 
     def test_verified_archive_installs(self):
         with self.pin(archive_bytes([("age/age", b"#!/bin/sh\n", "file")])):
