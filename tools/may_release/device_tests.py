@@ -320,6 +320,14 @@ def run_tag():
     return "qa-" + (run if re.fullmatch(r"[1-9][0-9]{4,19}", run) else str(int(time.time())))
 
 
+def show_touches(adb, env, log, on):
+    """Android's own touch dots (Settings > Developer options > Show taps) on the emulator, so each recording shows
+    where every tap lands (Samuel, 24 Oct); on before the scenarios and off after. A setting that will not take
+    never stops the run."""
+    flows.run_private([adb, "shell", "settings", "put", "system", "show_touches", "1" if on else "0"], log, env=env,
+                      check=False)
+
+
 def launch(adb, env, token, log):
     """The app, stopped and started again with a fresh test session (signed out, with no token: the smoke scenario).
     It names MainActivity, as may-app's hook documents (TestSession.kt), rather than resolving the launcher: smoke run
@@ -535,6 +543,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     try:
         at("installing the app")
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
+        show_touches(adb, env, log, True)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()))
         budget = (budgeted or Budget)()
@@ -598,6 +607,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             cleaned_count = cleaned(base, token, since, tag)
     finally:
         token = secret = ""
+        show_touches(adb, env, log, False)
         emulator.terminate()
         try:
             emulator.wait(timeout=60)
