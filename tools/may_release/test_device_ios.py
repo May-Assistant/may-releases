@@ -70,14 +70,17 @@ class BuildTests(Workspace):
             device_ios.build(tool=tool)
         return calls, out.getvalue()
 
-    def test_builds_a_debug_playground_for_the_simulator_unsigned(self):
+    def test_builds_a_debug_playground_for_the_simulator_signed_ad_hoc(self):
         calls, out = self.build()
         self.assertEqual(calls[0], (["/x/xcodegen", "generate"], self.source / "ios"))
         xcodebuild = calls[1][0]
         for flag, value in (("-scheme", "MayPlayground"), ("-configuration", "Debug"),
                             ("-destination", "generic/platform=iOS Simulator")):
             self.assertEqual(xcodebuild[xcodebuild.index(flag) + 1], value)
-        self.assertEqual(xcodebuild[-2:], ["CODE_SIGNING_ALLOWED=NO", "build"])
+        # Signed ad hoc so the Keychain works (run 40035089599: unsigned, it refused the test session).
+        self.assertEqual(xcodebuild[-4:], ["CODE_SIGN_IDENTITY=-", "CODE_SIGN_STYLE=Manual", "DEVELOPMENT_TEAM=",
+                                           "build"])
+        self.assertNotIn("CODE_SIGNING_ALLOWED=NO", xcodebuild)
         self.assertEqual(out.strip(), "May device tests: Playground debug app built for the iOS simulator")
 
     def test_a_failed_or_missing_build_stops(self):
