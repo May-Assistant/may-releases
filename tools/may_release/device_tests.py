@@ -300,6 +300,45 @@ def question_truth(base, token, state, tag, get=urllib.request.urlopen):
     return 200, False
 
 
+# What became of a chat scenario's messages (the coordinator, 24 Oct: "Not delivered" with no reason on the board).
+# Codes alone ever leave the runner: a reply run's status and its error code, as the server names them.
+CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+NONE_STORED = "none stored"
+MAX_DELIVERY = 10
+
+
+def sends_messages(row):
+    """An agent scenario whose goal sends May a message (chat, poll, routines): its messages are read afterwards."""
+    return row["driver"] == "agent" and "Send this message" in row["goal"]
+
+
+def message_codes(base, token, tag, get=urllib.request.urlopen):
+    """For each of the user's messages holding the tag, in May's own chat and any named with it (as question_truth),
+    its reply run's "<status>" or "<status> (<error_code>)" (latest_run), or "no run": at most MAX_DELIVERY. None
+    stored at all ([NONE_STORED]) means the app's send was refused before the server kept anything. None when the
+    chats could not be read. The text is read here only to find the tag."""
+    status, data = read_json(base, token, "/v1/agents", get)
+    if status != 200:
+        return None
+    agents = [row for row in listed(data, "agents") if isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
+    chosen = [row for row in agents if holds(row.get("name"), tag)] + agents[:1]
+    codes = []
+    for agent in list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]:
+        status, data = read_json(base, token, f"/v1/conversations/{agent['id']}/messages", get)
+        for message in listed(data, "messages") if status == 200 else []:
+            if message.get("author") == "user" and holds(message, tag):
+                codes.append(run_code(message.get("latest_run")))
+    return codes[:MAX_DELIVERY] or [NONE_STORED]
+
+
+def run_code(run):
+    if not isinstance(run, dict):
+        return "no run"
+    status = run.get("status") if isinstance(run.get("status"), str) and CODE.fullmatch(run["status"]) else "unknown"
+    error = run.get("error_code")
+    return f"{status} ({error})" if isinstance(error, str) and CODE.fullmatch(error) else status
+
+
 def cleanup(base, token, since, tag, post=urllib.request.urlopen):
     """K's cleanup of what the run created (only items made after since whose name or title holds tag): how many
     were removed, or None when it did not answer 200."""
@@ -516,7 +555,8 @@ def settle(entry, row, passed):
 
 
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
-                  agent=device_agent.run_agent, install=device_agent.install, budgeted=None):
+                  agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None):
+    delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
     require_step_secrets((SIGNIN_SECRET, device_agent.OAUTH))
@@ -601,6 +641,10 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 else:
                     path, (status, found) = check["get"], truth(base, token, check["get"], tag)
                 entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
+            if sends_messages(row):
+                codes = delivered(base, token, tag)
+                if codes is not None:
+                    entry["delivery"] = codes
             settle(entry, row, passed if flow is not None else None)
             token = ""
         if any(row["driver"] == "agent" for row in chosen):

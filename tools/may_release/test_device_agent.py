@@ -11,6 +11,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import device_agent
@@ -49,8 +50,12 @@ class AgentRunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
-                      asked=None):
+                      asked=None, delivered=None):
         calls, minted, seen = [], [], {}
+
+        def deliver(base, token, tag):
+            seen.setdefault("delivered", []).append((token, tag))
+            return ["failed (model_cap_reached)"]
 
         class Process:
             def terminate(self):
@@ -97,7 +102,7 @@ class AgentRunTests(unittest.TestCase):
             device_tests.run_scenarios(selection, minted=mint, checked=lambda *a: 200,
                                        truth=lambda base, token, path, tag: truth,
                                        asked=asked or (lambda base, token, state, tag: truth),
-                                       cleaned=clean, agent=agent,
+                                       cleaned=clean, agent=agent, delivered=delivered or deliver,
                                        install=lambda root: root / "may-claude" / "claude")
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", os.environ)
@@ -131,6 +136,10 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(report["scenarios"][2]["server"], [{"get": "/v1/routines", "status": 200, "pass": True},
                                                             {"get": "/v1/agents", "status": 200, "pass": True}])
         self.assertEqual(report["scenarios"][0]["notes"], "fine <b>")
+        self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738"), (TOKEN + "3", "qa-39557415738")],
+                         "chat and routines send May a message: their messages are read with their own session")
+        self.assertEqual([row.get("delivery") for row in report["scenarios"]],
+                         [["failed (model_cap_reached)"], None, ["failed (model_cap_reached)"]])
         self.assertEqual(run_out.splitlines(), [
             "May device tests (android): 3 scenarios ran; verdicts follow the judge step",
             "May device tests (android): the test session's cleanup removed 3 tagged items"])
@@ -196,6 +205,11 @@ class AgentRunTests(unittest.TestCase):
             ("routines", "skipped", device_tests.SWITCHED_OFF)])
         self.assertEqual(len(seen["goals"]), 1, "only notes ran")
 
+    def test_unreadable_chats_leave_no_delivery_in_the_row(self):
+        _, _, _, report, _, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3,
+                                                   delivered=lambda base, token, tag: None)
+        self.assertEqual([row.get("delivery") for row in report["scenarios"]], [None, None, None])
+
     def test_a_cleanup_that_does_not_answer_is_said(self):
         _, _, _, _, run_out, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3, cleaned=None)
         self.assertIn("the test session's cleanup did not answer; tagged items may remain", run_out)
@@ -250,6 +264,50 @@ class ServerTruthTests(unittest.TestCase):
                          "a question in a chat without the tag is someone else's")
         get, seen = server([{"id": "../../v1/account", "name": tag}], {})
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False))
+        self.assertEqual(seen, ["/v1/agents"], "an id that is not a plain id is never put in a path")
+
+    def test_message_codes_are_each_tagged_user_messages_run_status_and_error_code(self):
+        tag = "qa-39557415738"
+
+        def server(chats, messages, agents_status=200):
+            seen = []
+
+            def get(request, timeout):
+                path = request.full_url.removeprefix("https://s")
+                seen.append(path)
+                if path == "/v1/agents":
+                    if agents_status != 200:
+                        raise urllib.error.HTTPError(request.full_url, agents_status, "no", {}, None)
+                    return FakeReply(json.dumps({"agents": chats}).encode())
+                return FakeReply(json.dumps({"messages": messages.get(path, [])}).encode())
+            return get, seen
+
+        may = [{"id": "may", "name": "May"}, {"id": "a7", "name": "Week " + tag}]
+        get, seen = server(may, {
+            "/v1/conversations/may/messages": [
+                {"author": "user", "text": "Hello " + tag, "latest_run": {"status": "failed", "error_code": "model_cap_reached"}},
+                {"author": "may", "text": "Reply " + tag, "latest_run": {"status": "succeeded"}},
+                {"author": "user", "text": "untagged", "latest_run": {"status": "failed", "error_code": "other"}}],
+            "/v1/conversations/a7/messages": [
+                {"author": "user", "text": "Plan " + tag, "latest_run": {"status": "succeeded", "error_code": None}},
+                {"author": "user", "text": "Again " + tag},
+                {"author": "user", "text": "Odd " + tag, "latest_run": {"status": "Sent!", "error_code": "<b>"}}]})
+        codes = device_tests.message_codes("https://s", TOKEN, tag, get=get)
+        self.assertEqual(sorted(codes), sorted(["failed (model_cap_reached)", "succeeded", "no run", "unknown"]))
+        self.assertEqual(set(seen), {"/v1/agents", "/v1/conversations/may/messages", "/v1/conversations/a7/messages"})
+        for text in ("Hello", "Plan", "Sent!", "<b>", "other"):
+            self.assertNotIn(text, json.dumps(codes), "codes alone leave the reader")
+        get, _ = server(may, {"/v1/conversations/may/messages": [{"author": "user", "text": "untagged"}]})
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), [device_tests.NONE_STORED],
+                         "no tagged message at all: the send was refused before the server kept anything")
+        get, _ = server(may, {}, agents_status=401)
+        self.assertIsNone(device_tests.message_codes("https://s", TOKEN, tag, get=get))
+        many = [{"author": "user", "text": tag, "latest_run": {"status": "queued"}}] * 30
+        get, _ = server(may[:1], {"/v1/conversations/may/messages": many})
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get),
+                         ["queued"] * device_tests.MAX_DELIVERY)
+        get, seen = server([{"id": "../../v1/account", "name": tag}], {})
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), [device_tests.NONE_STORED])
         self.assertEqual(seen, ["/v1/agents"], "an id that is not a plain id is never put in a path")
 
     def test_cleanup_sends_since_and_tag_and_counts(self):
@@ -564,6 +622,28 @@ class PublishNotesTests(unittest.TestCase):
             path.write_text(json.dumps({"device": "android", "scenarios": [dict(row, reason="free text")]}))
             with self.assertRaises(publish.PublishError):
                 publish.device_report(path, set(), titles)
+
+
+    def test_delivery_codes_are_shown_and_anything_else_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            row = {"id": "chat", "verdict": "fail", "reason": device_tests.NO_TRUTH, "videos": [], "screenshots": [],
+                   "server": [{"get": "/v1/agents", "status": 200}], "delivery": ["failed (model_cap_reached)", "no run"]}
+            titles = {"chat": "Chat with May"}
+            path.write_text(json.dumps({"device": "android", "scenarios": [row]}))
+            _, rows = publish.device_report(path, set(), titles)
+            readme, _ = publish.device_pages("20261021-" + SHA[:12], {"android": rows}, "note")
+            self.assertIn("Server: GET /v1/agents: 200; Messages: failed (model_cap_reached), no run", readme)
+            path.write_text(json.dumps({"device": "android", "scenarios": [dict(row, delivery=[device_tests.NONE_STORED])]}))
+            _, rows = publish.device_report(path, set(), titles)
+            readme, _ = publish.device_pages("20261021-" + SHA[:12], {"android": rows}, "note")
+            self.assertIn("Messages: none stored (the send was refused before the server kept anything)", readme)
+            for delivery in (["Failed"], ["failed (x) (y)"], ["no run "], ["succeeded"] * 11, "succeeded", [1],
+                             ["failed (" + "a" * 70 + ")"]):
+                with self.subTest(delivery=delivery):
+                    path.write_text(json.dumps({"device": "android", "scenarios": [dict(row, delivery=delivery)]}))
+                    with self.assertRaises(publish.PublishError):
+                        publish.device_report(path, set(), titles)
 
 
 class SecretNameTests(unittest.TestCase):
