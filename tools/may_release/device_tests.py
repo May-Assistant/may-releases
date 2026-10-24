@@ -60,6 +60,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import board
 import device_agent
 from device_agent import AgentError
+import device_prototypes
 import flows
 from gate import AGE_RECIPIENT
 from prepare import head_revision
@@ -740,6 +741,9 @@ def board_inputs(source, folder):
         path = source / name
         if path.is_file() and not path.is_symlink() and path.stat().st_size <= board.MAX_INPUT:
             shutil.copyfile(path, folder / target)
+    if folder.name == "android":
+        # The flow prototypes' expected paths, once a run (board.py reads the Android folder's).
+        device_prototypes.copy_paths(source, folder)
 
 
 # A flow's own tags name the platforms it is written for; a scenario whose flow is not tagged for this job's platform is
@@ -1268,6 +1272,27 @@ def ffmpeg_encoder(root, log):
     return encode
 
 
+def render_prototypes(rendered=device_prototypes.render):
+    """The flow prototypes' expected screens (device_prototypes.py), into the Android run folder before the seal. Its own
+    step, with no secret, which the workflow also lets fail and bounds; nothing here ever fails the job."""
+    require_step_secrets(())
+    try:
+        root = runner_root()
+        runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
+        folder = runs[0] / "android" if len(runs) == 1 else None
+        work = root / "may-private" / "prototypes"
+        work.mkdir(mode=0o700, parents=True, exist_ok=True)
+        made, failed = rendered(root / "may-source", folder, work, work / "build.log") if folder and folder.is_dir() \
+            else (None, None)
+    except Exception:
+        print("May device tests (android): no prototype screens (an error stopped them; the seal goes on)")
+        return
+    if made is None:
+        print("May device tests (android): no prototype screens (no named path, or the build or Chrome is unavailable)")
+    else:
+        print(f"May device tests (android): {made} prototype screens rendered, {failed} failed")
+
+
 def make_previews(platform="android", encoder=None):
     """A PREVIEW_WIDTH-wide, silent preview of each scenario's recording, beside it in the run folder before the seal.
     Its own step, with no secret, which the workflow also lets fail (continue-on-error) and bounds (timeout-minutes),
@@ -1381,7 +1406,7 @@ def verdict(platform="android"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("build", "run", "judge", "previews", "seal", "verdict"))
+    parser.add_argument("command", choices=("build", "run", "judge", "previews", "prototypes", "seal", "verdict"))
     parser.add_argument("--scenarios", default="all")
     parser.add_argument("--platform", choices=PLATFORMS, default="android")
     args = parser.parse_args()
@@ -1400,7 +1425,7 @@ if __name__ == "__main__":
             build()
         else:
             {"judge": lambda: judge_scenarios(platform=args.platform), "seal": lambda: seal(args.platform),
-             "previews": lambda: make_previews(args.platform),
+             "previews": lambda: make_previews(args.platform), "prototypes": render_prototypes,
              "verdict": lambda: verdict(args.platform)}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None

@@ -370,6 +370,69 @@ class PreviewTests(BoardCase):
         self.assertNotIn("getElementById('meta')", template, "nothing adds a description to the header")
 
 
+PATH = {"flow": "sign-in-out", "board": "2", "pattern": "review-pages 1.1",
+        "cases": [{"id": "main", "name": "Sign in", "goal": "Sign in.", "start": None, "given": None},
+                  {"id": "unsent", "name": "Unsent", "goal": "Counts unsent.", "start": "x", "given": "One waits."}],
+        "steps": [{"n": 1, "platform": "both", "action": "assert", "target": {"id": "demo-signin"}, "expect": "Sign-in."},
+                  {"n": 2, "platform": "ios", "action": "type", "target": {"text": "Email"}, "value": "a@b.c",
+                   "expect": "Typed.", "step": "email", "unconfirmed": True},
+                  {"n": 1, "platform": "both", "action": "tap", "target": {"id": "demo-out"}, "expect": "Out.",
+                   "edge": "unsent", "given": {"code": "unsent", "text": "One waits."}}]}
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
+
+
+class ExpectedTests(BoardCase):
+    def test_a_path_is_checked_and_keeps_its_main_path(self):
+        checked = board.checked_path(PATH, "2")
+        self.assertEqual(checked["main"], {"name": "Sign in", "goal": "Sign in."})
+        self.assertEqual([(s["n"], s["platform"]) for s in checked["steps"]], [(1, "both"), (2, "ios")],
+                         "edge steps are left out; unconfirmed is not carried")
+        self.assertNotIn("unconfirmed", checked["steps"][1])
+        bad_steps = ({"n": 0}, {"platform": "web"}, {"action": "swipe"}, {"expect": "x" * 161}, {"target": "id"},
+                     {"target": {"id": "x", "xpath": "//a"}}, {"value": 7}, {"given": {"code": "x", "when": "y"}})
+        for change in bad_steps:
+            with self.subTest(change=change), self.assertRaises(board.BoardError):
+                board.checked_path(dict(PATH, steps=[dict(PATH["steps"][0], **change)]), "2")
+        for change in ({"board": "3"}, {"flow": "../x"}, {"cases": []}, {"steps": PATH["steps"] * 70},
+                       {"cases": [PATH["cases"][1]]}):
+            with self.subTest(change=change), self.assertRaises(board.BoardError):
+                board.checked_path(dict(PATH, **change), "2")
+
+    def write_run(self, name, files):
+        folder = self.base / name / "android"
+        folder.mkdir(parents=True)
+        reports = {"android": [row("sign-in", "pass")]}
+        for shot in reports["android"][0]["screenshots"]:
+            (folder / shot).write_bytes(b"\x89PNG")
+        for file_name, data in files.items():
+            (folder / file_name).write_bytes(data if isinstance(data, bytes) else json.dumps(data).encode())
+        return board.update(self.base, name, str(int(name[-12:], 16)), reports, FLOWS, NOTES, url, 10, TITLES, now=NOW)
+
+    def test_the_board_shows_the_newest_paths_and_keeps_them_through_a_run_without_any(self):
+        self.write_run(folder(1), {"path-2.json": PATH, "path-9.json": dict(PATH, board="9"),
+                                   "proto-2-android-1.png": PNG_BYTES, "proto-2-ios-2.png": b"GIF89a",
+                                   "proto-2-ios-1.png": PNG_BYTES + b"\0" * board.MAX_SHOT})
+        data = self.data(folder(1))[0]
+        self.assertEqual(data["expected"]["2"]["screens"], {"android": {"1": "expected/2/android/1.png"}, "ios": {}},
+                         "a screen that is not a small PNG is left out")
+        self.assertNotIn("9", data["expected"], "a path for a flow the board does not list is not shown")
+        self.write_run(folder(2), {})
+        kept = self.data(folder(2))[0]["expected"]
+        self.assertIn("2", kept, "a run without paths keeps the last set")
+        self.assertEqual(kept["2"]["main"]["name"], "Sign in")
+        self.assertTrue((self.base / board.BOARD / board.EXPECTED / "2" / "android" / "1.png").is_file())
+
+    def test_the_page_shows_expected_beside_the_recording_with_its_bar_under_it(self):
+        template = board.TEMPLATE.read_text()
+        well = template[template.index("function expectedWell("):template.index("function hasExpected(")]
+        self.assertRegex(well, r"el\('div', \{ class: 'player' \}, \[ph\]\),\s*el\('div', \{ class: 'xbar' \}",
+                         "the play bar sits under the media")
+        self.assertIn("@container (min-width: 560px)", template, "side by side when the card is wide")
+        self.assertIn(".pair[data-view=\"expected\"] .rec, .pair[data-view=\"recording\"] .exp { display: none; }",
+                      template, "one at a time, with a toggle, when it is narrow")
+        self.assertIn("timers.splice(0).forEach", template, "playback stops when the view changes")
+
+
 class DeviceInputTests(unittest.TestCase):
     def test_the_device_jobs_carry_may_apps_board_files_into_the_sealed_report(self):
         with tempfile.TemporaryDirectory() as directory:

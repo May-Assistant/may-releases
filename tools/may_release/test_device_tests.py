@@ -1310,6 +1310,27 @@ class PublishDeviceTests(unittest.TestCase):
                                     "notes (may-app's board-notes.json is malformed)")
         self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
 
+    def test_the_flow_prototypes_reach_the_board_and_a_bad_one_never_stops_the_publish(self):
+        flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
+        path = {"flow": "sign-in-out", "board": "2", "cases": [{"id": "main", "name": "Sign in", "goal": "Sign in."}],
+                "steps": [{"n": 1, "platform": "both", "action": "assert", "target": {"id": "demo-signin"},
+                           "expect": "The sign-in screen."}]}
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        try:
+            self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
+                                        (RUN + "/android/path-2.json", json.dumps(path).encode()),
+                                        (RUN + "/android/path-3.json", b'{"flow": '),
+                                        (RUN + "/android/proto-2-android-1.png", png),
+                                        (RUN + "/android/proto-2-ios-1.png", b"GIF89a not a png")])
+        except publish.PublishError as error:
+            self.fail(f"a bad prototype file stopped device-open: {error}")
+        work, _, _ = self.push_for_board()
+        page = (work / "device-tests" / "board" / "index.html").read_text()
+        data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
+        self.assertEqual(data["expected"]["2"]["screens"], {"android": {"1": "expected/2/android/1.png"}, "ios": {}})
+        self.assertEqual((work / "device-tests" / "board" / "expected" / "2" / "android" / "1.png").read_bytes(), png)
+        self.assertNotIn("3", data["expected"], "the malformed path is dropped")
+
     def test_deeply_nested_may_app_json_never_stops_the_publish(self):
         """Re-review of #86: 200,000 "[" raised RecursionError, which escaped extract() and stopped device-open."""
         try:

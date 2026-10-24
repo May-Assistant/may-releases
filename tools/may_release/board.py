@@ -122,6 +122,90 @@ def checked_notes(data):
     return {"banner": banner, "flows": flows, "results": results, "scenario_titles": titles}
 
 
+# The flow prototypes' expected paths (may-app's docs/evidence/prototypes/paths, review pages 1.1), carried in the
+# Android report as path-<board>.json, with each main-path step's screen as proto-<board>-<platform>-<n>.png
+# (device_prototypes.py). The board keeps the newest set in EXPECTED/ beside its media: rebuilt only from a run that
+# brings paths, so a run whose render failed keeps the last good one.
+EXPECTED, MAX_STEPS, MAX_CASES, MAX_SHOT = "expected", 200, 20, 512 * 1024
+PATH_FILE = re.compile(r"path-(" + FLOW_ID.pattern + r")\.json")
+SHOT_FILE = re.compile(r"proto-(" + FLOW_ID.pattern + r")-(android|ios)-([1-9][0-9]{0,2})\.png")
+ACTIONS, STEP_PLATFORMS = ("tap", "type", "wait", "assert"), ("both", "android", "ios")
+CASE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
+
+
+def checked_path(data, board_id):
+    """A prototype path (review pages 1.1): its cases and its main path's steps, each a fixed shape, or BoardError."""
+    cases, steps = (data.get("cases"), data.get("steps")) if isinstance(data, dict) else (None, None)
+    if not (isinstance(data, dict) and data.get("board") == board_id and isinstance(data.get("flow"), str) and
+            CASE_ID.fullmatch(data["flow"]) and isinstance(cases, list) and 0 < len(cases) <= MAX_CASES and
+            isinstance(steps, list) and 0 < len(steps) <= MAX_STEPS):
+        raise BoardError("A prototype path is malformed")
+    main = None
+    for case in cases:
+        if not (isinstance(case, dict) and isinstance(case.get("id"), str) and CASE_ID.fullmatch(case["id"]) and
+                text(case.get("name"), MAX_LINE) and text(case.get("goal"), MAX_LINE)):
+            raise BoardError("A prototype path has a malformed case")
+        if case["id"] == "main":
+            main = {"name": case["name"], "goal": case["goal"]}
+    kept = []
+    for step in steps:
+        target = step.get("target") if isinstance(step, dict) else None
+        if not (isinstance(step, dict) and type(step.get("n")) is int and 1 <= step["n"] <= 999 and
+                step.get("platform") in STEP_PLATFORMS and step.get("action") in ACTIONS and
+                text(step.get("expect"), MAX_LINE) and isinstance(target, dict) and set(target) <= {"id", "text"} and
+                all(text(value, MAX_LINE) for value in target.values()) and
+                all(key not in step or text(step[key], MAX_LINE) for key in ("value", "step", "edge")) and
+                ("given" not in step or text(step["given"], MAX_LINE) or isinstance(step["given"], dict) and
+                 set(step["given"]) <= {"code", "text"} and all(text(v, MAX_LINE) for v in step["given"].values()))):
+            raise BoardError("A prototype path has a malformed step")
+        if "edge" not in step:
+            kept.append({key: step[key] for key in ("n", "platform", "action", "target", "expect", "value", "step")
+                         if key in step})
+    if main is None or not kept:
+        raise BoardError("A prototype path has no main path")
+    return {"flow": data["flow"], "main": main, "steps": kept}
+
+
+def expected_from(run_folder, target):
+    """This run's checked paths and their screens, written to target (EXPECTED/): {board id: path with "screens"}, or
+    None when the run brought no path (the board keeps its last set). A malformed path, or a screen that is not a
+    small PNG, is left out."""
+    android = run_folder / "android"
+    files = sorted(android.glob("path-*.json")) if android.is_dir() else []
+    if not any(PATH_FILE.fullmatch(path.name) for path in files):
+        return None
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True)
+    expected = {}
+    for path in files:
+        match = PATH_FILE.fullmatch(path.name)
+        try:
+            checked = checked_path(read_json(path), match.group(1)) if match else None
+        except BoardError:
+            checked = None
+        if checked is None:
+            continue
+        board_id, screens = match.group(1), {"android": {}, "ios": {}}
+        for shot in sorted(android.glob(f"proto-{board_id}-*.png")):
+            found = SHOT_FILE.fullmatch(shot.name)
+            if not found or found.group(1) != board_id or shot.is_symlink() or not shot.is_file() or \
+                    shot.stat().st_size > MAX_SHOT or not shot.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+                continue
+            platform, n = found.group(2), found.group(3)
+            (target / board_id / platform).mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(shot, target / board_id / platform / f"{n}.png")
+            screens[platform][n] = f"{EXPECTED}/{board_id}/{platform}/{n}.png"
+        expected[board_id] = dict(checked, screens=screens)
+    (target / "paths.json").write_text(json.dumps(expected, indent=2) + "\n")
+    return expected
+
+
+def kept_expected(target):
+    """The board's last expected set (EXPECTED/paths.json), or {}."""
+    data = read_json(target / "paths.json")
+    return data if isinstance(data, dict) else {}
+
+
 def entry(folder, run, reports, now, previews=frozenset()):
     """This run's history entry from the checked device reports ({device: rows}); previews holds the
     "<device>/<scenario>" whose preview was made."""
@@ -247,7 +331,7 @@ def latest(entries):
     return found
 
 
-def payload(flows, notes, entries, asset_url, keep, titles):
+def payload(flows, notes, entries, asset_url, keep, titles, expected=None):
     """The page's data: flows with their state from each test's latest result, every kept run oldest first with its
     own results, and the latest view ("latest": each test's newest result, with the lanes' curated text)."""
     archived = archived_runs(entries, keep)
@@ -270,7 +354,9 @@ def payload(flows, notes, entries, asset_url, keep, titles):
                 row = flow_row({"id": f"{flow['id']}-{scenario}", "title": titles.get(scenario, scenario),
                                 "scenarios": [scenario], "components": flow["components"]}, {}, newest, entries)
                 out.append(dict(row, parent=flow["id"], scenario_row=True))
-    return {"flows": out, "runs": runs, "current": entries[0]["folder"], "results": results}
+    flow_ids = {flow["id"] for flow in flows}
+    return {"flows": out, "runs": runs, "current": entries[0]["folder"], "results": results,
+            "expected": {key: value for key, value in (expected or {}).items() if key in flow_ids}}
 
 
 def flow_row(flow, extra, newest, entries):
@@ -375,7 +461,10 @@ def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, 
                 word = "no notes"
             (staging / MEDIA).mkdir(exist_ok=True)
             (staging / MEDIA / "previews.json").write_text(json.dumps(previews_list(entries, keep), indent=2) + "\n")
-            (staging / "index.html").write_text(page(payload(flows, notes, entries, asset_url, keep, titles),
+            expected = expected_from(base / folder, staging / EXPECTED)
+            if expected is None:
+                expected = kept_expected(staging / EXPECTED)
+            (staging / "index.html").write_text(page(payload(flows, notes, entries, asset_url, keep, titles, expected),
                                                      notes["banner"], new["when"]))
         history = base / ".history.json.new"
         history.write_text(json.dumps(entries, indent=2) + "\n")
