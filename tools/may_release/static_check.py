@@ -1194,7 +1194,7 @@ def renders_workflow_problems(text):
 RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)",
                         "not_ios", "len(entries)"}
 PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices",
-                        "uploaded", "kept", "removed", "made", "failed"}
+                        "uploaded", "kept", "removed", "previews"}
 
 
 def renders_print_problems(root):
@@ -1222,7 +1222,7 @@ DEVICE_RUNS = [
     "python3 -I -S -B tools/may_release/toolchain.py age",
     'python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"',
     DEVICE_TOOL + "build", "|", DEVICE_TOOL + 'run --scenarios "$MAY_SCENARIOS"', DEVICE_TOOL + "judge",
-    DEVICE_TOOL + "seal", DEVICE_TOOL + "verdict",
+    DEVICE_TOOL + "previews", DEVICE_TOOL + "seal", DEVICE_TOOL + "verdict",
     'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
     '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
     '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
@@ -1230,15 +1230,13 @@ DEVICE_RUNS = [
     "python3 -I -S -B tools/may_release/toolchain.py age",
     'python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"',
     IOS_TOOL.format("build"), DEVICE_TOOL + 'run --platform ios --scenarios "$MAY_SCENARIOS"',
-    IOS_TOOL.format("judge"), IOS_TOOL.format("seal"), IOS_TOOL.format("verdict"),
+    IOS_TOOL.format("judge"), IOS_TOOL.format("previews"), IOS_TOOL.format("seal"), IOS_TOOL.format("verdict"),
     'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
     '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
     '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
     # publish
-    "python3 -I -S -B tools/may_release/toolchain.py age", "python3 -I -S -B tools/may_release/toolchain.py ffmpeg",
-    "python3 -I -S -B tools/may_release/publish.py device-open",
-    "python3 -I -S -B tools/may_release/publish.py device-previews",
-    "python3 -I -S -B tools/may_release/publish.py device-push",
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    "python3 -I -S -B tools/may_release/publish.py device-open", "python3 -I -S -B tools/may_release/publish.py device-push",
     "python3 -I -S -B tools/may_release/publish.py device-release",
     'rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-device-download" "$RUNNER_TEMP/may-publish-tree" '
     '"$RUNNER_TEMP/may-publish-git"']
@@ -1359,6 +1357,7 @@ def device_tests_workflow_problems(text):
 
 
 DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count", "platform",
+                       "made",
                        "smoke_passed", "stage", "detail"}
 
 

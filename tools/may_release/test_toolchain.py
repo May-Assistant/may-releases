@@ -79,36 +79,3 @@ class ToolchainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class AptPinTests(unittest.TestCase):
-    """ffmpeg for the flow board's previews: Ubuntu's own package, at exactly the recorded version."""
-
-    def run_with(self, version):
-        calls = []
-
-        class Done:
-            def __init__(self, code=0, out=b""):
-                self.returncode, self.stdout = code, out
-
-        def run(argv, stdout, stderr, stdin, env, timeout):
-            calls.append(argv)
-            return Done(out=version.encode()) if argv[0] == "dpkg-query" else Done()
-
-        with patch("toolchain.platform.system", return_value="Linux"):
-            toolchain.apt_install("ffmpeg", run=run)
-        return calls
-
-    def test_the_pinned_version_is_installed_and_checked(self):
-        calls = self.run_with(toolchain.APT_PINS["ffmpeg"])
-        self.assertEqual(calls[1][-1], "ffmpeg=7:6.1.1-3ubuntu5")
-        self.assertEqual(calls[0], ["sudo", "apt-get", "update", "-qq"])
-        self.assertEqual(calls[2][:2], ["dpkg-query", "-W"])
-
-    def test_another_version_or_runner_is_refused(self):
-        with self.assertRaises(StoreError):
-            self.run_with("7:6.1.1-3ubuntu6")
-        with patch("toolchain.platform.system", return_value="Darwin"), self.assertRaises(StoreError):
-            toolchain.apt_install("ffmpeg", run=lambda *a, **k: self.fail("ran"))
-        with self.assertRaises(StoreError):
-            toolchain.apt_install("curl", run=lambda *a, **k: self.fail("ran"))

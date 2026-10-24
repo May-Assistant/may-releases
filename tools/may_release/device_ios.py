@@ -64,6 +64,20 @@ def build(tool=renders.build):
     print("May device tests: Playground debug app built for the iOS simulator")
 
 
+def preview_encoder(log, tool=renders.build):
+    """preview.swift (AVFoundation), compiled with the pinned Xcode's swiftc into the private folder, as stitch.swift:
+    the function that makes one preview."""
+    binary = log.parent / "preview"
+    env = dict(os.environ, DEVELOPER_DIR=str(renders.XCODE))
+    tool(["xcrun", "swiftc", "-O", "-swift-version", "5", "-o", str(binary),
+          str(Path(__file__).resolve().parent / "preview.swift")], log, env=env)
+
+    def encode(video, target):
+        return not renders.quiet([str(binary), str(video), str(target), str(device_tests.PREVIEW_WIDTH)], log,
+                                 env=xcode(), timeout=device_tests.PREVIEW_SECONDS).returncode
+    return encode
+
+
 def xcode():
     env = child_env(DEVELOPER_DIR=str(renders.XCODE))
     # Maestro runs on the runner's Java 17 when the image names one.

@@ -325,15 +325,24 @@ class PreviewTests(BoardCase):
                          previews={"android/sign-in"})
         data, _ = self.data(folder(12))
         newest, oldest = data["results"][folder(12)], data["results"][folder(1)]
-        self.assertEqual(newest["android/sign-in"]["preview"], f"media/{folder(12)}/android-sign-in-preview.mp4")
+        self.assertEqual(newest["android/sign-in"]["preview"], f"media/{folder(12)}/android-sign-in.preview.mp4")
         self.assertNotIn("preview", newest["ios/sign-in"], "no preview was made for iOS")
         self.assertNotIn("preview", oldest["android/sign-in"], "an archived run has no release, so no preview")
         listed = json.loads((self.base / board.BOARD / board.MEDIA / "previews.json").read_text())
         self.assertEqual(len(listed), 10)
-        self.assertEqual(listed[f"media/{folder(12)}/android-sign-in-preview.mp4"],
-                         {"tag": f"device-tests-{folder(12)}", "asset": "android-sign-in-preview.mp4"})
-        self.assertEqual(publish.asset_name("android", "sign-in-preview.mp4"), "android-sign-in-preview.mp4",
-                         "the asset device-release uploads is the one listed")
+        self.assertEqual(listed[f"media/{folder(12)}/android-sign-in.preview.mp4"],
+                         {"tag": f"device-tests-{folder(12)}", "asset": "android-sign-in.preview.mp4"})
+        # The file the device job makes passes publish's layout, and device-release uploads it under the listed name.
+        made = "sign-in" + device_tests.PREVIEW
+        self.assertTrue(publish.DEVICE_FILE.fullmatch(made))
+        self.assertEqual(publish.asset_name("android", made), "android-sign-in.preview.mp4")
+
+    def test_the_page_falls_back_to_the_end_screen_when_a_preview_is_absent(self):
+        """Review of #88: a missing preview (not downloaded, or its upload failed) shows the end screen."""
+        template = board.TEMPLATE.read_text()
+        card = template[template.index("function card("):template.index("function tallyOf(")]
+        self.assertRegex(card, r"v\.addEventListener\('error', function \(\) \{\s*ph\.innerHTML = '';\s*"
+                               r"ph\.appendChild\(r\.thumb \? el\('img', \{ src: r\.thumb")
         self.assertFalse(list((self.base / board.BOARD).rglob("*.mp4")), "no video in git")
 
 

@@ -68,7 +68,7 @@ DEVICES = ("android", "ios")
 # may-app's flows and board notes, sealed by each device job and set aside by device-open for the flow board
 # (board.py), never committed.
 BOARD_INPUTS, BOARD, DROPPED = ("flows.json", "board-notes.json"), "may-device-board", ".dropped"
-DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.xml)|report\.json|"
+DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.preview\.mp4|\.xml)|report\.json|"
                          + "|".join(re.escape(name) for name in BOARD_INPUTS))
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS)
@@ -84,14 +84,12 @@ VIDEO_DAYS = 7
 RELEASE_TOKEN, RENDERS_REPO = "MAY_RENDERS_RELEASE_TOKEN", "May-Assistant/may-renders"
 UPLOADS = "https://uploads.github.com"
 VIDEOS = "may-device-videos"
-# The flow board's recording previews: release assets beside the recordings, never in git.
-PREVIEW, PREVIEW_WIDTH, PREVIEW_SECONDS = "-preview.mp4", 270, 300
 RELEASE_TAG = re.compile(r"device-tests-[0-9]{8}-[0-9a-f]{12}")
 _RELEASES = r"/repos/" + re.escape(RENDERS_REPO) + r"/releases"
 RELEASE_CALLS = (("POST", API, _RELEASES), ("GET", API, _RELEASES + r"/tags/" + RELEASE_TAG.pattern),
                  ("GET", API, _RELEASES + r"\?per_page=100"),
                  ("GET", API, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?per_page=100"),
-                 ("POST", UPLOADS, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?name=(?:android|ios)-[a-z0-9][a-z0-9-]{0,60}\.mp4"),
+                 ("POST", UPLOADS, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?name=(?:android|ios)-[a-z0-9][a-z0-9-]{0,60}(?:\.preview)?\.mp4"),
                  ("DELETE", API, _RELEASES + r"/[1-9][0-9]{0,15}"),
                  ("DELETE", API, r"/repos/" + re.escape(RENDERS_REPO) + r"/git/refs/tags/" + RELEASE_TAG.pattern))
 MAX_FILES = 2000
@@ -172,8 +170,8 @@ def is_json(data):
 
 
 def extract(archive, members, destination):
-    """The checked members, written under destination; returns the names of may-app board files it dropped as not
-    JSON."""
+    """The checked members, written under destination; returns the names of optional files it dropped: may-app board
+    files that are not JSON, and previews that are not small MP4s."""
     dropped = []
     for member in sorted(members, key=lambda m: m.name.count("/")):
         path = destination.joinpath(*member.name.split("/"))
@@ -190,6 +188,10 @@ def extract(archive, members, destination):
             output.write(data)
         if path.suffix == ".png" and not data.startswith(PNG):
             raise PublishError("A render is not a PNG")
+        if path.name.endswith(device_tests.PREVIEW) and (data[4:8] != b"ftyp" or len(data) > device_tests.MAX_PREVIEW):
+            path.unlink()  # a preview is optional: one that is not a small MP4 is dropped, never decoded here
+            dropped.append(path.name)
+            continue
         if path.suffix == ".mp4" and data[4:8] != b"ftyp":
             raise PublishError("A recording is not an MP4")
         if path.name in ("screens.json", "report.json"):
@@ -527,58 +529,6 @@ def open_device():
           f"from {devices} devices")
 
 
-def video_folder(root):
-    """The one run folder of recordings device-open moved aside, or None."""
-    base = root / "may-private" / VIDEOS
-    folders = [p for p in base.iterdir() if p.is_dir()] if base.is_dir() else []
-    return folders[0] if len(folders) == 1 and DEVICE_RUN.fullmatch(folders[0].name) else None
-
-
-def preview_sources(folder):
-    """(device, scenario, recording) for each scenario's recording, its first part when it has several."""
-    for device in sorted(folder.iterdir()):
-        if device.name not in DEVICES or not device.is_dir() or device.is_symlink():
-            continue
-        for video in sorted(device.iterdir()):
-            name = video.name
-            if name.endswith(PREVIEW) or re.search(r"-part[0-9]{1,2}\.mp4$", name) and not name.endswith("-part1.mp4"):
-                continue
-            match = re.fullmatch(r"([a-z0-9][a-z0-9-]{0,47}?)(?:-part1)?\.mp4", name)
-            if match and video.is_file() and not video.is_symlink():
-                yield device.name, match.group(1), video
-
-
-def make_previews(run=subprocess.run):
-    """A PREVIEW_WIDTH-wide, silent preview of each scenario's recording, beside it, for device-release to upload as
-    <device>-<scenario>-preview.mp4. Its own step, with no secret: ffmpeg (Ubuntu's, pinned in toolchain.APT_PINS)
-    reads the recordings, and its output goes to a private log."""
-    require_step_secrets(())
-    root = runner_root()
-    folder = video_folder(root)
-    if folder is None:
-        print("May device tests: no recordings were decrypted, so no previews were made")
-        return
-    log = root / "may-private" / "previews.log"
-    made = failed = 0
-    for device, scenario, video in list(preview_sources(folder)):
-        out = video.parent / (scenario + PREVIEW)
-        try:
-            with log.open("ab") as output:
-                done = run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(video), "-an",
-                                 "-vf", f"scale={PREVIEW_WIDTH}:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf",
-                                 "32", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-n", str(out)],
-                                stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=child_env(),
-                                timeout=PREVIEW_SECONDS).returncode
-        except (OSError, subprocess.SubprocessError):
-            done = 1
-        if not done and out.is_file() and out.read_bytes()[4:8] == b"ftyp" and out.stat().st_size <= MAX_FILE:
-            made += 1
-        else:
-            out.unlink(missing_ok=True)
-            failed += 1
-    print(f"May device tests: {made} previews made, {failed} failed")
-
-
 def push_device(run_git=git):
     require_step_secrets((WRITE_KEY,))
     key_text = write_key()
@@ -595,21 +545,20 @@ def push_device(run_git=git):
     inputs = root / "may-private" / BOARD
     # The reports device-open checked (the recordings have left the tree since, so they are not checked again).
     reports = board.read_json(inputs / "reports.json") or {}
+    # The previews the device jobs made (checked by device-open): the board points at them; device-release uploads them.
+    videos = root / "may-private" / VIDEOS / folder
+    previews = {f"{device.name}/{video.name[:-len(device_tests.PREVIEW)]}"
+                for device in (videos.iterdir() if videos.is_dir() else []) if device.name in DEVICES
+                for video in device.iterdir() if video.name.endswith(device_tests.PREVIEW)}
     # Android's copy of may-app's files first, else iOS's: both jobs check out the same commit.
     found = {name: next((board.read_json(inputs / f"{device}-{name}") for device in DEVICES
                          if (inputs / f"{device}-{name}").is_file()), None) for name in BOARD_INPUTS}
-    # The previews device-previews made: the board points at them, and device-release uploads them next.
-    folder_videos = video_folder(root)
-    previews = {f"{device.name}/{video.name[:-len(PREVIEW)]}" for device in (folder_videos.iterdir() if folder_videos
-                                                                               else []) if device.is_dir()
-                for video in device.iterdir() if video.name.endswith(PREVIEW)}
 
     def build_board(base):
         # The board never costs the run its publishing: any error in it skips the board alone (the log says so).
         try:
             return board.update(base, folder, entry["run"], reports, found["flows.json"], found["board-notes.json"],
-                                asset_url, KEEP, scenario_titles(), notes_dropped=notes_dropped,
-                                previews=previews)
+                                asset_url, KEEP, scenario_titles(), notes_dropped=notes_dropped, previews=previews)
         except Exception:
             return "error"
 
@@ -706,19 +655,24 @@ def release_device(api=renders_api):
               if DEVICE_FILE.fullmatch(video.name) and video.suffix == ".mp4" and video.is_file()
               and not video.is_symlink()]
     release, present = release_for(run, token, api)
-    uploaded = 0
-    for device, video in videos:
+    uploaded = previews = 0
+    # The recordings first, each one required; then the board's previews, each one optional (a missing preview shows
+    # the end screen), so a preview can never cost the run its recordings.
+    for device, video in sorted(videos, key=lambda pair: pair[1].name.endswith(device_tests.PREVIEW)):
         name = asset_name(device, video.name)
         if name in present:
             continue
         status, _ = api("POST", UPLOADS, f"/repos/{RENDERS_REPO}/releases/{release}/assets?name={name}", token,
                         data=video.read_bytes())
-        if status != 201:
+        if video.name.endswith(device_tests.PREVIEW):
+            previews += status == 201
+        elif status != 201:
             raise PublishError("A recording could not be uploaded to the may-renders release")
-        uploaded += 1
+        else:
+            uploaded += 1
     kept, removed = prune_releases(token, api)
-    print(f"May device tests: {uploaded} recordings uploaded to the may-renders release for device-tests/{run}/ "
-          f"({kept} releases kept, {removed} removed)")
+    print(f"May device tests: {uploaded} recordings and {previews} previews uploaded to the may-renders release for "
+          f"device-tests/{run}/ ({kept} releases kept, {removed} removed)")
 
 
 _PR = r"/repos/" + re.escape(APP_REPO) + r"/{}/[1-9][0-9]{{0,6}}"
@@ -782,16 +736,13 @@ def comment(sha, pr, call_api=github):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("open", "push", "comment", "device-open", "device-previews", "device-push",
-                                            "device-release"))
+    parser.add_argument("command", choices=("open", "push", "comment", "device-open", "device-push", "device-release"))
     parser.add_argument("--source-sha")
     parser.add_argument("--pr-number")
     args = parser.parse_args()
     try:
         if args.command == "device-open":
             open_device()
-        elif args.command == "device-previews":
-            make_previews()
         elif args.command == "device-push":
             push_device()
         elif args.command == "device-release":

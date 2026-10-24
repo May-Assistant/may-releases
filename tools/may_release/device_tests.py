@@ -707,6 +707,83 @@ def smoke_rows(platform):
     return scenarios(",".join(ids), platform) if ids else []
 
 
+# The flow board's previews (board.py): made here, in the device job that already runs may-app code, never in the
+# publish job that holds the publish secrets (review of may-releases #88). A dot is never in a scenario id, so a
+# preview never shares a name with a recording; publish.py only checks and uploads them.
+PREVIEW, PREVIEW_WIDTH, PREVIEW_SECONDS = ".preview.mp4", 270, 300
+MAX_PREVIEW = 20 * 1024 * 1024
+
+
+def preview_sources(folder):
+    """(scenario, recording) for each scenario's recording in a device folder: its first part when it has several."""
+    for video in sorted(folder.iterdir()) if folder.is_dir() else []:
+        name = video.name
+        if name.endswith(PREVIEW) or re.search(r"-part[0-9]{1,2}\.mp4$", name) and not name.endswith("-part1.mp4"):
+            continue
+        match = re.fullmatch(r"([a-z0-9][a-z0-9-]{0,47}?)(?:-part1)?\.mp4", name)
+        if match and video.is_file() and not video.is_symlink():
+            yield match.group(1), video
+
+
+def ffmpeg_encoder(root, log):
+    """Ubuntu's ffmpeg from apt (its current, patched build; apt checks the archive's signature): the function that
+    makes one preview. Raises DeviceTestsError when it will not install."""
+    env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C"}
+    for argv in (["sudo", "apt-get", "update", "-qq"],
+                 ["sudo", "apt-get", "install", "-y", "-qq", "--no-install-recommends", "ffmpeg"]):
+        if flows.run_private(argv, log, env=env, check=False, timeout=600):
+            raise DeviceTestsError("ffmpeg did not install")
+
+    def encode(video, target):
+        return not flows.run_private(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(video), "-an", "-vf",
+             f"scale={PREVIEW_WIDTH}:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "32", "-pix_fmt",
+             "yuv420p", "-movflags", "+faststart", "-n", str(target)], log, env=env, check=False,
+            timeout=PREVIEW_SECONDS)
+    return encode
+
+
+def make_previews(platform="android", encoder=None):
+    """A PREVIEW_WIDTH-wide, silent preview of each scenario's recording, beside it in the run folder before the seal.
+    Its own step, with no secret. Nothing here ever fails the job: a preview that will not make is left out, and the
+    board shows the end screen instead."""
+    require_step_secrets(())
+    root = runner_root()
+    runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
+    folder = runs[0] / platform if len(runs) == 1 else None
+    sources = list(preview_sources(folder)) if folder else []
+    if not sources:
+        print(f"May device tests ({platform}): no recordings, so no previews")
+        return
+    log = root / "may-private" / "previews.log"
+    log.parent.mkdir(mode=0o700, exist_ok=True)
+    try:
+        if encoder is None:
+            if platform == "ios":
+                sys.modules.setdefault("device_tests", sys.modules[__name__])
+                import device_ios
+                encoder = device_ios.preview_encoder(log)
+            else:
+                encoder = ffmpeg_encoder(root, log)
+    except Exception:
+        print(f"May device tests ({platform}): no previews (the encoder is unavailable)")
+        return
+    made = failed = 0
+    for scenario, video in sources:
+        target = folder / (scenario + PREVIEW)
+        try:
+            ok = encoder(video, target)
+        except Exception:
+            ok = False
+        if ok and target.is_file() and not target.is_symlink() and target.stat().st_size <= MAX_PREVIEW and \
+                target.read_bytes()[4:8] == b"ftyp":
+            made += 1
+        else:
+            target.unlink(missing_ok=True)
+            failed += 1
+    print(f"May device tests ({platform}): {made} previews made, {failed} failed")
+
+
 def seal(platform="android"):
     """One tar of the run folder, encrypted to MAY_RENDERS_RECIPIENT; nothing in the clear leaves the runner."""
     require_step_secrets(())
@@ -754,7 +831,7 @@ def verdict(platform="android"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("build", "run", "judge", "seal", "verdict"))
+    parser.add_argument("command", choices=("build", "run", "judge", "previews", "seal", "verdict"))
     parser.add_argument("--scenarios", default="all")
     parser.add_argument("--platform", choices=PLATFORMS, default="android")
     args = parser.parse_args()
@@ -773,6 +850,7 @@ if __name__ == "__main__":
             build()
         else:
             {"judge": lambda: judge_scenarios(platform=args.platform), "seal": lambda: seal(args.platform),
+             "previews": lambda: make_previews(args.platform),
              "verdict": lambda: verdict(args.platform)}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None

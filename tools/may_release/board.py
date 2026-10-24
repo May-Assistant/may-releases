@@ -13,7 +13,8 @@ list), each with its own state; the flow's own page lists them.
 
 The run history (device-tests/history.json) keeps HISTORY runs, newest first, each with its verdicts and its end
 screenshots copied to device-tests/board/media/<folder>/, so they outlive the run folder (publish.KEEP). Previews
-(270px, silent) are release assets, never in git: the page expects each at media/<folder>/<device>-<scenario>-preview.mp4
+(270px, silent, made by the device jobs) are release assets, never in git: the page expects each at
+media/<folder>/<device>-<scenario>.preview.mp4
 and media/previews.json says which release asset holds it; a preview that is absent falls back to the end screen. A run older than
 the KEEP newest has lost its release, so the board shows it as Archived: verdict and end screen, no recording.
 """
@@ -287,7 +288,7 @@ def preview_path(folder, key):
 
 def preview_asset(key):
     device, scenario = key.split("/")
-    return f"{device}-{scenario}-preview.mp4"
+    return f"{device}-{scenario}.preview.mp4"  # device_tests.PREVIEW, as publish.asset_name names the upload
 
 
 def previews_list(entries, keep):

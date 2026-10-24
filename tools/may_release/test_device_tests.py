@@ -436,6 +436,78 @@ class ToolTests(unittest.TestCase):
             self.assertIn(["/sdk/adb", "shell", "pkill", "-2", "screenrecord"], pulled)
 
 
+class DevicePreviewTests(unittest.TestCase):
+    """Review of #88: previews are made in the device job (which already runs may-app code, and holds no publish
+    secret), before the seal; nothing in that step ever fails the job."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.folder = self.root / device_tests.OUT / RUN / "android"
+        self.folder.mkdir(parents=True)
+        for name in ("sign-in.mp4", "notes-part1.mp4", "notes-part2.mp4", "chat.mp4", "sign-in-end.png"):
+            (self.folder / name).write_bytes(MP4)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def previews(self, encoder, platform="android"):
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            try:
+                device_tests.make_previews(platform, encoder=encoder)
+            except Exception as error:
+                self.fail(f"the previews step failed the job: {type(error).__name__}")
+        return out.getvalue().strip()
+
+    def test_each_scenarios_first_recording_gets_a_preview_and_a_bad_one_is_left_out(self):
+        seen = []
+
+        def encode(video, target):
+            seen.append(video.name)
+            if video.name == "chat.mp4":
+                target.write_bytes(b"not an mp4")  # made, but not a video: left out
+                return True
+            if video.name == "notes-part1.mp4":
+                raise OSError("encoder crashed")
+            target.write_bytes(MP4)
+            return True
+
+        self.assertEqual(self.previews(encode), "May device tests (android): 1 previews made, 2 failed")
+        self.assertEqual(sorted(seen), ["chat.mp4", "notes-part1.mp4", "sign-in.mp4"])
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir() if p.name.endswith(device_tests.PREVIEW)),
+                         ["sign-in.preview.mp4"])
+
+    def test_no_encoder_or_no_recording_never_fails_the_job(self):
+        with patch("device_tests.ffmpeg_encoder", side_effect=DeviceTestsError("ffmpeg did not install")):
+            self.assertEqual(self.previews(None), "May device tests (android): no previews (the encoder is unavailable)")
+        self.assertEqual(self.previews(lambda v, t: True, platform="ios"), "May device tests (ios): no recordings, so "
+                                                                            "no previews")
+
+    def test_android_encodes_with_apts_ffmpeg_at_270px_silent_never_overwriting(self):
+        calls = []
+        with patch("device_tests.flows.run_private", side_effect=lambda argv, log, **k: calls.append(argv) or 0):
+            encode = device_tests.ffmpeg_encoder(self.root, self.root / "log")
+            encode(self.folder / "sign-in.mp4", self.folder / "sign-in.preview.mp4")
+        self.assertEqual(calls[1][-1], "ffmpeg", "apt's current ffmpeg, not a pinned old one")
+        self.assertIn("scale=270:-2", calls[2])
+        self.assertIn("-an", calls[2])
+        self.assertEqual(calls[2][-2:], ["-n", str(self.folder / "sign-in.preview.mp4")])
+
+    def test_ios_compiles_preview_swift_with_the_pinned_xcode(self):
+        import device_ios
+        built = []
+        encode = device_ios.preview_encoder(self.root / "log", tool=lambda argv, log, env: built.append((argv, env)))
+        argv, env = built[0]
+        self.assertEqual(argv[:3], ["xcrun", "swiftc", "-O"])
+        self.assertTrue(argv[-1].endswith("preview.swift") and Path(argv[-1]).is_file())
+        self.assertEqual(env["DEVELOPER_DIR"], str(device_ios.renders.XCODE))
+        with patch("renders.quiet", return_value=Done(0)) as quiet:
+            self.assertTrue(encode(self.folder / "sign-in.mp4", self.folder / "sign-in.preview.mp4"))
+        self.assertEqual(quiet.call_args.args[0][1:], [str(self.folder / "sign-in.mp4"),
+                                                        str(self.folder / "sign-in.preview.mp4"), "270"])
+
+
 class ReasonTests(unittest.TestCase):
     """Run 40057045702: a full run's iOS budget-skipped row carried a reason publish.py did not accept, so device-open
     refused the whole report and nothing was published."""
@@ -691,45 +763,22 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(data["results"]["latest"]["android/sign-in"]["headline"], "Signs in")
         self.assertFalse(list((work / "device-tests").rglob("flows.json")), "may-app's files are never committed")
 
-    def test_previews_are_made_beside_each_scenarios_first_recording_and_the_board_points_at_them(self):
-        """The flow board's previews (Samuel, 24 Oct): 270px, silent, release assets, never in git."""
+    def test_device_made_previews_are_checked_kept_apart_and_the_board_points_at_them(self):
+        """Review of #88: previews come sealed from the device job; publish checks them and never decodes them."""
         flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
-        self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
-                                    (RUN + "/android/notes-part1.mp4", MP4), (RUN + "/android/notes-part2.mp4", MP4)])
+        try:
+            self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
+                                        (RUN + "/android/sign-in" + device_tests.PREVIEW, MP4),
+                                        (RUN + "/android/notes" + device_tests.PREVIEW, b"<html>not a video")])
+        except publish.PublishError as error:
+            self.fail(f"a bad preview stopped device-open: {error}")
         videos = self.root / "may-private" / publish.VIDEOS / RUN / "android"
-        calls = []
-
-        def ffmpeg(argv, stdout, stderr, stdin, env, timeout):
-            calls.append(argv)
-            if "notes-part1.mp4" in argv[argv.index("-i") + 1]:
-                return Done(1)  # one failure: no preview, and the run goes on
-            Path(argv[-1]).write_bytes(MP4)
-            return Done(0)
-
-        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
-                patch("sys.stdout", new_callable=io.StringIO) as out:
-            publish.make_previews(run=ffmpeg)
-        self.assertEqual(out.getvalue().strip(), "May device tests: 1 previews made, 1 failed")
-        self.assertEqual(sorted(Path(argv[argv.index("-i") + 1]).name for argv in calls),
-                         ["notes-part1.mp4", "sign-in.mp4"], "each scenario's first recording alone")
-        self.assertIn("scale=270:-2", calls[0])
-        self.assertIn("-an", calls[0])
-        self.assertEqual(sorted(p.name for p in videos.iterdir() if p.name.endswith("-preview.mp4")),
-                         ["sign-in-preview.mp4"])
-        work = self.root / "may-publish-git"
-
-        def git(argv, log, env, cwd, capture=False):
-            if argv[0] == "init":
-                Path(argv[-1]).mkdir()
-            return b""
-
-        key = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "A" * 120 + "\n-----END OPENSSH PRIVATE KEY-----"
-        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_APP_RENDERS_WRITE_KEY": key,
-                                     "GITHUB_RUN_ID": "9"}, clear=True), patch("sys.stdout", new_callable=io.StringIO):
-            publish.push_device(run_git=git)
+        self.assertEqual(sorted(p.name for p in videos.iterdir()), ["sign-in.mp4", "sign-in.preview.mp4"],
+                         "the bad preview is dropped, the good one set aside with the recordings, out of git")
+        work, lines, _ = self.push_for_board()
         page = (work / "device-tests" / "board" / "index.html").read_text()
         data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
-        self.assertEqual(data["results"][RUN]["android/sign-in"]["preview"], f"media/{RUN}/android-sign-in-preview.mp4")
+        self.assertEqual(data["results"][RUN]["android/sign-in"]["preview"], f"media/{RUN}/android-sign-in.preview.mp4")
         self.assertFalse(list((work / "device-tests").rglob("*.mp4")), "no video in may-renders' git")
 
     def push_for_board(self):
@@ -802,8 +851,9 @@ class PublishDeviceTests(unittest.TestCase):
 class FakeRenders:
     """may-renders' release API as device-release sees it, recording every call."""
 
-    def __init__(self, existing=(), create=201, assets=(), upload=201):
+    def __init__(self, existing=(), create=201, assets=(), upload=201, failing=()):
         self.calls, self.existing, self.create, self.assets, self.upload = [], list(existing), create, list(assets), upload
+        self.failing = set(failing)
 
     def __call__(self, method, host, path, token, payload=None, data=None):
         self.calls.append((method, host, path, payload, data))
@@ -815,7 +865,7 @@ class FakeRenders:
         if method == "GET" and path == base + "/releases/77/assets?per_page=100":
             return 200, [{"name": name} for name in self.assets]
         if method == "POST" and host == publish.UPLOADS:
-            return self.upload, {}
+            return (500 if path.rsplit("=", 1)[1] in self.failing else self.upload), {}
         if method == "GET" and path == base + "/releases?per_page=100":
             return 200, self.existing
         if method == "DELETE":
@@ -850,8 +900,8 @@ class ReleaseDeviceTests(unittest.TestCase):
         existing = [{"id": n, "tag_name": "device-tests-202610%02d-%012x" % (n, n), "created_at": "x"}
                     for n in range(1, 12)] + [{"id": 500, "tag_name": "v1.0"}]
         api = FakeRenders(existing=existing)
-        self.assertEqual(self.release(api), f"May device tests: 3 recordings uploaded to the may-renders release for "
-                                            f"device-tests/{RUN}/ (10 releases kept, 1 removed)")
+        self.assertEqual(self.release(api), f"May device tests: 3 recordings and 0 previews uploaded to the may-renders "
+                                            f"release for device-tests/{RUN}/ (10 releases kept, 1 removed)")
         create = api.calls[0]
         self.assertEqual(create[:3], ("POST", publish.API, "/repos/May-Assistant/may-renders/releases"))
         self.assertEqual((create[3]["tag_name"], create[3]["target_commitish"], create[3]["make_latest"]),
@@ -865,9 +915,34 @@ class ReleaseDeviceTests(unittest.TestCase):
                                    "/repos/May-Assistant/may-renders/git/refs/tags/device-tests-20261001-000000000001"],
                          "only the oldest device-tests release goes; other releases are never touched")
 
+    def test_recordings_go_up_first_and_a_preview_that_fails_never_costs_them(self):
+        """Review of #88: "x-preview.mp4" sorted before "x.mp4", and a failed preview upload aborted the recordings."""
+        (self.videos / ("sign-in" + device_tests.PREVIEW)).write_bytes(MP4)
+        (self.videos / ("connections" + device_tests.PREVIEW)).write_bytes(MP4)
+        api = FakeRenders(failing=["android-connections.preview.mp4"])
+        try:
+            out = self.release(api)
+        except publish.PublishError as error:
+            self.fail(f"a preview upload failure stopped the release: {error}")
+        names = [c[2].rsplit("=", 1)[1] for c in api.calls if c[1] == publish.UPLOADS]
+        self.assertEqual(names[:3], ["android-connections-part1.mp4", "android-connections-part2.mp4",
+                                     "android-sign-in.mp4"], "every recording before any preview")
+        self.assertEqual(sorted(names[3:]), ["android-connections.preview.mp4", "android-sign-in.preview.mp4"])
+        self.assertIn("3 recordings and 1 previews uploaded", out, "previews are never counted as recordings")
+        with self.assertRaises(publish.PublishError):
+            self.release(FakeRenders(failing=["android-sign-in.mp4"]))
+
+    def test_the_longest_scenario_ids_preview_is_a_file_and_an_asset_the_release_accepts(self):
+        """Review of #88: a long id made "<id>-preview.mp4" too long for DEVICE_FILE, so it never uploaded."""
+        longest = "s" * 48
+        self.assertTrue(publish.DEVICE_FILE.fullmatch(longest + device_tests.PREVIEW))
+        upload = next(pattern for method, host, pattern in publish.RELEASE_CALLS if host == publish.UPLOADS)
+        self.assertTrue(re.fullmatch(upload, "/repos/May-Assistant/may-renders/releases/77/assets?name=" +
+                                     publish.asset_name("ios", longest + device_tests.PREVIEW)))
+
     def test_a_re_run_reuses_the_release_and_skips_assets_already_there(self):
         api = FakeRenders(create=422, assets=["android-sign-in.mp4"])
-        self.assertIn("2 recordings uploaded", self.release(api))
+        self.assertIn("2 recordings and 0 previews uploaded", self.release(api))
         self.assertIn(("GET", publish.API, f"/repos/May-Assistant/may-renders/releases/tags/device-tests-{RUN}", None,
                        None), api.calls)
 
