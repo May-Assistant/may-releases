@@ -793,10 +793,16 @@ def scenario_flow(row, source, private):
 # literal's fixed start before an interpolation ("connections.row.${c.wire}") whose remainder is itself a literal
 # ("google_calendar"), so a misspelt row id is still caught.
 FLOW_IDS = "the flow names an id the app's sources lack"
-DESIGN_SYSTEM = "may-design-system"
+# prepare.py moves the design system's checkout into may-app's Android build: its Kotlin under android/, its Swift under
+# swift/. Each platform reads may-app's own folder (the design system's checkout left out of Android's) and its own
+# part of the design system.
+DESIGN_SYSTEM_BUILD = "build-deps/may-design-system"
+PLATFORM_SOURCES = {"android": ("android", "android"), "ios": ("ios", "swift")}
 SOURCE_SUFFIXES = (".kt", ".swift")
-FLOW_ID = re.compile(r"\s*(?:-\s+)?id:\s*([\"']?)([^\"'#\s]+)\1\s*(?:#.*)?")
-RUN_FLOW = re.compile(r"\s*-\s+runFlow:\s*([\"']?)([A-Za-z0-9_./-]+\.yaml)\1\s*(?:#.*)?")
+# A flow's ids in either form, "id: x" on its own line or inline in {id: x, …}, and the flows it runs, as runFlow: x.yaml
+# or a runFlow block's file: x.yaml (a runScript's file is JavaScript, never followed).
+FLOW_ID = re.compile(r"(?<![\w-])id:\s*([\"']?)([^\"',{}\s]+)\1")
+RUN_FLOW = re.compile(r"(?<![\w-])(?:runFlow|file):\s*([\"']?)([A-Za-z0-9_./-]+\.yaml)\1")
 LITERAL = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
 ID_PATTERN = re.compile(r"[\\*+?()\[\]{}^$]")
 INTERPOLATION = re.compile(r"\$\{|\$[A-Za-z_]|\\\(")
@@ -810,11 +816,25 @@ def flow_ids(flow, seen=None):
     seen.add(flow)
     ids = set()
     for line in flow.read_text(errors="replace")[:MAX_FLOW_BYTES].splitlines():
-        if (found := FLOW_ID.fullmatch(line)):
-            ids.add(found.group(2))
-        elif (nested := RUN_FLOW.fullmatch(line)) and ".." not in Path(nested.group(2)).parts:
-            ids |= flow_ids(flow.parent / nested.group(2), seen)
+        line = uncommented(line)
+        ids.update(found[1] for found in FLOW_ID.findall(line))
+        for _, nested in RUN_FLOW.findall(line):
+            if ".." not in Path(nested).parts:
+                ids |= flow_ids(flow.parent / nested, seen)
     return ids
+
+
+def uncommented(line):
+    """A flow line without its YAML comment: from a # at its start or after a space, outside quotes."""
+    quote = None
+    for at, char in enumerate(line):
+        if quote:
+            quote = None if char == quote else quote
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (at == 0 or line[at - 1].isspace()):
+            return line[:at]
+    return line
 
 
 def app_literals(roots):
@@ -836,11 +856,14 @@ def app_literals(roots):
 
 
 def test_code(relative):
-    """Whether a source file is test code (a test source set or target, a snapshot target, the emulator flows module),
-    whose literals say nothing about the app."""
-    folders = relative.parts[:-1]
-    return (relative.stem.endswith(("Test", "Tests")) or "flows" in folders or "Snapshots" in folders or
-            any(part.startswith(("test", "androidTest")) or part.endswith("Tests") for part in folders))
+    """Whether a source file (relative to may-app's android/ or ios/, or the design system's android/ or swift/) says
+    nothing about the shipped screens: a test source set (test, androidTest, test<Variant>, androidTest<Variant>) or the
+    previews set, a test or snapshot target, a fixture, the emulator flows module or the design system's build copy."""
+    folders, name = relative.parts[:-1], relative.stem
+    source_set = folders[folders.index("src") + 1] if "src" in folders[:-1] else ""
+    return (name.endswith(("Test", "Tests")) or "Fixture" in name or folders[:1] in (("flows",), ("build-deps",)) or
+            re.fullmatch(r"(?:test|androidTest)(?:[A-Z]\w*)?|previews", source_set) is not None or
+            any(part.endswith("Tests") or part == "Snapshots" for part in folders))
 
 
 def lacking_ids(ids, literals):
@@ -852,10 +875,11 @@ def lacking_ids(ids, literals):
 
 
 def app_sources(root, platform):
-    """The literals of a platform's app code, read once a run and only when asked: may-app's and its design system's
-    android/ or ios/ on the runner."""
-    return functools.cache(lambda: app_literals([folder / platform for folder in (root / "may-source",
-                                                                                   root / DESIGN_SYSTEM)]))
+    """The literals of a platform's app code, read once a run and only when asked: may-app's own and its design
+    system's (PLATFORM_SOURCES) where prepare.py left them."""
+    app, design = PLATFORM_SOURCES[platform]
+    source = root / "may-source"
+    return functools.cache(lambda: app_literals([source / app, source / "android" / DESIGN_SYSTEM_BUILD / design]))
 
 
 def flow_lacks_ids(row, flow, literals, platform):

@@ -473,24 +473,39 @@ class FlowIdTests(unittest.TestCase):
     def test_a_flow_and_the_flows_it_runs_give_their_ids(self):
         self.write("flows/start.yaml", 'appId: x\n---\n- tapOn:\n    id: "demo-start"\n- runFlow: start.yaml\n')
         self.write("flows/sub/finish.yaml", "appId: x\n---\n- assertVisible:\n    id: demo-done  # the end\n")
+        self.write("flows/sub/when.yaml", "appId: x\n---\n- tapOn: {id: \"demo-when\", optional: true}\n")
+        self.write("flows/script.yaml", "appId: x\n---\n- tapOn:\n    id: demo-script\n")
         self.write("outside.yaml", "appId: x\n---\n- tapOn:\n    id: demo-outside\n")
         flow = self.write("flows/main.yaml", "\n".join((
             "appId: x", "---", "- runFlow: start.yaml", "- runFlow: sub/finish.yaml", "- runFlow: ../outside.yaml",
+            "- runFlow:", "    when:", "      visible:", "        id: \"demo-gate\"", "    file: sub/when.yaml",
+            "- runFlow:", "    file: '../outside.yaml'",
+            "- runScript:", "    file: script.js",
+            "- tapOn: {id: 'demo-inline'}", "- assertVisible: { id: demo-spaced, enabled: true }",
             "- extendedWaitUntil:", "    visible:", "      id: 'demo-list|demo-empty'", "# id: demo-commented",
-            "- tapOn: \"Settings\"", "")))
-        self.assertEqual(device_tests.flow_ids(flow), {"demo-start", "demo-done", "demo-list|demo-empty"},
-                         "a loop, a comment, a label and a flow outside the folder give nothing")
+            "- tapOn: \"Settings\"  # id: demo-trailing", "")))
+        self.assertEqual(device_tests.flow_ids(flow), {
+            "demo-start", "demo-done", "demo-gate", "demo-when", "demo-inline", "demo-spaced", "demo-list|demo-empty"},
+            "runFlow's file: form is followed and inline {id: …} is read; a loop, a comment, a label, a script and a "
+            "flow outside the folder give nothing")
 
-    def test_the_app_literals_leave_test_code_out(self):
+    def test_the_app_literals_leave_test_code_fixtures_and_previews_out(self):
         self.write("android/app/src/main/Rows.kt", 'val tag = "demo.row.${c.wire}"\nval wire = "calendar"\n'
                                                      'val name = "$title"\nval quote = "say \\"hi\\""\n')
+        self.write("android/app/src/main/kotlin/may/testsession/Gate.kt", 'val gate = "demo-testsession"\n')
+        self.write("android/app/src/playground/kotlin/may/Hook.kt", 'val hook = "demo-playground"\n')
         self.write("ios/App/Shared/Rows.swift", 'let tag = "demo.cell.\\(row.wire)"\n')
+        self.write("ios/App/Shared/flows/Steps.swift", 'let steps = "demo-ios-flows-folder"\n')
         for test in ("android/app/src/test/T.kt", "android/app/src/testPlayground/T.kt", "android/app/src/androidTest/T.kt",
+                     "android/app/src/androidTestPlayground/T.kt", "android/app/src/previews/P.kt",
                      "android/flows/src/F.kt", "ios/App/Snapshots/S.swift", "ios/AppTests/T.swift",
+                     "ios/MayCore/Tests/MayCoreTests/T.swift", "ios/App/Playground/ParityFixtures.swift",
                      "android/app/src/main/RowsTest.kt", "ios/App/Shared/RowsTests.swift"):
             self.write(test, 'val only = "demo-test-only"\n')
         whole, starts = device_tests.app_literals([self.root / "android", self.root / "ios"])
-        self.assertEqual(whole, {"calendar", 'say \\"hi\\"'})
+        self.assertEqual(whole, {"calendar", 'say \\"hi\\"', "demo-testsession", "demo-playground",
+                                 "demo-ios-flows-folder"},
+                         "only whole test source sets and targets, fixtures, previews and the flows module are left out")
         self.assertEqual(starts, {"demo.row.", "demo.cell."})
 
     def test_an_id_is_there_as_a_literal_or_a_fixed_start_and_a_literal_remainder(self):
@@ -502,13 +517,19 @@ class FlowIdTests(unittest.TestCase):
                          "a misspelt id, a row id with a misspelt remainder and a missing alternative are caught; "
                          "an id using pattern syntax is not checked")
 
-    def test_a_platform_reads_may_app_and_its_design_system(self):
-        self.write("may-source/android/app/src/main/A.kt", 'val a = "demo-app"\n')
-        self.write(f"{device_tests.DESIGN_SYSTEM}/android/components/src/main/B.kt", 'val b = "demo-ds"\n')
-        self.write("may-source/ios/App/C.swift", 'let c = "demo-ios"\n')
-        literals = device_tests.app_sources(self.root, "android")
-        self.assertEqual(literals()[0], {"demo-app", "demo-ds"})
-        self.assertIs(literals(), literals(), "read once a run")
+    def test_each_platform_reads_may_app_and_the_design_system_where_prepare_puts_it(self):
+        """prepare.py moves the design system into may-source/android/build-deps/may-design-system; its Kotlin is
+        under android/ and its Swift under swift/ (the coordinator's review of #102)."""
+        ds = "may-source/android/build-deps/may-design-system"
+        self.write("may-source/android/app/src/main/A.kt", 'val a = "demo-app-android"\n')
+        self.write("may-source/ios/App/C.swift", 'let c = "demo-app-ios"\n')
+        self.write(f"{ds}/android/components/src/main/B.kt", 'val b = "demo-ds-android"\n')
+        self.write(f"{ds}/swift/Sources/MayDS/D.swift", 'let d = "demo-ds-swift"\n')
+        self.write(f"{ds}/swift/Tests/MayDSTests/T.swift", 'let t = "demo-ds-test"\n')
+        android, ios = device_tests.app_sources(self.root, "android"), device_tests.app_sources(self.root, "ios")
+        self.assertEqual(android()[0], {"demo-app-android", "demo-ds-android"}, "no Swift counts for Android")
+        self.assertEqual(ios()[0], {"demo-app-ios", "demo-ds-swift"}, "the design system's Swift counts for iOS")
+        self.assertIs(android(), android(), "read once a run")
 
 
 class RunTests(unittest.TestCase):
