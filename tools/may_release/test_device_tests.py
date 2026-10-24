@@ -324,8 +324,16 @@ class BudgetTests(unittest.TestCase):
         workflow = (Path(device_tests.__file__).parent.parent.parent / ".github/workflows/device-tests.yml").read_text()
         timeouts = re.findall(r"(?m)^    timeout-minutes: (\d+)$", workflow)
         job = min(int(minutes) for minutes in timeouts[:2]) * 60
-        self.assertLessEqual(device_tests.RUN_BUDGET_SECONDS + 10 * 60 + 8 * 60, job,
-                             "the build (about 8 minutes) and 10 minutes to seal and hand over must fit too")
+        previews = re.findall(r"(?m)^        continue-on-error: true\n        timeout-minutes: (\d+)\n"
+                              r"        run: python3 -I -S -B tools/may_release/device_tests.py previews", workflow)
+        self.assertEqual(len(previews), 2, "each device job bounds its preview step")
+        # Run 40075535088: a 25-minute preview step after a full 100-minute run could outlast the job's 120 minutes,
+        # so the seal never ran and the report was lost.
+        self.assertLessEqual(device_tests.RUN_BUDGET_SECONDS + max(int(m) for m in previews) * 60 + 8 * 60 + 10 * 60,
+                             job, "the build (about 8 minutes), the previews and 10 minutes to seal and hand over "
+                             "must fit after the run")
+        self.assertLess(device_tests.PREVIEW_STEP_SECONDS, min(int(m) for m in previews) * 60,
+                        "no preview starts so late that the step's timeout stops it")
 
 
 class OnboardingTests(unittest.TestCase):
@@ -710,6 +718,41 @@ class DevicePreviewTests(unittest.TestCase):
                          ["routines-part2.preview.mp4", "sign-in.preview.mp4"],
                          "re-review of #88: an id ending -partN keeps its own preview")
 
+    def test_a_preview_reaches_the_run_folder_only_whole(self):
+        """Run 40075535088: a step stopped by its timeout must never leave a half-written preview to be sealed."""
+        given = []
+
+        def encode(video, target):
+            given.append(target)
+            target.write_bytes(MP4[:6])  # what a kill mid-encode would leave behind
+            if video.name == "chat.mp4":
+                raise KeyboardInterrupt  # stands for the step's timeout stopping it here
+            target.write_bytes(MP4)
+            return True
+
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), self.assertRaises(KeyboardInterrupt):
+            device_tests.previews_in("android", encode)
+        self.assertTrue(given and all(self.folder not in path.parents for path in given),
+                        "each preview is made outside the run folder")
+        self.assertNotIn("chat.preview.mp4", [p.name for p in self.folder.iterdir()],
+                         "the half-written preview never reaches the run folder")
+        self.assertIn("sign-in.preview.mp4", [p.name for p in self.folder.iterdir()], "a whole one is moved in")
+
+    def test_no_preview_starts_after_the_step_budget(self):
+        ticks = iter([0, 0, device_tests.PREVIEW_STEP_SECONDS + 1, device_tests.PREVIEW_STEP_SECONDS + 2,
+                      device_tests.PREVIEW_STEP_SECONDS + 3])
+        seen = []
+
+        def encode(video, target):
+            seen.append(video.name)
+            target.write_bytes(MP4)
+            return True
+
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True):
+            made, failed = device_tests.previews_in("android", encode, clock=lambda: next(ticks))
+        self.assertEqual((made, failed, seen), (1, 3, ["sign-in.mp4"]),
+                         "after PREVIEW_STEP_SECONDS the rest are left out, so the step ends before its timeout")
+
     def test_any_error_is_contained_so_the_seal_always_runs(self):
         """Re-review of #88: an OSError outside the encoder (stat, unlink, mkdir) failed the step."""
         def encode(video, target):
@@ -735,9 +778,13 @@ class DevicePreviewTests(unittest.TestCase):
             encode = device_tests.ffmpeg_encoder(self.root, self.root / "log")
             encode(self.folder / "sign-in.mp4", self.folder / "sign-in.preview.mp4")
         self.assertEqual(calls[1][-1], "ffmpeg", "apt's current ffmpeg, not a pinned old one")
-        self.assertIn("scale=270:-2", calls[2])
-        self.assertIn("-an", calls[2])
-        self.assertEqual(calls[2][-2:], ["-n", str(self.folder / "sign-in.preview.mp4")])
+        argv = calls[2]
+        self.assertEqual(argv[argv.index("-vf") + 1], "setpts=PTS/1.0000,fps=8,scale=270:-2",
+                         "a recording with no readable length plays at its own speed, cut at PREVIEW_MAX_SECONDS")
+        self.assertIn("-an", argv)
+        for flag, value in (("-crf", "34"), ("-maxrate", "160000"), ("-t", "60")):
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertEqual(argv[-2:], ["-n", str(self.folder / "sign-in.preview.mp4")])
 
     def test_ios_compiles_preview_swift_with_the_pinned_xcode(self):
         import device_ios
@@ -752,7 +799,46 @@ class DevicePreviewTests(unittest.TestCase):
         with patch("renders.quiet", return_value=Done(0)) as quiet:
             self.assertTrue(encode(self.folder / "sign-in.mp4", self.folder / "sign-in.preview.mp4"))
         self.assertEqual(quiet.call_args.args[0][1:], [str(self.folder / "sign-in.mp4"),
-                                                        str(self.folder / "sign-in.preview.mp4"), "270"])
+                                                        str(self.folder / "sign-in.preview.mp4"), "270", "60", "8",
+                                                        "160000"])
+
+    def test_a_long_recording_becomes_a_timelapse_within_the_ceiling(self):
+        """Run 40075535088: a 10-minute iOS chat preview came to 15.9 MB, over the artifact's 15 MB limit."""
+        def mp4(seconds, scale=1000, wide=False):
+            if wide:
+                mvhd = bytes([1, 0, 0, 0]) + bytes(16) + scale.to_bytes(4, "big") + (seconds * scale).to_bytes(8, "big")
+            else:
+                mvhd = bytes(4) + bytes(8) + scale.to_bytes(4, "big") + (seconds * scale).to_bytes(4, "big")
+            mvhd += bytes(80)
+            moov = (8 + 8 + len(mvhd)).to_bytes(4, "big") + b"moov" + (8 + len(mvhd)).to_bytes(4, "big") + b"mvhd" + mvhd
+            return b"\0\0\0\x18ftypmp42" + bytes(12) + moov
+
+        path = self.root / "long.mp4"
+        for seconds, wide in ((600, False), (600, True), (30, False)):
+            with self.subTest(seconds=seconds, wide=wide):
+                path.write_bytes(mp4(seconds, wide=wide))
+                self.assertEqual(device_tests.mp4_seconds(path), seconds)
+        path.write_bytes(MP4)
+        self.assertIsNone(device_tests.mp4_seconds(path), "a file with no moov has no length")
+        self.assertEqual([device_tests.timelapse(s) for s in (600, 60, 30, None)], [10.0, 1.0, 1.0, 1.0])
+        path.write_bytes(mp4(600))
+        calls = []
+        with patch("device_tests.flows.run_private", side_effect=lambda argv, log, **k: calls.append(argv) or 0):
+            device_tests.ffmpeg_encoder(self.root, self.root / "log")(path, self.root / "out.mp4")
+        self.assertIn("setpts=PTS/10.0000,fps=8", calls[-1][calls[-1].index("-vf") + 1])
+        # 60 seconds at about 160 kbit/s is about 1.2 MB: under the ceiling, which stays at 2 MB.
+        self.assertLessEqual(device_tests.PREVIEW_MAX_SECONDS * device_tests.PREVIEW_BITRATE / 8 * 1.5,
+                             device_tests.MAX_PREVIEW)
+        self.assertLessEqual(device_tests.MAX_PREVIEW, 2 * 1024 * 1024, "a preview stays under about 2 MB")
+        self.assertLessEqual(device_tests.PREVIEW_FPS, 8)
+
+    def test_a_preview_over_the_ceiling_is_left_out(self):
+        def encode(video, target):
+            target.write_bytes(MP4 + bytes(device_tests.MAX_PREVIEW))
+            return True
+
+        self.assertEqual(self.previews(encode), "May device tests (android): 0 previews made, 4 failed")
+        self.assertFalse([p for p in self.folder.iterdir() if p.name.endswith(device_tests.PREVIEW)])
 
 
 class ReasonTests(unittest.TestCase):

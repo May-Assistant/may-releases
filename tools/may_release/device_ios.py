@@ -77,7 +77,9 @@ def preview_encoder(log, tool=renders.quiet):
         raise DeviceTestsError("preview.swift did not compile")
 
     def encode(video, target):
-        return not renders.quiet([str(binary), str(video), str(target), str(device_tests.PREVIEW_WIDTH)], log,
+        return not renders.quiet([str(binary), str(video), str(target), str(device_tests.PREVIEW_WIDTH),
+                                  str(device_tests.PREVIEW_MAX_SECONDS), str(device_tests.PREVIEW_FPS),
+                                  str(device_tests.PREVIEW_BITRATE)], log,
                                  env=xcode(), timeout=device_tests.PREVIEW_SECONDS).returncode
     return encode
 
