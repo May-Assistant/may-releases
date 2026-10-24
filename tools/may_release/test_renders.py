@@ -238,6 +238,24 @@ class ManifestAndCountTests(unittest.TestCase):
         rows = renders.manifest_rows(self.work.source)
         self.assertEqual([(row["id"], row["component"]) for row in rows], [("chat-reply", "ChatPage"), ("sign-in", "")])
 
+    def test_a_component_not_named_yet_is_kept_as_a_question_mark(self):
+        """screens.json marks a row whose component is not named yet with "?", which shows as-is."""
+        (self.work.source / renders.MANIFEST).write_text(json.dumps([dict(self.work.rows[0], component="?")]))
+        try:
+            rows = renders.manifest_rows(self.work.source)
+        except RendersError as refused:
+            self.fail(f'a component of "?" was refused: {refused}')
+        self.assertEqual([row["component"] for row in rows], ["?"])
+        row = rows[0]
+        body = renders.page(SHA, "", [row], [{"id": row["id"], "mode": "light", "android": True, "rendered": True}],
+                            set())
+        self.assertIn(f"<small>{row['id']} · <code>?</code> ", body)
+        for change in ({"component": "??"}, {"component": "?Chat"}, {"component": "Chat?"}):
+            with self.subTest(change=change):
+                (self.work.source / renders.MANIFEST).write_text(json.dumps([dict(self.work.rows[0], **change)]))
+                with self.assertRaises(RendersError):
+                    renders.manifest_rows(self.work.source)
+
     def test_a_platform_without_renders_and_a_sibling_evidence_folder_are_accepted(self):
         good = dict(self.work.rows[0])
         rows = [dict(good, id="no-android", android=None, note="to add"),

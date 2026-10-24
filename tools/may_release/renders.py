@@ -67,8 +67,9 @@ MANIFEST = EVIDENCE + "/screens.json"
 FRAME = (1179, 2556)
 MODES = ("light", "dark")
 SCREEN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
-# A design-system component name, as screens.json gives it (e.g. AgendaScreen, ApprovalCard).
-COMPONENT = re.compile(r"[A-Z][A-Za-z0-9]{0,63}")
+# A design-system component name, as screens.json gives it (e.g. AgendaScreen, ApprovalCard), or "?" for a
+# row whose component is not named yet, shown as-is.
+COMPONENT = re.compile(r"[A-Z][A-Za-z0-9]{0,63}|\?")
 # Relative to EVIDENCE; one leading "../" reaches a sibling evidence folder (docs/evidence/<other>/), never further.
 EVIDENCE_PATH = re.compile(r"(?:\.\./[A-Za-z0-9_][A-Za-z0-9_-]{0,63}/)?[A-Za-z0-9_][A-Za-z0-9_./-]{0,239}\.png")
 MAX_LOG = 8 * 1024 * 1024
