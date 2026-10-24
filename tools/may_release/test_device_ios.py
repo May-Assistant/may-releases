@@ -121,7 +121,8 @@ class FakeRecorder:
 
 
 class RunTests(Workspace):
-    def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None, budgeted=None):
+    def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None, budgeted=None,
+               calls_left=None):
         calls, minted, self.maestro_timeouts, self.delivered = [], [], [], []
         self.built()
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
@@ -155,6 +156,7 @@ class RunTests(Workspace):
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
                                      install=lambda root: root / "may-claude" / "claude", budgeted=budgeted,
                                      deleted_by=lambda base, token: self.deleted.append(token) or True,
+                                     calls_left=calls_left or (lambda base, token: 100),
                                      delivered=lambda base, token, tag: self.delivered.append(token) or
                                      [device_tests.NONE_STORED])
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
@@ -291,6 +293,16 @@ class RunTests(Workspace):
                         env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
                              "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", device_tests.FRESH: "all"})
         self.assertEqual(self.deleted, [TOKEN + "1"], "the run's finally deleted chat's account")
+
+    def test_an_agent_scenario_near_the_model_call_cap_is_skipped_on_ios_too(self):
+        def agent(*args, **kwargs):
+            self.fail("an agent ran near the model-call cap")
+
+        _, minted, report, _, _ = self.run_it(
+            selection="chat", agent=agent, calls_left=lambda base, token: 0,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("chat", "skipped", device_tests.MODEL_CAP)])
 
     def test_refusals(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),

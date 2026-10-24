@@ -581,7 +581,7 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.head_revision", return_value=SHA), patch("sys.stdout", new_callable=io.StringIO):
             device_tests.run_scenarios("chat", minted=lambda base, secret: TOKEN, agent=agent,
                                        install=lambda root: root / "claude", cleaned=lambda *args: 0,
-                                       delivered=lambda *args: None)
+                                       delivered=lambda *args: None, calls_left=lambda *args: None)
         driven = [argv for argv, _ in calls if argv[0] in ("/fake/maestro", "agent")]
         self.assertEqual(driven, [["/fake/maestro", "--device", device_tests.SERIAL, "test",
                                    str(self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING)], ["agent"]])
