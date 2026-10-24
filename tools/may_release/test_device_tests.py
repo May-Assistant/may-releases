@@ -165,6 +165,15 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("on the {tag} task", goal)
         self.assertNotIn("first item", goal)
 
+    def test_the_notes_scenario_uses_the_details_notes_field(self):
+        """Run 40095010166: the task detail has Details, Thread and Files, its notes field on Details ("Add notes");
+        both judges failed a goal that asked for a Notes tab."""
+        goal = device_tests.scenarios("notes")[0]["goal"]
+        self.assertIn("On its Details, tap the notes field that says Add notes", goal)
+        self.assertIn("open the {tag} task again", goal, "the note is checked after reopening the task")
+        for stale in ("Notes tab", "Take notes"):
+            self.assertNotIn(stale, goal)
+
     def test_every_agent_scenario_fits_inside_one_test_session(self):
         """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
         each agent's cap leaves ten minutes for the launch, recording, stop and server reads."""
