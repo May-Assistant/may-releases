@@ -1333,8 +1333,9 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         entry.pop("reason", None)
         if verdict_reason["reason"]:
             entry["reason"] = verdict_reason["reason"]
-        if judged[1]:
-            entry["notes"] = judged[1]
+        note = device_agent.redacted(judged[1])
+        if note:
+            entry["notes"] = note
     token = ""
     path.write_text(json.dumps(report, indent=2) + "\n")
     (private / VERDICTS).unlink(missing_ok=True)

@@ -251,6 +251,12 @@ class AgentRunTests(unittest.TestCase):
             self.assertLess(order.index(("read", token)), order.index(("diagnostics", token)),
                             "each scenario's diagnostics after its own delivery read")
 
+    def test_the_judges_note_is_stored_redacted(self):
+        _, _, _, report, _, _ = self.run_and_judge(
+            [record(), record(), record()],
+            [("pass", "Saw the reply.\ntoken=abc123"), ("pass", ""), ("pass", "")])
+        self.assertEqual(report["scenarios"][0].get("notes"), "Saw the reply.")
+
     def test_the_poll_scenarios_read_the_question_card_in_the_tagged_chat(self):
         asked = []
 
@@ -761,6 +767,22 @@ class AgentRunnerTests(unittest.TestCase):
                                MODEL)
         self.assertIn("sends nothing): none", seen["prompt"])
 
+    def test_the_judges_prompt_holds_the_summary_redacted(self):
+        """The security read of #110: the agent's summary reached the judge's prompt, an argument, as it was."""
+        seen = {}
+
+        def run(command, cwd, env, stdout, stderr, stdin, timeout):
+            seen["prompt"] = command[command.index("-p") + 1]
+            stdout.write(json.dumps({"is_error": False, "structured_output": {"verdict": "pass", "note": ""}}).encode())
+
+        evidence = dict(record(), summary="Sent it.\nAuthorization: Bearer abc\nsk_live_51HabcdefGHIJKLMNOP")
+        with patch("device_agent.subprocess.run", side_effect=run):
+            device_agent.judge(Path("/cli/claude"), "Do {tag}", "qa-12345678", evidence, self.root / "judge", OAUTH,
+                               MODEL)
+        self.assertIn("Sent it.", seen["prompt"])
+        for secret in ("Bearer", "sk_live_"):
+            self.assertNotIn(secret, seen["prompt"])
+
     def test_the_judge_has_no_tool_and_answers_in_the_schema(self):
         seen = {}
 
@@ -892,6 +914,21 @@ class DeviceServerTests(unittest.TestCase):
         stored = json.loads(self.result.read_text())
         self.assertTrue(stored["hierarchy"].startswith("(no fresh hierarchy at done; the agent's last look follows)"))
         self.assertIn("text='Chats'", stored["hierarchy"])
+
+    def test_the_hierarchy_the_agent_reads_is_redacted(self):
+        """The security read of #110: the hierarchy tool gave the agent the tree as it was."""
+        xml = (b'<hierarchy><node text="Chats" bounds="[0,0][9,9]"/><node text="Authorization: Bearer abc" '
+               b'bounds="[0,0][9,9]"/><node text="sam@example.com" bounds="[0,0][9,9]"/></hierarchy>')
+
+        def run(argv, capture_output, stdin, timeout):
+            return subprocess.CompletedProcess(argv, 0, xml, b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            failed, content = device_mcp.call("hierarchy", {}, self.config)
+        self.assertFalse(failed)
+        self.assertIn("text='Chats'", content[0]["text"])
+        self.assertNotIn("Bearer", content[0]["text"])
+        self.assertIn("***@example.com", content[0]["text"])
 
     def test_type_takes_plain_text_alone(self):
         for text in ("a; reboot", "$(id)", "a`b`", "it's", "a|b", "a\nb", "x" * 201, "", "a>b", "a&b", 7):

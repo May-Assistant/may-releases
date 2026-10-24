@@ -45,6 +45,8 @@ SECRET_LINE = re.compile(
     rb"(?i)"
     # headers and named credentials: Authorization, Bearer, cookies, API keys, Anthropic and Google keys;
     rb"authorization|bearer|cookie|x-api-key|api[_-]?key|sk-ant-|AIza[0-9A-Za-z_-]{20}|"
+    # prefixed opaque keys whatever their length: sk_live_, pk_test_, rk_, ghp_, gho_, xoxb-, ...;
+    rb"\b(?:sk|pk|rk|whsec|ghp|gho|ghs|ghu|github_pat|xox[abpr])[_-](?:live_|test_)?[A-Za-z0-9_-]{12,}|"
     # any token, secret, password, session, key or signature set to a value: token=, "access_token":, secret=, ...;
     rb"\b(?:[a-z0-9]+[_-])*(?:token|secret|password|passwd|session|key|sig|signature|credential)[\"']?[ \t]*[:=]|"
     # a URL's query naming one, or an OAuth code;
@@ -291,7 +293,9 @@ def call(name, args, config):
         if not text:
             return True, [{"type": "text", "text": "No hierarchy this time; take a screenshot instead"}]
         config["hierarchy"] = text
-        return False, [{"type": "text", "text": text}]
+        # What the agent reads goes through the same redaction as everything else it sees.
+        kept, _ = kept_lines(text.encode(), "")
+        return False, [{"type": "text", "text": kept.decode("utf-8", "replace")}]
     ints = {key: args.get(key) for key in ("x", "y", "x1", "y1", "x2", "y2", "ms", "seconds")}
     if any(value is not None and (type(value) is not int or not 0 <= value <= 4000) for value in ints.values()):
         return True, [{"type": "text", "text": "Coordinates and times are whole numbers in range"}]

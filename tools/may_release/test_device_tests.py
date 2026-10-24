@@ -1576,7 +1576,10 @@ class DiagnosticsTests(unittest.TestCase):
             "GET /oauth/cb?code=4/0Adeu5", "x-api-key: abc", "using sk-ant-api03-abcdef", "AIzaSyA1234567890abcdefghij",
             "secret=abc", "password=hunter2", "session=deadbeef", "digest 0123456789abcdef0123456789abcdef",
             "blob QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaA==", "may-key=1", "x may%5Ftest%5Fsession y",
-            "may_test_session=abc", "id_token=abc")
+            "may_test_session=abc", "id_token=abc",
+            # From the security read of #110: prefixed opaque keys, which no session token passed in would catch.
+            "charge with sk_live_51HabcdefGHIJKLMNOP", "pk_test_TYooMQauvdEDq54NiTphI7jx",
+            "clone ghp_16C7e42F292c6912E7710c838347Ae178B4a", "post xoxb-123456789012-abcdef")
 
     def test_each_reported_gap_is_dropped_by_the_writer_and_refused_by_publish(self):
         """The coordinator's security read of #108: one test per pattern, in both places."""

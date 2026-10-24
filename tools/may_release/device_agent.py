@@ -26,6 +26,7 @@ import subprocess
 import sys
 import urllib.request
 
+from device_mcp import kept_lines
 from review import CLI_MAX_BYTES, CLI_SHA512, CLI_URL, checked_cli, header_safe, outcome
 
 # review.py's pinned release for macOS on Apple silicon (macos-15): npm's darwin-arm64 platform package, a single
@@ -164,11 +165,17 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
             "actions": record.get("actions") if type(record.get("actions")) is int else 0}
 
 
+def redacted(text):
+    """text through kept_lines: what the judge reads in its prompt, an argument on the runner, and what it says."""
+    kept, _ = kept_lines(str(text or "").encode(), "")
+    return kept.decode("utf-8", "replace").strip()
+
+
 def judge(cli, goal, tag, agent, work, token, model):
     """The judge's verdict on one agent run: ("pass" | "fail" | "rate_limited" | "error", note)."""
     work = fresh(work)
     prompt = JUDGE_PROMPT.format(goal=goal.replace("{tag}", tag), outcome=agent.get("outcome") or "none",
-                                 actions=agent.get("actions", 0), summary=agent.get("summary") or "(none)",
+                                 actions=agent.get("actions", 0), summary=redacted(agent.get("summary")) or "(none)",
                                  hierarchy=agent.get("hierarchy") or "(none)",
                                  delivery=", ".join(agent.get("delivery") or []) or "none")
     command = base_command(cli, prompt, model) + ["--json-schema", JUDGE_SCHEMA]
