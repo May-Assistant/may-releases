@@ -1,4 +1,6 @@
-"""The May flow board (board.html), written into each device-tests run folder in may-renders by the publish job.
+"""The May flow board, written by the publish job into may-renders as one self-contained folder, device-tests/board/
+(index.html and media/, every path relative and below it), so the coordinator can upload it as-is.
+board-notes.json may also name each test's row (scenario_titles).
 
 Verdicts come from the device reports publish.py has already checked, never from hand-curated data. may-app supplies
 the flows (docs/evidence/flows.json) and the lanes' curated text (docs/evidence/board-notes.json: a banner, per flow
@@ -6,8 +8,11 @@ what it means, what comes before the next run, an open issue and the pull reques
 headline, a note and links), sealed into the encrypted report by the device jobs. Every value is checked against a
 fixed shape here and escaped by the page, which builds itself from the JSON it carries (board_template.html).
 
+A flow with several tests gets one nested row per test (<flow>-<scenario>, titled from this repository's scenario
+list), each with its own state; the flow's own page lists them.
+
 The run history (device-tests/history.json) keeps HISTORY runs, newest first, each with its verdicts and its end
-screenshots copied to device-tests/history/<folder>/, so they outlive the run folder (publish.KEEP). A run older than
+screenshots copied to device-tests/board/media/<folder>/, so they outlive the run folder (publish.KEEP). A run older than
 the KEEP newest has lost its release, so the board shows it as Archived: verdict and end screen, no recording.
 """
 import datetime
@@ -19,6 +24,7 @@ import shutil
 HERE = Path(__file__).resolve().parent
 TEMPLATE = HERE / "board_template.html"
 HISTORY = 60
+BOARD, MEDIA = "board", "media"
 DEVICES = ("android", "ios")
 FOLDER = re.compile(r"[0-9]{8}-[0-9a-f]{12}")
 RUN = re.compile(r"[1-9][0-9]{0,19}")
@@ -79,7 +85,7 @@ def links(value):
 
 def checked_notes(data):
     """may-app's board-notes.json: the lanes' curated text, each field a fixed shape, or BoardError."""
-    if not isinstance(data, dict) or not set(data) <= {"banner", "flows", "results"}:
+    if not isinstance(data, dict) or not set(data) <= {"banner", "flows", "results", "scenario_titles"}:
         raise BoardError("may-app's board-notes.json is malformed")
     banner = data.get("banner")
     if not (banner is None or isinstance(banner, dict) and set(banner) == {"title", "body"} and
@@ -106,7 +112,11 @@ def checked_notes(data):
             ("note" not in note or text(note["note"])) and ("links" not in note or links(note["links"]))
             for key, note in results.items())):
         raise BoardError("may-app's board-notes.json has a malformed result note")
-    return {"banner": banner, "flows": flows, "results": results}
+    titles = data.get("scenario_titles", {})
+    if not (isinstance(titles, dict) and all(isinstance(key, str) and SCENARIO.fullmatch(key) and text(title, MAX_LINE)
+                                             for key, title in titles.items())):
+        raise BoardError("may-app's board-notes.json has a malformed scenario title")
+    return {"banner": banner, "flows": flows, "results": results, "scenario_titles": titles}
 
 
 def entry(folder, run, reports, now):
@@ -177,7 +187,7 @@ def run_date(folder):
     return f"{int(folder[6:8])} {MONTHS[int(folder[4:6]) - 1]}"
 
 
-def payload(flows, notes, entries, asset_url, keep):
+def payload(flows, notes, entries, asset_url, keep, titles):
     """The page's data: flows with their state in the newest run, every kept run oldest first, and each run's results
     (the curated text on the newest run's alone)."""
     newest = entries[0]
@@ -191,7 +201,7 @@ def payload(flows, notes, entries, asset_url, keep):
             device, scenario = key.split("/")
             row = {"verdict": result["verdict"], "run": item["run"], "run_date": run_date(item["folder"])}
             if result["shot"]:
-                row["thumb"] = f"../history/{item['folder']}/{device}/{result['shot']}"
+                row["thumb"] = f"{MEDIA}/{item['folder']}/{device}/{result['shot']}"
             if result["videos"] and not archived:
                 row["video"] = asset_url(item["folder"], device, result["videos"][0])
             if result["reason"]:
@@ -200,22 +210,33 @@ def payload(flows, notes, entries, asset_url, keep):
                 row.update(notes["results"].get(key, {}))
             shown[key] = row
         results[item["folder"]] = shown
+    # A nested row's title: the lanes' own (board-notes.json), else this repository's scenario list, else its id.
+    titles = {**titles, **notes["scenario_titles"]}
     out = []
     for flow in flows:
-        extra = notes["flows"].get(flow["id"], {})
-        verdicts = {device: [newest["results"].get(f"{device}/{s}", {}).get("verdict", "none")
-                             for s in flow["scenarios"]] for device in DEVICES}
-        passed = next((item for item in entries if flow["scenarios"] and all(
-            item["results"].get(f"{device}/{s}", {}).get("verdict") == "pass"
-            for s in flow["scenarios"] for device in DEVICES)), None)
-        out.append({**flow, "parent": flow["id"].split(".")[0] if "." in flow["id"] else None,
-                    "state": flow_state(verdicts["android"] + verdicts["ios"]),
-                    "android": platform_state(verdicts["android"]), "ios": platform_state(verdicts["ios"]),
-                    "means": extra.get("means"), "next": extra.get("next", []), "issue": extra.get("issue"),
-                    "changed": extra.get("changed", []),
-                    "last_pass": f"{run_date(passed['folder'])} {passed['folder'][:4]}" +
-                    (f", run {passed['run']}" if passed["run"] else "") if passed else None})
+        out.append(flow_row(flow, notes["flows"].get(flow["id"], {}), newest, entries))
+        if len(flow["scenarios"]) > 1:
+            for scenario in flow["scenarios"]:
+                row = flow_row({"id": f"{flow['id']}-{scenario}", "title": titles.get(scenario, scenario),
+                                "scenarios": [scenario], "components": flow["components"]}, {}, newest, entries)
+                out.append(dict(row, parent=flow["id"], scenario_row=True))
     return {"flows": out, "runs": runs, "current": newest["folder"], "results": results}
+
+
+def flow_row(flow, extra, newest, entries):
+    """A sidebar row: the flow, its state in the newest run and when it last passed, and its curated text."""
+    verdicts = {device: [newest["results"].get(f"{device}/{s}", {}).get("verdict", "none") for s in flow["scenarios"]]
+                for device in DEVICES}
+    passed = next((item for item in entries if flow["scenarios"] and all(
+        item["results"].get(f"{device}/{s}", {}).get("verdict") == "pass"
+        for s in flow["scenarios"] for device in DEVICES)), None)
+    return {**flow, "parent": flow["id"].split(".")[0] if "." in flow["id"] else None,
+            "state": flow_state(verdicts["android"] + verdicts["ios"]),
+            "android": platform_state(verdicts["android"]), "ios": platform_state(verdicts["ios"]),
+            "means": extra.get("means"), "next": extra.get("next", []), "issue": extra.get("issue"),
+            "changed": extra.get("changed", []),
+            "last_pass": f"{run_date(passed['folder'])} {passed['folder'][:4]}" +
+            (f", run {passed['run']}" if passed["run"] else "") if passed else None}
 
 
 def page(data, banner, when):
@@ -228,9 +249,9 @@ def page(data, banner, when):
         .replace("{{BANNER}}", flash).replace("{{DATA}}", blob)
 
 
-def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, now=None):
-    """Record this run in base/history.json, copy its end screenshots from base/folder to base/history/folder, drop
-    those beyond HISTORY and write base/folder/board.html. Returns "written", "no notes" (written without the
+def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, titles, now=None):
+    """Record this run in base/history.json, copy its end screenshots from base/folder to base/BOARD/MEDIA/folder,
+    drop those beyond HISTORY and write base/BOARD/index.html. Returns "written", "no notes" (written without the
     malformed board-notes.json) or "no flows" (not written: flows.json missing or malformed)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     index = base / "history.json"
@@ -244,13 +265,13 @@ def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, 
         device = device_key.split("/")[0]
         source = base / folder / device / result["shot"] if result["shot"] else None
         if source and source.is_file() and not source.is_symlink():
-            target = base / "history" / folder / device
+            target = base / BOARD / MEDIA / folder / device
             target.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target / result["shot"])
         else:
             result["shot"] = None
     for old in removed:
-        shutil.rmtree(base / "history" / old, ignore_errors=True)
+        shutil.rmtree(base / BOARD / MEDIA / old, ignore_errors=True)
     index.write_text(json.dumps(entries, indent=2) + "\n")
     try:
         flows = checked_flows(flows_data)
@@ -260,6 +281,7 @@ def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, 
         notes, word = checked_notes(notes_data if notes_data is not None else {}), "written"
     except BoardError:
         notes, word = checked_notes({}), "no notes"
-    (base / folder / "board.html").write_text(page(payload(flows, notes, entries, asset_url, keep), notes["banner"],
-                                                   new["when"]))
+    (base / BOARD).mkdir(exist_ok=True)
+    (base / BOARD / "index.html").write_text(page(payload(flows, notes, entries, asset_url, keep, titles),
+                                                  notes["banner"], new["when"]))
     return word

@@ -64,14 +64,17 @@ button { font: inherit; color: inherit; }
 .fopt[aria-checked="true"] { font-weight: 600; }
 .fopt .chk { width: 16px; flex: none; color: var(--fg); text-align: center; }
 .nav { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.nav ul { list-style: none; margin: 2px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.nav ul { list-style: none; margin: 2px 0 4px 32px; padding: 0 0 0 4px; border-left: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
 .it { width: 100%; display: flex; align-items: center; gap: 8px; text-align: left; background: none; border: 0; border-radius: 6px; padding: 6px 8px; cursor: pointer; }
 .it:hover { background: var(--selected); }
 .it[aria-current="true"] { background: var(--selected); font-weight: 600; }
 .it .chev { width: 16px; height: 16px; color: var(--fg-muted); flex: none; transition: transform .15s; }
 .it .chev.open { transform: rotate(90deg); } .it .chev.blank { visibility: hidden; }
 .it .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nav ul .it { padding-left: 32px; font-size: 13px; }
+.nav ul .it { padding-left: 12px; color: var(--fg-muted); }
+.nav ul .it:hover, .nav ul .it[aria-current="true"] { color: var(--fg); }
+.nav ul .it[aria-current="true"] { font-weight: 400; }
+.it.parent-open { font-weight: 600; }
 
 .main { padding: 16px 24px 40px; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 24px; align-items: start; }
 .content { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
@@ -87,6 +90,10 @@ button { font: inherit; color: inherit; }
 .flash { display: flex; gap: 10px; padding: 12px 16px; border: 1px solid var(--danger-border); background: var(--danger-bg); border-radius: 6px; }
 .flash.ok { border-color: var(--success); background: var(--success-bg); }
 .flash strong { display: block; } .flash p { margin: 2px 0 0; }
+.scn-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 6px; }
+.scn { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 0; border-top: 1px solid var(--border); background: none; cursor: pointer; text-align: left; font-size: 14px; }
+.scn:first-child { border-top: 0; } .scn:hover { background: var(--selected); }
+.scn .t { flex: 1; font-weight: 600; } .scn .tally { color: var(--fg-muted); font-size: 13px; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); overflow-x: auto; }
 .tab { border: 0; background: none; padding: 8px 12px; border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap; }
 .tab[aria-selected="true"] { border-bottom-color: #fd8c73; font-weight: 600; }
@@ -230,7 +237,8 @@ button { font: inherit; color: inherit; }
       var chev = el('span'); chev.innerHTML = SVG.chev; chev = chev.firstChild;
       chev.setAttribute('class', 'chev' + (ch.length ? (open[f.id] ? ' open' : '') : ' blank'));
       var it = el('button', { type: 'button', class: 'it', 'aria-current': String(current === f.id), title: LBL[f.state] }, [
-        f.parent ? null : chev, el('span', { class: 't', text: f.title }), icon(f.state)]);
+        f.parent ? null : chev, el('span', { class: 't', text: f.title }), f.parent && f.state === 'none' ? null : icon(f.state)]);
+      if (ch.length && open[f.id]) it.classList.add('parent-open');
       if (ch.length) it.setAttribute('aria-expanded', String(!!open[f.id]));
       it.addEventListener('click', function () {
         if (ch.length && current === f.id) { open[f.id] = !open[f.id]; store('flowOpen', JSON.stringify(open)); renderNav(); return; }
@@ -268,6 +276,31 @@ button { font: inherit; color: inherit; }
     ]);
   }
 
+  function tallyOf(f) {
+    var n = { pass: 0, fail: 0, skipped: 0, none: 0 }, total = 0;
+    f.scenarios.forEach(function (sc) { ['android', 'ios'].forEach(function (pf) { var r = R(pf + '/' + sc); n[r ? r.verdict : 'none']++; total++; }); });
+    return !total || n.none === total ? 'No test yet' : n.pass === total ? 'All passing' : n.skipped === total ? 'Switched off'
+      : [[n.pass, 'passed'], [n.fail, 'failed'], [n.skipped, 'switched off'], [n.none, 'not run']].filter(function (x) { return x[0]; }).map(function (x) { return x[0] + ' ' + x[1]; }).join(', ');
+  }
+
+  // One dot per run, newest on the right, for one test; a click shows that run's two phones.
+  function history(sid) {
+    var dots = el('div', { class: 'dots' });
+    D.runs.forEach(function (x) {
+      var vs = ['android', 'ios'].map(function (pf) { var r = (D.results[x.folder] || {})[pf + '/' + sid]; return r ? r.verdict : 'none'; });
+      var st = vs.every(function (v) { return v === 'none'; }) ? 'none' : vs.every(function (v) { return v === 'pass'; }) ? 'pass'
+        : vs.indexOf('pass') >= 0 ? 'partial' : vs.indexOf('fail') >= 0 ? 'fail' : 'skipped';
+      var d = el('button', { type: 'button', class: 'dot ' + st + (x.archived ? ' archived' : ''), 'aria-pressed': String(x.folder === view),
+        title: x.date + ' · ' + (x.run ? 'Run ' + x.run : x.folder) + ' · ' + LBL[st] + (x.archived ? ' · Archived' : ''), 'aria-label': x.date + ', ' + LBL[st] + (x.archived ? ', archived' : '') });
+      d.addEventListener('click', function () { view = x.folder; render(); });
+      dots.appendChild(d);
+    });
+    var shown = runOf(view);
+    return el('div', { class: 'hist' }, [el('span', { text: 'Runs' }), dots,
+      shown ? el('span', { text: shown.date + (shown.run ? ' · Run ' + shown.run : '') + (view === D.current ? ' (newest)' : '') }) : null,
+      shown && shown.archived ? el('span', { class: 'archived-note', text: 'Archived: the recordings were pruned; the verdict and end screen are kept.' }) : null]);
+  }
+
   function render() {
     var f = byId[current]; main.innerHTML = '';
     if (!f) return;
@@ -280,38 +313,24 @@ button { font: inherit; color: inherit; }
     if (parent) { var pl = el('a', { href: '#flow-' + parent.id, text: parent.title }); pl.addEventListener('click', function (e) { e.preventDefault(); select(parent.id, true); }); crumbs.appendChild(el('span', { class: 'sep', text: '/' })); crumbs.appendChild(pl); }
     crumbs.appendChild(el('span', { class: 'sep', text: '/' })); crumbs.appendChild(el('span', { class: 'cur', 'aria-current': 'page', text: f.title }));
     content.appendChild(crumbs);
-    var n = { pass: 0, fail: 0, skipped: 0, none: 0 }, total = 0;
-    f.scenarios.forEach(function (sc) { ['android', 'ios'].forEach(function (pf) { var r = R(pf + '/' + sc); n[r ? r.verdict : 'none']++; total++; }); });
-    var tally = !total || n.none === total ? 'No test yet' : n.pass === total ? 'All passing' : n.skipped === total ? 'Switched off'
-      : [[n.pass, 'passed'], [n.fail, 'failed'], [n.skipped, 'switched off'], [n.none, 'not run']].filter(function (x) { return x[0]; }).map(function (x) { return x[0] + ' ' + x[1]; }).join(', ');
+    var tally = tallyOf(f);
     content.appendChild(el('div', { class: 'd-title' }, [el('h2', { text: f.title }), el('span', { class: 'tally', text: tally })]));
     if (!f.scenarios.length) {
       content.appendChild(el('div', { class: 'card' }, [el('div', { class: 'card-b' }, [el('strong', { text: 'No recorded test yet' }), el('p', { text: 'This flow joins the nightly run once its test is written.' })])]));
     } else {
-      var sid = scen[f.id] && f.scenarios.indexOf(scen[f.id]) >= 0 ? scen[f.id] : f.scenarios[0];
-      if (f.scenarios.length > 1) {
-        var tabs = el('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Tests' });
-        f.scenarios.forEach(function (s) {
-          var t = el('button', { type: 'button', class: 'tab', role: 'tab', 'aria-selected': String(s === sid), text: s });
-          t.addEventListener('click', function () { scen[f.id] = s; render(); }); tabs.appendChild(t);
+      var rows = kids(f).filter(function (c) { return c.scenario_row; });
+      if (rows.length) {
+        var list = el('div', { class: 'scn-list' });
+        rows.forEach(function (c) {
+          var b = el('button', { type: 'button', class: 'scn' }, [icon(c.state), el('span', { class: 't', text: c.title }), el('span', { class: 'tally', text: tallyOf(c) })]);
+          b.addEventListener('click', function () { select(c.id, true); }); list.appendChild(b);
         });
-        content.appendChild(tabs);
+        content.appendChild(list);
+      } else {
+        var sid = f.scenarios[0];
+        content.appendChild(history(sid));
+        content.appendChild(el('div', { class: 'cards' }, [card(sid, 'android'), card(sid, 'ios')]));
       }
-      var dots = el('div', { class: 'dots' });
-      D.runs.forEach(function (x) {
-        var vs = ['android', 'ios'].map(function (pf) { var r = (D.results[x.folder] || {})[pf + '/' + sid]; return r ? r.verdict : 'none'; });
-        var st = vs.every(function (v) { return v === 'none'; }) ? 'none' : vs.every(function (v) { return v === 'pass'; }) ? 'pass'
-          : vs.indexOf('pass') >= 0 ? 'partial' : vs.indexOf('fail') >= 0 ? 'fail' : vs.every(function (v) { return v === 'skipped' || v === 'none'; }) ? 'skipped' : 'none';
-        var d = el('button', { type: 'button', class: 'dot ' + st + (x.archived ? ' archived' : ''), 'aria-pressed': String(x.folder === view),
-          title: x.date + ' · ' + (x.run ? 'Run ' + x.run : x.folder) + ' · ' + LBL[st] + (x.archived ? ' · Archived' : ''), 'aria-label': x.date + ', ' + LBL[st] + (x.archived ? ', archived' : '') });
-        d.addEventListener('click', function () { view = x.folder; render(); });
-        dots.appendChild(d);
-      });
-      var shown = runOf(view);
-      content.appendChild(el('div', { class: 'hist' }, [el('span', { text: 'Runs' }), dots,
-        shown ? el('span', { text: shown.date + (shown.run ? ' · Run ' + shown.run : '') + (view === D.current ? ' (newest)' : '') }) : null,
-        shown && shown.archived ? el('span', { class: 'archived-note', text: 'Archived: the recordings were pruned; the verdict and end screen are kept.' }) : null]));
-      content.appendChild(el('div', { class: 'cards' }, [card(sid, 'android'), card(sid, 'ios')]));
     }
     var ol = null;
     if (f.next && f.next.length) { ol = el('ol', { class: 'rail-next' }); f.next.forEach(function (n) { ol.appendChild(el('li', { text: n })); }); }

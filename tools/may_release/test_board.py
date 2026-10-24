@@ -18,6 +18,7 @@ from board import BoardError
 import device_tests
 import publish
 
+TITLES = {"chat": "Chat with May", "poll": "Answer May's question"}
 NOW = datetime.datetime(2026, 10, 24, 3, 3, tzinfo=datetime.timezone.utc)
 FLOWS = {"about": "x", "flows": [
     {"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": ["SignInScreen"]},
@@ -58,10 +59,11 @@ class InputTests(unittest.TestCase):
 
     def test_notes_are_checked_and_links_go_only_to_may_assistant(self):
         self.assertEqual(board.checked_notes(NOTES)["banner"]["title"], "Sign-in passes")
-        self.assertEqual(board.checked_notes({}), {"banner": None, "flows": {}, "results": {}})
+        self.assertEqual(board.checked_notes({}), {"banner": None, "flows": {}, "results": {}, "scenario_titles": {}})
         bad = ({"extra": 1}, {"banner": {"title": "x"}}, {"flows": {"two": {}}}, {"flows": {"2": {"means": 7}}},
                {"flows": {"2": {"issue": "12"}}}, {"flows": {"2": {"changed": [-1]}}},
-               {"results": {"web/sign-in": {}}}, {"results": {"android/sign-in": {"colour": "red"}}},
+               {"results": {"web/sign-in": {}}}, {"scenario_titles": {"Poll": "x"}},
+               {"scenario_titles": {"poll": ""}}, {"scenario_titles": {"poll": 7}}, {"scenario_titles": ["poll"]}, {"results": {"android/sign-in": {"colour": "red"}}},
                {"results": {"android/sign-in": {"links": [{"text": "x", "url": "https://evil.example/pull/1"}]}}},
                {"results": {"android/sign-in": {"links": [{"text": "x", "url": "javascript:alert(1)"}]}}},
                {"results": {"android/sign-in": {"links": [{"text": "x",
@@ -107,10 +109,10 @@ class BoardTests(unittest.TestCase):
             for r in rows:
                 for shot in r["screenshots"]:
                     (self.base / name / device / shot).write_bytes(b"\x89PNG")
-        return board.update(self.base, name, str(int(name[-12:], 16)), reports, FLOWS, NOTES, url, 10, now=NOW)
+        return board.update(self.base, name, str(int(name[-12:], 16)), reports, FLOWS, NOTES, url, 10, TITLES, now=NOW)
 
     def data(self, name):
-        page = (self.base / name / "board.html").read_text()
+        page = (self.base / board.BOARD / "index.html").read_text()
         blob = page.split('<script type="application/json" id="board-data">')[1].split("</script>")[0]
         return json.loads(blob), page
 
@@ -131,11 +133,43 @@ class BoardTests(unittest.TestCase):
         newest, older = data["results"][folder(2)], data["results"][folder(1)]
         self.assertEqual(newest["android/sign-in"]["headline"], "Signs in")
         self.assertNotIn("headline", older["android/sign-in"], "curated text describes the newest run alone")
-        self.assertEqual(newest["android/sign-in"]["thumb"], f"../history/{folder(2)}/android/sign-in-end.png")
+        self.assertEqual(newest["android/sign-in"]["thumb"], f"media/{folder(2)}/android/sign-in-end.png")
         self.assertEqual(newest["android/sign-in"]["video"], url(folder(2), "android", "sign-in.mp4"))
-        self.assertTrue((self.base / "history" / folder(2) / "android" / "sign-in-end.png").is_file())
+        self.assertTrue((self.base / "board" / "media" / folder(2) / "android" / "sign-in-end.png").is_file())
         self.assertIn("Updated 24 Oct, 03:03 UTC", page)
         self.assertEqual(json.loads(page.split('id="board-banner">')[1].split("</script>")[0])["title"], "Sign-in passes")
+
+    def test_a_flow_with_several_tests_gets_a_nested_row_per_test_with_its_own_state(self):
+        self.run_folder(folder(1), {"android": [row("chat", "pass"), row("poll", "fail")],
+                                    "ios": [row("chat", "pass"), row("poll", "pass")]})
+        flows = {f["id"]: f for f in self.data(folder(1))[0]["flows"]}
+        self.assertEqual(flows["4"]["state"], "partial")
+        self.assertEqual([i for i in flows if i.startswith("4-")], ["4-chat", "4-poll"])
+        chat, poll = flows["4-chat"], flows["4-poll"]
+        self.assertEqual((chat["title"], chat["parent"], chat["scenarios"], chat["scenario_row"], chat["state"]),
+                         ("Chat with May", "4", ["chat"], True, "pass"))
+        self.assertEqual((poll["title"], poll["state"], poll["android"], poll["ios"]),
+                         ("Answer May's question", "partial", "fail", "pass"))
+        self.assertNotIn("2-sign-in", flows, "a flow with one test has no nested row")
+
+    def test_the_lanes_can_name_a_tests_row(self):
+        notes = dict(NOTES, scenario_titles={"poll": "Answers a question"})
+        (self.base / folder(1) / "android").mkdir(parents=True)
+        board.update(self.base, folder(1), "1", {"android": [row("chat", "pass", shot=False)]}, FLOWS, notes, url, 10,
+                     TITLES, now=NOW)
+        flows = {f["id"]: f for f in self.data(folder(1))[0]["flows"]}
+        self.assertEqual((flows["4-poll"]["title"], flows["4-chat"]["title"]), ("Answers a question", "Chat with May"))
+
+    def test_the_board_is_one_folder_whose_paths_stay_inside_it(self):
+        self.run_folder(folder(1), {"android": [row("sign-in", "pass")]})
+        data, page = self.data(folder(1))
+        thumbs = [r["thumb"] for results in data["results"].values() for r in results.values() if "thumb" in r]
+        self.assertTrue(thumbs)
+        for thumb in thumbs:
+            self.assertTrue(thumb.startswith(board.MEDIA + "/") and ".." not in thumb, thumb)
+            self.assertTrue((self.base / board.BOARD / thumb).is_file(), thumb)
+        self.assertNotIn("../", page)
+        self.assertFalse((self.base / folder(1) / "board.html").exists(), "the latest board alone; history is inside it")
 
     def test_runs_beyond_the_kept_releases_are_archived_with_verdict_and_end_screen_but_no_recording(self):
         for n in range(1, 13):
@@ -144,7 +178,7 @@ class BoardTests(unittest.TestCase):
         archived = [r["folder"] for r in data["runs"] if r["archived"]]
         self.assertEqual(archived, [folder(1), folder(2)], "the 10 newest keep their releases")
         oldest = data["results"][folder(1)]["android/sign-in"]
-        self.assertEqual((oldest["verdict"], oldest["thumb"]), ("pass", f"../history/{folder(1)}/android/sign-in-end.png"))
+        self.assertEqual((oldest["verdict"], oldest["thumb"]), ("pass", f"media/{folder(1)}/android/sign-in-end.png"))
         self.assertNotIn("video", oldest)
         self.assertIn("video", data["results"][folder(3)]["android/sign-in"])
 
@@ -152,8 +186,8 @@ class BoardTests(unittest.TestCase):
         with patch("board.HISTORY", 3):
             for n in range(1, 5):
                 self.run_folder(folder(n), {"android": [row("sign-in", "pass")]})
-        self.assertFalse((self.base / "history" / folder(1)).exists())
-        self.assertTrue((self.base / "history" / folder(2)).exists())
+        self.assertFalse((self.base / "board" / "media" / folder(1)).exists())
+        self.assertTrue((self.base / "board" / "media" / folder(2)).exists())
         self.assertEqual(len(json.loads((self.base / "history.json").read_text())), 3)
 
     def test_no_value_can_break_out_of_the_page(self):
@@ -163,9 +197,9 @@ class BoardTests(unittest.TestCase):
                  "results": {"android/sign-in": {"headline": hostile, "note": hostile}}}
         flows = {"flows": [dict(FLOWS["flows"][0], title=hostile)]}
         (self.base / folder(1) / "android").mkdir(parents=True)
-        board.update(self.base, folder(1), "1", {"android": [row("sign-in", "pass", shot=False)]}, flows, notes, url, 10,
+        board.update(self.base, folder(1), "1", {"android": [row("sign-in", "pass", shot=False)]}, flows, notes, url, 10, TITLES,
                      now=NOW)
-        page = (self.base / folder(1) / "board.html").read_text()
+        page = (self.base / board.BOARD / "index.html").read_text()
         template = board.TEMPLATE.read_text()
         self.assertNotIn(hostile, page)
         self.assertEqual(page.count("<script"), template.count("<script"))
@@ -176,10 +210,10 @@ class BoardTests(unittest.TestCase):
     def test_missing_flows_write_no_board_and_malformed_notes_a_board_without_them(self):
         (self.base / folder(1) / "android").mkdir(parents=True)
         reports = {"android": [row("sign-in", "pass", shot=False)]}
-        self.assertEqual(board.update(self.base, folder(1), "1", reports, None, NOTES, url, 10), "no flows")
-        self.assertFalse((self.base / folder(1) / "board.html").exists())
-        self.assertEqual(board.update(self.base, folder(1), "1", reports, FLOWS, {"banner": 7}, url, 10), "no notes")
-        data = json.loads((self.base / folder(1) / "board.html").read_text()
+        self.assertEqual(board.update(self.base, folder(1), "1", reports, None, NOTES, url, 10, TITLES), "no flows")
+        self.assertFalse((self.base / board.BOARD / "index.html").exists())
+        self.assertEqual(board.update(self.base, folder(1), "1", reports, FLOWS, {"banner": 7}, url, 10, TITLES), "no notes")
+        data = json.loads((self.base / board.BOARD / "index.html").read_text()
                           .split('id="board-data">')[1].split("</script>")[0])
         self.assertIsNone(data["flows"][0]["means"])
 

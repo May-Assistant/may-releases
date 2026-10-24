@@ -527,13 +527,13 @@ def push_device(run_git=git):
     kept, removed, built = publish_tree(
         runs[0], DEVICE_PREFIX, folder, entry, f"Device tests {folder}", key_text, run_git,
         extra=lambda base: board.update(base, folder, entry["run"], reports, found["flows.json"],
-                                        found["board-notes.json"], asset_url, KEEP))
+                                        found["board-notes.json"], asset_url, KEEP, scenario_titles()))
     print(f"May device tests published to may-renders as device-tests/{folder}/ ({len(kept)} run folders kept, "
           f"{len(removed)} removed)")
     if built == "written":
-        print("May device tests: the flow board is board.html in the run folder")
+        print("May device tests: the flow board is device-tests/board/ in may-renders")
     elif built == "no notes":
-        print("May device tests: the flow board is board.html in the run folder, without notes (may-app's "
+        print("May device tests: the flow board is device-tests/board/ in may-renders, without notes (may-app's "
               "board-notes.json is malformed)")
     else:
         print("May device tests: no flow board (may-app's flows.json is missing or malformed)")

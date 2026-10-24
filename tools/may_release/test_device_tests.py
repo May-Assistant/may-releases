@@ -607,7 +607,7 @@ class PublishDeviceTests(unittest.TestCase):
         # The run is recorded in the board's history even without a board, its end screen kept beside it.
         history = json.loads((work / "device-tests" / "history.json").read_text())
         self.assertEqual([(item["folder"], item["run"]) for item in history], [(RUN, "9")])
-        self.assertTrue((work / "device-tests" / "history" / RUN / "android" / "sign-in-end.png").is_file())
+        self.assertTrue((work / "device-tests" / "board" / "media" / RUN / "android" / "sign-in-end.png").is_file())
 
     def test_the_flow_board_is_built_from_the_sealed_may_app_files_which_are_never_committed(self):
         flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
@@ -628,8 +628,8 @@ class PublishDeviceTests(unittest.TestCase):
                                      "GITHUB_RUN_ID": "9"}, clear=True), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             publish.push_device(run_git=git)
-        self.assertEqual(out.getvalue().splitlines()[-1], "May device tests: the flow board is board.html in the run folder")
-        page = (work / "device-tests" / RUN / "board.html").read_text()
+        self.assertEqual(out.getvalue().splitlines()[-1], "May device tests: the flow board is device-tests/board/ in may-renders")
+        page = (work / "device-tests" / "board" / "index.html").read_text()
         data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
         self.assertEqual(data["results"][RUN]["android/sign-in"]["verdict"], "pass", "ui-pass from the report")
         self.assertEqual(data["results"][RUN]["android/sign-in"]["headline"], "Signs in")
