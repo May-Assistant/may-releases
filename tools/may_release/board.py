@@ -139,11 +139,22 @@ def entry(folder, run, reports, now, previews=frozenset()):
             "results": results}
 
 
+def valid_folder(folder):
+    """<UTC date>-<sha> with a real date: run_date reads its month and day."""
+    if not (isinstance(folder, str) and FOLDER.fullmatch(folder)):
+        return False
+    try:
+        datetime.datetime.strptime(folder[:8], "%Y%m%d")
+    except ValueError:
+        return False
+    return True
+
+
 def history_entries(existing):
     """history.json's entries that still have the fixed shape; anything else is dropped."""
     kept = []
     for item in existing if isinstance(existing, list) else []:
-        if not (isinstance(item, dict) and isinstance(item.get("folder"), str) and FOLDER.fullmatch(item["folder"]) and
+        if not (isinstance(item, dict) and valid_folder(item.get("folder")) and
                 (item.get("run") is None or isinstance(item["run"], str) and RUN.fullmatch(item["run"])) and
                 text(item.get("when"), 40) and isinstance(item.get("results"), dict)):
             continue
@@ -170,7 +181,8 @@ def history_after(existing, new):
 
 
 def flow_state(verdicts):
-    """pass: every test passed on both apps; partial: some passed; fail: something failed and none passed."""
+    """pass: every test passed on both apps; partial: some passed; fail: something failed and none passed; skipped:
+    none ran, and at least one was switched off or skipped (as the page's run dots)."""
     if not verdicts or all(v == "none" for v in verdicts):
         return "none"
     if all(v == "skipped" for v in verdicts):
@@ -179,7 +191,7 @@ def flow_state(verdicts):
         return "pass"
     if "pass" in verdicts:
         return "partial"
-    return "fail" if "fail" in verdicts else "none"
+    return "fail" if "fail" in verdicts else "skipped"
 
 
 def platform_state(verdicts):
@@ -192,31 +204,52 @@ def run_date(folder):
     return f"{int(folder[6:8])} {MONTHS[int(folder[4:6]) - 1]}"
 
 
-def payload(flows, notes, entries, asset_url, keep, titles):
-    """The page's data: flows with their state in the newest run, every kept run oldest first, and each run's results
-    (the curated text on the newest run's alone)."""
-    newest = entries[0]
-    runs, results = [], {}
-    for index, item in reversed(list(enumerate(entries))):
-        archived = index >= keep
-        runs.append({"folder": item["folder"], "run": item["run"], "date": run_date(item["folder"]),
-                     "when": item["when"], "archived": archived})
-        shown = {}
+def row_for(item, key, result, archived, asset_url):
+    """One result as the page shows it: verdict, end screen, recording link (none once archived) and reason."""
+    device = key.split("/")[0]
+    row = {"verdict": result["verdict"], "run": item["run"], "run_date": run_date(item["folder"])}
+    if result["shot"]:
+        row["thumb"] = f"{MEDIA}/{item['folder']}/{device}/{result['shot']}"
+    if result["videos"] and not archived:
+        row["video"] = asset_url(item["folder"], device, result["videos"][0])
+    if result["preview"] and not archived:
+        row["preview"] = preview_path(item["folder"], key)
+    if result["reason"]:
+        row["note"] = result["reason"]
+    return row
+
+
+def archived_runs(entries, keep):
+    """The runs whose release is gone: a release holds a run's recordings, and only the newest keep releases are kept,
+    so only runs with a recording count towards keep (a smoke or no-recording run never pushes others out)."""
+    with_videos = [item["folder"] for item in entries if any(r["videos"] for r in item["results"].values())]
+    return set(with_videos[keep:])
+
+
+def latest(entries):
+    """Each test's newest result from any run: the newest that ran (passed or failed), else the newest skip. A partial
+    run (a subset, the smoke scenario) so never hides an older result. {key: (entry, result)}."""
+    found = {}
+    for item in entries:
         for key, result in item["results"].items():
-            device, scenario = key.split("/")
-            row = {"verdict": result["verdict"], "run": item["run"], "run_date": run_date(item["folder"])}
-            if result["shot"]:
-                row["thumb"] = f"{MEDIA}/{item['folder']}/{device}/{result['shot']}"
-            if result["videos"] and not archived:
-                row["video"] = asset_url(item["folder"], device, result["videos"][0])
-            if result["preview"] and not archived:
-                row["preview"] = preview_path(item["folder"], key)
-            if result["reason"]:
-                row["note"] = result["reason"]
-            if item is newest:
-                row.update(notes["results"].get(key, {}))
-            shown[key] = row
-        results[item["folder"]] = shown
+            if key not in found or found[key][1]["verdict"] == "skipped" and result["verdict"] != "skipped":
+                found[key] = (item, result)
+    return found
+
+
+def payload(flows, notes, entries, asset_url, keep, titles):
+    """The page's data: flows with their state from each test's latest result, every kept run oldest first with its
+    own results, and the latest view ("latest": each test's newest result, with the lanes' curated text)."""
+    archived = archived_runs(entries, keep)
+    newest = latest(entries)
+    runs, results = [], {}
+    for item in reversed(entries):
+        runs.append({"folder": item["folder"], "run": item["run"], "date": run_date(item["folder"]),
+                     "when": item["when"], "archived": item["folder"] in archived})
+        results[item["folder"]] = {key: row_for(item, key, result, item["folder"] in archived, asset_url)
+                                   for key, result in item["results"].items()}
+    results["latest"] = {key: dict(row_for(item, key, result, item["folder"] in archived, asset_url),
+                                   **notes["results"].get(key, {})) for key, (item, result) in newest.items()}
     # A nested row's title: the lanes' own (board-notes.json), else this repository's scenario list, else its id.
     titles = {**titles, **notes["scenario_titles"]}
     out = []
@@ -227,13 +260,14 @@ def payload(flows, notes, entries, asset_url, keep, titles):
                 row = flow_row({"id": f"{flow['id']}-{scenario}", "title": titles.get(scenario, scenario),
                                 "scenarios": [scenario], "components": flow["components"]}, {}, newest, entries)
                 out.append(dict(row, parent=flow["id"], scenario_row=True))
-    return {"flows": out, "runs": runs, "current": newest["folder"], "results": results}
+    return {"flows": out, "runs": runs, "current": entries[0]["folder"], "results": results}
 
 
 def flow_row(flow, extra, newest, entries):
-    """A sidebar row: the flow, its state in the newest run and when it last passed, and its curated text."""
-    verdicts = {device: [newest["results"].get(f"{device}/{s}", {}).get("verdict", "none") for s in flow["scenarios"]]
-                for device in DEVICES}
+    """A sidebar row: the flow, its state from its tests' latest results and when it last passed, and its curated
+    text."""
+    verdicts = {device: [newest[f"{device}/{s}"][1]["verdict"] if f"{device}/{s}" in newest else "none"
+                         for s in flow["scenarios"]] for device in DEVICES}
     passed = next((item for item in entries if flow["scenarios"] and all(
         item["results"].get(f"{device}/{s}", {}).get("verdict") == "pass"
         for s in flow["scenarios"] for device in DEVICES)), None)
@@ -258,9 +292,11 @@ def preview_asset(key):
 
 def previews_list(entries, keep):
     """media/previews.json: for each preview the page expects, the release (tag) and asset that hold it, so the
-    coordinator can download them into the folder before uploading it. The newest keep runs alone have releases."""
+    coordinator can download them into the folder before uploading it. Archived runs have no release."""
+    archived = archived_runs(entries, keep)
     return {preview_path(item["folder"], key): {"tag": f"device-tests-{item['folder']}", "asset": preview_asset(key)}
-            for item in entries[:keep] for key, result in sorted(item["results"].items()) if result["preview"]}
+            for item in entries if item["folder"] not in archived
+            for key, result in sorted(item["results"].items()) if result["preview"]}
 
 
 def page(data, banner, when):
@@ -268,9 +304,9 @@ def page(data, banner, when):
     blob = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e") \
         .replace("&", "\\u0026")
     flash = json.dumps(banner).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    template = TEMPLATE.read_text()
-    return template.replace("{{RUN_WHEN}}", when.replace("&", "&amp;").replace("<", "&lt;")) \
-        .replace("{{BANNER}}", flash).replace("{{DATA}}", blob)
+    values = {"RUN_WHEN": when.replace("&", "&amp;").replace("<", "&lt;"), "BANNER": flash, "DATA": blob}
+    # One pass: a value holding "{{DATA}}" (a banner, say) is never itself filled in.
+    return re.sub(r"\{\{(RUN_WHEN|BANNER|DATA)\}\}", lambda match: values[match.group(1)], TEMPLATE.read_text())
 
 
 def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, titles, now=None, previews=frozenset()):
@@ -284,7 +320,7 @@ def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, 
     except (OSError, ValueError):
         existing = []
     new = entry(folder, run, reports, now, previews)
-    entries, removed = history_after(existing, new)
+    entries, _ = history_after(existing, new)
     for device_key, result in new["results"].items():
         device = device_key.split("/")[0]
         source = base / folder / device / result["shot"] if result["shot"] else None
@@ -294,8 +330,13 @@ def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, 
             shutil.copyfile(source, target / result["shot"])
         else:
             result["shot"] = None
-    for old in removed:
-        shutil.rmtree(base / BOARD / MEDIA / old, ignore_errors=True)
+    # Media of every run no longer in the history goes: those just dropped, and any a reset or malformed history.json
+    # left behind.
+    kept = {item["folder"] for item in entries}
+    media = base / BOARD / MEDIA
+    for old in list(media.iterdir()) if media.is_dir() else []:
+        if old.is_dir() and old.name not in kept:
+            shutil.rmtree(old, ignore_errors=True)
     index.write_text(json.dumps(entries, indent=2) + "\n")
     try:
         flows = checked_flows(flows_data)

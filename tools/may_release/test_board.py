@@ -134,9 +134,11 @@ class BoardTests(BoardCase):
         self.assertEqual((flows["2"]["means"], flows["2"]["issue"], flows["2"]["changed"]),
                          ("Sign in, see your chats.", 12, [1178]))
         self.assertEqual(flows["2"]["last_pass"], "3 Oct 2026, run 2")
-        newest, older = data["results"][folder(2)], data["results"][folder(1)]
+        self.assertIn("latest", data["results"], "each test's latest result is the default view")
+        newest, older = data["results"]["latest"], data["results"][folder(1)]
         self.assertEqual(newest["android/sign-in"]["headline"], "Signs in")
-        self.assertNotIn("headline", older["android/sign-in"], "curated text describes the newest run alone")
+        self.assertNotIn("headline", older["android/sign-in"], "curated text describes the latest results alone")
+        self.assertNotIn("headline", data["results"][folder(2)]["android/sign-in"])
         self.assertEqual(newest["android/sign-in"]["thumb"], f"media/{folder(2)}/android/sign-in-end.png")
         self.assertEqual(newest["android/sign-in"]["video"], url(folder(2), "android", "sign-in.mp4"))
         self.assertTrue((self.base / "board" / "media" / folder(2) / "android" / "sign-in-end.png").is_file())
@@ -173,7 +175,8 @@ class BoardTests(BoardCase):
             self.assertTrue(thumb.startswith(board.MEDIA + "/") and ".." not in thumb, thumb)
             self.assertTrue((self.base / board.BOARD / thumb).is_file(), thumb)
         self.assertNotIn("../", page)
-        self.assertFalse((self.base / folder(1) / "board.html").exists(), "the latest board alone; history is inside it")
+        self.assertEqual(list(self.base.rglob("*.html")), [self.base / board.BOARD / "index.html"],
+                         "one board, the latest; its history is inside it")
 
     def test_runs_beyond_the_kept_releases_are_archived_with_verdict_and_end_screen_but_no_recording(self):
         for n in range(1, 13):
@@ -185,6 +188,56 @@ class BoardTests(BoardCase):
         self.assertEqual((oldest["verdict"], oldest["thumb"]), ("pass", f"media/{folder(1)}/android/sign-in-end.png"))
         self.assertNotIn("video", oldest)
         self.assertIn("video", data["results"][folder(3)]["android/sign-in"])
+
+    def test_a_partial_run_never_hides_an_older_result_nor_pushes_runs_towards_archived(self):
+        """Review of #86: a subset or smoke run made every untested flow read "No test yet"."""
+        self.run_folder(folder(1), {"android": [row("sign-in", "pass"), row("chat", "fail")]})
+        for n in range(2, 13):  # eleven runs of sign-in alone, without a recording
+            self.run_folder(folder(n), {"android": [row("sign-in", "pass", video=False)]})
+        self.run_folder(folder(13), {"android": [row("chat", "skipped", shot=False, video=False, reason="r")]})
+        data, _ = self.data(folder(13))
+        flows = {f["id"]: f for f in data["flows"]}
+        self.assertEqual(flows["2"]["android"], "pass")
+        self.assertEqual(flows["4-chat"]["android"], "fail", "the newest run that ran chat, not its newest skip")
+        latest = data["results"]["latest"]
+        self.assertEqual((latest["android/chat"]["verdict"], latest["android/chat"]["run"]), ("fail", "1"))
+        self.assertEqual([r["folder"] for r in data["runs"] if r["archived"]], [],
+                         "runs with no recording never push a run with one out of the kept releases")
+        self.assertIn("video", data["results"][folder(1)]["android/chat"])
+
+    def test_a_flow_with_tests_switched_off_and_never_run_reads_switched_off(self):
+        """Review of #86: the sidebar said "No test yet" where the run dot said switched off."""
+        self.assertEqual(board.flow_state(["skipped", "none"]), "skipped")
+        self.assertEqual(board.flow_state(["none", "none"]), "none")
+        self.assertEqual(board.flow_state(["fail", "skipped"]), "fail")
+
+    def test_history_entries_with_an_impossible_date_are_dropped(self):
+        """Review of #86: month 13 made run_date raise, month 00 read as December."""
+        good = board.entry(folder(1), "1", {"android": [row("sign-in", "pass")]}, NOW)
+        bad = [dict(good, folder="20261301-" + "a" * 12), dict(good, folder="20261000-" + "b" * 12),
+               dict(good, folder="20260230-" + "c" * 12)]
+        self.assertEqual([item["folder"] for item in board.history_entries(bad + [good])], [folder(1)])
+
+    def test_media_of_runs_no_longer_in_the_history_is_removed_even_after_a_reset(self):
+        self.run_folder(folder(1), {"android": [row("sign-in", "pass")]})
+        (self.base / "history.json").write_text("not json")  # a reset or a broken history
+        self.run_folder(folder(2), {"android": [row("sign-in", "pass")]})
+        self.assertEqual(sorted(p.name for p in (self.base / board.BOARD / board.MEDIA).iterdir() if p.is_dir()),
+                         [folder(2)])
+
+    def test_a_banner_naming_a_placeholder_leaves_the_page_whole(self):
+        """Review of #86: the banner was filled in before the data, so "{{DATA}}" in it took the data blob."""
+        notes = dict(NOTES, banner={"title": "{{DATA}} {{BANNER}}", "body": "{{RUN_WHEN}}"})
+        (self.base / folder(1) / "android").mkdir(parents=True)
+        board.update(self.base, folder(1), "1", {"android": [row("sign-in", "pass", shot=False)]}, FLOWS, notes, url,
+                     10, TITLES, now=NOW)
+        try:
+            data, page = self.data(folder(1))
+            banner = json.loads(page.split('id="board-banner">')[1].split("</script>")[0])
+        except ValueError as error:
+            self.fail(f"the page no longer parses: {error}")
+        self.assertEqual(banner, {"title": "{{DATA}} {{BANNER}}", "body": "{{RUN_WHEN}}"})
+        self.assertEqual(data["current"], folder(1))
 
     def test_screenshots_beyond_the_history_are_removed(self):
         with patch("board.HISTORY", 3):
