@@ -160,6 +160,9 @@ class RunTests(Workspace):
         self.assertIn(["xcrun", "simctl", "install", UDID, str(self.root / device_ios.APP)], [a for a, _ in calls])
         tests = [argv for argv, _ in calls if argv[0] == "/fake/maestro"]
         self.assertEqual([argv[:4] for argv in tests], [["/fake/maestro", "--device", UDID, "test"]] * 2)
+        # Run 40051935128: each flow gets its own scenario's session in Maestro's environment, for ${MAESTRO_...}.
+        self.assertEqual([env.get(device_tests.MAESTRO_SESSION) for argv, env in calls if argv[0] == "/fake/maestro"],
+                         [TOKEN + "1", TOKEN + "2"])
         self.assertEqual([row["id"] for row in report["scenarios"]], ["sign-in", "connections"],
                          "Android's agent scenarios are not run here")
         self.assertEqual(report["device"], "ios")

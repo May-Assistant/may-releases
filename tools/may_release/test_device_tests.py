@@ -252,7 +252,7 @@ class RunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None):
-        calls = []
+        calls, self.maestro_envs = [], []
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
         (self.private / device_tests.AGENTS).unlink(missing_ok=True)
@@ -266,6 +266,8 @@ class RunTests(unittest.TestCase):
 
         def private(argv, log, *, cwd=None, env=None, check=True, timeout=None):
             calls.append(list(argv))
+            if argv[0] == "/fake/maestro":
+                self.maestro_envs.append(dict(env or {}))
             return 1 if argv[-1].endswith(".xml") and any(f"/{name}.xml" in argv[-1] for name in fail) else 0
 
         def screenshot(adb, env, path, log):
@@ -320,6 +322,16 @@ class RunTests(unittest.TestCase):
         self.assertRegex(run.name, r"^[0-9]{8}-" + SHA[:12] + "$")
         self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "fail"])
         self.assertIn(["terminate"], calls)
+
+    def test_the_flow_gets_the_session_in_maestros_environment_never_as_an_argument(self):
+        """Run 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in."""
+        calls, _, _, _ = self.run_it(selection="sign-in")
+        maestro = [argv for argv in calls if argv[0] == "/fake/maestro"]
+        self.assertEqual(len(maestro), 1)
+        self.assertNotIn(TOKEN, " ".join(maestro[0]))
+        self.assertEqual([env.get(device_tests.MAESTRO_SESSION) for env in self.maestro_envs], [TOKEN])
+        self.assertEqual(device_tests.MAESTRO_SESSION, "MAESTRO_MAY_TEST_SESSION",
+                         "Maestro's CLI passes only MAESTRO_-prefixed variables to a flow")
 
     def test_a_failing_flow_and_server_checks(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text("appId: x\n")

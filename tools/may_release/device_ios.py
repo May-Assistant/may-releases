@@ -230,8 +230,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 try:
                     passed = not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format",
                                                 "junit", "--output", str(folder / (row["id"] + ".xml"))], log,
-                                               env=dict(env, MAESTRO_CLI_NO_ANALYTICS="1",
-                                                        MAESTRO_DISABLE_UPDATE_CHECK="true"),
+                                               env=device_tests.with_session(
+                                                   dict(env, MAESTRO_CLI_NO_ANALYTICS="1",
+                                                        MAESTRO_DISABLE_UPDATE_CHECK="true"), token),
                                                timeout=device_tests.FLOW_SECONDS).returncode
                 except subprocess.SubprocessError:
                     passed = False

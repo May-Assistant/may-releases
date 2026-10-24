@@ -92,6 +92,10 @@ TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{20,4096}")
 # Recordings: about 720p at about 1 Mbps, in screenrecord's 3-minute chunks: under 25 MB a chunk.
 RECORD_SIZE, RECORD_BITRATE, RECORD_SECONDS = "720x1600", "1000000", 180
 FLOW_SECONDS = 600
+# The scenario's test session, handed to its Maestro flow in Maestro's environment, never as an argument: Maestro's CLI
+# makes each MAESTRO_-prefixed variable a flow variable, so a flow reads it as ${MAESTRO_MAY_TEST_SESSION} (run
+# 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in).
+MAESTRO_SESSION = "MAESTRO_MAY_TEST_SESSION"
 # Each device job has 120 minutes (device-tests.yml). Its build takes about 7, and after the scenarios come the judge
 # (up to device_agent.JUDGE_SECONDS for each agent scenario that ran), the seal and the handover. The scenarios and
 # their judging get RUN_BUDGET_SECONDS from the run step's start, so the job always seals and publishes what ran
@@ -439,6 +443,11 @@ def staging(secret, staged):
     return base
 
 
+def with_session(env, token):
+    """Maestro's environment for one scenario's flow: the session in MAESTRO_SESSION when there is one."""
+    return dict(env, **{MAESTRO_SESSION: token}) if token else dict(env)
+
+
 def scenario_flow(row, source, private):
     """The Maestro flow a scenario runs: may-app's for a Maestro row, SMOKE_FLOW for the smoke row, none for an agent."""
     if row["driver"] == "maestro":
@@ -545,7 +554,8 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 try:
                     passed = not flows.run_private(
                         [str(launcher), "--device", SERIAL, "test", str(flow), "--format", "junit", "--output",
-                         str(folder / (row["id"] + ".xml"))], log, env=maestro_env, check=False, timeout=FLOW_SECONDS)
+                         str(folder / (row["id"] + ".xml"))], log, env=with_session(maestro_env, token), check=False,
+                        timeout=FLOW_SECONDS)
                 except subprocess.TimeoutExpired:
                     passed = False
             if row["driver"] != "maestro":
