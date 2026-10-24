@@ -46,7 +46,8 @@ button { font: inherit; color: inherit; }
 .meta { margin: 8px 0 16px; color: var(--fg-muted); }
 
 .split { flex: 1; display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 0; }
-.side { border-right: 1px solid var(--border); padding: 16px 16px 24px; }
+.side { border-right: 1px solid var(--border); padding: 16px 16px 24px; position: sticky; top: 0; align-self: start; height: 100vh; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+.side .nav { flex: 1; min-height: 0; overflow-y: auto; }
 .side-h { display: flex; justify-content: space-between; align-items: center; margin: 0 0 10px 8px; font-weight: 600; }
 .side-h span { font-weight: 400; font-size: 12px; color: var(--fg-muted); }
 .fmenu { position: relative; }
@@ -64,14 +65,14 @@ button { font: inherit; color: inherit; }
 .fopt[aria-checked="true"] { font-weight: 600; }
 .fopt .chk { width: 16px; flex: none; color: var(--fg); text-align: center; }
 .nav { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.nav ul { list-style: none; margin: 2px 0 4px 32px; padding: 0 0 0 4px; border-left: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
+.nav ul { list-style: none; margin: 2px 0 4px 15px; padding: 0; border-left: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
 .it { width: 100%; display: flex; align-items: center; gap: 8px; text-align: left; background: none; border: 0; border-radius: 6px; padding: 6px 8px; cursor: pointer; }
 .it:hover { background: var(--selected); }
 .it[aria-current="true"] { background: var(--selected); font-weight: 600; }
 .it .chev { width: 16px; height: 16px; color: var(--fg-muted); flex: none; transition: transform .15s; }
 .it .chev.open { transform: rotate(90deg); } .it .chev.blank { visibility: hidden; }
 .it .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nav ul .it { padding-left: 12px; color: var(--fg-muted); }
+.nav ul .it { padding-left: 16px; color: var(--fg-muted); }
 .nav ul .it:hover, .nav ul .it[aria-current="true"] { color: var(--fg); }
 .nav ul .it[aria-current="true"] { font-weight: 400; }
 .it.parent-open { font-weight: 600; }
@@ -81,6 +82,7 @@ button { font: inherit; color: inherit; }
 .back { display: none; align-self: flex-start; }
 .d-crumbs { display: flex; flex-wrap: wrap; gap: 6px; font-size: 13px; color: var(--fg-muted); }
 .d-crumbs .cur { color: var(--fg); }
+.d-crumbs a { color: var(--fg-muted); text-decoration: underline; }
 .d-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .d-title .tally { color: var(--fg-muted); font-size: 14px; }
 .d-title h2 { margin: 0; font-size: 22px; font-weight: 600; }
@@ -102,8 +104,8 @@ button { font: inherit; color: inherit; }
 .card-h { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: var(--canvas-subtle); border-bottom: 1px solid var(--border); font-weight: 600; }
 .card-h .label { margin-left: auto; padding-left: 4px; }
 .label .ico { width: 14px; height: 14px; }
-.player { display: flex; justify-content: center; padding: 20px 16px; background: var(--canvas-subtle); border-bottom: 1px solid var(--border); }
-.phone { position: relative; height: 368px; aspect-ratio: 9 / 19.5; box-shadow: 0 0 0 4px #1f2328; border-radius: 14px; margin: 4px; overflow: hidden; background: #ffffff; display: flex; align-items: center; justify-content: center; }
+.player { display: flex; justify-content: center; align-items: center; box-sizing: border-box; height: 424px; padding: 20px 16px; background: var(--canvas-subtle); border-bottom: 1px solid var(--border); }
+.phone { position: relative; height: 368px; max-width: 100%; flex: none; aspect-ratio: 9 / 19.5; box-shadow: 0 0 0 4px #1f2328; border-radius: 14px; margin: 4px; overflow: hidden; background: #ffffff; display: flex; align-items: center; justify-content: center; }
 .phone video, .phone img { width: 100%; height: 100%; object-fit: contain; display: block; background: #ffffff; }
 .phone .empty { color: #59636e; text-align: center; padding: 16px; font-size: 13px; }
 .phone .empty strong { display: block; color: #1f2328; font-size: 14px; margin-bottom: 2px; }
@@ -135,7 +137,7 @@ button { font: inherit; color: inherit; }
 @media (max-width: 1020px) { .main { grid-template-columns: 1fr; } .rail { border-left: 0; padding-left: 0; border-top: 1px solid var(--border); padding-top: 16px; } }
 @media (max-width: 760px) {
   .split { grid-template-columns: 1fr; }
-  .side { border-right: 0; }
+  .side { border-right: 0; position: static; height: auto; overflow: visible; }
   .main { padding: 16px 16px 40px; }
   .top { padding: 16px 16px 0; }
   .split.detail .side { display: none; } .split:not(.detail) .main { display: none; }
@@ -362,7 +364,7 @@ button { font: inherit; color: inherit; }
     rorder.forEach(function (n) { var x = rseen[n], both = x.p.android && x.p.ios;
       runs.appendChild(el('div', { class: 'prrow' }, [el('a', { href: 'https://github.com/May-Assistant/may-releases/actions/runs/' + n, target: '_blank', rel: 'noopener', text: (x.d ? x.d + ' · ' : '') + 'Run ' + n }), el('span', { class: 'plat', text: both ? 'Both' : x.p.android ? 'Android' : 'iOS' })])); });
     var rail = el('aside', { class: 'rail' }, [el('h3', { text: 'About this flow' }), el('dl', {}, [
-      f.means ? el('div', {}, [el('dt', { text: 'Works when' }), el('dd', { text: f.means })]) : null,
+      f.means ? el('div', {}, [el('dt', { text: 'Goal' }), el('dd', { text: f.means })]) : null,
       ol ? el('div', {}, [el('dt', { text: 'Before the next run' }), el('dd', {}, [ol])]) : null,
       rorder.length ? el('div', {}, [el('dt', { text: 'Recorded in' }), runs]) : null,
       el('div', {}, [el('dt', { text: 'Last passed' }), el('dd', { text: f.last_pass || 'Never' })]),

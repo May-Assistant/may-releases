@@ -1,9 +1,21 @@
 [
   {
     "id": "sign-in",
-    "title": "Sign in with a staging test session",
+    "title": "Sign in with an injected test session",
     "driver": "maestro",
     "flow": "sign-in.yaml",
+    "platforms": [
+      "android",
+      "ios"
+    ],
+    "outward": false,
+    "server": []
+  },
+  {
+    "id": "sign-out",
+    "title": "Sign out from Settings",
+    "driver": "maestro",
+    "flow": "sign-out.yaml",
     "platforms": [
       "android",
       "ios"
@@ -16,6 +28,18 @@
     "title": "Connections are listed",
     "driver": "maestro",
     "flow": "connections.yaml",
+    "platforms": [
+      "android",
+      "ios"
+    ],
+    "outward": false,
+    "server": []
+  },
+  {
+    "id": "connection-detail",
+    "title": "Google Calendar's connection row",
+    "driver": "maestro",
+    "flow": "connection-detail.yaml",
     "platforms": [
       "android",
       "ios"
@@ -55,7 +79,7 @@
     "id": "notes",
     "title": "Add a note to a new agenda task",
     "driver": "agent",
-    "goal": "In May Playground, open Agenda and add a new task titled {tag} task. Open that task, open its Notes tab and add a note that says: {tag} note from the device test. Make sure the note is saved and shown on the {tag} task.",
+    "goal": "In May Playground, open Agenda and add a new task titled {tag} task. Open that task. On its Details, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on the {tag} task.",
     "platforms": [
       "android",
       "ios"

@@ -152,8 +152,8 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "connections", "onboarding", "chat", "notes", "poll", "poll-skip",
-                               "routines"])
+        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "onboarding", "chat", "notes",
+                               "poll", "poll-skip", "routines"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ids, "both devices run all")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
@@ -165,6 +165,15 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("add a new task titled {tag} task", goal)
         self.assertIn("on the {tag} task", goal)
         self.assertNotIn("first item", goal)
+
+    def test_the_notes_scenario_uses_the_details_notes_field(self):
+        """Run 40095010166: the task detail has Details, Thread and Files, its notes field on Details ("Add notes");
+        both judges failed a goal that asked for a Notes tab."""
+        goal = device_tests.scenarios("notes")[0]["goal"]
+        self.assertIn("On its Details, tap the notes field that says Add notes", goal)
+        self.assertIn("open the {tag} task again", goal, "the note is checked after reopening the task")
+        for stale in ("Notes tab", "Take notes"):
+            self.assertNotIn(stale, goal)
 
     def test_every_agent_scenario_fits_inside_one_test_session(self):
         """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
@@ -343,6 +352,35 @@ def ticking_budget():
     return device_tests.Budget(total=device_tests.FLOW_SECONDS + 1, clock=lambda: next(ticks))
 
 
+class BootTests(unittest.TestCase):
+    def test_the_emulator_runs_its_animations_at_normal_speed(self):
+        puts = []
+
+        class Done:
+            returncode, stdout = 0, b"1\n"
+
+        class Emulator:
+            def poll(self):
+                return None
+
+        def private(argv, log, *, env=None, timeout=None):
+            if argv[1:4] == ["shell", "settings", "put"]:
+                puts.append(argv[4:])
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
+                patch("device_tests.flows.sdk_tool", side_effect=lambda home, tool: str(home / tool)), \
+                patch("device_tests.subprocess.run", return_value=Done()), \
+                patch("device_tests.subprocess.Popen", return_value=Emulator()), \
+                patch("device_tests.flows.run_private", side_effect=private):
+            root = Path(directory)
+            device_tests.boot(root, root / "log")
+        self.assertEqual(puts, [["global", setting, "1"] for setting in
+                                ("window_animation_scale", "transition_animation_scale", "animator_duration_scale")],
+                         "at 0, Compose's reduced motion stops the mascot ring and the recording hides the design")
+
+
 class BudgetTests(unittest.TestCase):
     def test_a_scenario_starts_only_when_its_cap_and_all_judging_still_fit(self):
         now = [0]
@@ -441,6 +479,84 @@ class OnboardingTests(unittest.TestCase):
         row = device_tests.scenarios("onboarding")[0]
         self.assertEqual(self.finish(row), ([], ""), "the subflow would skip the onboarding being recorded")
         self.assertEqual(self.finish(dict(row, id="chat", onboarding=None)), ([self.flow], ""))
+
+
+class FlowIdTests(unittest.TestCase):
+    """A Maestro flow's ids against the app's own sources, so a flow naming an id the app lacks never runs."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def write(self, relative, text):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_a_flow_and_the_flows_it_runs_give_their_ids(self):
+        self.write("flows/start.yaml", 'appId: x\n---\n- tapOn:\n    id: "demo-start"\n- runFlow: start.yaml\n')
+        self.write("flows/sub/finish.yaml", "appId: x\n---\n- assertVisible:\n    id: demo-done  # the end\n")
+        self.write("flows/sub/when.yaml", "appId: x\n---\n- tapOn: {id: \"demo-when\", optional: true}\n")
+        self.write("flows/script.yaml", "appId: x\n---\n- tapOn:\n    id: demo-script\n")
+        self.write("outside.yaml", "appId: x\n---\n- tapOn:\n    id: demo-outside\n")
+        flow = self.write("flows/main.yaml", "\n".join((
+            "appId: x", "---", "- runFlow: start.yaml", "- runFlow: sub/finish.yaml", "- runFlow: ../outside.yaml",
+            "- runFlow:", "    when:", "      visible:", "        id: \"demo-gate\"", "    file: sub/when.yaml",
+            "- runFlow:", "    file: '../outside.yaml'",
+            "- runScript:", "    file: script.js",
+            "- tapOn: {id: 'demo-inline'}", "- assertVisible: { id: demo-spaced, enabled: true }",
+            "- extendedWaitUntil:", "    visible:", "      id: 'demo-list|demo-empty'", "# id: demo-commented",
+            "- tapOn: \"Settings\"  # id: demo-trailing", "")))
+        self.assertEqual(device_tests.flow_ids(flow), {
+            "demo-start", "demo-done", "demo-gate", "demo-when", "demo-inline", "demo-spaced", "demo-list|demo-empty"},
+            "runFlow's file: form is followed and inline {id: …} is read; a loop, a comment, a label, a script and a "
+            "flow outside the folder give nothing")
+
+    def test_the_app_literals_leave_test_code_fixtures_and_previews_out(self):
+        self.write("android/app/src/main/Rows.kt", 'val tag = "demo.row.${c.wire}"\nval wire = "calendar"\n'
+                                                     'val name = "$title"\nval quote = "say \\"hi\\""\n')
+        self.write("android/app/src/main/kotlin/may/testsession/Gate.kt", 'val gate = "demo-testsession"\n')
+        self.write("android/app/src/playground/kotlin/may/Hook.kt", 'val hook = "demo-playground"\n')
+        self.write("ios/App/Shared/Rows.swift", 'let tag = "demo.cell.\\(row.wire)"\n')
+        self.write("ios/App/Shared/flows/Steps.swift", 'let steps = "demo-ios-flows-folder"\n')
+        for test in ("android/app/src/test/T.kt", "android/app/src/testPlayground/T.kt", "android/app/src/androidTest/T.kt",
+                     "android/app/src/androidTestPlayground/T.kt", "android/app/src/previews/P.kt",
+                     "android/flows/src/F.kt", "ios/App/Snapshots/S.swift", "ios/AppTests/T.swift",
+                     "ios/MayCore/Tests/MayCoreTests/T.swift", "ios/App/Playground/ParityFixtures.swift",
+                     "android/app/src/main/RowsTest.kt", "ios/App/Shared/RowsTests.swift"):
+            self.write(test, 'val only = "demo-test-only"\n')
+        whole, starts = device_tests.app_literals([self.root / "android", self.root / "ios"])
+        self.assertEqual(whole, {"calendar", 'say \\"hi\\"', "demo-testsession", "demo-playground",
+                                 "demo-ios-flows-folder"},
+                         "only whole test source sets and targets, fixtures, previews and the flows module are left out")
+        self.assertEqual(starts, {"demo.row.", "demo.cell."})
+
+    def test_an_id_is_there_as_a_literal_or_a_fixed_start_and_a_literal_remainder(self):
+        literals = ({"demo-root", "demo-list", "calendar"}, {"demo.row."})
+        self.assertEqual(device_tests.lacking_ids({"demo-root", "demo.row.calendar", "demo-list"}, literals), [])
+        self.assertEqual(device_tests.lacking_ids({"demo-rootX", "demo.row.calendarX", "demo-list|demo-gone",
+                                                   "demo-.*", "demo-(a|b)"}, literals),
+                         ["demo-gone", "demo-rootX", "demo.row.calendarX"],
+                         "a misspelt id, a row id with a misspelt remainder and a missing alternative are caught; "
+                         "an id using pattern syntax is not checked")
+
+    def test_each_platform_reads_may_app_and_the_design_system_where_prepare_puts_it(self):
+        """prepare.py moves the design system into may-source/android/build-deps/may-design-system; its Kotlin is
+        under android/ and its Swift under swift/ (the coordinator's review of #102)."""
+        ds = "may-source/android/build-deps/may-design-system"
+        self.write("may-source/android/app/src/main/A.kt", 'val a = "demo-app-android"\n')
+        self.write("may-source/ios/App/C.swift", 'let c = "demo-app-ios"\n')
+        self.write(f"{ds}/android/components/src/main/B.kt", 'val b = "demo-ds-android"\n')
+        self.write(f"{ds}/swift/Sources/MayDS/D.swift", 'let d = "demo-ds-swift"\n')
+        self.write(f"{ds}/swift/Tests/MayDSTests/T.swift", 'let t = "demo-ds-test"\n')
+        android, ios = device_tests.app_sources(self.root, "android"), device_tests.app_sources(self.root, "ios")
+        self.assertEqual(android()[0], {"demo-app-android", "demo-ds-android"}, "no Swift counts for Android")
+        self.assertEqual(ios()[0], {"demo-app-ios", "demo-ds-swift"}, "the design system's Swift counts for iOS")
+        self.assertIs(android(), android(), "read once a run")
 
 
 class RunTests(unittest.TestCase):
@@ -575,6 +691,19 @@ class RunTests(unittest.TestCase):
             ("sign-in", "skipped", "skipped (flow not tagged for android)"), ("connections", "ui-pass", device_tests.UNCONFIGURED)])
         self.assertNotIn(str(flow), " ".join(" ".join(argv) for argv in calls), "the untagged flow never ran")
 
+    def test_a_flow_naming_an_id_the_app_lacks_fails_and_never_runs(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        flow = self.source / device_tests.FLOWS_DIR / "sign-in.yaml"
+        flow.write_text(FLOW + "- tapOn:\n    id: \"demo-sign-in\"\n")
+        calls, report, _, _ = self.run_it()
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("sign-in", "fail", device_tests.FLOW_IDS), ("connections", "ui-pass", device_tests.UNCONFIGURED)])
+        self.assertNotIn(str(flow), " ".join(" ".join(argv) for argv in calls), "the flow never ran")
+        (self.source / "android/app/src/main/SignIn.kt").parent.mkdir(parents=True)
+        (self.source / "android/app/src/main/SignIn.kt").write_text('val tag = "demo-sign-in"\n')
+        _, report, _, _ = self.run_it()
+        self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass", "the app has the id: it runs")
+
     def test_flow_tags_reads_the_header_alone(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "f.yaml"
@@ -593,7 +722,7 @@ class RunTests(unittest.TestCase):
     def test_a_failing_flow_and_server_checks(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         listed = json.loads(device_tests.SCENARIOS.read_text())
-        listed[1]["server"] = [{"get": "/v1/connections", "expect": 200}]
+        next(row for row in listed if row["id"] == "connections")["server"] = [{"get": "/v1/connections", "expect": 200}]
         path = self.root / "scenarios.json"
         path.write_text(json.dumps(listed))
         with patch("device_tests.SCENARIOS", path):
@@ -1052,7 +1181,7 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(out.strip(), f"May device tests decrypted and checked: run folder device-tests/{RUN}/ with 2 "
                                       "scenario reports from 1 devices")
         readme = (tree / "README.md").read_text()
-        self.assertIn("## sign-in: Sign in with a staging test session", readme)
+        self.assertIn("## sign-in: Sign in with an injected test session", readme)
         self.assertIn("**android: ui-pass** (server checks not configured)", readme)
         self.assertIn('<img src="android/sign-in-end.png" width="300">', readme)
         self.assertIn("[Recording: sign-in.mp4](https://github.com/May-Assistant/may-renders/releases/download/device-tests-" + RUN + "/android-sign-in.mp4)", readme)

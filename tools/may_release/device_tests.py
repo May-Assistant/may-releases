@@ -36,6 +36,7 @@ server's guard for test sessions as the backstop.
 
 import argparse
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -662,8 +663,15 @@ def screenshot(adb, env, path, log):
     return path.name
 
 
+# The emulator's three animation scales, at normal speed so a recording shows the app's real design (its mascot ring:
+# at 0, Compose's reduced motion stops it). flows.py's renders keep theirs at 0, for still screens.
+ANIMATION_SETTINGS = ("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
+ANIMATION_SCALE = "1"
+
+
 def boot(root, log):
-    """The emulator, as flows.run starts it (API 35 image, KVM, no window), with animations off: (adb, process, env)."""
+    """The emulator, as flows.run starts it (API 35 image, KVM, no window), with animations at ANIMATION_SCALE: (adb,
+    process, env)."""
     home = flows.sdk()
     env = child_env(ANDROID_AVD_HOME=str(root / "may-avd"), ANDROID_EMULATOR_HOME=str(root / "may-avd"))
     adb = flows.sdk_tool(home, "platform-tools/adb")
@@ -684,8 +692,8 @@ def boot(root, log):
             emulator.kill()
             raise DeviceTestsError("The emulator did not boot; no scenario ran")
         time.sleep(5)
-    for setting in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
-        flows.run_private([adb, "shell", "settings", "put", "global", setting, "0"], log, env=env)
+    for setting in ANIMATION_SETTINGS:
+        flows.run_private([adb, "shell", "settings", "put", "global", setting, ANIMATION_SCALE], log, env=env)
     return adb, emulator, env
 
 
@@ -784,6 +792,112 @@ def scenario_flow(row, source, private):
     return None
 
 
+# Every id a Maestro scenario's flow (and the flows it runs) taps or waits on must be in the app's own sources for the
+# job's platform: may-app's and its design system's Kotlin or Swift, test code left out. A flow naming one that is not
+# fails without being driven (FLOW_IDS), and the log gives a count alone. An id is there as a string literal, or as a
+# literal's fixed start before an interpolation ("connections.row.${c.wire}") whose remainder is itself a literal
+# ("google_calendar"), so a misspelt row id is still caught.
+FLOW_IDS = "the flow names an id the app's sources lack"
+# prepare.py moves the design system's checkout into may-app's Android build: its Kotlin under android/, its Swift under
+# swift/. Each platform reads may-app's own folder (the design system's checkout left out of Android's) and its own
+# part of the design system.
+DESIGN_SYSTEM_BUILD = "build-deps/may-design-system"
+PLATFORM_SOURCES = {"android": ("android", "android"), "ios": ("ios", "swift")}
+SOURCE_SUFFIXES = (".kt", ".swift")
+# A flow's ids in either form, "id: x" on its own line or inline in {id: x, …}, and the flows it runs, as runFlow: x.yaml
+# or a runFlow block's file: x.yaml (a runScript's file is JavaScript, never followed).
+FLOW_ID = re.compile(r"(?<![\w-])id:\s*([\"']?)([^\"',{}\s]+)\1")
+RUN_FLOW = re.compile(r"(?<![\w-])(?:runFlow|file):\s*([\"']?)([A-Za-z0-9_./-]+\.yaml)\1")
+LITERAL = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
+ID_PATTERN = re.compile(r"[\\*+?()\[\]{}^$]")
+INTERPOLATION = re.compile(r"\$\{|\$[A-Za-z_]|\\\(")
+
+
+def flow_ids(flow, seen=None):
+    """The ids a flow and every flow it runs (runFlow, beside it) name, as written."""
+    seen = set() if seen is None else seen
+    if flow in seen or not flow.is_file() or flow.is_symlink():
+        return set()
+    seen.add(flow)
+    ids = set()
+    for line in flow.read_text(errors="replace")[:MAX_FLOW_BYTES].splitlines():
+        line = uncommented(line)
+        ids.update(found[1] for found in FLOW_ID.findall(line))
+        for _, nested in RUN_FLOW.findall(line):
+            if ".." not in Path(nested).parts:
+                ids |= flow_ids(flow.parent / nested, seen)
+    return ids
+
+
+def uncommented(line):
+    """A flow line without its YAML comment: from a # at its start or after a space, outside quotes."""
+    quote = None
+    for at, char in enumerate(line):
+        if quote:
+            quote = None if char == quote else quote
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (at == 0 or line[at - 1].isspace()):
+            return line[:at]
+    return line
+
+
+def app_literals(roots):
+    """The string literals in the Kotlin and Swift under roots, test code left out: (whole literals, fixed starts of
+    interpolated ones)."""
+    whole, starts = set(), set()
+    for root in roots:
+        for path in sorted(root.rglob("*")) if root.is_dir() else []:
+            if path.suffix not in SOURCE_SUFFIXES or path.is_symlink() or not path.is_file() or test_code(
+                    path.relative_to(root)):
+                continue
+            for literal in LITERAL.findall(path.read_text(errors="replace")):
+                cut = INTERPOLATION.search(literal)
+                if cut is None:
+                    whole.add(literal)
+                elif cut.start():
+                    starts.add(literal[:cut.start()])
+    return whole, starts
+
+
+def test_code(relative):
+    """Whether a source file (relative to may-app's android/ or ios/, or the design system's android/ or swift/) says
+    nothing about the shipped screens: a test source set (test, androidTest, test<Variant>, androidTest<Variant>) or the
+    previews set, a test or snapshot target, a fixture, the emulator flows module or the design system's build copy."""
+    folders, name = relative.parts[:-1], relative.stem
+    source_set = folders[folders.index("src") + 1] if "src" in folders[:-1] else ""
+    return (name.endswith(("Test", "Tests")) or "Fixture" in name or folders[:1] in (("flows",), ("build-deps",)) or
+            re.fullmatch(r"(?:test|androidTest)(?:[A-Z]\w*)?|previews", source_set) is not None or
+            any(part.endswith("Tests") or part == "Snapshots" for part in folders))
+
+
+def lacking_ids(ids, literals):
+    """The ids no literal (or fixed start plus a literal remainder) accounts for. Maestro reads an id as a regular
+    expression: each alternative of an a|b id must be there, and an id using any other pattern syntax is not checked."""
+    whole, starts = literals
+    names = {name for i in ids if not ID_PATTERN.search(i) for name in i.split("|")}
+    return sorted(n for n in names if n not in whole and not any(n.startswith(s) and n[len(s):] in whole for s in starts))
+
+
+def app_sources(root, platform):
+    """The literals of a platform's app code, read once a run and only when asked: may-app's own and its design
+    system's (PLATFORM_SOURCES) where prepare.py left them."""
+    app, design = PLATFORM_SOURCES[platform]
+    source = root / "may-source"
+    return functools.cache(lambda: app_literals([source / app, source / "android" / DESIGN_SYSTEM_BUILD / design]))
+
+
+def flow_lacks_ids(row, flow, literals, platform):
+    """Whether a Maestro scenario's flow names an id the app's sources lack (literals() reads them): the scenario fails
+    with FLOW_IDS, never driven, and the public log gives the count alone."""
+    if row["driver"] != "maestro":
+        return False
+    scenario, missing = row["id"], len(lacking_ids(flow_ids(flow), literals()))
+    if missing:
+        print(f"May device tests ({platform}): {scenario}: {missing} id(s) its flow names are not in the app's sources")
+    return bool(missing)
+
+
 class Budget:
     """RUN_BUDGET_SECONDS from the run's start: a scenario starts only when its own cap, the judging of every agent
     scenario started so far and its own judging still fit."""
@@ -858,6 +972,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     claude = device_agent.settings(os.environ) if agents else (os.environ.pop(device_agent.OAUTH, ""), None)
     root = runner_root()
     source, private = root / "may-source", root / "may-private"
+    literals = app_sources(root, "android")
     if not source.is_dir() or not (source / APK).is_file():
         raise DeviceTestsError("The Playground app is not built")
     base = staging(secret, staged)
@@ -901,6 +1016,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 continue
             if flow is not None and untagged(row, flow, "android"):
                 entry["reason"] = UNTAGGED["android"]
+                continue
+            if flow is not None and flow_lacks_ids(row, flow, literals, "android"):
+                entry.update(verdict="fail", reason=FLOW_IDS)
                 continue
             # A fresh session per scenario: one lasts SESSION_SECONDS and has no refresh. The smoke scenario has none.
             token = accounts.session(row, base, secret, entry)

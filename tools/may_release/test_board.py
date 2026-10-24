@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -352,6 +353,36 @@ class PreviewTests(BoardCase):
         self.assertRegex(card, r"v\.addEventListener\('error', function \(\) \{\s*ph\.innerHTML = '';\s*"
                                r"ph\.appendChild\(r\.thumb \? el\('img', \{ src: r\.thumb")
         self.assertFalse(list((self.base / board.BOARD).rglob("*.mp4")), "no video in git")
+
+
+    def test_the_page_follows_review_pages_1_1(self):
+        """Samuel's review of the layout (review-pages 1.1): the rail says Goal, children align with their parent's
+        text without a chevron slot, both platforms' wells are one height, and the header says when alone."""
+        template = board.TEMPLATE.read_text()
+        self.assertIn("el('dt', { text: 'Goal' })", template)
+        self.assertNotIn("Works when", template)
+        self.assertIn(".nav ul { list-style: none; margin: 2px 0 4px 15px; padding: 0;", template)
+        self.assertIn(".nav ul .it { padding-left: 16px;", template)
+        self.assertIn("f.parent ? null : chev", template, "a child row has no chevron slot")
+        player = re.search(r"\.player \{([^}]*)\}", template).group(1)
+        self.assertRegex(player, r"(?<![-\w])height: \d+px", "one well height for both platforms")
+        self.assertIn('<div class="meta" id="meta">Updated {{RUN_WHEN}}</div>', template)
+        self.assertNotIn("getElementById('meta')", template, "nothing adds a description to the header")
+
+
+class ReviewPages12Tests(unittest.TestCase):
+    def test_the_sidebar_scrolls_on_its_own_and_breadcrumb_links_are_muted(self):
+        """Samuel's review (review pages 1.2): the flow list is a fixed-height column that scrolls by itself, its
+        "Flows · All" row fixed, back to static on a phone; breadcrumb links are muted and underlined, not accent."""
+        template = board.TEMPLATE.read_text()
+        side = re.search(r"\n\.side \{([^}]*)\}", template).group(1)
+        for rule in ("position: sticky", "top: 0", "align-self: start", "height: 100vh", "display: flex",
+                     "flex-direction: column", "overflow: hidden"):
+            self.assertIn(rule, side)
+        self.assertIn(".side .nav { flex: 1; min-height: 0; overflow-y: auto; }", template)
+        narrow = template[template.index("@media (max-width: 760px) {"):]
+        self.assertIn(".side { border-right: 0; position: static; height: auto; overflow: visible; }", narrow)
+        self.assertIn(".d-crumbs a { color: var(--fg-muted); text-decoration: underline; }", template)
 
 
 class DeviceInputTests(unittest.TestCase):
