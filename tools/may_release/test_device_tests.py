@@ -170,10 +170,19 @@ class ScenarioTests(unittest.TestCase):
         """Run 40095010166: the task detail has Details, Thread and Files, its notes field on Details ("Add notes");
         both judges failed a goal that asked for a Notes tab."""
         goal = device_tests.scenarios("notes")[0]["goal"]
-        self.assertIn("On its Details, tap the notes field that says Add notes", goal)
+        self.assertIn("On its Details tab, tap the notes field that says Add notes", goal)
+        self.assertIn("tap the Agenda tab in the bottom bar (not a chat)", goal,
+                      "run 40113277692: on iOS the agent opened the chat named May, never Agenda")
         self.assertIn("open the {tag} task again", goal, "the note is checked after reopening the task")
         for stale in ("Notes tab", "Take notes"):
             self.assertNotIn(stale, goal)
+
+    def test_chat_goals_name_the_existing_may_chat_and_never_the_plus_button(self):
+        """Run 40119835677: "start a new chat" sent the agent to +, which makes agents, tasks and projects."""
+        for scenario in ("chat", "poll", "poll-skip", "routines"):
+            goal = device_tests.scenarios(scenario)[0]["goal"]
+            self.assertIn("open the existing chat named May; do not use the + button", goal)
+            self.assertNotIn("start a new chat", goal)
 
     def test_every_agent_scenario_fits_inside_one_test_session(self):
         """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
@@ -241,6 +250,34 @@ class FakeReply(io.BytesIO):
 
     def __exit__(self, *args):
         return False
+
+
+class SealedAgentTests(unittest.TestCase):
+    """Coordinator, 24 Oct: the agent's outcome, steps and summary go into the private report.json alone."""
+
+    def test_the_summary_is_redacted_capped_and_shaped(self):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.c2ln"
+        summary = ("Typed the message but never found send.\nAuthorization: Bearer " + TOKEN + "\ntoken " + jwt +
+                   "\nSigned in as sam.avery@example.com.\n" + "More. " * 100)
+        sealed = device_tests.sealed_agent({"outcome": "blocked", "summary": summary, "actions": 80})
+        self.assertEqual((sealed["outcome"], sealed["actions"]), ("blocked", 80))
+        self.assertLessEqual(len(sealed["summary"]), device_tests.MAX_AGENT_SUMMARY)
+        self.assertTrue(sealed["summary"].startswith("Typed the message but never found send. Signed in as "
+                                                     "***@example.com."))
+        for secret in (TOKEN, jwt, "Bearer", "sam.avery"):
+            self.assertNotIn(secret, sealed["summary"])
+        self.assertTrue(publish.agent_ok(sealed))
+        odd = device_tests.sealed_agent({"outcome": "finished", "summary": 7, "actions": "80"})
+        self.assertEqual(odd, {"outcome": None, "actions": 0, "summary": "7"})
+
+    def test_publish_refuses_a_sealed_account_out_of_shape(self):
+        good = {"outcome": "completed", "actions": 3, "summary": "ok"}
+        self.assertTrue(publish.agent_ok(good))
+        for bad in (dict(good, summary="x" * (device_tests.MAX_AGENT_SUMMARY + 1)),
+                    dict(good, summary="Cookie: sid=1"), dict(good, summary="sam@example.com"),
+                    dict(good, outcome="finished"), dict(good, actions=999), dict(good, extra=1), "ok"):
+            with self.subTest(bad=bad):
+                self.assertFalse(publish.agent_ok(bad))
 
 
 class MintTests(unittest.TestCase):

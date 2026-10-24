@@ -170,6 +170,10 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(report["scenarios"][2]["server"], [{"get": "/v1/routines", "status": 200, "pass": True},
                                                             {"get": "/v1/agents", "status": 200, "pass": True}])
         self.assertEqual(report["scenarios"][0]["notes"], "fine <b>")
+        self.assertEqual([row.get("agent") for row in report["scenarios"]],
+                         [{"outcome": "completed", "actions": 7, "summary": "saw it"}] * 3,
+                         "the agent's own account, sealed into the private report")
+        self.assertNotIn("saw it", run_out + judge_out, "never in the public log")
         self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738"), (TOKEN + "3", "qa-39557415738")],
                          "chat and routines send May a message: their messages are read with their own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
@@ -748,7 +752,8 @@ class DeviceServerTests(unittest.TestCase):
         self.assertEqual(self.call("tap", x=540, y=1200), (False, [{"type": "text", "text": "Done"}]))
         self.assertEqual(self.adb[-1], ["/sdk/adb", "-s", "emulator-5554", "shell", "input", "tap", "540", "1200"])
         self.call("type", text="This is device test qa-123. Reply!")
-        self.assertEqual(self.adb[-1][-1], "This%sis%sdevice%stest%sqa-123.%sReply!")
+        self.assertEqual(self.adb[-2][-1], "This%sis%sdevice%stest%sqa-123.%sReply!", "one input text call")
+        self.assertEqual(self.adb[-1][-3:], ["uiautomator", "dump", "/dev/tty"], "then what landed is read")
         self.call("swipe", x1=1, y1=2, x2=3, y2=4)
         self.assertEqual(self.adb[-1][-6:], ["swipe", "1", "2", "3", "4", "300"])
         self.call("back")
@@ -758,6 +763,39 @@ class DeviceServerTests(unittest.TestCase):
                          (False, "image", b"\x89PNG data"))
         failed, content = self.call("hierarchy")
         self.assertEqual(content[0]["text"], "text='Chats' | id=tab | clickable | (50, 30)")
+
+    def answer_type(self, field):
+        """The type tool's answer when the focused field holds field after the input."""
+        xml = (b'<hierarchy><node text="Ask May" focused="false" bounds="[0,0][9,9]"/><node text="' + field +
+               b'" focused="true" bounds="[0,0][9,9]"/></hierarchy>')
+
+        def run(argv, capture_output, stdin, timeout):
+            self.adb.append(argv)
+            return subprocess.CompletedProcess(argv, 0, xml if "uiautomator" in argv else b"", b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            return device_mcp.call("type", {"text": "hello"}, self.config)
+
+    def test_type_says_what_landed_so_the_agent_never_types_it_again(self):
+        """Run 40119835677: Android chat typed one sentence in pieces for three minutes and never tapped send."""
+        failed, content = self.answer_type(b"This is device test qa-123. Reply with the word received.")
+        self.assertFalse(failed)
+        self.assertEqual(content[0]["text"],
+                         "Done. The focused field now reads: 'This is device test qa-123. Reply with the word received.'")
+        self.assertEqual([argv for argv in self.adb if "text" in argv], [self.adb[0]], "a single input text call")
+
+    def test_what_landed_comes_back_through_the_redaction(self):
+        """Coordinator, 24 Oct: nothing secret-shaped reaches the agent through type's answer."""
+        jwt = b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.c2ln"
+        for field in (b"Bearer abc", b"token " + jwt, b"refresh_token=x", b"Cookie: sid=1",
+                      b"may_session_key=Zm9vYmFyYmF6cXV4cXV1eHF1dXg"):
+            with self.subTest(field=field):
+                _, content = self.answer_type(field)
+                self.assertEqual(content[0]["text"], "Done. The focused field now reads: '(hidden)'")
+        _, content = self.answer_type(b"write to sam.avery@example.com")
+        self.assertEqual(content[0]["text"], "Done. The focused field now reads: 'write to ***@example.com'")
+        _, content = self.answer_type(b"x" * 400)
+        self.assertEqual(len(content[0]["text"]), len("Done. The focused field now reads: ''") + device_mcp.MAX_FIELD)
 
     def test_type_takes_plain_text_alone(self):
         for text in ("a; reboot", "$(id)", "a`b`", "it's", "a|b", "a\nb", "x" * 201, "", "a>b", "a&b", 7):

@@ -60,6 +60,9 @@ import zipfile
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import board
+# The one redaction: the device server's (it keeps typed text out of the agent's view), the diagnostics' and publish's.
+import device_mcp
+from device_mcp import EMAIL, MASKED, SECRET_LINE, kept_lines
 import device_agent
 from device_agent import AgentError
 import device_prototypes
@@ -699,14 +702,6 @@ DIAG = ".diag.txt"
 LOGCAT_LINES, MAX_DIAG, DIAG_SECONDS = 2000, 512 * 1024, 60
 LOG_BUFFERS = "main,system,crash"
 ANR, CRASH = "data_app_anr", "data_app_crash"
-# A line that could carry a session or a credential is dropped whole: an Authorization or Bearer header, a refresh
-# token, a cookie, the launch's session extra, a JWT, or any may_* key with a long opaque value.
-SECRET_LINE = re.compile(rb"(?i)authorization|bearer|refresh_token|cookie|may_test_session|"
-                         rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
-                         rb"\bmay_[a-z0-9_]+[\"']?\s*[=:]\s*[\"']?[A-Za-z0-9+/_.~-]{20,}")
-# An email address keeps its domain alone.
-EMAIL = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24})")
-MASKED = rb"***@\1"
 
 
 def adb_output(adb, env, argv):
@@ -717,16 +712,6 @@ def adb_output(adb, env, argv):
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout if done.returncode == 0 and isinstance(done.stdout, bytes) else None
-
-
-def kept_lines(data, token):
-    """(data without any line that could carry the session or a credential (SECRET_LINE, or the token itself), with
-    each email address masked to its domain, the number of lines dropped)."""
-    secret = token.encode() if token else None
-    lines = data.splitlines(keepends=True)
-    kept = [EMAIL.sub(MASKED, line) if b"@" in line else line
-            for line in lines if not SECRET_LINE.search(line) and not (secret and secret in line)]
-    return b"".join(kept), len(lines) - len(kept)
 
 
 class Diagnostics:
@@ -1280,6 +1265,19 @@ def combined(entry, record, judged):
     return {"verdict": "fail", "reason": NO_TRUTH}
 
 
+# The agent's own account of its run, sealed into the private report.json alone (never a log or the job summary): its
+# outcome, how many look-or-act steps it took, and its summary through kept_lines, at most MAX_AGENT_SUMMARY characters.
+MAX_AGENT_SUMMARY = 300
+
+
+def sealed_agent(record):
+    summary, _ = kept_lines(str(record.get("summary") or "").encode(), "")
+    actions = record.get("actions")
+    return {"outcome": record.get("outcome") if record.get("outcome") in ("completed", "blocked") else None,
+            "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MAX_ACTIONS else 0,
+            "summary": " ".join(summary.decode("utf-8", "replace").split())[:MAX_AGENT_SUMMARY]}
+
+
 def judge_scenarios(judged_by=device_agent.judge, platform="android"):
     """Each agent scenario judged, then every verdict printed; the report and the recorded verdicts updated. The iOS job
     runs it too, with nothing to judge (agent scenarios are Android's), for its verdict lines."""
@@ -1315,6 +1313,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
             except (OSError, subprocess.SubprocessError, KeyError):
                 judged = ("error", "")
         verdict_reason = combined(entry, record, judged)
+        entry["agent"] = sealed_agent(record)
         entry["verdict"] = verdict_reason["verdict"]
         entry.pop("reason", None)
         if verdict_reason["reason"]:

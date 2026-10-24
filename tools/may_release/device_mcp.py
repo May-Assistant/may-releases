@@ -37,7 +37,26 @@ PROTOCOL = "2025-06-18"
 MAX_ACTIONS = 80
 MAX_HIERARCHY = 40_000
 MAX_SUMMARY = 1000
+MAX_FIELD = 300
 TEXT = re.compile(r"[A-Za-z0-9 .,?!:@_-]{1,200}")
+# A line that could carry a session or a credential is dropped whole: an Authorization or Bearer header, a refresh
+# token, a cookie, the launch's session extra, a JWT, or any may_* key with a long opaque value.
+SECRET_LINE = re.compile(rb"(?i)authorization|bearer|refresh_token|cookie|may_test_session|"
+                         rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
+                         rb"\bmay_[a-z0-9_]+[\"']?\s*[=:]\s*[\"']?[A-Za-z0-9+/_.~-]{20,}")
+# An email address keeps its domain alone.
+EMAIL = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24})")
+MASKED = rb"***@\1"
+
+
+def kept_lines(data, token):
+    """(data without any line that could carry the session or a credential (SECRET_LINE, or the token itself), with
+    each email address masked to its domain, the number of lines dropped)."""
+    secret = token.encode() if token else None
+    lines = data.splitlines(keepends=True)
+    kept = [EMAIL.sub(MASKED, line) if b"@" in line else line
+            for line in lines if not SECRET_LINE.search(line) and not (secret and secret in line)]
+    return b"".join(kept), len(lines) - len(kept)
 COORD = {"type": "integer", "minimum": 0, "maximum": 4000}
 TOOLS = [
     {"name": "screenshot", "description": "A PNG screenshot of the emulator's screen (1080 x 2400 pixels)",
@@ -270,7 +289,31 @@ def call(name, args, config):
     else:
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
     status, _ = adb(config, *argv)
-    return bool(status), [{"type": "text", "text": "Done" if not status else "The device did not take it"}]
+    if status:
+        return True, [{"type": "text", "text": "The device did not take it"}]
+    if name != "type":
+        return False, [{"type": "text", "text": "Done"}]
+    # What landed, so the agent never types it again piece by piece (run 40119835677: three minutes on one sentence).
+    status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
+    landed = None if status else focused_text(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
+    if landed is None:
+        return False, [{"type": "text", "text": "Done; the focused field could not be read, so take a hierarchy"}]
+    return False, [{"type": "text", "text": f"Done. The focused field now reads: {landed!r}"}]
+
+
+def focused_text(xml):
+    """The focused field's text as the agent may see it: through kept_lines (a field that could hold a credential is
+    "(hidden)", an email address keeps its domain alone), at most MAX_FIELD characters; None when no field is focused."""
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return None
+    field = next((node for node in root.iter("node") if node.get("focused") == "true"), None)
+    if field is None:
+        return None
+    text = field.get("text", "").replace("\n", " ").replace("\r", " ")
+    kept, dropped = kept_lines(text.encode(), "")
+    return "(hidden)" if dropped else kept.decode("utf-8", "replace")[:MAX_FIELD]
 
 
 def ios_act(name, args, ints, config):
