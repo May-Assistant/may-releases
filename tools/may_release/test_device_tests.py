@@ -209,6 +209,15 @@ class MintTests(unittest.TestCase):
 
         self.assertEqual(device_tests.mint("https://s", "s" * 32, post, fresh=True), TOKEN)
         self.assertEqual(seen["body"], {"secret": "s" * 32, "fresh": True})
+        for reply in ({"token": TOKEN, "expires_at": "x", "user_id": "u"}, {"token": TOKEN, "fresh": False},
+                      {"token": TOKEN, "fresh": "true"}):
+            with self.subTest(reply=reply):
+                answer = lambda request, timeout: FakeReply(json.dumps(reply).encode())  # noqa: E731
+                with self.assertRaises(device_tests.FreshRefused) as caught:
+                    device_tests.mint("https://s", "s", answer, fresh=True)
+                self.assertEqual(caught.exception.reason, device_tests.NOT_FRESH,
+                                 "a session on the shared account is never taken for a fresh one")
+                self.assertEqual(device_tests.mint("https://s", "s", answer), TOKEN, "a shared mint reads no fresh")
 
         def refused(code, status=429):
             def answer(request, timeout):
@@ -712,7 +721,10 @@ class ReasonTests(unittest.TestCase):
             else:
                 reasons.add(ast.unparse(value))  # a reason worked out at run time must be added here by hand
         # The judge step copies combined()'s reason, whose own values are read above from its returned dicts.
-        return reasons - {None, "verdict_reason['reason']"}
+        # Accounts.session's reason is a FreshRefused's own: FRESH_EXHAUSTED or NOT_FRESH.
+        if "self.refused" in reasons:
+            reasons |= {device_tests.FreshExhausted.reason, device_tests.FreshRefused.reason}
+        return reasons - {None, "verdict_reason['reason']", "self.refused"}
 
     def test_every_reason_a_device_job_writes_is_one_publish_accepts(self):
         written = self.written_reasons()

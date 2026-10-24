@@ -52,6 +52,7 @@ class AgentRunTests(unittest.TestCase):
     def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
                       asked=None, exhausted=False, delivered=None):
         calls, minted, seen = [], [], {}
+        self.last_seen = seen
 
         def deliver(base, token, tag):
             seen.setdefault("delivered", []).append((token, tag))
@@ -76,7 +77,7 @@ class AgentRunTests(unittest.TestCase):
         def mint(base, secret, fresh=False):
             if fresh and exhausted:
                 seen.setdefault("refused", []).append(secret)
-                raise device_tests.FreshExhausted("used up")
+                raise (device_tests.FreshRefused if exhausted == "not fresh" else device_tests.FreshExhausted)("no")
             minted.append(secret if not fresh else "fresh")
             return TOKEN + str(len(minted))
 
@@ -89,6 +90,8 @@ class AgentRunTests(unittest.TestCase):
             # The agent's process never sees the staging secret or the OAuth token in this step's environment.
             seen.setdefault("environ", set(os.environ))
             seen.setdefault("goals", []).append((goal, tag, token, model, cli))
+            if isinstance(records[len(seen["goals"]) - 1], Exception):
+                raise records[len(seen["goals"]) - 1]
             return records[len(seen["goals"]) - 1]
 
         def clean(base, token, since, tag):
@@ -258,6 +261,24 @@ class AgentRunTests(unittest.TestCase):
         _, _, _, report, _, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3,
                                                    delivered=lambda base, token, tag: None)
         self.assertEqual([row.get("delivery") for row in report["scenarios"]], [None, None, None])
+
+    def test_a_reply_that_is_not_fresh_is_never_used_or_deleted(self):
+        try:
+            _, minted, seen, report, run_out, _ = self.run_and_judge(
+                [record()], [("pass", "")], env={device_tests.FRESH: "chat,routines"}, exhausted="not fresh")
+        except IndexError:
+            self.fail("a scenario whose fresh account was refused ran anyway")
+        except device_tests.FreshRefused:
+            self.fail("a reply that is not fresh stopped the run instead of skipping its scenario")
+        self.assertEqual([(row["id"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", device_tests.NOT_FRESH), ("notes", device_tests.UNCONFIGURED), ("routines", device_tests.NOT_FRESH)])
+        self.assertEqual(len(seen.get("refused", [])), 1)
+        self.assertNotIn("deleted", seen, "a session that is not on a fresh account never reaches delete_fresh")
+
+    def test_a_fresh_account_is_deleted_when_its_scenario_stops_part_way(self):
+        with self.assertRaises(OSError):
+            self.run_and_judge([OSError("agent died")], [], env={device_tests.FRESH: "chat"}, selection="chat")
+        self.assertEqual(self.last_seen.get("deleted"), [TOKEN + "1"], "the run's finally deleted chat's account")
 
     def test_a_cleanup_that_does_not_answer_is_said(self):
         _, _, _, _, run_out, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3, cleaned=None)

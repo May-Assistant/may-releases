@@ -303,6 +303,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             token = minted(base, secret)
             cleaned_count = cleaned(base, token, since, tag)
     finally:
+        accounts.abandon(base)
         token = secret = ""
         renders.quiet(["xcrun", "simctl", "shutdown", udid], log, env=env)
     at("writing the report")

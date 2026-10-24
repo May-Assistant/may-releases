@@ -133,6 +133,9 @@ SKIP = "MAY_DEVICE_TESTS_SKIP"
 # shared account instead.
 FRESH = "MAY_DEVICE_TESTS_FRESH"
 FRESH_EXHAUSTED = "skipped: staging's fresh test accounts for today are used up"
+# A fresh mint whose reply does not say fresh (a staging older than may-app 150, or one that ignores it) is a session on
+# the shared account: never used as a fresh one, never deleted.
+NOT_FRESH = "skipped: staging did not put this scenario on a fresh account"
 
 
 def fresh_switch():
@@ -155,8 +158,14 @@ class DeviceTestsError(ValueError):
     pass
 
 
-class FreshExhausted(DeviceTestsError):
+class FreshRefused(DeviceTestsError):
+    """A fresh mint that gave no fresh account; its reason is the skipped scenario's."""
+    reason = NOT_FRESH
+
+
+class FreshExhausted(FreshRefused):
     """Staging made its last fresh test account for today (429 fresh_accounts_exhausted)."""
+    reason = FRESH_EXHAUSTED
 
 
 # Where the run step is, for the public failure line: fixed words and this repository's scenario ids alone.
@@ -259,6 +268,8 @@ def mint(base, secret, post=urllib.request.urlopen, *, fresh=False):
     token = data.get("token") if isinstance(data, dict) else None
     if not (isinstance(token, str) and TOKEN.fullmatch(token)):
         raise DeviceTestsError("The staging test session reply has no token")
+    if fresh and data.get("fresh") is not True:
+        raise FreshRefused("The staging test session reply is not on a fresh account")
     return token
 
 
@@ -409,12 +420,13 @@ def delete_fresh(base, token, post=urllib.request.urlopen):
 
 class Accounts:
     """Each scenario's staging session: on the shared test account, or on a fresh one of its own (wants_fresh),
-    deleted at the scenario's end. Once staging says the day's fresh accounts are used up, every later fresh scenario
-    is skipped with FRESH_EXHAUSTED."""
+    deleted at the scenario's end, or, when the run stops part-way, by the run's finally (abandon). Once staging gives no
+    fresh account (the day's are used up, or its reply is not fresh), every later fresh scenario is skipped for that
+    reason, never run on the shared account."""
 
     def __init__(self, chosen, minted, deleted_by):
         self.ids, self.minted, self.deleted_by = fresh_switch(), minted, deleted_by
-        self.exhausted, self.deleted, self.kept = False, 0, 0
+        self.refused, self.open, self.deleted, self.kept = None, None, 0, 0
         # What ran on the shared account is undone by tag at the run's end; a fresh account goes at its scenario's end.
         self.shared = any(row["driver"] == "agent" and not wants_fresh(row, self.ids) for row in chosen)
 
@@ -424,22 +436,34 @@ class Accounts:
             return ""
         if not wants_fresh(row, self.ids):
             return self.minted(base, secret)
-        if not self.exhausted:
+        if self.refused is None:
             try:
-                return self.minted(base, secret, fresh=True)
-            except FreshExhausted:
-                self.exhausted = True
-        entry["reason"] = FRESH_EXHAUSTED
+                self.open = self.minted(base, secret, fresh=True)
+                return self.open
+            except FreshRefused as refused:
+                self.refused = refused.reason
+        entry["reason"] = self.refused
         return None
 
     def finish(self, row, base, token):
-        """A fresh scenario's cleanup: its whole account deleted, with its own session (it can't get another)."""
+        """A fresh scenario's cleanup, after its reads: its whole account deleted, with its own session (it can't get
+        another)."""
         if row["driver"] != SMOKE and wants_fresh(row, self.ids):
             at(f"{row['id']}: deleting its fresh account")
-            if self.deleted_by(base, token):
-                self.deleted += 1
-            else:
-                self.kept += 1
+            self.delete(base, token)
+
+    def abandon(self, base):
+        """The run's finally: a fresh account whose scenario stopped part-way is deleted all the same."""
+        if self.open:
+            at("deleting a fresh account left open")
+            self.delete(base, self.open)
+
+    def delete(self, base, token):
+        self.open = None
+        if self.deleted_by(base, token):
+            self.deleted += 1
+        else:
+            self.kept += 1
 
     def report(self, platform):
         """Prints the public lines on the fresh accounts the run made: counts alone."""
@@ -778,6 +802,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             token = minted(base, secret)
             cleaned_count = cleaned(base, token, since, tag)
     finally:
+        accounts.abandon(base)
         token = secret = ""
         show_touches(adb, env, log, False)
         emulator.terminate()

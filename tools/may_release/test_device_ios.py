@@ -263,6 +263,16 @@ class RunTests(Workspace):
         self.assertIn("May device tests (ios): 2 fresh test accounts were deleted by their cleanup", out)
         self.assertNotIn("the test session's cleanup", out)
 
+    def test_a_fresh_account_is_deleted_when_its_scenario_stops_part_way_on_ios(self):
+        def agent(*args, **kwargs):
+            raise OSError("agent died")
+
+        with self.assertRaises(OSError):
+            self.run_it(selection="chat", agent=agent,
+                        env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
+                             "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", device_tests.FRESH: "all"})
+        self.assertEqual(self.deleted, [TOKEN + "1"], "the run's finally deleted chat's account")
+
     def test_refusals(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),
                              ({"MAY_STAGING_API_URL": "http://staging.example"}, "MAY_STAGING_API_URL is not https://staging-api.usemay.co"),

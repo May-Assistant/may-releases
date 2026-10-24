@@ -76,7 +76,7 @@ VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS)
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
            device_tests.UNCONFIGURED, device_tests.RATE_LIMITED, device_tests.UNFINISHED, device_tests.BLOCKED,
            device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO,
-           device_tests.BUDGET, device_tests.FRESH_EXHAUSTED)
+           device_tests.BUDGET, device_tests.FRESH_EXHAUSTED, device_tests.NOT_FRESH)
 MAX_NOTES = 600
 # A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
 DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)
