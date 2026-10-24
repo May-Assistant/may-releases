@@ -45,6 +45,10 @@ def fixture_ipa(path, build="9", icon=True):
         archive.writestr("Payload/May.app/Assets.car", b"BOMStore fixture ... AppIcon ... renditions")
 
 
+# A private path as Apple might echo it back, which the public log must never carry.
+PRIVATE_PATH = "/Users/runner/work/_temp/may-private/upload.ipa"
+
+
 class Workspace:
     def __init__(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -417,7 +421,7 @@ class IosUploadTests(unittest.TestCase):
             if argv[2] == "--validate-app":
                 return  # validation: no output, so it passes
             log.write_text("*** Error: The file couldn't be opened because it isn't in the correct format. (259)\n"
-                           "*** Error: Upload failed for '" + argv[3] + "'.\n")
+                           "*** Error: Upload failed for '" + PRIVATE_PATH + "'.\n")  # not argv[3]: see PRIVATE_PATH
 
         asked = []
 
@@ -441,6 +445,7 @@ class IosUploadTests(unittest.TestCase):
         self.assertEqual(lines[at + 2:at + 5], ["  lines naming an error: 2; naming a warning: 0", "  codes: none",
                                       "  error kinds: file format (the package could not be read), unrecognised"])
         self.assertEqual(lines[-1], "altool finished, so the upload may be in App Store Connect; check there before retrying")
+        self.assertNotIn(PRIVATE_PATH, output.getvalue())
         self.assertNotIn(str(self.work.root), output.getvalue())
         self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
         self.assertFalse((self.work.root / "may-private/asc-keys").exists())
@@ -459,7 +464,9 @@ class IosUploadTests(unittest.TestCase):
                      "userInfo": {"code": "STATE_ERROR.VALIDATION_ERROR", "status": "409",
                                   "title": "The provided entity includes an attribute with a value that has already "
                                            "been used",
-                                  "detail": issuer + " " + str(self.work.root)}}]}, indent=2) + "\n")
+                                  # A fixed private path, not the random temporary root: a random name holding
+                                  # "jwt", "team" or "role" would match an error kind (no-secret-controls on #81).
+                                  "detail": issuer + " " + PRIVATE_PATH}}]}, indent=2) + "\n")
 
         with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=json_altool), \
                 patch("ios_upload.asc_token", return_value="token"), \
@@ -478,6 +485,7 @@ class IosUploadTests(unittest.TestCase):
             "    codes -19232, STATE_ERROR.VALIDATION_ERROR; status 409; title The provided entity includes an "
             "attribute with a value that has already been used"])
         self.assertNotIn(issuer, output.getvalue())
+        self.assertNotIn(PRIVATE_PATH, output.getvalue())
         self.assertNotIn(str(self.work.root), output.getvalue())
         self.assertFalse((self.work.root / "may-release/upload-record.json").exists())
 
@@ -491,7 +499,7 @@ class IosUploadTests(unittest.TestCase):
                 log.write_text(json.dumps({"product-errors": [{"code": -19241, "userInfo": {
                     "status": "409", "title": "Validation failed",
                     "NSLocalizedFailureReason": "Missing Info.plist value for 'CFBundleIconName' in "
-                                                + str(self.work.root)}}]}))
+                                                + PRIVATE_PATH}}]}))
 
         with patch.dict(os.environ, self.env, clear=True), patch("ios_upload.run_private", side_effect=validating_altool), \
                 patch("ios_upload.asc_token", return_value="token"), \
@@ -509,6 +517,7 @@ class IosUploadTests(unittest.TestCase):
                                                 "      message: Missing Info.plist value for 'CFBundleIconName' in "
                                                 "<path>"])
         self.assertNotIn("may be in App Store Connect", output.getvalue())
+        self.assertNotIn(PRIVATE_PATH, output.getvalue())
         self.assertNotIn(str(self.work.root), output.getvalue())
         self.assertFalse((self.work.root / "may-private/asc-keys").exists())
 

@@ -151,7 +151,7 @@ def launch(udid, env, token, log):
 
 def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check, truth=device_tests.tagged,
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
-                  install=device_agent.install):
+                  install=device_agent.install, budgeted=None):
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
     agents, staged = device_tests.uses(chosen)
@@ -181,6 +181,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         at("installing the app")
         if renders.quiet(["xcrun", "simctl", "install", udid, str(root / APP)], log, env=env).returncode:
             raise DeviceTestsError("May Playground did not install on the simulator; no scenario ran")
+        budget = (budgeted or device_tests.Budget)()
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
                      "server": []}
@@ -190,6 +191,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 continue
             if row["id"] in skipped:
                 entry["reason"] = device_tests.SWITCHED_OFF
+                continue
+            if not budget.fits(row, device_tests.cap(row, device_agent.IOS_AGENT_SECONDS)):
+                entry["reason"] = device_tests.BUDGET
                 continue
             flow = device_tests.scenario_flow(row, source, private)
             if flow is not None and (not flow.is_file() or flow.is_symlink()):
@@ -207,7 +211,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                     passed = not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format",
                                                 "junit", "--output", str(folder / (row["id"] + ".xml"))], log,
                                                env=dict(env, MAESTRO_CLI_NO_ANALYTICS="1",
-                                                        MAESTRO_DISABLE_UPDATE_CHECK="true")).returncode
+                                                        MAESTRO_DISABLE_UPDATE_CHECK="true"),
+                                               timeout=device_tests.FLOW_SECONDS).returncode
                 except subprocess.SubprocessError:
                     passed = False
             if row["driver"] != "maestro":

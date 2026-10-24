@@ -23,6 +23,12 @@ from test_renders import png
 UDID = "0A1B2C3D-0000-4000-8000-000000000001"
 
 
+def ticking_budget():
+    """A budget of one Maestro flow on a clock that has used it up by the second scenario."""
+    ticks = iter([0, 0, device_tests.FLOW_SECONDS])
+    return device_tests.Budget(total=device_tests.FLOW_SECONDS + 1, clock=lambda: next(ticks))
+
+
 class Done:
     def __init__(self, code=0):
         self.returncode, self.stdout = code, b""
@@ -101,14 +107,16 @@ class FakeRecorder:
 
 
 class RunTests(Workspace):
-    def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None):
-        calls, minted = [], []
+    def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None, budgeted=None):
+        calls, minted, self.maestro_timeouts = [], [], []
         self.built()
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
 
-        def quiet(argv, log, cwd=None, env=None, capture=False):
+        def quiet(argv, log, cwd=None, env=None, capture=False, timeout=None):
             calls.append((list(argv), dict(env or {})))
+            if "test" in argv and "--device" in argv:
+                self.maestro_timeouts.append(timeout)
             if argv[:4] == ["xcrun", "simctl", "io", UDID] and argv[4] == "screenshot":
                 Path(argv[-1]).write_bytes(png())
             return Done(1 if maestro_fails and "test" in argv and "--device" in argv else 0)
@@ -129,7 +137,7 @@ class RunTests(Workspace):
                                      asked=lambda base, token, state, tag: (200, True),
                                      cleaned=lambda base, token, since, tag: 2,
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
-                                     install=lambda root: root / "may-claude" / "claude")
+                                     install=lambda root: root / "may-claude" / "claude", budgeted=budgeted)
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             if "CLAUDE_CODE_OAUTH_TOKEN" in environ:
                 os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = environ["CLAUDE_CODE_OAUTH_TOKEN"]
@@ -162,6 +170,15 @@ class RunTests(Workspace):
             "0 skipped"])
         self.assertNotIn(TOKEN, out + (run / "ios" / "report.json").read_text())
         self.assertIn((["xcrun", "simctl", "shutdown", UDID]), [a for a, _ in calls])
+
+    def test_maestro_is_bounded_and_the_budget_skips_what_cannot_fit_on_ios_too(self):
+        calls, minted, report, out, _ = self.run_it(
+            budgeted=ticking_budget)
+        self.assertEqual(self.maestro_timeouts, [device_tests.FLOW_SECONDS], "a hung flow no longer runs unbounded")
+        self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]],
+                         [("sign-in", "ui-pass"), ("connections", "skipped")])
+        self.assertEqual(report["scenarios"][1]["reason"], device_tests.BUDGET)
+        self.assertEqual(len(minted), 1, "no session for a scenario that never started")
 
     def test_a_missing_flow_or_failing_maestro_fails(self):
         _, _, report, _, _ = self.run_it(maestro_fails=True)

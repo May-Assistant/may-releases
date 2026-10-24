@@ -170,7 +170,7 @@ class IosSmokeTests(Workspace):
     def test_runs_signed_out_on_the_simulator_without_staging(self):
         self.minted, self.goals, self.judged, calls, flows = [], [], [], [], []
 
-        def quiet(argv, log, cwd=None, env=None, capture=False):
+        def quiet(argv, log, cwd=None, env=None, capture=False, timeout=None):
             calls.append((list(argv), dict(env or {})))
             if argv[:4] == ["xcrun", "simctl", "io", UDID] and argv[4] == "screenshot":
                 Path(argv[-1]).write_bytes(png())
