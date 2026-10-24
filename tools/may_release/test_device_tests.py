@@ -390,6 +390,8 @@ class RunTests(unittest.TestCase):
             for text, tags in ((FLOW, {"android", "ios"}),
                                ("appId: x\ntags: [android, ios]\n---\n", {"android", "ios"}),
                                ("appId: x\ntags:\n  - android\nname: x\n  - ios\n---\n", {"android"}),
+                               ("appId: x\ntags:\n  - android\n  # for both devices\n\n  - ios\n---\n",
+                                {"android", "ios"}),
                                ("appId: x\n---\ntags:\n  - ios\n", set()),
                                ("appId: x\ntags:\n  - ../x\n  - ios\n---\n", {"ios"}),
                                ("appId: x\n", set())):

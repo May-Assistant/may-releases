@@ -522,6 +522,8 @@ def flow_tags(path):
     for line in path.read_text(errors="replace")[:MAX_FLOW_BYTES].splitlines():
         if line.strip() == "---":
             break
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue  # a blank or comment line, inside a tag list or not, ends nothing
         item = re.fullmatch(r"\s+-\s+(\S+)\s*", line)
         if listing and item:
             tags.add(item.group(1))
