@@ -37,6 +37,10 @@ MAX_RECORDING = 38 * 1024 * 1024
 # presets as MPEG-4 at 720p and 540p.
 CONVERSIONS = (("PresetAppleM4V720pHD", ".m4v"), ("Preset1280x720", ".mp4"), ("Preset960x540", ".mp4"))
 STOP_SECONDS = 30
+# Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
+# ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
+# (errSecMissingEntitlement) and the app signed out with "Something went wrong on this device" (run 40035089599).
+ADHOC = ("CODE_SIGN_IDENTITY=-", "CODE_SIGN_STYLE=Manual", "DEVELOPMENT_TEAM=")
 
 
 def build(tool=renders.build):
@@ -51,7 +55,7 @@ def build(tool=renders.build):
         tool([str(generator), "generate"], log, cwd=source / "ios", env=env)
         tool(["xcodebuild", "-project", str(source / "ios/May.xcodeproj"), "-scheme", SCHEME, "-configuration", "Debug",
               "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", str(root / "may-derived"),
-              "-clonedSourcePackagesDirPath", str(root / "may-packages"), "CODE_SIGNING_ALLOWED=NO", "build"],
+              "-clonedSourcePackagesDirPath", str(root / "may-packages"), *ADHOC, "build"],
              log, env=env)
     except renders.RendersError:
         raise DeviceTestsError("The Playground app did not build for the simulator; no scenario ran") from None
