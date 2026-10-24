@@ -1,0 +1,150 @@
+{
+ "thumbs": "/tmp/claude-0/-home-user/dcdc5690-7b6a-5f88-b516-f0230893c7c1/scratchpad/dt1/thumbs.json",
+ "flows": "/tmp/claude-0/-home-user/dcdc5690-7b6a-5f88-b516-f0230893c7c1/scratchpad/board/flows.json",
+ "run": {
+  "id": "40055826521",
+  "url": "https://github.com/May-Assistant/may-releases/actions/runs/40055826521",
+  "when": "24 Oct, 03:03 UTC",
+  "sha": "c81051bc",
+  "release": "https://github.com/May-Assistant/may-renders/releases/tag/device-tests-20261024-5da93a786737",
+  "report": "https://github.com/May-Assistant/may-renders/tree/main/device-tests/20261024-5da93a786737",
+  "results": {
+   "android/sign-in": {
+    "verdict": "pass",
+    "headline": "Signs in and opens Chats",
+    "note": "The test signs in with a staging test session and lands on Chats. The second half, which checks that a refused token stays signed out, runs on Android only.",
+    "preview": "v/android-sign-in-4.mp4",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261024-5da93a786737/android-sign-in.mp4",
+    "links": [
+     {
+      "text": "#1178",
+      "url": "https://github.com/May-Assistant/may-app/pull/1178"
+     },
+     {
+      "text": "#1180",
+      "url": "https://github.com/May-Assistant/may-app/pull/1180"
+     },
+     {
+      "text": "may-releases #85",
+      "url": "https://github.com/May-Assistant/may-releases/pull/85"
+     }
+    ]
+   },
+   "android/connections": {
+    "verdict": "fail",
+    "note": "The app never signed in",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261023-9ef300073738/android-connections.mp4",
+    "preview": "v/android-connections.mp4"
+   },
+   "android/chat": {
+    "verdict": "fail",
+    "note": "The app never signed in",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261023-9ef300073738/android-chat.mp4",
+    "preview": "v/android-chat.mp4"
+   },
+   "android/notes": {
+    "verdict": "fail",
+    "note": "The app never signed in",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261023-9ef300073738/android-notes.mp4",
+    "preview": "v/android-notes.mp4"
+   },
+   "android/poll": {
+    "verdict": "fail",
+    "note": "The app never signed in",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261023-9ef300073738/android-poll.mp4",
+    "preview": "v/android-poll.mp4"
+   },
+   "android/poll-skip": {
+    "verdict": "fail",
+    "note": "The app never signed in",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261023-9ef300073738/android-poll-skip.mp4",
+    "preview": "v/android-poll-skip.mp4"
+   },
+   "android/routines": {
+    "verdict": "skipped",
+    "note": "Switched off for this run"
+   },
+   "ios/sign-in": {
+    "verdict": "pass",
+    "headline": "Signs in and opens Chats",
+    "note": "The test signs in with a staging test session and lands on Chats.",
+    "preview": "v/ios-sign-in-4.mp4",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261024-5da93a786737/ios-sign-in.mp4",
+    "links": [
+     {
+      "text": "may-releases #84",
+      "url": "https://github.com/May-Assistant/may-releases/pull/84"
+     },
+     {
+      "text": "may-releases #85",
+      "url": "https://github.com/May-Assistant/may-releases/pull/85"
+     },
+     {
+      "text": "#1180",
+      "url": "https://github.com/May-Assistant/may-app/pull/1180"
+     }
+    ]
+   },
+   "ios/connections": {
+    "verdict": "fail",
+    "note": "Signed in, but could not save the sign-in",
+    "video": "https://github.com/May-Assistant/may-renders/releases/download/device-tests-20261023-9ef300073738/ios-connections.mp4",
+    "preview": "v/ios-connections.mp4"
+   },
+   "ios/chat": {
+    "verdict": "fail",
+    "note": "Signed in, but could not save the sign-in"
+   },
+   "ios/notes": {
+    "verdict": "fail",
+    "note": "Signed in, but could not save the sign-in"
+   },
+   "ios/poll": {
+    "verdict": "fail",
+    "note": "Signed in, but could not save the sign-in"
+   },
+   "ios/poll-skip": {
+    "verdict": "fail",
+    "note": "Signed in, but could not save the sign-in"
+   },
+   "ios/routines": {
+    "verdict": "skipped",
+    "note": "Switched off for this run"
+   }
+  }
+ },
+ "last_pass": {
+  "2": "24 Oct 2026, run 40055826521"
+ },
+ "changed": {},
+ "issues": {},
+ "banner": {
+  "title": "Sign-in passes on both apps",
+  "body": "The sign-in test passed on Android and iOS in run 40055826521. The other flows show the 23 Oct run; every flow runs again next."
+ },
+ "means": {
+  "1": "A new account goes from hello to done, through email, phone, computer, apps, look and notifications, and lands in chats.",
+  "2": "Sign in, see your chats; sign out, back to sign-in.",
+  "3": "Connections are listed. You connect Gmail or Calendar, and May can read it.",
+  "4": "Send a message and get a reply. Stop and retry work.",
+  "5": "May asks a multiple-choice question. You answer it, or skip it with a free reply.",
+  "6": "The agenda loads. Add a task or event, add a note, complete it, move it.",
+  "7": "May asks before acting. You approve or decline, and the result shows in chat and For you.",
+  "8": "Suggestions and updates show. Accept, dismiss, mark done and snooze work.",
+  "9": "Ask May in chat for a routine. It appears and runs on schedule.",
+  "10": "May has an inbox. Mail to it shows up, and May drafts a reply for approval.",
+  "11": "Ask May to do something on a website. You can watch the computer page, and it finishes or asks you.",
+  "12": "Speak to May and hear her answer. The session ends cleanly.",
+  "13": "The permission ask appears at the agreed moment, and a push arrives and opens the right place.",
+  "14": "Create, rename and restyle an agent. Change the model. Delete the account.",
+  "15": "Take notes on an event by voice or typing. The transcript is kept, a summary lands in Notes, and an action item can be added as a task."
+ },
+ "flow_extra": {
+  "2": {
+   "next": [
+    "Run every flow (scenarios: all) against the staging deploy of main c81051bc.",
+    "Add a refused-token check for iOS that clears the Keychain first."
+   ]
+  }
+ }
+}
