@@ -122,7 +122,7 @@ class FakeRecorder:
 
 class RunTests(Workspace):
     def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None, budgeted=None,
-               calls_left=None):
+               calls_left=None, fail_mint=()):
         calls, minted, self.maestro_timeouts, self.delivered = [], [], [], []
         self.built()
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
@@ -136,7 +136,12 @@ class RunTests(Workspace):
                 Path(argv[-1]).write_bytes(png())
             return Done(1 if maestro_fails and "test" in argv and "--device" in argv else 0)
 
+        failures = list(fail_mint)
+
         def mint(base, secret, fresh=False):
+            status = failures.pop(0) if failures else None
+            if status is not None:
+                raise device_tests.MintFailed(status)
             minted.append("fresh" if fresh else secret)
             return TOKEN + str(len(minted))
 
@@ -146,6 +151,7 @@ class RunTests(Workspace):
                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin", **(env or {})}
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
                 patch("renders.quiet", side_effect=quiet), patch("renders.simulator", return_value=UDID), \
+                patch("device_tests.flows.sleep"), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.head_revision", return_value=SHA), patch("device_ios.Recorder", FakeRecorder), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
@@ -303,6 +309,18 @@ class RunTests(Workspace):
             env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]],
                          [("chat", "skipped", device_tests.MODEL_CAP)])
+
+    def test_a_mint_that_fails_twice_skips_its_scenario_alone_on_ios_too(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        try:
+            _, minted, report, out, _ = self.run_it(fail_mint=(None, 0, 0))
+        except DeviceTestsError as error:
+            self.fail("a failed mint stopped the iOS run: " + error.args[0])
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("sign-in", "ui-pass", device_tests.UNCONFIGURED),
+                          ("connections", "skipped", device_tests.MINT_FAILED)])
+        self.assertIn("May device tests (ios): connections: staging did not mint a session (HTTP status 0, 0 for no "
+                      "reply), twice; the scenario is skipped", out)
 
     def test_refusals(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),

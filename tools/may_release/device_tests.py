@@ -142,6 +142,12 @@ NOT_FRESH = "skipped: staging did not put this scenario on a fresh account"
 # model_calls) and skips one that MODEL_CALL_MARGIN calls might not cover, rather than run it into the cap.
 MODEL_CALL_MARGIN = 10
 MODEL_CAP = "skipped: the test account's model calls for today are nearly used up"
+# A session staging would not mint part-way through a run (run 40077167994: one failed 50 minutes into the iOS run and
+# the whole report was lost) is asked for once more after MINT_RETRY_SECONDS, then only its scenario is skipped. A
+# refusal that means the setup is wrong (MINT_FATAL: the secret, or the test sign-in switched off) still stops the run.
+MINT_FAILED = "skipped: staging did not mint a test session for it"
+MINT_RETRY_SECONDS = 30
+MINT_FATAL = (401, 403, 404)
 
 
 def fresh_switch():
@@ -162,6 +168,15 @@ def switched_off():
 
 class DeviceTestsError(ValueError):
     pass
+
+
+class MintFailed(DeviceTestsError):
+    """Staging did not mint a session: status is its HTTP status, or 0 when it did not answer."""
+
+    def __init__(self, status):
+        super().__init__("The staging test session could not be minted (" +
+                         (f"HTTP {status}" if status else "no reply") + ")")
+        self.status = status
 
 
 class FreshRefused(DeviceTestsError):
@@ -268,9 +283,9 @@ def mint(base, secret, post=urllib.request.urlopen, *, fresh=False):
     except urllib.error.HTTPError as error:
         if fresh and error.code == 429 and error_code(error) == "fresh_accounts_exhausted":
             raise FreshExhausted("Staging's fresh test accounts for today are used up") from None
-        raise DeviceTestsError("The staging test session could not be minted") from None
+        raise MintFailed(error.code) from None
     except (urllib.error.URLError, TimeoutError, ValueError):
-        raise DeviceTestsError("The staging test session could not be minted") from None
+        raise MintFailed(0) from None
     token = data.get("token") if isinstance(data, dict) else None
     if not (isinstance(token, str) and TOKEN.fullmatch(token)):
         raise DeviceTestsError("The staging test session reply has no token")
@@ -451,8 +466,8 @@ class Accounts:
     fresh account (the day's are used up, or its reply is not fresh), every later fresh scenario is skipped for that
     reason, never run on the shared account."""
 
-    def __init__(self, chosen, minted, deleted_by):
-        self.ids, self.minted, self.deleted_by = fresh_switch(), minted, deleted_by
+    def __init__(self, chosen, minted, deleted_by, platform="android"):
+        self.ids, self.minted, self.deleted_by, self.platform = fresh_switch(), minted, deleted_by, platform
         self.refused, self.open, self.deleted, self.kept = None, None, 0, 0
         # What ran on the shared account is undone by tag at the run's end; a fresh account goes at its scenario's end.
         self.shared = any(row["driver"] == "agent" and not wants_fresh(row, self.ids) for row in chosen)
@@ -461,15 +476,31 @@ class Accounts:
         """The scenario's token ("" for the smoke scenario), or None when it is skipped (entry's reason says why)."""
         if row["driver"] == SMOKE:
             return ""
-        if not wants_fresh(row, self.ids):
-            return self.minted(base, secret)
-        if self.refused is None:
+        fresh = wants_fresh(row, self.ids)
+        if fresh and self.refused is not None:
+            entry["reason"] = self.refused
+            return None
+        for attempt in range(2):
             try:
-                self.open = self.minted(base, secret, fresh=True)
-                return self.open
+                token = self.minted(base, secret, fresh=True) if fresh else self.minted(base, secret)
             except FreshRefused as refused:
                 self.refused = refused.reason
-        entry["reason"] = self.refused
+                entry["reason"] = self.refused
+                return None
+            except MintFailed as failed:
+                if failed.status in MINT_FATAL:
+                    raise
+                if attempt:
+                    scenario, status, platform = row["id"], failed.status, self.platform
+                    print(f"May device tests ({platform}): {scenario}: staging did not mint a session (HTTP status "
+                          f"{status}, 0 for no reply), twice; the scenario is skipped")
+                    entry["reason"] = MINT_FAILED
+                    return None
+                flows.sleep(MINT_RETRY_SECONDS)
+                continue
+            if fresh:
+                self.open = token
+            return token
         return None
 
     def finish(self, row, base, token):
@@ -791,7 +822,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         raise DeviceTestsError("The Playground app is not built")
     base = staging(secret, staged)
     outward = os.environ.get(OUTWARD, "").strip() != "off"
-    skipped, accounts = switched_off(), Accounts(chosen, minted, deleted_by)
+    skipped, accounts = switched_off(), Accounts(chosen, minted, deleted_by, "android")
     folder = root / OUT / run_folder(source) / "android"
     folder.mkdir(parents=True, mode=0o700)
     board_inputs(source, folder)
@@ -885,8 +916,11 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             token = ""
         if accounts.shared:
             at("cleanup")
-            token = minted(base, secret)
-            cleaned_count = cleaned(base, token, since, tag)
+            try:
+                token = minted(base, secret)
+            except MintFailed:
+                token = ""  # read as a cleanup that did not answer: the report is kept
+            cleaned_count = cleaned(base, token, since, tag) if token else None
     finally:
         accounts.abandon(base)
         token = secret = ""

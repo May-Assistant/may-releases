@@ -207,7 +207,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         raise DeviceTestsError("The Playground app is not built")
     base = device_tests.staging(secret, staged)
     outward = os.environ.get(device_tests.OUTWARD, "").strip() != "off"
-    skipped, accounts = device_tests.switched_off(), device_tests.Accounts(chosen, minted, deleted_by)
+    skipped, accounts = device_tests.switched_off(), device_tests.Accounts(chosen, minted, deleted_by, "ios")
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
     folder.mkdir(parents=True, mode=0o700)
     device_tests.board_inputs(source, folder)
@@ -310,8 +310,11 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             device_tests.settle(entry, row, passed if flow is not None else None)
         if accounts.shared:
             at("cleanup")
-            token = minted(base, secret)
-            cleaned_count = cleaned(base, token, since, tag)
+            try:
+                token = minted(base, secret)
+            except device_tests.MintFailed:
+                token = ""  # read as a cleanup that did not answer: the report is kept
+            cleaned_count = cleaned(base, token, since, tag) if token else None
     finally:
         accounts.abandon(base)
         token = secret = ""
