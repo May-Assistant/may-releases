@@ -137,6 +137,11 @@ FRESH_EXHAUSTED = "skipped: staging's fresh test accounts for today are used up"
 # A fresh mint whose reply does not say fresh (a staging older than may-app 150, or one that ignores it) is a session on
 # the shared account: never used as a fresh one, never deleted.
 NOT_FRESH = "skipped: staging did not put this scenario on a fresh account"
+# Staging caps a test account's model calls a UTC day (MAY_TEST_SESSION_CALLS_PER_DAY, may-app 125): past it, replies fail
+# test_session_limit_reached. Before each agent scenario the run reads what is left (GET /v1/auth/test-session/state,
+# model_calls) and skips one that MODEL_CALL_MARGIN calls might not cover, rather than run it into the cap.
+MODEL_CALL_MARGIN = 10
+MODEL_CAP = "skipped: the test account's model calls for today are nearly used up"
 
 
 def fresh_switch():
@@ -404,6 +409,27 @@ def cleanup(base, token, since, tag, post=urllib.request.urlopen):
     counts = [data.get(key) for key in ("chats", "tasks", "notes", "routines", "for_you", "approvals_expired")] \
         if isinstance(data, dict) else []
     return sum(count for count in counts if type(count) is int and count >= 0)
+
+
+def model_calls_left(base, token, get=urllib.request.urlopen):
+    """The test account's model calls left today (model_calls.limit - used), or None when the state read does not
+    give both as counts (a staging without the cap reports no model_calls)."""
+    status, data = read_json(base, token, "/v1/auth/test-session/state", get)
+    calls = data.get("model_calls") if status == 200 and isinstance(data, dict) else None
+    used, limit = (calls.get("used"), calls.get("limit")) if isinstance(calls, dict) else (None, None)
+    if type(used) is int and type(limit) is int and used >= 0 and limit >= 1:
+        return limit - used
+    return None
+
+
+def near_model_cap(row, base, token, calls_left):
+    """Whether an agent scenario is to be skipped because the account's model calls left today are fewer than
+    MODEL_CALL_MARGIN. An unknown count runs the scenario."""
+    if row["driver"] != "agent":
+        return False
+    at(f"{row['id']}: reading the model calls left")
+    left = calls_left(base, token)
+    return left is not None and left < MODEL_CALL_MARGIN
 
 
 def delete_fresh(base, token, post=urllib.request.urlopen):
@@ -751,7 +777,7 @@ def settle(entry, row, passed):
 
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
-                  deleted_by=delete_fresh):
+                  deleted_by=delete_fresh, calls_left=model_calls_left):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -808,6 +834,11 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             # A fresh session per scenario: one lasts SESSION_SECONDS and has no refresh. The smoke scenario has none.
             token = accounts.session(row, base, secret, entry)
             if token is None:
+                continue
+            if near_model_cap(row, base, token, calls_left):
+                entry["reason"] = MODEL_CAP
+                accounts.finish(row, base, token)
+                token = ""
                 continue
             at(f"{row['id']}: launching the app")
             launch(adb, env, token, log)

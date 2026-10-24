@@ -61,7 +61,7 @@ class AgentRunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
-                      asked=None, exhausted=False, delivered=None):
+                      asked=None, exhausted=False, delivered=None, calls_left=None):
         calls, minted, seen = [], [], {}
         self.last_seen = seen
 
@@ -129,6 +129,7 @@ class AgentRunTests(unittest.TestCase):
                                        asked=asked or (lambda base, token, state, tag: truth),
                                        cleaned=clean, agent=agent, deleted_by=delete,
                                        delivered=delivered or deliver,
+                                       calls_left=calls_left or (lambda base, token: 100),
                                        install=lambda root: root / "may-claude" / "claude")
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", os.environ)
@@ -293,6 +294,36 @@ class AgentRunTests(unittest.TestCase):
             self.run_and_judge([OSError("agent died")], [], env={device_tests.FRESH: "chat"}, selection="chat")
         self.assertEqual(self.last_seen.get("deleted"), [TOKEN + "1"], "the run's finally deleted chat's account")
 
+    def test_an_agent_scenario_near_the_model_call_cap_is_skipped_and_never_run(self):
+        read = []
+
+        def left(base, token):
+            read.append(token)
+            return device_tests.MODEL_CALL_MARGIN - 1 if token == TOKEN + "1" else device_tests.MODEL_CALL_MARGIN
+
+        try:
+            _, minted, seen, report, _, _ = self.run_and_judge([record(), record()], [("pass", ""), ("pass", "")],
+                                                               calls_left=left)
+        except IndexError:
+            self.fail("a scenario near the model-call cap ran")
+        self.assertEqual(read, [TOKEN + "1", TOKEN + "2", TOKEN + "3"], "read with each scenario's own session")
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", "skipped", device_tests.MODEL_CAP), ("notes", "ui-pass", device_tests.UNCONFIGURED),
+            ("routines", "pass", None)])
+        self.assertEqual([goal[1] for goal in seen["goals"]], ["qa-39557415738"] * 2, "chat's agent never ran")
+
+    def test_a_fresh_account_skipped_near_the_cap_is_deleted_then_and_there(self):
+        try:
+            _, _, seen, report, _, _ = self.run_and_judge(
+                [record()], [("pass", "")], selection="chat,notes", env={device_tests.FRESH: "all"},
+                calls_left=lambda base, token: 0 if token == TOKEN + "1" else 100)
+        except IndexError:
+            self.fail("a scenario near the model-call cap ran")
+        self.assertEqual([row.get("reason") for row in report["scenarios"]],
+                         [device_tests.MODEL_CAP, device_tests.UNCONFIGURED])
+        self.assertEqual(seen.get("deleted"), [TOKEN + "1", TOKEN + "2"],
+                         "chat's fresh account is deleted when it is skipped, before notes' is minted")
+
     def test_a_cleanup_that_does_not_answer_is_said(self):
         _, _, _, _, run_out, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3, cleaned=None)
         self.assertIn("the test session's cleanup did not answer; tagged items may remain", run_out)
@@ -411,6 +442,36 @@ class ServerTruthTests(unittest.TestCase):
         get, seen = server([{"id": "../../v1/account", "name": tag}], {})
         self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), [device_tests.NONE_STORED])
         self.assertEqual(seen, ["/v1/agents"], "an id that is not a plain id is never put in a path")
+
+    def test_model_calls_left_reads_the_state_counts_alone(self):
+        seen = []
+
+        def state(body, status=200):
+            def get(request, timeout):
+                seen.append((request.full_url, request.headers.get("Authorization")))
+                if status != 200:
+                    raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+                return FakeReply(json.dumps(body).encode())
+            return get
+
+        self.assertEqual(device_tests.model_calls_left("https://s", TOKEN, state(
+            {"agents": 1, "model_calls": {"used": 120, "limit": 150}})), 30)
+        self.assertEqual(seen, [("https://s/v1/auth/test-session/state", "Bearer " + TOKEN)])
+        for body in ({"agents": 1}, {"model_calls": {"used": "3", "limit": 150}}, {"model_calls": {"used": 3}},
+                     {"model_calls": {"used": -1, "limit": 150}}, {"model_calls": {"used": 1, "limit": 0}},
+                     {"model_calls": {"used": True, "limit": 150}}, {"model_calls": [1, 2]}, []):
+            with self.subTest(body=body):
+                self.assertIsNone(device_tests.model_calls_left("https://s", TOKEN, state(body)))
+        self.assertIsNone(device_tests.model_calls_left("https://s", TOKEN, state({}, status=404)),
+                          "a staging without the state read runs the scenarios")
+
+    def test_only_an_agent_scenario_short_of_the_margin_is_near_the_cap(self):
+        agent, maestro = {"id": "chat", "driver": "agent"}, {"id": "sign-in", "driver": "maestro"}
+        margin = device_tests.MODEL_CALL_MARGIN
+        for row, left, near in ((agent, margin - 1, True), (agent, margin, False), (agent, None, False),
+                                (agent, -5, True), (maestro, 0, False)):
+            with self.subTest(row=row["id"], left=left):
+                self.assertIs(device_tests.near_model_cap(row, "https://s", TOKEN, lambda base, token: left), near)
 
     def test_cleanup_sends_since_and_tag_and_counts(self):
         seen = {}
