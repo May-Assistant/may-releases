@@ -575,7 +575,7 @@ class RunTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None):
+    def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None, diagnosed=None):
         calls, self.maestro_envs = [], []
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
@@ -610,7 +610,8 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.head_revision", return_value=SHA), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             device_tests.run_scenarios(selection, minted=lambda base, secret: TOKEN,
-                                       checked=lambda base, token, path: status, budgeted=budgeted)
+                                       checked=lambda base, token, path: status, budgeted=budgeted,
+                                       diagnosed=diagnosed)
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             device_tests.judge_scenarios(judged_by=lambda *args: self.fail("judged a Maestro scenario"))
         runs = list((self.root / device_tests.OUT).iterdir())
@@ -668,6 +669,27 @@ class RunTests(unittest.TestCase):
         self.assertRegex(run.name, r"^[0-9]{8}-" + SHA[:12] + "$")
         self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "fail"])
         self.assertIn(["terminate"], calls)
+
+    def test_each_scenario_that_ran_keeps_its_diagnostics_and_the_log_gives_counts(self):
+        kept = []
+
+        class Fake:
+            def __init__(self, adb, env):
+                self.kept, self.anrs, self.crashes, self.dropped = 0, 0, 0, {}
+
+            def keep(self, folder, scenario, token):
+                kept.append((folder.name, scenario, token))
+                self.kept, self.anrs, self.dropped[scenario] = self.kept + 1, 1, 2
+
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        _, _, out, _ = self.run_it(diagnosed=Fake)
+        self.assertEqual(kept, [("android", "sign-in", TOKEN), ("android", "connections", TOKEN)],
+                         "after each scenario's recording, with its session so its lines are dropped")
+        self.assertIn("May device tests (android): diagnostics kept for 2 scenarios (1 with an ANR, 0 with a crash)",
+                      out)
+        self.assertIn("May device tests (android): sign-in diagnostics: 2 lines dropped", out)
+        self.assertIn("May device tests (android): connections diagnostics: 2 lines dropped", out)
+        self.assertNotIn(TOKEN, out)
 
     def test_the_flow_gets_the_session_in_maestros_environment_never_as_an_argument(self):
         """Run 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in."""
@@ -1337,6 +1359,19 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(data["results"][RUN]["android/sign-in"]["preview"], f"media/{RUN}/android-sign-in.preview.mp4")
         self.assertFalse(list((work / "device-tests").rglob("*.mp4")), "no video in may-renders' git")
 
+    def test_android_diagnostics_are_checked_and_kept_apart_never_committed(self):
+        try:
+            self.open_with(self.GOOD + [(RUN + "/android/sign-in" + device_tests.DIAG, b'"main" prio=5 tid=1\n'),
+                                        (RUN + "/android/chat" + device_tests.DIAG, b"Authorization: Bearer x\n"),
+                                        (RUN + "/android/notes" + device_tests.DIAG, b"\xff\xfe")])
+        except publish.PublishError as error:
+            self.fail(f"a bad diagnostics file stopped device-open: {error}")
+        tree = self.root / publish.TREE / RUN
+        self.assertEqual(list(tree.rglob("*" + device_tests.DIAG)), [], "diagnostics never enter may-renders history")
+        videos = self.root / "may-private" / publish.VIDEOS / RUN / "android"
+        self.assertEqual(sorted(p.name for p in videos.iterdir()), ["sign-in.diag.txt", "sign-in.mp4"],
+                         "a file with a secret-shaped line or not UTF-8 is dropped; the good one is set aside")
+
     def push_for_board(self):
         work = self.root / "may-publish-git"
 
@@ -1425,6 +1460,173 @@ class PublishDeviceTests(unittest.TestCase):
             "May device tests: nothing was decrypted, so nothing was pushed"])
 
 
+
+def dropbox(*entries, tag="data_app_anr"):
+    sep = b"=" * 40 + b"\n"
+    return b"Drop box contents: %d entries\n" % len(entries) + b"".join(
+        sep + b"2026-10-24 17:%02d:00 " % i + tag.encode() + b" (text, 100 bytes)\n" + body + b"\n"
+        for i, body in enumerate(entries))
+
+
+class FakeEmulator:
+    """adb as Diagnostics and settle_boot see it: dropbox entries, a log, and every call."""
+
+    def __init__(self, anrs=(), crashes=(), log=b"", fail=False):
+        self.anrs, self.crashes, self.log, self.fail, self.calls = list(anrs), list(crashes), log, fail, []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv[1:])
+        if self.fail:
+            raise subprocess.TimeoutExpired(argv, 60)
+        out = b""
+        if argv[1:5] == ["shell", "dumpsys", "dropbox", "--print"]:
+            out = dropbox(*self.anrs) if argv[5] == "data_app_anr" else dropbox(*self.crashes, tag="data_app_crash")
+        elif argv[1:3] == ["logcat", "-d"]:
+            out = self.log
+        return subprocess.CompletedProcess(argv, 0, out, b"")
+
+
+class DiagnosticsTests(unittest.TestCase):
+    """Coordinator, 24 Oct: sign-out's recording showed "May Playground isn't responding"; M needs its stack."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.folder = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_each_scenario_keeps_its_own_anr_and_log_and_no_line_that_could_carry_the_session(self):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.c2ln"
+        emulator = FakeEmulator(anrs=[b"old ANR from before the run"])
+        with patch("device_tests.subprocess.run", side_effect=emulator):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            emulator.anrs.append(b'Subject: Input dispatching timed out\n"main" prio=5 tid=1 Blocked\n  at MainActivity')
+            emulator.log = ("I/ActivityManager: Start proc\n"
+                            f"D/OkHttp: Authorization: Bearer {TOKEN}\n"
+                            f"D/May: session {TOKEN}\n"
+                            f"D/May: token {jwt}\n"
+                            "I/am: may_test_session extra\n"
+                            "E/ActivityManager: ANR in io.github.mayassistant.may.playground\n").encode()
+            diagnostics.keep(self.folder, "sign-out", TOKEN)
+            emulator.log = b"I/May: next scenario\n"
+            diagnostics.keep(self.folder, "connections", TOKEN)
+        text = (self.folder / "sign-out.diag.txt").read_text()
+        self.assertIn('"main" prio=5 tid=1 Blocked', text)
+        self.assertIn("ANR in io.github.mayassistant.may.playground", text)
+        self.assertNotIn("old ANR from before the run", text, "an entry already there belongs to no scenario")
+        for secret in (TOKEN, jwt, "Authorization", "may_test_session"):
+            self.assertNotIn(secret, text)
+        later = (self.folder / "connections.diag.txt").read_text()
+        self.assertNotIn("Input dispatching", later, "each ANR is kept once, with its own scenario")
+        self.assertIn("next scenario", later)
+        self.assertEqual((diagnostics.kept, diagnostics.anrs, diagnostics.crashes), (2, 1, 0))
+        dumps = [i for i, argv in enumerate(emulator.calls) if argv[:2] == ["logcat", "-d"]]
+        clears = [i for i, argv in enumerate(emulator.calls) if argv[-1:] == ["-c"]]
+        self.assertEqual(len(clears), 2)
+        self.assertTrue(all(dump < clear for dump, clear in zip(dumps, clears)), "the log is cleared once read")
+        self.assertIn(["logcat", "-d", "-t", "2000", "-b", "main,system,crash"], emulator.calls)
+
+    def test_no_credential_survives_and_email_addresses_keep_their_domain_alone(self):
+        """Coordinator, 24 Oct: refresh tokens, cookies, may_* keys with opaque values, and email addresses."""
+        opaque = "Zm9vYmFyYmF6cXV4cXV1eHF1dXg"
+        log = ("I/May: refresh_token=" + opaque + "\n"
+               "D/OkHttp: Set-Cookie: sid=" + opaque + "; HttpOnly\n"
+               "D/OkHttp: Cookie: sid=" + opaque + "\n"
+               "D/May: may_agent_key=" + opaque + "\n"
+               'D/May: {"may_device_token": "' + opaque + '"}\n'
+               "I/May: signed in as sam.avery+qa@example.com from qa-40113277692@staging.may.example\n"
+               "I/May: may_screen=chats\n"
+               "I/Choreographer: Skipped 42 frames\n").encode()
+        emulator = FakeEmulator(log=log)
+        with patch("device_tests.subprocess.run", side_effect=emulator):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            diagnostics.keep(self.folder, "sign-in", TOKEN)
+        text = (self.folder / "sign-in.diag.txt").read_text()
+        for secret in (opaque, "sam.avery", "qa-40113277692@", "Cookie"):
+            self.assertNotIn(secret, text)
+        self.assertIn("signed in as ***@example.com from ***@staging.may.example", text)
+        self.assertIn("may_screen=chats", text, "a short may_* value is no credential")
+        self.assertIn("Skipped 42 frames", text)
+        self.assertEqual(diagnostics.dropped, {"sign-in": 5})
+        self.assertTrue(publish.diagnostics_ok(text.encode()))
+        self.assertFalse(publish.diagnostics_ok(b"I/May: sam@example.com\n"), "an unmasked address is refused")
+        self.assertFalse(publish.diagnostics_ok(b"Cookie: x\n"))
+
+    def test_a_file_stays_within_its_size_with_the_stacks_and_the_newest_log_lines(self):
+        emulator = FakeEmulator(crashes=[])
+        with patch("device_tests.subprocess.run", side_effect=emulator):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            emulator.crashes.append(b'"main" crashed\n' + b"x" * (device_tests.MAX_DIAG * 2))
+            emulator.log = b"".join(b"I/May: line %06d\n" % n for n in range(60000)) + b"I/May: the newest line\n"
+            diagnostics.keep(self.folder, "chat", "")
+        data = (self.folder / "chat.diag.txt").read_bytes()
+        self.assertLessEqual(len(data), device_tests.MAX_DIAG)
+        self.assertIn(b'"main" crashed', data)
+        self.assertTrue(data.endswith(b"I/May: the newest line\n"))
+        self.assertEqual(diagnostics.crashes, 1)
+
+    def test_stray_bytes_never_take_a_file_over_its_size(self):
+        emulator = FakeEmulator(log=b"I/May: \xff\xfe\n" * (device_tests.MAX_DIAG // 8))
+        with patch("device_tests.subprocess.run", side_effect=emulator):
+            device_tests.Diagnostics("/sdk/adb", {}).keep(self.folder, "chat", "")
+        data = (self.folder / "chat.diag.txt").read_bytes()
+        self.assertLessEqual(len(data), device_tests.MAX_DIAG, "each stray byte becomes three once replaced")
+        data.decode("utf-8")
+
+    def test_an_emulator_that_does_not_answer_never_stops_the_run(self):
+        with patch("device_tests.subprocess.run", side_effect=FakeEmulator(fail=True)):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            diagnostics.keep(self.folder, "sign-in", TOKEN)
+        self.assertEqual(list(self.folder.iterdir()), [])
+        self.assertEqual(diagnostics.kept, 0)
+
+    def test_the_emulator_settles_before_the_app_is_installed(self):
+        now, sleeps, answers = [0], [], iter([b"\n", b"9.10 4.00 1.00 3/400 99\n", b"1\n", b"3.50 2.00 1.00 3/400 99\n",
+                                               b"1\n", b"1.20 2.00 1.00 3/400 99\n"])
+
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, next(answers), b"")
+
+        log = self.folder / "log"
+        with patch("device_tests.subprocess.run", side_effect=run):
+            settled = device_tests.settle_boot("/sdk/adb", {}, log, clock=lambda: now[0],
+                                               sleep=lambda seconds: sleeps.append(seconds) or now.__setitem__(0, now[0] + seconds))
+        self.assertTrue(settled)
+        self.assertEqual(sleeps, [5, 5], "dev.bootcomplete first, then a load average under SETTLE_LOAD")
+        self.assertEqual(log.read_bytes(), b"emulator settled\n")
+
+    def test_an_emulator_that_never_settles_still_runs_after_the_ceiling(self):
+        now = [0]
+
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, b"1\n" if "getprop" in argv else b"8.00 8.00 8.00 3/400 99\n",
+                                               b"")
+
+        log = self.folder / "log"
+        with patch("device_tests.subprocess.run", side_effect=run):
+            settled = device_tests.settle_boot("/sdk/adb", {}, log, clock=lambda: now[0],
+                                               sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        self.assertFalse(settled)
+        self.assertEqual(now[0], device_tests.SETTLE_SECONDS)
+        self.assertEqual(log.read_bytes(), b"emulator did not settle; going on\n")
+
+    def test_boot_settles_the_emulator_before_returning(self):
+        with patch("device_tests.settle_boot") as settle, \
+                patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
+                patch("device_tests.flows.sdk_tool", side_effect=lambda home, tool: str(home / tool)), \
+                patch("device_tests.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"1\n")), \
+                patch("device_tests.subprocess.Popen"), patch("device_tests.flows.run_private", return_value=0):
+            device_tests.boot(self.folder, self.folder / "log")
+        self.assertEqual(settle.call_count, 1)
+
+    def test_a_secret_shaped_line_or_an_oversized_or_binary_file_is_dropped_at_publish(self):
+        self.assertTrue(publish.diagnostics_ok(b'"main" prio=5\n'))
+        self.assertFalse(publish.diagnostics_ok(b"Authorization: Bearer abc\n"))
+        self.assertFalse(publish.diagnostics_ok(b"\xff\xfe"))
+        self.assertFalse(publish.diagnostics_ok(b"x" * (device_tests.MAX_DIAG + 1)))
+
+
 class FakeRenders:
     """may-renders' release API as device-release sees it, recording every call."""
 
@@ -1477,8 +1679,9 @@ class ReleaseDeviceTests(unittest.TestCase):
         existing = [{"id": n, "tag_name": "device-tests-202610%02d-%012x" % (n, n), "created_at": "x"}
                     for n in range(1, 12)] + [{"id": 500, "tag_name": "v1.0"}]
         api = FakeRenders(existing=existing)
-        self.assertEqual(self.release(api), f"May device tests: 3 recordings and 0 previews uploaded to the may-renders "
-                                            f"release for device-tests/{RUN}/ (10 releases kept, 1 removed)")
+        self.assertEqual(self.release(api), f"May device tests: 3 recordings, 0 previews and 0 diagnostics uploaded to "
+                                            f"the may-renders release for device-tests/{RUN}/ (10 releases kept, 1 "
+                                            "removed)")
         create = api.calls[0]
         self.assertEqual(create[:3], ("POST", publish.API, "/repos/May-Assistant/may-renders/releases"))
         self.assertEqual((create[3]["tag_name"], create[3]["target_commitish"], create[3]["make_latest"]),
@@ -1505,7 +1708,7 @@ class ReleaseDeviceTests(unittest.TestCase):
         self.assertEqual(names[:3], ["android-connections-part1.mp4", "android-connections-part2.mp4",
                                      "android-sign-in.mp4"], "every recording before any preview")
         self.assertEqual(sorted(names[3:]), ["android-connections.preview.mp4", "android-sign-in.preview.mp4"])
-        self.assertIn("3 recordings and 1 previews uploaded", out, "previews are never counted as recordings")
+        self.assertIn("3 recordings, 1 previews and 0 diagnostics uploaded", out, "previews are never counted as recordings")
         with self.assertRaises(publish.PublishError):
             self.release(FakeRenders(failing=["android-sign-in.mp4"]))
 
@@ -1526,7 +1729,7 @@ class ReleaseDeviceTests(unittest.TestCase):
             out = self.release(flaky)
         except (OSError, http.client.HTTPException) as error:
             self.fail(f"a preview's network error stopped the release: {type(error).__name__}")
-        self.assertIn("3 recordings and 0 previews uploaded", out)
+        self.assertIn("3 recordings, 0 previews and 0 diagnostics uploaded", out)
         self.assertIn("GET", [c[0] for c in api.calls if c[2].endswith("/releases?per_page=100")],
                       "the pruning still ran")
 
@@ -1538,9 +1741,47 @@ class ReleaseDeviceTests(unittest.TestCase):
         self.assertTrue(re.fullmatch(upload, "/repos/May-Assistant/may-renders/releases/77/assets?name=" +
                                      publish.asset_name("ios", longest + device_tests.PREVIEW)))
 
+    def test_diagnostics_go_up_after_the_recordings_and_a_failed_one_never_costs_them(self):
+        (self.videos / ("sign-in" + device_tests.DIAG)).write_text('"main" prio=5\n')
+        (self.videos / ("connections" + device_tests.DIAG)).write_text("log\n")
+        api = FakeRenders(failing=["android-connections.diag.txt"])
+        try:
+            out = self.release(api)
+        except publish.PublishError as error:
+            self.fail(f"a diagnostics upload failure stopped the release: {error}")
+        names = [c[2].rsplit("=", 1)[1] for c in api.calls if c[1] == publish.UPLOADS]
+        self.assertEqual(names[:3], ["android-connections-part1.mp4", "android-connections-part2.mp4",
+                                     "android-sign-in.mp4"], "every recording first")
+        self.assertEqual(sorted(names[3:]), ["android-connections.diag.txt", "android-sign-in.diag.txt"])
+        self.assertIn("3 recordings, 0 previews and 1 diagnostics uploaded", out)
+
+    def test_a_diagnostics_asset_is_sent_as_text(self):
+        sent = []
+
+        class Reply(io.BytesIO):
+            status = 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout):
+            sent.append(request)
+            return Reply(b"{}")
+
+        path = "/repos/May-Assistant/may-renders/releases/77/assets?name=android-sign-in.diag.txt"
+        with patch("publish.urllib.request.urlopen", side_effect=urlopen):
+            self.assertEqual(publish.renders_api("POST", publish.UPLOADS, path, TOKEN, data=b"x")[0], 201)
+            publish.renders_api("POST", publish.UPLOADS, path.replace(".diag.txt", ".mp4"), TOKEN, data=MP4)
+        self.assertEqual([r.get_header("Content-type") for r in sent], ["text/plain; charset=utf-8", "video/mp4"])
+        with self.assertRaises(PublishError):
+            publish.renders_api("POST", publish.UPLOADS, path.replace(".diag.txt", ".txt"), TOKEN, data=b"x")
+
     def test_a_re_run_reuses_the_release_and_skips_assets_already_there(self):
         api = FakeRenders(create=422, assets=["android-sign-in.mp4"])
-        self.assertIn("2 recordings and 0 previews uploaded", self.release(api))
+        self.assertIn("2 recordings, 0 previews and 0 diagnostics uploaded", self.release(api))
         self.assertIn(("GET", publish.API, f"/repos/May-Assistant/may-renders/releases/tags/device-tests-{RUN}", None,
                        None), api.calls)
 

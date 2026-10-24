@@ -69,7 +69,8 @@ DEVICES = ("android", "ios")
 # may-app's flows and board notes, sealed by each device job and set aside by device-open for the flow board
 # (board.py), never committed.
 BOARD_INPUTS, BOARD, DROPPED = ("flows.json", "board-notes.json"), "may-device-board", ".dropped"
-DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.preview\.mp4|\.xml)|report\.json|"
+DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.preview\.mp4|\.xml|"
+                         r"\.diag\.txt)|report\.json|"
                          + "|".join(re.escape(name) for name in BOARD_INPUTS) + "|" + board.PATH_FILE.pattern + "|" +
                          board.SHOT_FILE.pattern)
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
@@ -95,7 +96,8 @@ _RELEASES = r"/repos/" + re.escape(RENDERS_REPO) + r"/releases"
 RELEASE_CALLS = (("POST", API, _RELEASES), ("GET", API, _RELEASES + r"/tags/" + RELEASE_TAG.pattern),
                  ("GET", API, _RELEASES + r"\?per_page=100"),
                  ("GET", API, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?per_page=100"),
-                 ("POST", UPLOADS, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?name=(?:android|ios)-[a-z0-9][a-z0-9-]{0,60}(?:\.preview)?\.mp4"),
+                 ("POST", UPLOADS, _RELEASES + r"/[1-9][0-9]{0,15}/assets\?name=(?:android|ios)-[a-z0-9][a-z0-9-]{0,60}"
+                  r"(?:(?:\.preview)?\.mp4|\.diag\.txt)"),
                  ("DELETE", API, _RELEASES + r"/[1-9][0-9]{0,15}"),
                  ("DELETE", API, r"/repos/" + re.escape(RENDERS_REPO) + r"/git/refs/tags/" + RELEASE_TAG.pattern))
 MAX_FILES = 2000
@@ -175,6 +177,18 @@ def is_json(data):
     return True
 
 
+def diagnostics_ok(data):
+    """An Android scenario's diagnostics (device_tests.Diagnostics): small UTF-8 text with no line that could carry a
+    session or a credential and no unmasked email address, checked again here."""
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    # A masked address (***@domain) is left as it is by EMAIL; any other is refused.
+    return len(data) <= device_tests.MAX_DIAG and not device_tests.SECRET_LINE.search(data) and \
+        device_tests.EMAIL.sub(device_tests.MASKED, data) == data
+
+
 def extract(archive, members, destination):
     """The checked members, written under destination; returns the names of optional files it dropped: may-app board
     files that are not JSON, and previews that are not small MP4s."""
@@ -199,6 +213,10 @@ def extract(archive, members, destination):
             output.write(data)
         if path.suffix == ".png" and not data.startswith(PNG):
             raise PublishError("A render is not a PNG")
+        if path.name.endswith(device_tests.DIAG) and not diagnostics_ok(data):
+            path.unlink()  # optional: one too large, not UTF-8, or with a line that could carry a session is dropped
+            dropped.append(path.name)
+            continue
         if path.name.endswith(device_tests.PREVIEW) and (data[4:8] != b"ftyp" or len(data) > device_tests.MAX_PREVIEW):
             path.unlink()  # a preview is optional: one that is not a small MP4 is dropped, never decoded here
             dropped.append(path.name)
@@ -523,10 +541,10 @@ def open_device():
                     (folder / name).rename(private / BOARD / f"{device}-{name}")
             reports[device] = device_report(folder / "report.json", {p.name for p in folder.iterdir()}, titles)[1]
         run = runs.pop()
-        # Checked as MP4s above, then moved out of the tree: recordings never enter may-renders history; device-release
-        # uploads them from here.
+        # Checked above, then moved out of the tree: recordings and Android's diagnostics never enter may-renders
+        # history; device-release uploads them from here, to a release pruned after KEEP runs.
         videos = private / VIDEOS / run
-        for video in sorted((tree / run).glob("*/*.mp4")):
+        for video in sorted([*(tree / run).glob("*/*.mp4"), *(tree / run).glob("*/*" + device_tests.DIAG)]):
             (videos / video.parent.name).mkdir(mode=0o700, parents=True, exist_ok=True)
             video.rename(videos / video.parent.name / video.name)
         attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
@@ -601,7 +619,8 @@ def renders_api(method, host, path, token, payload=None, data=None):
         raise PublishError("Only may-renders' device-tests releases are reachable")
     headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28",
-               "Content-Type": "video/mp4" if data is not None else "application/json"}
+               "Content-Type": "application/json" if data is None else
+               "text/plain; charset=utf-8" if path.endswith(device_tests.DIAG) else "video/mp4"}
     body = data if data is not None else None if payload is None else json.dumps(payload).encode()
     call = urllib.request.Request(host + path, data=body, method=method, headers=headers)
     try:
@@ -667,24 +686,28 @@ def release_device(api=renders_api):
     videos = [(device.name, video) for device in sorted(folders[0].iterdir())
               if device.name in DEVICES and device.is_dir() and not device.is_symlink()
               for video in sorted(device.iterdir())
-              if DEVICE_FILE.fullmatch(video.name) and video.suffix == ".mp4" and video.is_file()
-              and not video.is_symlink()]
+              if DEVICE_FILE.fullmatch(video.name) and (video.suffix == ".mp4" or video.name.endswith(device_tests.DIAG))
+              and video.is_file() and not video.is_symlink()]
     release, present = release_for(run, token, api)
-    uploaded = previews = 0
-    # The recordings first, each one required; then the board's previews, each one optional (a missing preview shows
-    # the end screen), so a preview can never cost the run its recordings.
-    for device, video in sorted(videos, key=lambda pair: pair[1].name.endswith(device_tests.PREVIEW)):
+    uploaded = previews = diagnostics = 0
+    # The recordings first, each one required; then the board's previews and Android's diagnostics, each one optional
+    # (a missing preview shows the end screen), so neither can ever cost the run its recordings.
+    for device, video in sorted(videos, key=lambda pair: not pair[1].name.endswith(".mp4") or
+                                pair[1].name.endswith(device_tests.PREVIEW)):
         name = asset_name(device, video.name)
         if name in present:
             continue
-        if video.name.endswith(device_tests.PREVIEW):
+        if not video.name.endswith(".mp4") or video.name.endswith(device_tests.PREVIEW):
             # Optional: no error on one (a status, a reset connection, a short read) stops the rest or the pruning.
             try:
                 status, _ = api("POST", UPLOADS, f"/repos/{RENDERS_REPO}/releases/{release}/assets?name={name}", token,
                                 data=video.read_bytes())
             except (OSError, http.client.HTTPException, PublishError, DsCompileError):
                 status = None
-            previews += status == 201
+            if video.name.endswith(device_tests.PREVIEW):
+                previews += status == 201
+            else:
+                diagnostics += status == 201
             continue
         status, _ = api("POST", UPLOADS, f"/repos/{RENDERS_REPO}/releases/{release}/assets?name={name}", token,
                         data=video.read_bytes())
@@ -692,8 +715,8 @@ def release_device(api=renders_api):
             raise PublishError("A recording could not be uploaded to the may-renders release")
         uploaded += 1
     kept, removed = prune_releases(token, api)
-    print(f"May device tests: {uploaded} recordings and {previews} previews uploaded to the may-renders release for "
-          f"device-tests/{run}/ ({kept} releases kept, {removed} removed)")
+    print(f"May device tests: {uploaded} recordings, {previews} previews and {diagnostics} diagnostics uploaded to the "
+          f"may-renders release for device-tests/{run}/ ({kept} releases kept, {removed} removed)")
 
 
 _PR = r"/repos/" + re.escape(APP_REPO) + r"/{}/[1-9][0-9]{{0,6}}"
