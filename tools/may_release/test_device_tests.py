@@ -324,6 +324,35 @@ def ticking_budget():
     return device_tests.Budget(total=device_tests.FLOW_SECONDS + 1, clock=lambda: next(ticks))
 
 
+class BootTests(unittest.TestCase):
+    def test_the_emulator_runs_its_animations_at_normal_speed(self):
+        puts = []
+
+        class Done:
+            returncode, stdout = 0, b"1\n"
+
+        class Emulator:
+            def poll(self):
+                return None
+
+        def private(argv, log, *, env=None, timeout=None):
+            if argv[1:4] == ["shell", "settings", "put"]:
+                puts.append(argv[4:])
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
+                patch("device_tests.flows.sdk_tool", side_effect=lambda home, tool: str(home / tool)), \
+                patch("device_tests.subprocess.run", return_value=Done()), \
+                patch("device_tests.subprocess.Popen", return_value=Emulator()), \
+                patch("device_tests.flows.run_private", side_effect=private):
+            root = Path(directory)
+            device_tests.boot(root, root / "log")
+        self.assertEqual(puts, [["global", setting, "1"] for setting in
+                                ("window_animation_scale", "transition_animation_scale", "animator_duration_scale")],
+                         "at 0, Compose's reduced motion stops the mascot ring and the recording hides the design")
+
+
 class BudgetTests(unittest.TestCase):
     def test_a_scenario_starts_only_when_its_cap_and_all_judging_still_fit(self):
         now = [0]

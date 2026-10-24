@@ -657,8 +657,15 @@ def screenshot(adb, env, path, log):
     return path.name
 
 
+# The emulator's three animation scales, at normal speed so a recording shows the app's real design (its mascot ring:
+# at 0, Compose's reduced motion stops it). flows.py's renders keep theirs at 0, for still screens.
+ANIMATION_SETTINGS = ("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
+ANIMATION_SCALE = "1"
+
+
 def boot(root, log):
-    """The emulator, as flows.run starts it (API 35 image, KVM, no window), with animations off: (adb, process, env)."""
+    """The emulator, as flows.run starts it (API 35 image, KVM, no window), with animations at ANIMATION_SCALE: (adb,
+    process, env)."""
     home = flows.sdk()
     env = child_env(ANDROID_AVD_HOME=str(root / "may-avd"), ANDROID_EMULATOR_HOME=str(root / "may-avd"))
     adb = flows.sdk_tool(home, "platform-tools/adb")
@@ -679,8 +686,8 @@ def boot(root, log):
             emulator.kill()
             raise DeviceTestsError("The emulator did not boot; no scenario ran")
         time.sleep(5)
-    for setting in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
-        flows.run_private([adb, "shell", "settings", "put", "global", setting, "0"], log, env=env)
+    for setting in ANIMATION_SETTINGS:
+        flows.run_private([adb, "shell", "settings", "put", "global", setting, ANIMATION_SCALE], log, env=env)
     return adb, emulator, env
 
 
