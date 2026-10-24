@@ -27,7 +27,7 @@
     "id": "chat",
     "title": "Chat with May and get a reply",
     "driver": "agent",
-    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: This is device test {tag}. Reply with one short sentence. Then wait until May's reply appears under your message.",
+    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: This is device test {tag}. Reply with the word received. Then wait until May's reply appears under your message.",
     "platforms": [
       "android",
       "ios"
@@ -53,7 +53,7 @@
     "id": "poll",
     "title": "Answer May's multiple-choice question",
     "driver": "agent",
-    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me a multiple-choice question about my week, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until the card shows your choice as the answer.",
+    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me one multiple-choice question about which fruit I'd like as a snack, with three choices, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until the card shows your choice as the answer.",
     "platforms": [
       "android",
       "ios"
@@ -70,7 +70,7 @@
     "id": "poll-skip",
     "title": "Skip May's question with a free reply",
     "driver": "agent",
-    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me a multiple-choice question about my week, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer in my own words, {tag}. Then check that the question card now shows as skipped, with its choices dimmed.",
+    "goal": "In May Playground, open Chats and start a new chat with May. Send this message: Ask me one multiple-choice question about which fruit I'd like as a snack, with three choices, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I'll answer myself: apples, {tag}. Then check that the question card now shows as skipped, with its choices dimmed.",
     "platforms": [
       "android",
       "ios"

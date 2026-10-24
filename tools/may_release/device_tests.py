@@ -353,6 +353,36 @@ def listed(data, key):
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
+# A chat's messages come oldest first, MESSAGE_PAGE at a time after a seq cursor (GET .../messages?after=&limit=): the
+# shared account's May chat holds far more than one page, so a run's own messages are only on its last pages (run
+# 40087626039: May replied, yet the report said "none stored", because only the first 100 were read).
+MESSAGE_PAGE, MAX_MESSAGE_PAGES = 200, 50
+
+
+def chat_messages(base, token, conversation, get):
+    """(HTTP status of the first page, every message of a chat, oldest first), page by page to its end (at most
+    MAX_MESSAGE_PAGES pages)."""
+    messages, cursor, first = [], "0", None
+    for _ in range(MAX_MESSAGE_PAGES):
+        status, data = read_json(base, token, f"/v1/conversations/{conversation}/messages?after={cursor}"
+                                 f"&limit={MESSAGE_PAGE}", get)
+        first = status if first is None else first
+        page = listed(data, "messages") if status == 200 else []
+        messages += page
+        following = data.get("next_cursor") if isinstance(data, dict) else None
+        if len(page) < MESSAGE_PAGE or not (isinstance(following, str) and following.isdigit()) or \
+                int(following) <= int(cursor):
+            break
+        cursor = following
+    return first, messages
+
+
+def run_messages(messages, tag):
+    """A chat's messages from the run's first tagged one on: what this run said and what came after it."""
+    start = next((at for at, message in enumerate(messages) if holds(message, tag)), len(messages))
+    return messages[start:]
+
+
 def question_truth(base, token, state, tag, get=urllib.request.urlopen):
     """K's route to a question card (21 Oct): every chat is an agent (GET /v1/agents, May's own first), and a chat's
     id is its conversation's. True when a chat named with the tag, or May's own, holds the tag and a question
@@ -363,10 +393,10 @@ def question_truth(base, token, state, tag, get=urllib.request.urlopen):
     agents = [row for row in listed(data, "agents") if isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
     chosen = [row for row in agents if holds(row.get("name"), tag)] + agents[:1]
     for agent in list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]:
-        status, data = read_json(base, token, f"/v1/conversations/{agent['id']}/messages", get)
-        messages = listed(data, "messages") if status == 200 else []
-        if holds(messages, tag) and any(message.get("kind") == "question" and isinstance(message.get("question"), dict)
-                                        and message["question"].get("state") == state for message in messages):
+        status, messages = chat_messages(base, token, agent["id"], get)
+        # A question card counts only after the run's own first tagged message: an older run's card never passes.
+        if any(message.get("kind") == "question" and isinstance(message.get("question"), dict)
+               and message["question"].get("state") == state for message in run_messages(messages, tag)):
             return 200, True
     return 200, False
 
@@ -386,8 +416,8 @@ def sends_messages(row):
 def message_codes(base, token, tag, get=urllib.request.urlopen):
     """For each of the user's messages holding the tag, in May's own chat and any named with it (as question_truth),
     its reply run's "<status>" or "<status> (<error_code>)" (latest_run), or "no run": at most MAX_DELIVERY. None
-    stored at all ([NONE_STORED]) means the app's send was refused before the server kept anything. None when the
-    chats could not be read. The text is read here only to find the tag."""
+    stored at all ([NONE_STORED]) means no tagged user message was found in the chats read. None when the chats
+    could not be read. The text is read here only to find the tag."""
     status, data = read_json(base, token, "/v1/agents", get)
     if status != 200:
         return None
@@ -395,8 +425,8 @@ def message_codes(base, token, tag, get=urllib.request.urlopen):
     chosen = [row for row in agents if holds(row.get("name"), tag)] + agents[:1]
     codes = []
     for agent in list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]:
-        status, data = read_json(base, token, f"/v1/conversations/{agent['id']}/messages", get)
-        for message in listed(data, "messages") if status == 200 else []:
+        status, messages = chat_messages(base, token, agent["id"], get)
+        for message in messages:
             if message.get("author") == "user" and holds(message, tag):
                 codes.append(run_code(message.get("latest_run")))
     return codes[:MAX_DELIVERY] or [NONE_STORED]

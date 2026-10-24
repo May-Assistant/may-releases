@@ -89,7 +89,7 @@ class HistoryTests(unittest.TestCase):
         results = [board.entry(folder(1), "9", {"android": [chat]}, NOW)["results"]["android/chat"]["reason"]
                    for chat in (coded, stored, row("chat", "pass"))]
         self.assertEqual(results, [device_tests.NO_TRUTH + "; messages: failed (model_cap_reached)",
-                                   "messages: none stored (the send was refused before the server kept anything)", None])
+                                   "messages: none stored (no tagged message found in this chat)", None])
 
     def test_history_keeps_the_newest_runs_and_drops_malformed_entries(self):
         old = [board.entry(folder(n), str(n), {"android": [row("sign-in", "pass")]}, NOW) for n in range(70, 0, -1)]

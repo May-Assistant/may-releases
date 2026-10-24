@@ -156,7 +156,7 @@ def valid_folder(folder):
 
 def delivery_words(codes):
     """A chat scenario's message codes for a reader (device_tests.message_codes): "none stored" says what it means."""
-    return "none stored (the send was refused before the server kept anything)" if codes == ["none stored"] \
+    return "none stored (no tagged message found in this chat)" if codes == ["none stored"] \
         else ", ".join(codes)
 
 

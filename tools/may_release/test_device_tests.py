@@ -171,6 +171,17 @@ class ScenarioTests(unittest.TestCase):
         for seconds in (device_agent.AGENT_SECONDS, device_agent.IOS_AGENT_SECONDS):
             self.assertLessEqual(seconds + 10 * 60, device_tests.SESSION_SECONDS)
 
+    def test_the_chat_scripts_are_neutral_and_carry_the_tag(self):
+        """Run 40087626039: "a question about my week" drew crisis-safety replies; the scripts test delivery, not that."""
+        goals = {row["id"]: row["goal"] for row in device_tests.scenarios("chat,poll,poll-skip", "android")}
+        self.assertIn("Reply with the word received", goals["chat"])
+        for scenario in ("poll", "poll-skip"):
+            self.assertIn("which fruit I'd like as a snack, with three choices, tag {tag}", goals[scenario])
+        self.assertIn("I'll answer myself: apples, {tag}", goals["poll-skip"])
+        for scenario, goal in goals.items():
+            with self.subTest(scenario=scenario):
+                self.assertNotRegex(goal.lower(), r"\b(week|feel|feeling|mood|stress|worr)", "no personal or feelings topic")
+
     def test_malformed_rows_are_refused(self):
         good = device_tests.scenarios()[0]
         for change in ({"id": "Sign In"}, {"flow": "../x.yaml"}, {"driver": "shell"}, {"platforms": ["web"]},
