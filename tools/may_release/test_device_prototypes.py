@@ -324,12 +324,21 @@ class RenderTests(Fixture):
             seen.update(stage=stage, private=set(private))
             return 1, 0
 
-        home = Path.home()
-        with patch.dict(os.environ, {"RUNNER_TEMP": str(out)}, clear=True), patch("sys.stdout", new_callable=io.StringIO):
+        home, passwd = self.root / "home", self.root / "passwd"
+
+        class Entry:
+            pw_dir = str(passwd)
+
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(out)}, clear=True), patch("sys.stdout", new_callable=io.StringIO), \
+                patch("device_tests.Path.home", return_value=home), \
+                patch("device_tests.pwd.getpwuid", return_value=Entry()):
             device_tests.render_prototypes(copied=lambda *a: (0, 0), rendered=rendered)
         for folder in (out, out / "may-claude", out / "may-source", out / "may-private", out / "may-maestro-home",
-                       home / ".maestro", home / ".android"):
+                       home / ".maestro", home / ".android", passwd / ".maestro", passwd / ".android"):
             self.assertIn(folder, seen["private"])
+        # Hardening after #104: a hosted runner's home may be 755, with its own credentials in it.
+        self.assertIn(passwd, seen["private"], "the passwd home, which may-render could otherwise list and read")
+        self.assertIn(home, seen["private"])
         self.assertFalse(seen["stage"].parent.exists(), "the stage's empty temporary folder is removed too")
 
     def test_a_failed_handover_to_the_render_user_stops_the_render(self):
@@ -381,6 +390,11 @@ class RenderTests(Fixture):
         self.assertIsNone(read(self.stage, ("profiles", "b", "secret.png"), 1024))
         self.assertEqual(read(self.stage, ("profiles", "c", "shot.png"), 1024), PNG)
         self.assertIsNone(read(self.stage, ("profiles", "c", "shot.png"), len(PNG) - 1), "over the limit")
+        (self.stage / "profiles" / "d").mkdir()
+        os.mkfifo(self.stage / "profiles" / "d" / "shot.png")
+        self.assertIsNone(read(self.stage, ("profiles", "d", "shot.png"), 1024), "a FIFO in place of the shot")
+        (self.stage / "profiles" / "e" / "shot.png").mkdir(parents=True)
+        self.assertIsNone(read(self.stage, ("profiles", "e", "shot.png"), 1024), "a folder in place of the shot")
 
 
 class PublishTests(unittest.TestCase):

@@ -1331,9 +1331,11 @@ def render_prototypes(copied=device_prototypes.copy_paths, rendered=device_proto
             scratch = root / "may-private" / "prototypes"
             scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
             # Outside the runner's home: the render user reads only this, and none of private.
+            # The runner's home itself too (Java's passwd entry and $HOME): on a hosted image it may be 755, and it
+            # holds the runner's own files (its .credentials, ~/.docker/config.json) under default permissions.
+            homes = {Path(pwd.getpwuid(os.getuid()).pw_dir), Path.home()}
             private = (root, *(root / name for name in ("may-claude", "may-source", "may-private", MAESTRO_HOME)),
-                       *(home / name for home in {Path(pwd.getpwuid(os.getuid()).pw_dir), Path.home()}
-                         for name in (".maestro", ".android")))
+                       *homes, *(home / name for home in homes for name in (".maestro", ".android")))
             parent = Path(tempfile.mkdtemp(prefix="may-render-"))
             try:
                 made, failed = rendered(root / "may-source", folder, parent / "prototypes", scratch, private=private)
