@@ -634,7 +634,6 @@ class RunTests(unittest.TestCase):
                          ("fail", "may-app has no Maestro flow for this scenario"))
         self.assertEqual(out.splitlines(), [
             "May device tests (android): 2 scenarios ran; verdicts follow the judge step",
-            "May device tests (android): diagnostics kept for 0 scenarios (0 with an ANR, 0 with a crash)",
             "May device tests (android): sign-in: ui-pass", "May device tests (android): connections: fail",
             "May device tests (android): 0 passed, 1 passed on screen alone (server checks not configured), 1 failed, "
             "0 skipped"])

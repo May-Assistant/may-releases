@@ -1198,8 +1198,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     ran = sum(1 for entry in results if entry["verdict"] != "skipped")
     print(f"May device tests (android): {ran} scenarios ran; verdicts follow the judge step")
     kept, anrs, crashes = diagnostics.kept, diagnostics.anrs, diagnostics.crashes
-    print(f"May device tests (android): diagnostics kept for {kept} scenarios ({anrs} with an ANR, {crashes} with a "
-          "crash)")
+    if kept:
+        print(f"May device tests (android): diagnostics kept for {kept} scenarios ({anrs} with an ANR, {crashes} with "
+              "a crash)")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (android): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:
