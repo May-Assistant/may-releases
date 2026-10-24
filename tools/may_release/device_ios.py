@@ -81,12 +81,18 @@ class Recorder:
         # and how a recording was kept when it is not the usual conversion.
         self.dropped = self.kept = None
         self.private = private
+        self.started = None
+
+    def length(self):
+        """How long the recording ran, for the public log ("" when it was never started here)."""
+        return f" after {round(time.monotonic() - self.started)} s of recording" if self.started is not None else ""
 
     def start(self):
         with self.log.open("ab") as output:
             self.process = subprocess.Popen(["xcrun", "simctl", "io", self.udid, "recordVideo", "--codec=h264",
                                              "--force", str(self.raw)], stdout=output, stderr=output,
                                             stdin=subprocess.DEVNULL, env=self.env)
+        self.started = time.monotonic()
 
     def stop(self, folder):
         if self.process is None:
@@ -102,6 +108,9 @@ class Recorder:
         # Smoke run 39683880243: the M4V preset's conversion to .mp4 failed. Each preset writes the file type it
         # supports, in the private folder; the first one that works and fits the cap is published as .mp4 (an M4V is
         # an MPEG-4 file). When none does, the original H.264 recording is published if it fits.
+        # Run 40035089599 dropped five recordings with "no conversion worked", which did not say whether avconvert
+        # failed or wrote a file still over the cap; each preset's outcome is now named, in fixed words and MB.
+        outcomes = []
         for preset, suffix in CONVERSIONS:
             converted = self.private / (self.scenario + "-converted" + suffix)
             with self.log.open("ab") as output:
@@ -112,15 +121,22 @@ class Recorder:
                 converted.replace(out)
                 self.raw.unlink(missing_ok=True)
                 return [out.name]
+            outcomes.append(f"{preset} " + (f"failed (exit {failed})" if failed else
+                                            f"{megabytes(converted)} MB" if converted.is_file() else "wrote no file"))
             converted.unlink(missing_ok=True)
+        tried = ", ".join(outcomes)
         if self.raw.is_file() and self.raw.stat().st_size <= MAX_RECORDING:
             self.raw.replace(out)
-            self.kept = "unconverted: no conversion worked"
+            self.kept = f"unconverted: no conversion fit the cap ({tried}){self.length()}"
             return [out.name]
-        size = self.raw.stat().st_size // (1024 * 1024) if self.raw.is_file() else 0
+        size = megabytes(self.raw) if self.raw.is_file() else 0
         self.raw.unlink(missing_ok=True)
-        self.dropped = f"no conversion worked and the original is {size} MB, over the cap"
+        self.dropped = f"no conversion fit the cap ({tried}) and the original is {size} MB, over it{self.length()}"
         return []
+
+
+def megabytes(path):
+    return path.stat().st_size // (1024 * 1024)
 
 
 def screenshot(udid, env, path, log):
