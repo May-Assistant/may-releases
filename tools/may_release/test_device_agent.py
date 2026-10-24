@@ -21,8 +21,19 @@ import device_tests
 import publish
 import review
 import store
-from test_device_tests import STDIN, FakeRecorder, SHA, TOKEN
+from test_device_tests import network_tripwire, STDIN, FakeRecorder, SHA, TOKEN
 from test_renders import png
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
 
 OAUTH = "sk-ant-oat01-" + "o" * 40
 MODEL = "claude-sonnet-5-5"

@@ -37,6 +37,30 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/device-tests.yml"
 RECIPIENT = "age1" + "q" * 58
 TOKEN = "session-token-" + "x" * 30
+
+
+def no_network(opener, request, *args, **kwargs):
+    url = getattr(request, "full_url", str(request))
+    raise AssertionError("a device test reached the network: " + url.split("?")[0])
+
+
+def network_tripwire():
+    """For each device test module's setUpModule: every real urlopen (OpenerDirector.open, which the readers' bound
+    defaults reach too) fails the test, so a reader a test forgot to fake never calls staging."""
+    return patch("urllib.request.OpenerDirector.open", no_network)
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
+
+
 # Marks a line the fake adb shell read on stdin, in a run's recorded calls: never an argument.
 STDIN = "<adb shell stdin>"
 # A flow written for both devices, as may-app tags it.

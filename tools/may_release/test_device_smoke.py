@@ -18,8 +18,19 @@ from device_tests import DeviceTestsError
 import publish
 from test_device_agent import MODEL, OAUTH, record
 from test_device_ios import Done, FakeRecorder as FakeIosRecorder, UDID
-from test_device_tests import FLOW, STDIN, FakeRecorder, MP4, RECIPIENT, RUN, SHA, TOKEN, device_tar
+from test_device_tests import network_tripwire, FLOW, STDIN, FakeRecorder, MP4, RECIPIENT, RUN, SHA, TOKEN, device_tar
 from test_renders import png
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
 
 NO_STAGING = {"MAY_TEST_SIGNIN_SECRET": None, "MAY_STAGING_API_URL": None}
 

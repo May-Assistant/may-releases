@@ -18,6 +18,18 @@ import device_tests
 from device_tests import DeviceTestsError
 from test_device_agent import OAUTH, fake_cli_package
 from test_device_smoke import NO_STAGING, Workspace
+from test_device_tests import network_tripwire
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
 
 TOOL = Path(device_tests.__file__)
 
