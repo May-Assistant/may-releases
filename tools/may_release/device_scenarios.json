@@ -1,9 +1,21 @@
 [
   {
     "id": "sign-in",
-    "title": "Sign in with a staging test session",
+    "title": "Sign in with an injected test session",
     "driver": "maestro",
     "flow": "sign-in.yaml",
+    "platforms": [
+      "android",
+      "ios"
+    ],
+    "outward": false,
+    "server": []
+  },
+  {
+    "id": "sign-out",
+    "title": "Sign out from Settings",
+    "driver": "maestro",
+    "flow": "sign-out.yaml",
     "platforms": [
       "android",
       "ios"
@@ -16,6 +28,18 @@
     "title": "Connections are listed",
     "driver": "maestro",
     "flow": "connections.yaml",
+    "platforms": [
+      "android",
+      "ios"
+    ],
+    "outward": false,
+    "server": []
+  },
+  {
+    "id": "connection-detail",
+    "title": "Google Calendar's connection row",
+    "driver": "maestro",
+    "flow": "connection-detail.yaml",
     "platforms": [
       "android",
       "ios"
