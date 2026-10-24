@@ -101,6 +101,9 @@ SESSION_SECONDS = 30 * 60
 # makes each MAESTRO_-prefixed variable a flow variable, so a flow reads it as ${MAESTRO_MAY_TEST_SESSION} (run
 # 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in).
 MAESTRO_SESSION = "MAESTRO_MAY_TEST_SESSION"
+# may-app's subflow that taps a signed-in account through onboarding ("Hi, I'm May") to Chats, run before each agent
+# scenario: the shared test account lands in onboarding, not Chats (run 40046272749), and the agent starts from launch.
+ONBOARDING, ONBOARDING_SECONDS = "subflows/finish-onboarding.yaml", 180
 # Each device job has 120 minutes (device-tests.yml). Its build takes about 7, and after the scenarios come the judge
 # (up to device_agent.JUDGE_SECONDS for each agent scenario that ran), the seal and the handover. The scenarios and
 # their judging get RUN_BUDGET_SECONDS from the run step's start, so the job always seals and publishes what ran
@@ -124,6 +127,25 @@ SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
 SMOKE_FLOW = "appId: " + APP_ID + "\n---\n- launchApp\n- waitForAnimationToEnd\n"
 SWITCHED_OFF = "switched off (MAY_DEVICE_TESTS_SKIP)"
 SKIP = "MAY_DEVICE_TESTS_SKIP"
+# A scenario on its own new account (POST /v1/auth/test-session {fresh: true}, may-app 150), deleted by its cleanup at
+# the scenario's end: the row's "fresh": true, or the variable MAY_DEVICE_TESTS_FRESH ("all", or comma-separated ids).
+# Staging makes at most 50 a UTC day; past that a fresh scenario is skipped with FRESH_EXHAUSTED, never run on the
+# shared account instead.
+FRESH = "MAY_DEVICE_TESTS_FRESH"
+FRESH_EXHAUSTED = "skipped: staging's fresh test accounts for today are used up"
+# A fresh mint whose reply does not say fresh (a staging older than may-app 150, or one that ignores it) is a session on
+# the shared account: never used as a fresh one, never deleted.
+NOT_FRESH = "skipped: staging did not put this scenario on a fresh account"
+
+
+def fresh_switch():
+    """The ids MAY_DEVICE_TESTS_FRESH lists, or {"all"}."""
+    return {part.strip() for part in os.environ.get(FRESH, "").split(",") if part.strip()}
+
+
+def wants_fresh(row, switched):
+    """Whether a scenario runs on its own fresh account; never the smoke scenario, which has no session."""
+    return row["driver"] != SMOKE and (row.get("fresh") is True or "all" in switched or row["id"] in switched)
 
 
 def switched_off():
@@ -134,6 +156,16 @@ def switched_off():
 
 class DeviceTestsError(ValueError):
     pass
+
+
+class FreshRefused(DeviceTestsError):
+    """A fresh mint that gave no fresh account; its reason is the skipped scenario's."""
+    reason = NOT_FRESH
+
+
+class FreshExhausted(FreshRefused):
+    """Staging made its last fresh test account for today (429 fresh_accounts_exhausted)."""
+    reason = FRESH_EXHAUSTED
 
 
 # Where the run step is, for the public failure line: fixed words and this repository's scenario ids alone.
@@ -176,7 +208,8 @@ def scenarios(selection="all", platform="android"):
                     isinstance(row.get("goal"), str) and len(row["goal"]) <= MAX_GOAL and row.get("server") == [])
                 and isinstance(row.get("title"), str) and
                 isinstance(row.get("platforms"), list) and set(row["platforms"]) <= set(PLATFORMS) and
-                isinstance(row.get("outward"), bool) and isinstance(row.get("server"), list) and
+                isinstance(row.get("outward"), bool) and isinstance(row.get("fresh", False), bool) and
+                isinstance(row.get("server"), list) and
                 all(isinstance(c, dict) and isinstance(c.get("get"), str) and SERVER_PATH.fullmatch(c["get"]) and
                     c.get("expect") == 200 for c in row["server"])):
             raise DeviceTestsError("The scenario list has a malformed row")
@@ -215,22 +248,39 @@ def build():
     print("May device tests: Playground debug app built for the emulator")
 
 
-def mint(base, secret, post=urllib.request.urlopen):
+def mint(base, secret, post=urllib.request.urlopen, *, fresh=False):
     """A short-lived staging session for the test account: POST <staging>/v1/auth/test-session {secret}. Staging fixes
-    the account itself (MAY_TEST_SIGNIN_EMAIL) and replies {token, expires_at, user_id}. The token is held in memory
-    alone; nothing from the reply is printed."""
+    the account itself (MAY_TEST_SIGNIN_EMAIL) and replies {token, expires_at, user_id}. With fresh, the session is on
+    a new account of its own, which can never get a second session ({secret, fresh: true}); FreshExhausted past the
+    day's cap. The token is held in memory alone; nothing from the reply is printed."""
     request = urllib.request.Request(base + "/v1/auth/test-session", method="POST",
-                                     data=json.dumps({"secret": secret}).encode(),
-                                     headers={"Content-Type": "application/json"})
+                                     data=json.dumps(dict({"secret": secret}, **({"fresh": True} if fresh else {})))
+                                     .encode(), headers={"Content-Type": "application/json"})
     try:
         with post(request, timeout=30) as reply:
             data = json.loads(reply.read())
+    except urllib.error.HTTPError as error:
+        if fresh and error.code == 429 and error_code(error) == "fresh_accounts_exhausted":
+            raise FreshExhausted("Staging's fresh test accounts for today are used up") from None
+        raise DeviceTestsError("The staging test session could not be minted") from None
     except (urllib.error.URLError, TimeoutError, ValueError):
         raise DeviceTestsError("The staging test session could not be minted") from None
     token = data.get("token") if isinstance(data, dict) else None
     if not (isinstance(token, str) and TOKEN.fullmatch(token)):
         raise DeviceTestsError("The staging test session reply has no token")
+    if fresh and data.get("fresh") is not True:
+        raise FreshRefused("The staging test session reply is not on a fresh account")
     return token
+
+
+def error_code(error):
+    """An API refusal's code ({"error": {"code": ...}}), or None."""
+    try:
+        data = json.loads(error.read(64 * 1024))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    found = data.get("error", {}).get("code") if isinstance(data, dict) and isinstance(data.get("error"), dict) else None
+    return found if isinstance(found, str) else None
 
 
 def server_check(base, token, path, get=urllib.request.urlopen):
@@ -353,6 +403,76 @@ def cleanup(base, token, since, tag, post=urllib.request.urlopen):
     counts = [data.get(key) for key in ("chats", "tasks", "notes", "routines", "for_you", "approvals_expired")] \
         if isinstance(data, dict) else []
     return sum(count for count in counts if type(count) is int and count >= 0)
+
+
+def delete_fresh(base, token, post=urllib.request.urlopen):
+    """A fresh account's cleanup: the same POST, which on a fresh account deletes the whole account (since and tag are
+    ignored there). True when staging answered {account_deleted: true}."""
+    request = urllib.request.Request(base + "/v1/auth/test-session/cleanup", method="POST", data=b"{}",
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            data = json.loads(reply.read(64 * 1024))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("account_deleted") is True
+
+
+class Accounts:
+    """Each scenario's staging session: on the shared test account, or on a fresh one of its own (wants_fresh),
+    deleted at the scenario's end, or, when the run stops part-way, by the run's finally (abandon). Once staging gives no
+    fresh account (the day's are used up, or its reply is not fresh), every later fresh scenario is skipped for that
+    reason, never run on the shared account."""
+
+    def __init__(self, chosen, minted, deleted_by):
+        self.ids, self.minted, self.deleted_by = fresh_switch(), minted, deleted_by
+        self.refused, self.open, self.deleted, self.kept = None, None, 0, 0
+        # What ran on the shared account is undone by tag at the run's end; a fresh account goes at its scenario's end.
+        self.shared = any(row["driver"] == "agent" and not wants_fresh(row, self.ids) for row in chosen)
+
+    def session(self, row, base, secret, entry):
+        """The scenario's token ("" for the smoke scenario), or None when it is skipped (entry's reason says why)."""
+        if row["driver"] == SMOKE:
+            return ""
+        if not wants_fresh(row, self.ids):
+            return self.minted(base, secret)
+        if self.refused is None:
+            try:
+                self.open = self.minted(base, secret, fresh=True)
+                return self.open
+            except FreshRefused as refused:
+                self.refused = refused.reason
+        entry["reason"] = self.refused
+        return None
+
+    def finish(self, row, base, token):
+        """A fresh scenario's cleanup, after its reads: its whole account deleted, with its own session (it can't get
+        another)."""
+        if row["driver"] != SMOKE and wants_fresh(row, self.ids):
+            at(f"{row['id']}: deleting its fresh account")
+            self.delete(base, token)
+
+    def abandon(self, base):
+        """The run's finally: a fresh account whose scenario stopped part-way is deleted all the same."""
+        if self.open:
+            at("deleting a fresh account left open")
+            self.delete(base, self.open)
+
+    def delete(self, base, token):
+        self.open = None
+        if self.deleted_by(base, token):
+            self.deleted += 1
+        else:
+            self.kept += 1
+
+    def report(self, platform):
+        """Prints the public lines on the fresh accounts the run made: counts alone."""
+        deleted, kept = self.deleted, self.kept
+        if deleted:
+            print(f"May device tests ({platform}): {deleted} fresh test accounts were deleted by their cleanup")
+        if kept:
+            print(f"May device tests ({platform}): {kept} fresh test accounts' cleanup did not answer; staging sweeps "
+                  "them after 2 hours")
 
 
 def run_tag():
@@ -571,7 +691,30 @@ class Budget:
 
 def cap(row, agent_seconds=device_agent.AGENT_SECONDS):
     """The longest a scenario may take: its Maestro flow's timeout, or the agent's."""
-    return FLOW_SECONDS if row["driver"] == "maestro" else agent_seconds
+    if row["driver"] == "maestro":
+        return FLOW_SECONDS
+    return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" else 0)
+
+
+def finish_onboarding(row, source, platform, drive):
+    """may-app's ONBOARDING subflow before an agent scenario, so the agent starts from Chats; drive(flow) is the
+    platform's Maestro call, true when the flow passed. Without the subflow (an older may-app) or when it does not
+    pass, the agent starts where the app is, and the public log says so."""
+    if row["driver"] != "agent":
+        return
+    flow, scenario = source / FLOWS_DIR / ONBOARDING, row["id"]
+    if not flow.is_file() or flow.is_symlink():
+        print(f"May device tests ({platform}): {scenario}: may-app has no onboarding subflow; the agent starts "
+              "from launch")
+        return
+    at(f"{scenario}: onboarding subflow")
+    try:
+        passed = drive(flow)
+    except subprocess.SubprocessError:
+        passed = False
+    if not passed:
+        print(f"May device tests ({platform}): {scenario}: the onboarding subflow did not pass; the agent starts "
+              "where it stopped")
 
 
 def settle(entry, row, passed):
@@ -589,7 +732,8 @@ def settle(entry, row, passed):
 
 
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
-                  agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None):
+                  agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
+                  deleted_by=delete_fresh):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -603,7 +747,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         raise DeviceTestsError("The Playground app is not built")
     base = staging(secret, staged)
     outward = os.environ.get(OUTWARD, "").strip() != "off"
-    skipped = switched_off()
+    skipped, accounts = switched_off(), Accounts(chosen, minted, deleted_by)
     folder = root / OUT / run_folder(source) / "android"
     folder.mkdir(parents=True, mode=0o700)
     board_inputs(source, folder)
@@ -644,7 +788,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 entry["reason"] = UNTAGGED["android"]
                 continue
             # A fresh session per scenario: one lasts SESSION_SECONDS and has no refresh. The smoke scenario has none.
-            token = minted(base, secret) if row["driver"] != SMOKE else ""
+            token = accounts.session(row, base, secret, entry)
+            if token is None:
+                continue
             at(f"{row['id']}: launching the app")
             launch(adb, env, token, log)
             recorder = Recorder(adb, env, row["id"], log)
@@ -659,6 +805,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                         timeout=FLOW_SECONDS)
                 except subprocess.TimeoutExpired:
                     passed = False
+            finish_onboarding(row, source, "android", lambda path: not flows.run_private(
+                [str(launcher), "--device", SERIAL, "test", str(path)], log, env=maestro_env, check=False,
+                timeout=ONBOARDING_SECONDS))
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL}
@@ -682,13 +831,15 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 codes = delivered(base, token, tag)
                 if codes is not None:
                     entry["delivery"] = codes
+            accounts.finish(row, base, token)
             settle(entry, row, passed if flow is not None else None)
             token = ""
-        if any(row["driver"] == "agent" for row in chosen):
+        if accounts.shared:
             at("cleanup")
             token = minted(base, secret)
             cleaned_count = cleaned(base, token, since, tag)
     finally:
+        accounts.abandon(base)
         token = secret = ""
         show_touches(adb, env, log, False)
         emulator.terminate()
@@ -705,8 +856,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     print(f"May device tests (android): {ran} scenarios ran; verdicts follow the judge step")
     if cleaned_count is not None:
         print(f"May device tests (android): the test session's cleanup removed {cleaned_count} tagged items")
-    elif any(row["driver"] == "agent" for row in chosen):
+    elif accounts.shared:
         print("May device tests (android): the test session's cleanup did not answer; tagged items may remain")
+    accounts.report("android")
 
 
 def combined(entry, record, judged):

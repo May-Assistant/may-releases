@@ -50,11 +50,13 @@ class AgentRunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
-                      asked=None, delivered=None):
+                      asked=None, exhausted=False, delivered=None):
         calls, minted, seen = [], [], {}
+        self.last_seen = seen
 
         def deliver(base, token, tag):
             seen.setdefault("delivered", []).append((token, tag))
+            seen.setdefault("order", []).append(("read", token))
             return ["failed (model_cap_reached)"]
 
         class Process:
@@ -72,14 +74,24 @@ class AgentRunTests(unittest.TestCase):
             path.write_bytes(png())
             return path.name
 
-        def mint(base, secret):
-            minted.append(secret)
+        def mint(base, secret, fresh=False):
+            if fresh and exhausted:
+                seen.setdefault("refused", []).append(secret)
+                raise (device_tests.FreshRefused if exhausted == "not fresh" else device_tests.FreshExhausted)("no")
+            minted.append(secret if not fresh else "fresh")
             return TOKEN + str(len(minted))
+
+        def delete(base, token):
+            seen.setdefault("deleted", []).append(token)
+            seen.setdefault("order", []).append(("delete", token))
+            return token != TOKEN + "2"
 
         def agent(cli, goal, tag, device, work, token, model):
             # The agent's process never sees the staging secret or the OAuth token in this step's environment.
             seen.setdefault("environ", set(os.environ))
             seen.setdefault("goals", []).append((goal, tag, token, model, cli))
+            if isinstance(records[len(seen["goals"]) - 1], Exception):
+                raise records[len(seen["goals"]) - 1]
             return records[len(seen["goals"]) - 1]
 
         def clean(base, token, since, tag):
@@ -102,7 +114,8 @@ class AgentRunTests(unittest.TestCase):
             device_tests.run_scenarios(selection, minted=mint, checked=lambda *a: 200,
                                        truth=lambda base, token, path, tag: truth,
                                        asked=asked or (lambda base, token, state, tag: truth),
-                                       cleaned=clean, agent=agent, delivered=delivered or deliver,
+                                       cleaned=clean, agent=agent, deleted_by=delete,
+                                       delivered=delivered or deliver,
                                        install=lambda root: root / "may-claude" / "claude")
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", os.environ)
@@ -141,6 +154,9 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
                          [["failed (model_cap_reached)"], None, ["failed (model_cap_reached)"]])
         self.assertEqual(run_out.splitlines(), [
+            # This may-app fixture has no onboarding subflow, so each agent starts from launch and the log says so.
+            *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"
+              for scenario in ("chat", "notes", "routines")],
             "May device tests (android): 3 scenarios ran; verdicts follow the judge step",
             "May device tests (android): the test session's cleanup removed 3 tagged items"])
         self.assertEqual(judge_out.splitlines(), [
@@ -205,10 +221,64 @@ class AgentRunTests(unittest.TestCase):
             ("routines", "skipped", device_tests.SWITCHED_OFF)])
         self.assertEqual(len(seen["goals"]), 1, "only notes ran")
 
+    def test_a_fresh_scenario_runs_on_its_own_account_and_deletes_it_with_its_own_session(self):
+        _, minted, seen, report, run_out, _ = self.run_and_judge(
+            [record()] * 3, [("pass", "")] * 3, env={device_tests.FRESH: "chat"})
+        self.assertEqual(minted, ["fresh", "s" * 32, "s" * 32, "s" * 32],
+                         "chat on a fresh account; notes and routines, and their run-wide cleanup, on the shared one")
+        self.assertEqual(seen.get("deleted"), [TOKEN + "1"], "only chat's account, with chat's own session")
+        self.assertEqual(seen["order"][:2], [("read", TOKEN + "1"), ("delete", TOKEN + "1")],
+                         "chat's messages are read before its account is deleted")
+        self.assertEqual(seen["cleanup"][0], TOKEN + "4")
+        self.assertIn("May device tests (android): 1 fresh test accounts were deleted by their cleanup", run_out)
+
+    def test_every_scenario_fresh_needs_no_shared_cleanup_and_counts_what_did_not_answer(self):
+        _, minted, seen, report, run_out, _ = self.run_and_judge(
+            [record()] * 3, [("pass", "")] * 3, env={device_tests.FRESH: "all"})
+        self.assertEqual(minted, ["fresh"] * 3)
+        self.assertEqual(seen.get("deleted"), [TOKEN + "1", TOKEN + "2", TOKEN + "3"])
+        self.assertNotIn("cleanup", seen, "nothing ran on the shared account")
+        self.assertEqual(run_out.splitlines()[-2:], [
+            "May device tests (android): 2 fresh test accounts were deleted by their cleanup",
+            "May device tests (android): 1 fresh test accounts' cleanup did not answer; staging sweeps them after 2 "
+            "hours"])
+        self.assertNotIn("the test session's cleanup", run_out)
+
+    def test_used_up_fresh_accounts_skip_with_their_own_reason_and_never_fall_back_to_the_shared_one(self):
+        try:
+            _, minted, seen, report, run_out, _ = self.run_and_judge(
+                [record()], [("pass", "")], env={device_tests.FRESH: "chat,routines"}, exhausted=True)
+        except IndexError:
+            self.fail("a scenario whose fresh account was refused ran anyway")
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", "skipped", device_tests.FRESH_EXHAUSTED), ("notes", "ui-pass", device_tests.UNCONFIGURED),
+            ("routines", "skipped", device_tests.FRESH_EXHAUSTED)])
+        self.assertEqual(len(seen.get("refused", [])), 1, "once used up, staging is not asked again")
+        self.assertEqual(minted, ["s" * 32, "s" * 32], "notes and the cleanup alone, on the shared account")
+        self.assertNotIn("deleted", seen)
+
     def test_unreadable_chats_leave_no_delivery_in_the_row(self):
         _, _, _, report, _, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3,
                                                    delivered=lambda base, token, tag: None)
         self.assertEqual([row.get("delivery") for row in report["scenarios"]], [None, None, None])
+
+    def test_a_reply_that_is_not_fresh_is_never_used_or_deleted(self):
+        try:
+            _, minted, seen, report, run_out, _ = self.run_and_judge(
+                [record()], [("pass", "")], env={device_tests.FRESH: "chat,routines"}, exhausted="not fresh")
+        except IndexError:
+            self.fail("a scenario whose fresh account was refused ran anyway")
+        except device_tests.FreshRefused:
+            self.fail("a reply that is not fresh stopped the run instead of skipping its scenario")
+        self.assertEqual([(row["id"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", device_tests.NOT_FRESH), ("notes", device_tests.UNCONFIGURED), ("routines", device_tests.NOT_FRESH)])
+        self.assertEqual(len(seen.get("refused", [])), 1)
+        self.assertNotIn("deleted", seen, "a session that is not on a fresh account never reaches delete_fresh")
+
+    def test_a_fresh_account_is_deleted_when_its_scenario_stops_part_way(self):
+        with self.assertRaises(OSError):
+            self.run_and_judge([OSError("agent died")], [], env={device_tests.FRESH: "chat"}, selection="chat")
+        self.assertEqual(self.last_seen.get("deleted"), [TOKEN + "1"], "the run's finally deleted chat's account")
 
     def test_a_cleanup_that_does_not_answer_is_said(self):
         _, _, _, _, run_out, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3, cleaned=None)
@@ -265,6 +335,25 @@ class ServerTruthTests(unittest.TestCase):
         get, seen = server([{"id": "../../v1/account", "name": tag}], {})
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False))
         self.assertEqual(seen, ["/v1/agents"], "an id that is not a plain id is never put in a path")
+
+    def test_delete_fresh_posts_with_the_session_and_reads_account_deleted(self):
+        seen = {}
+
+        def post(body):
+            def answer(request, timeout):
+                seen.update(url=request.full_url, body=request.data, auth=request.headers.get("Authorization"))
+                return FakeReply(json.dumps(body).encode())
+            return answer
+
+        self.assertTrue(device_tests.delete_fresh("https://s", TOKEN, post({"account_deleted": True})))
+        self.assertEqual(seen, {"url": "https://s/v1/auth/test-session/cleanup", "body": b"{}", "auth": "Bearer " + TOKEN})
+        for body in ({"account_deleted": "yes"}, {"chats": 1}, []):
+            self.assertFalse(device_tests.delete_fresh("https://s", TOKEN, post(body)))
+
+        def refused(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 403, "no", {}, None)
+
+        self.assertFalse(device_tests.delete_fresh("https://s", TOKEN, refused))
 
     def test_message_codes_are_each_tagged_user_messages_run_status_and_error_code(self):
         tag = "qa-39557415738"

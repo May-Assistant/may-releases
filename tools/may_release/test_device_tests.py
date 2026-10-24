@@ -148,7 +148,7 @@ class ScenarioTests(unittest.TestCase):
     def test_malformed_rows_are_refused(self):
         good = device_tests.scenarios()[0]
         for change in ({"id": "Sign In"}, {"flow": "../x.yaml"}, {"driver": "shell"}, {"platforms": ["web"]},
-                       {"outward": "no"}, {"server": [{"get": "https://elsewhere/v1/x", "expect": 200}]},
+                       {"outward": "no"}, {"fresh": "yes"}, {"server": [{"get": "https://elsewhere/v1/x", "expect": 200}]},
                        {"server": [{"get": "/v1/me", "expect": 500}]}):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "s.json"
@@ -202,6 +202,48 @@ class MintTests(unittest.TestCase):
         with self.assertRaises(DeviceTestsError):
             device_tests.mint("https://staging.example", "s", refused)
 
+    def test_a_fresh_mint_asks_for_its_own_account_and_a_used_up_day_is_its_own_refusal(self):
+        seen = {}
+
+        def post(request, timeout):
+            seen["body"] = json.loads(request.data)
+            return FakeReply(json.dumps({"token": TOKEN, "expires_at": "x", "user_id": "u", "fresh": True}).encode())
+
+        self.assertEqual(device_tests.mint("https://s", "s" * 32, post, fresh=True), TOKEN)
+        self.assertEqual(seen["body"], {"secret": "s" * 32, "fresh": True})
+        for reply in ({"token": TOKEN, "expires_at": "x", "user_id": "u"}, {"token": TOKEN, "fresh": False},
+                      {"token": TOKEN, "fresh": "true"}):
+            with self.subTest(reply=reply):
+                answer = lambda request, timeout: FakeReply(json.dumps(reply).encode())  # noqa: E731
+                with self.assertRaises(device_tests.FreshRefused) as caught:
+                    device_tests.mint("https://s", "s", answer, fresh=True)
+                self.assertEqual(caught.exception.reason, device_tests.NOT_FRESH,
+                                 "a session on the shared account is never taken for a fresh one")
+                self.assertEqual(device_tests.mint("https://s", "s", answer), TOKEN, "a shared mint reads no fresh")
+
+        def refused(code, status=429):
+            def answer(request, timeout):
+                raise urllib.error.HTTPError(request.full_url, status, "no", {}, io.BytesIO(
+                    json.dumps({"error": {"code": code, "message": "m", "request_id": "r"}}).encode()))
+            return answer
+
+        with self.assertRaises(device_tests.FreshExhausted):
+            device_tests.mint("https://s", "s", refused("fresh_accounts_exhausted"), fresh=True)
+        for answer, fresh in ((refused("rate_limited"), True), (refused("fresh_accounts_exhausted", 403), True),
+                              (refused("fresh_accounts_exhausted"), False)):
+            with self.subTest(fresh=fresh), self.assertRaises(DeviceTestsError) as caught:
+                device_tests.mint("https://s", "s", answer, fresh=fresh)
+            self.assertNotIsInstance(caught.exception, device_tests.FreshExhausted)
+
+    def test_which_scenarios_run_fresh(self):
+        agent, smoke = {"id": "chat", "driver": "agent"}, {"id": "smoke", "driver": device_tests.SMOKE}
+        for env, row, fresh in (({}, agent, False), ({}, dict(agent, fresh=True), True),
+                                ({device_tests.FRESH: "all"}, agent, True), ({device_tests.FRESH: " poll, chat"}, agent, True),
+                                ({device_tests.FRESH: "poll"}, agent, False), ({device_tests.FRESH: "all"}, smoke, False),
+                                ({}, dict(smoke, fresh=True), False)):
+            with self.subTest(env=env, row=row), patch.dict(os.environ, env, clear=True):
+                self.assertIs(device_tests.wants_fresh(row, device_tests.fresh_switch()), fresh)
+
     def test_server_check_status(self):
         def refused(request, timeout):
             raise urllib.error.HTTPError(request.full_url, 401, "no", {}, None)
@@ -245,9 +287,12 @@ class BudgetTests(unittest.TestCase):
 
     def test_each_platform_caps_a_scenario_by_its_own_timeout(self):
         self.assertEqual(device_tests.cap({"driver": "maestro"}), device_tests.FLOW_SECONDS)
-        self.assertEqual(device_tests.cap({"driver": "agent"}), device_agent.AGENT_SECONDS)
+        # An agent scenario's cap holds the onboarding subflow run before it.
+        self.assertEqual(device_tests.cap({"driver": "agent"}),
+                         device_agent.AGENT_SECONDS + device_tests.ONBOARDING_SECONDS)
         self.assertEqual(device_tests.cap({"driver": "agent"}, device_agent.IOS_AGENT_SECONDS),
-                         device_agent.IOS_AGENT_SECONDS)
+                         device_agent.IOS_AGENT_SECONDS + device_tests.ONBOARDING_SECONDS)
+        self.assertEqual(device_tests.cap({"driver": device_tests.SMOKE}), device_agent.AGENT_SECONDS)
 
     def test_the_budget_leaves_the_job_time_to_build_seal_and_publish(self):
         workflow = (Path(device_tests.__file__).parent.parent.parent / ".github/workflows/device-tests.yml").read_text()
@@ -255,6 +300,57 @@ class BudgetTests(unittest.TestCase):
         job = min(int(minutes) for minutes in timeouts[:2]) * 60
         self.assertLessEqual(device_tests.RUN_BUDGET_SECONDS + 10 * 60 + 8 * 60, job,
                              "the build (about 8 minutes) and 10 minutes to seal and hand over must fit too")
+
+
+class OnboardingTests(unittest.TestCase):
+    """Run 40046272749: the signed-in shared account lands in onboarding ("Hi, I'm May"), not Chats, so each agent
+    scenario first runs may-app's subflow that taps through it."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.source = Path(self.directory.name)
+        (self.source / device_tests.FLOWS_DIR / "subflows").mkdir(parents=True)
+        self.flow = self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def finish(self, row, passed=True):
+        driven = []
+
+        def drive(flow):
+            driven.append(flow)
+            if isinstance(passed, Exception):
+                raise passed
+            return passed
+
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            device_tests.finish_onboarding(row, self.source, "android", drive)
+        return driven, out.getvalue()
+
+    def test_an_agent_scenario_runs_the_subflow_first(self):
+        self.flow.write_text("appId: x\n")
+        self.assertEqual(self.finish({"id": "chat", "driver": "agent"}), ([self.flow], ""))
+
+    def test_a_maestro_or_smoke_scenario_does_not(self):
+        self.flow.write_text("appId: x\n")
+        for driver in ("maestro", device_tests.SMOKE):
+            with self.subTest(driver=driver):
+                self.assertEqual(self.finish({"id": "sign-in", "driver": driver}), ([], ""))
+
+    def test_without_the_subflow_the_agent_starts_from_launch_and_says_so(self):
+        self.assertEqual(self.finish({"id": "chat", "driver": "agent"}), (
+            [], "May device tests (android): chat: may-app has no onboarding subflow; the agent starts from launch\n"))
+        self.flow.symlink_to(self.source / "elsewhere.yaml")
+        self.assertEqual(self.finish({"id": "chat", "driver": "agent"})[0], [], "a symlinked subflow is not run")
+
+    def test_a_subflow_that_fails_or_times_out_is_said_and_the_agent_still_runs(self):
+        self.flow.write_text("appId: x\n")
+        for passed in (False, subprocess.TimeoutExpired("maestro", 1)):
+            with self.subTest(passed=passed):
+                self.assertEqual(self.finish({"id": "chat", "driver": "agent"}, passed)[1],
+                                 "May device tests (android): chat: the onboarding subflow did not pass; the agent "
+                                 "starts where it stopped\n")
 
 
 class RunTests(unittest.TestCase):
@@ -422,6 +518,41 @@ class RunTests(unittest.TestCase):
             self.assertEqual(report["scenarios"][0]["verdict"], "skipped")
             _, report, _, _ = self.run_it()
             self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass")
+
+    def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
+        (self.source / device_tests.FLOWS_DIR / "subflows").mkdir()
+        (self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING).write_text("appId: x\n")
+        calls = []
+
+        class Process:
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def private(argv, log, *, cwd=None, env=None, check=True, timeout=None):
+            calls.append((list(argv), timeout))
+            return 0
+
+        def agent(cli, goal, tag, device, folder, token, model, **kwargs):
+            calls.append((["agent"], None))
+            return {}
+
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
+                patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
+                patch("device_tests.device_agent.settings", return_value=("t", "m")), \
+                patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", return_value=None), \
+                patch("device_tests.head_revision", return_value=SHA), patch("sys.stdout", new_callable=io.StringIO):
+            device_tests.run_scenarios("chat", minted=lambda base, secret: TOKEN, agent=agent,
+                                       install=lambda root: root / "claude", cleaned=lambda *args: 0)
+        driven = [argv for argv, _ in calls if argv[0] in ("/fake/maestro", "agent")]
+        self.assertEqual(driven, [["/fake/maestro", "--device", device_tests.SERIAL, "test",
+                                   str(self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING)], ["agent"]])
+        self.assertIn(device_tests.ONBOARDING_SECONDS, [timeout for argv, timeout in calls if argv[0] == "/fake/maestro"])
 
     def test_refusals_before_anything_runs(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),
@@ -622,7 +753,10 @@ class ReasonTests(unittest.TestCase):
             else:
                 reasons.add(ast.unparse(value))  # a reason worked out at run time must be added here by hand
         # The judge step copies combined()'s reason, whose own values are read above from its returned dicts.
-        return reasons - {None, "verdict_reason['reason']"}
+        # Accounts.session's reason is a FreshRefused's own: FRESH_EXHAUSTED or NOT_FRESH.
+        if "self.refused" in reasons:
+            reasons |= {device_tests.FreshExhausted.reason, device_tests.FreshRefused.reason}
+        return reasons - {None, "verdict_reason['reason']", "self.refused"}
 
     def test_every_reason_a_device_job_writes_is_one_publish_accepts(self):
         written = self.written_reasons()
