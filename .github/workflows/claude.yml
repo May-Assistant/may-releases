@@ -12,11 +12,17 @@ on:
 
 jobs:
   claude:
+    # This repository is public, so anyone can comment. Only May-Assistant members (MEMBER, which is
+    # how GitHub labels the organization's owners too) and collaborators invited to this repository
+    # start Claude; strangers don't. The action then also refuses anyone without write access, so a
+    # read-only member can't start it either.
     if: |
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+        github.event.comment.author_association || github.event.review.author_association || github.event.issue.author_association) && (
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude'))))
     runs-on: ubuntu-latest
     permissions:
       contents: read
