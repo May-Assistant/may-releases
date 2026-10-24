@@ -414,6 +414,27 @@ class AgentRunTests(unittest.TestCase):
                 self.assertIn(message, refused.exception.args[0])
 
 
+def chat_server(chats, messages, agents_status=200):
+    """A fake staging for the chat readers: GET /v1/agents, and each chat's messages oldest first, served page by page
+    as the API does (?after=<seq>&limit=<n>, next_cursor the page's last seq). Each message gets its seq here."""
+    import urllib.parse
+    seen = []
+    numbered = {path: [dict(m, seq=str(at + 1)) for at, m in enumerate(rows)] for path, rows in messages.items()}
+
+    def get(request, timeout):
+        url = urllib.parse.urlsplit(request.full_url)
+        seen.append(url.path)
+        if url.path == "/v1/agents":
+            if agents_status != 200:
+                raise urllib.error.HTTPError(request.full_url, agents_status, "no", {}, None)
+            return FakeReply(json.dumps({"agents": chats}).encode())
+        query = dict(urllib.parse.parse_qsl(url.query))
+        after, limit = int(query.get("after", "0")), int(query.get("limit", "100"))
+        page = [m for m in numbered.get(url.path, []) if int(m["seq"]) > after][:limit]
+        return FakeReply(json.dumps({"messages": page, "next_cursor": page[-1]["seq"] if page else str(after)}).encode())
+    return get, seen
+
+
 class ServerTruthTests(unittest.TestCase):
     def test_tagged_finds_the_tag_anywhere_in_the_reply_case_insensitively(self):
         def get(body):
@@ -429,16 +450,7 @@ class ServerTruthTests(unittest.TestCase):
         tag = "qa-39557415738"
         question = {"id": "m2", "kind": "question", "question": {"state": "answered", "answer": {"choice_id": "c1"}}}
 
-        def server(chats, messages):
-            seen = []
-
-            def get(request, timeout):
-                path = request.full_url.removeprefix("https://s")
-                seen.append(path)
-                if path == "/v1/agents":
-                    return FakeReply(json.dumps({"agents": chats}).encode())
-                return FakeReply(json.dumps({"messages": messages.get(path, [])}).encode())
-            return get, seen
+        server = chat_server
 
         get, seen = server([{"id": "may", "name": "May"}, {"id": "a7", "name": "Week " + tag}],
                            {"/v1/conversations/a7/messages": [{"kind": "text", "text": "Ask me, tag " + tag}, question]})
@@ -478,18 +490,7 @@ class ServerTruthTests(unittest.TestCase):
     def test_message_codes_are_each_tagged_user_messages_run_status_and_error_code(self):
         tag = "qa-39557415738"
 
-        def server(chats, messages, agents_status=200):
-            seen = []
-
-            def get(request, timeout):
-                path = request.full_url.removeprefix("https://s")
-                seen.append(path)
-                if path == "/v1/agents":
-                    if agents_status != 200:
-                        raise urllib.error.HTTPError(request.full_url, agents_status, "no", {}, None)
-                    return FakeReply(json.dumps({"agents": chats}).encode())
-                return FakeReply(json.dumps({"messages": messages.get(path, [])}).encode())
-            return get, seen
+        server = chat_server
 
         may = [{"id": "may", "name": "May"}, {"id": "a7", "name": "Week " + tag}]
         get, seen = server(may, {
@@ -508,7 +509,7 @@ class ServerTruthTests(unittest.TestCase):
             self.assertNotIn(text, json.dumps(codes), "codes alone leave the reader")
         get, _ = server(may, {"/v1/conversations/may/messages": [{"author": "user", "text": "untagged"}]})
         self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), [device_tests.NONE_STORED],
-                         "no tagged message at all: the send was refused before the server kept anything")
+                         "no tagged message at all in the chats read")
         get, _ = server(may, {}, agents_status=401)
         self.assertIsNone(device_tests.message_codes("https://s", TOKEN, tag, get=get))
         many = [{"author": "user", "text": tag, "latest_run": {"status": "queued"}}] * 30
@@ -548,6 +549,48 @@ class ServerTruthTests(unittest.TestCase):
                                 (agent, -5, True), (maestro, 0, False)):
             with self.subTest(row=row["id"], left=left):
                 self.assertIs(device_tests.near_model_cap(row, "https://s", TOKEN, lambda base, token: left), near)
+
+    def test_the_readers_page_through_a_long_chat_to_this_runs_messages(self):
+        """Run 40087626039: May replied, yet "none stored", because only a chat's first 100 messages were read."""
+        tag = "qa-40087626039"
+        history = [{"author": "user" if at % 2 else "may", "kind": "chat", "body": f"older message {at}"}
+                   for at in range(450)]
+        old_card = {"author": "may", "kind": "question", "body": "Pick one", "question": {"state": "answered"}}
+        ours = [{"author": "user", "kind": "chat", "body": "This is device test " + tag,
+                 "latest_run": {"status": "succeeded", "error_code": None}},
+                {"author": "may", "kind": "chat", "body": "Done."}]
+        get, seen = chat_server([{"id": "may", "name": "May"}],
+                                {"/v1/conversations/may/messages": history[:200] + [old_card] + history[200:] + ours})
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), ["succeeded"])
+        self.assertEqual(seen.count("/v1/conversations/may/messages"), 3, "453 messages: two pages of 200 and one of 53")
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
+                         "an older run's answered card, before this run's first tagged message, never passes")
+        card = {"author": "may", "kind": "question", "body": "Which?", "question": {"state": "answered"}}
+        get, _ = chat_server([{"id": "may", "name": "May"}], {"/v1/conversations/may/messages": history + ours + [card]})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, True))
+
+    def test_paging_stops_at_a_cursor_that_does_not_move_and_at_the_page_cap(self):
+        calls = []
+
+        def stuck(request, timeout):
+            calls.append(request.full_url)
+            page = [{"author": "user", "body": "x", "seq": "5"}] * device_tests.MESSAGE_PAGE
+            return FakeReply(json.dumps({"messages": page, "next_cursor": "0"}).encode())
+
+        status, messages = device_tests.chat_messages("https://s", TOKEN, "may", stuck)
+        self.assertEqual((status, len(calls)), (200, 1), "a cursor that does not move ends the read")
+        calls.clear()
+        count = iter(range(1, 10 ** 6))
+
+        def endless(request, timeout):
+            calls.append(request.full_url)
+            seq = str(next(count) * device_tests.MESSAGE_PAGE)
+            page = [{"author": "user", "body": "x", "seq": seq}] * device_tests.MESSAGE_PAGE
+            return FakeReply(json.dumps({"messages": page, "next_cursor": seq}).encode())
+
+        device_tests.chat_messages("https://s", TOKEN, "may", endless)
+        self.assertEqual(len(calls), device_tests.MAX_MESSAGE_PAGES, "never more than MAX_MESSAGE_PAGES reads")
+        self.assertIn("?after=0&limit=200", calls[0])
 
     def test_cleanup_sends_since_and_tag_and_counts(self):
         seen = {}
@@ -876,7 +919,7 @@ class PublishNotesTests(unittest.TestCase):
             path.write_text(json.dumps({"device": "android", "scenarios": [dict(row, delivery=[device_tests.NONE_STORED])]}))
             _, rows = publish.device_report(path, set(), titles)
             readme, _ = publish.device_pages("20261021-" + SHA[:12], {"android": rows}, "note")
-            self.assertIn("Messages: none stored (the send was refused before the server kept anything)", readme)
+            self.assertIn("Messages: none stored (no tagged message found in this chat)", readme)
             for delivery in (["Failed"], ["failed (x) (y)"], ["no run "], ["succeeded"] * 11, "succeeded", [1],
                              ["failed (" + "a" * 70 + ")"]):
                 with self.subTest(delivery=delivery):
