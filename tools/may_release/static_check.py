@@ -1255,7 +1255,7 @@ DEVICE_CONDITIONS = ["if: always()", "if: always()", "if: ${{ !cancelled() && ne
 # The previews step (the flow board's): optional and bounded in each device job, so the seal always runs after it.
 PREVIEW_STEP = ("      - name: Make a 270px preview of each recording, with no secret\n"
                 "        # Optional and bounded: the seal and the handover always run after it.\n"
-                "        continue-on-error: true\n        timeout-minutes: 25\n"
+                "        continue-on-error: true\n        timeout-minutes: 8\n"
                 "        run: python3 -I -S -B tools/may_release/device_tests.py previews{}\n")
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
 DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"

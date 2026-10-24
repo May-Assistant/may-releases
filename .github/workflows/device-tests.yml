@@ -92,7 +92,7 @@ jobs:
       - name: Make a 270px preview of each recording, with no secret
         # Optional and bounded: the seal and the handover always run after it.
         continue-on-error: true
-        timeout-minutes: 25
+        timeout-minutes: 8
         run: python3 -I -S -B tools/may_release/device_tests.py previews
       - name: Encrypt the report to the renders public key
         env:
@@ -154,7 +154,7 @@ jobs:
       - name: Make a 270px preview of each recording, with no secret
         # Optional and bounded: the seal and the handover always run after it.
         continue-on-error: true
-        timeout-minutes: 25
+        timeout-minutes: 8
         run: python3 -I -S -B tools/may_release/device_tests.py previews --platform ios
       - name: Encrypt the report to the renders public key
         env:

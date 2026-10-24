@@ -110,7 +110,7 @@ ONBOARDING, ONBOARDING_SECONDS = "subflows/finish-onboarding.yaml", 180
 # their judging get RUN_BUDGET_SECONDS from the run step's start, so the job always seals and publishes what ran
 # (run 40035089599: four iOS agent scenarios at up to 25 minutes each could outlast the job). A scenario that would
 # not fit is not started.
-RUN_BUDGET_SECONDS = 100 * 60
+RUN_BUDGET_SECONDS = 90 * 60
 BUDGET = "skipped: the run's time budget left no room for it (RUN_BUDGET_SECONDS)"
 OUT, SEALED, VERDICTS = "may-device-out", "may-device-sealed", "device-verdicts.json"
 AGENTS = "device-agents.json"
@@ -1005,7 +1005,16 @@ def smoke_rows(platform):
 # publish job that holds the publish secrets (review of may-releases #88). A dot is never in a scenario id, so a
 # preview never shares a name with a recording; publish.py only checks and uploads them.
 PREVIEW, PREVIEW_WIDTH, PREVIEW_SECONDS = ".preview.mp4", 270, 300
-MAX_PREVIEW = 20 * 1024 * 1024
+# A preview is a timelapse of the whole recording, at most PREVIEW_MAX_SECONDS long at PREVIEW_FPS and about
+# PREVIEW_BITRATE, so it stays well under MAX_PREVIEW (run 40075535088: a 10-minute iOS chat preview came to 15.9 MB,
+# over the artifact's 15 MB limit). One over MAX_PREVIEW is left out.
+PREVIEW_MAX_SECONDS, PREVIEW_FPS, PREVIEW_BITRATE = 60, 8, 160_000
+MAX_PREVIEW = 2 * 1024 * 1024
+# The preview step's own timeout is 8 minutes (device-tests.yml), so the seal always has its turn before the job's 120
+# (run 40075535088: a 25-minute step after a full 100-minute run could outlast the job and lose the report). No new
+# preview starts after PREVIEW_STEP_SECONDS; each is made in may-private and moved into the run folder only whole, so
+# a step stopped part-way never leaves a half-written preview to be sealed.
+PREVIEW_STEP_SECONDS = 6 * 60
 
 
 def preview_sources(folder):
@@ -1025,6 +1034,38 @@ def preview_sources(folder):
             yield row["id"], video
 
 
+def mp4_seconds(path):
+    """A recording's length from its MP4 header (moov/mvhd), or None when the header is not one."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+
+    def boxes(start, end):
+        while start + 8 <= end:
+            size, kind = int.from_bytes(data[start:start + 4], "big"), data[start + 4:start + 8]
+            if size < 8 or start + size > end:
+                return
+            yield kind, start + 8, start + size
+            start += size
+
+    for kind, body, end in boxes(0, len(data)):
+        if kind == b"moov":
+            for inner, at, stop in boxes(body, end):
+                if inner == b"mvhd" and stop - at >= 32:
+                    wide = data[at] == 1
+                    scale_at = at + (20 if wide else 12)
+                    scale = int.from_bytes(data[scale_at:scale_at + 4], "big")
+                    length = int.from_bytes(data[scale_at + 4:scale_at + (12 if wide else 8)], "big")
+                    return length / scale if scale else None
+    return None
+
+
+def timelapse(seconds):
+    """How many times faster than the recording its preview plays, so it lasts PREVIEW_MAX_SECONDS at most."""
+    return max(1.0, (seconds or 0) / PREVIEW_MAX_SECONDS)
+
+
 def ffmpeg_encoder(root, log):
     """Ubuntu's ffmpeg from apt (its current, patched build; apt checks the archive's signature): the function that
     makes one preview. Raises DeviceTestsError when it will not install."""
@@ -1035,11 +1076,13 @@ def ffmpeg_encoder(root, log):
             raise DeviceTestsError("ffmpeg did not install")
 
     def encode(video, target):
+        speed = timelapse(mp4_seconds(video))
         return not flows.run_private(
             ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(video), "-an", "-vf",
-             f"scale={PREVIEW_WIDTH}:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "32", "-pix_fmt",
-             "yuv420p", "-movflags", "+faststart", "-n", str(target)], log, env=env, check=False,
-            timeout=PREVIEW_SECONDS)
+             f"setpts=PTS/{speed:.4f},fps={PREVIEW_FPS},scale={PREVIEW_WIDTH}:-2", "-c:v", "libx264", "-preset",
+             "veryfast", "-crf", "34", "-maxrate", str(PREVIEW_BITRATE), "-bufsize", str(2 * PREVIEW_BITRATE),
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", str(PREVIEW_MAX_SECONDS), "-n", str(target)],
+            log, env=env, check=False, timeout=PREVIEW_SECONDS)
     return encode
 
 
@@ -1062,14 +1105,16 @@ def make_previews(platform="android", encoder=None):
         print(f"May device tests ({platform}): {made} previews made, {failed} failed")
 
 
-def previews_in(platform, encoder):
-    """(made, failed); (None, None) with no recording; (0, None) when the encoder is unavailable."""
+def previews_in(platform, encoder, clock=time.monotonic):
+    """(made, failed); (None, None) with no recording; (0, None) when the encoder is unavailable. A recording left
+    for want of time (PREVIEW_STEP_SECONDS) counts as failed."""
     root = runner_root()
     runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
     folder = runs[0] / platform if len(runs) == 1 else None
     sources = list(preview_sources(folder)) if folder else []
     if not sources:
         return None, None
+    started = clock()
     log = root / "may-private" / "previews.log"
     log.parent.mkdir(mode=0o700, exist_ok=True)
     try:
@@ -1084,17 +1129,23 @@ def previews_in(platform, encoder):
         return 0, None
     made = failed = 0
     for scenario, video in sources:
-        target = folder / (scenario + PREVIEW)
+        if clock() - started > PREVIEW_STEP_SECONDS:
+            failed += 1
+            continue
+        target, part = folder / (scenario + PREVIEW), log.parent / (scenario + PREVIEW)
         try:
-            ok = encoder(video, target) and target.is_file() and not target.is_symlink() and \
-                target.stat().st_size <= MAX_PREVIEW and target.read_bytes()[4:8] == b"ftyp"
+            part.unlink(missing_ok=True)
+            ok = encoder(video, part) and part.is_file() and not part.is_symlink() and \
+                part.stat().st_size <= MAX_PREVIEW and part.read_bytes()[4:8] == b"ftyp"
+            if ok:
+                os.replace(part, target)
         except Exception:
             ok = False
         if ok:
             made += 1
         else:
             try:
-                target.unlink(missing_ok=True)
+                part.unlink(missing_ok=True)
             except OSError:
                 pass
             failed += 1

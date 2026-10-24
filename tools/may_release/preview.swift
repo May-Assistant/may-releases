@@ -1,12 +1,15 @@
-// A small silent preview: `preview <recording.mp4> <preview.mp4> <width>` writes the recording's video alone, scaled
-// to <width> points wide (its height even, the aspect kept), as H.264 at a low bit rate. device_ios.py compiles this
-// with the pinned Xcode's swiftc on the device runner, as renders.py compiles stitch.swift; it reads and writes only
-// the paths it is given.
+// A small silent preview: `preview <recording.mp4> <preview.mp4> <width> <seconds> <fps> <bitrate>` writes the
+// recording's video alone, scaled to <width> points wide (its height even, the aspect kept), as a timelapse of at most
+// <seconds> at <fps> frames a second, H.264 at about <bitrate> bits a second (device_tests.PREVIEW_*). device_ios.py
+// compiles this with the pinned Xcode's swiftc on the device runner, as renders.py compiles stitch.swift; it reads and
+// writes only the paths it is given.
 import AVFoundation
 import Foundation
 
 let arguments = CommandLine.arguments
-guard arguments.count == 4, let width = Double(arguments[3]), width >= 16, width <= 2000 else { exit(2) }
+guard arguments.count == 7, let width = Double(arguments[3]), width >= 16, width <= 2000,
+      let maxSeconds = Double(arguments[4]), maxSeconds >= 1, let fps = Double(arguments[5]), fps >= 1, fps <= 60,
+      let bitrate = Int(arguments[6]), bitrate >= 10_000 else { exit(2) }
 let asset = AVURLAsset(url: URL(fileURLWithPath: arguments[1]))
 guard let track = asset.tracks(withMediaType: .video).first else { exit(3) }
 let shown = track.naturalSize.applying(track.preferredTransform)
@@ -22,16 +25,35 @@ let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
     AVVideoCodecKey: AVVideoCodecType.h264,
     AVVideoWidthKey: rotated ? height : width, AVVideoHeightKey: rotated ? width : height,
     AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
-    AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 400_000]])
+    AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: bitrate]])
 input.transform = track.preferredTransform
 input.expectsMediaDataInRealTime = false
 guard reader.canAdd(output), writer.canAdd(input) else { exit(4) }
 reader.add(output)
 writer.add(input)
+// The whole recording, sped up to last maxSeconds at most; a frame is kept only once its sped-up time reaches the next
+// 1/fps slot, and is retimed to it.
+let speed = max(1, CMTimeGetSeconds(asset.duration) / maxSeconds)
 guard reader.startReading(), writer.startWriting(), let first = output.copyNextSampleBuffer() else { exit(5) }
-writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(first))
+let start = CMSampleBufferGetPresentationTimeStamp(first)
+writer.startSession(atSourceTime: .zero)
 var pending: CMSampleBuffer? = first
 var appended = true
+var slot = 0.0
+
+func retimed(_ sample: CMSampleBuffer) -> CMSampleBuffer? {
+    let at = CMTimeGetSeconds(CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(sample), start)) / speed
+    guard at + 1e-6 >= slot, at <= maxSeconds else { return nil }
+    slot = (at * fps).rounded(.down) / fps + 1 / fps
+    var timing = CMSampleTimingInfo(duration: CMTime(seconds: 1 / fps, preferredTimescale: 600),
+                                    presentationTimeStamp: CMTime(seconds: at, preferredTimescale: 600),
+                                    decodeTimeStamp: .invalid)
+    var copy: CMSampleBuffer?
+    guard CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: sample,
+                                                sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+                                                sampleBufferOut: &copy) == noErr else { return nil }
+    return copy
+}
 let done = DispatchSemaphore(value: 0)
 input.requestMediaDataWhenReady(on: DispatchQueue(label: "preview")) {
     while input.isReadyForMoreMediaData {
@@ -41,7 +63,8 @@ input.requestMediaDataWhenReady(on: DispatchQueue(label: "preview")) {
             return
         }
         pending = nil
-        if !input.append(sample) {
+        guard let kept = retimed(sample) else { continue }
+        if !input.append(kept) {
             appended = false
             input.markAsFinished()
             done.signal()
