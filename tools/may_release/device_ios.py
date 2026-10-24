@@ -37,6 +37,7 @@ MAX_RECORDING = 38 * 1024 * 1024
 # presets as MPEG-4 at 720p and 540p.
 CONVERSIONS = (("PresetAppleM4V720pHD", ".m4v"), ("Preset1280x720", ".mp4"), ("Preset960x540", ".mp4"))
 STOP_SECONDS = 30
+COMPILE_SECONDS = 300
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
 # (errSecMissingEntitlement) and the app signed out with "Something went wrong on this device" (run 40035089599).
@@ -64,13 +65,14 @@ def build(tool=renders.build):
     print("May device tests: Playground debug app built for the iOS simulator")
 
 
-def preview_encoder(log, tool=renders.build):
-    """preview.swift (AVFoundation), compiled with the pinned Xcode's swiftc into the private folder, as stitch.swift:
-    the function that makes one preview."""
+def preview_encoder(log, tool=renders.quiet):
+    """preview.swift (AVFoundation), compiled with the pinned Xcode's swiftc into the private folder, as stitch.swift,
+    within COMPILE_SECONDS: the function that makes one preview. Raises DeviceTestsError when it will not compile."""
     binary = log.parent / "preview"
     env = dict(os.environ, DEVELOPER_DIR=str(renders.XCODE))
-    tool(["xcrun", "swiftc", "-O", "-swift-version", "5", "-o", str(binary),
-          str(Path(__file__).resolve().parent / "preview.swift")], log, env=env)
+    if tool(["xcrun", "swiftc", "-O", "-swift-version", "5", "-o", str(binary),
+             str(Path(__file__).resolve().parent / "preview.swift")], log, env=env, timeout=COMPILE_SECONDS).returncode:
+        raise DeviceTestsError("preview.swift did not compile")
 
     def encode(video, target):
         return not renders.quiet([str(binary), str(video), str(target), str(device_tests.PREVIEW_WIDTH)], log,

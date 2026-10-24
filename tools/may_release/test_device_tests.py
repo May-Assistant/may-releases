@@ -2,6 +2,7 @@
 device_tests.py and publish.py device-open / device-push. Everything Android, GitHub and staging is faked."""
 
 import ast
+import http.client
 import io
 import json
 import os
@@ -447,6 +448,13 @@ class DevicePreviewTests(unittest.TestCase):
         self.folder.mkdir(parents=True)
         for name in ("sign-in.mp4", "notes-part1.mp4", "notes-part2.mp4", "chat.mp4", "sign-in-end.png"):
             (self.folder / name).write_bytes(MP4)
+        # Keyed by the report's rows: "routines-part2" is an id here, not the second part of "routines".
+        (self.folder / "routines-part2.mp4").write_bytes(MP4)
+        rows = [{"id": "sign-in", "videos": ["sign-in.mp4"]}, {"id": "notes", "videos": ["notes-part1.mp4",
+                                                                                         "notes-part2.mp4"]},
+                {"id": "chat", "videos": ["chat.mp4"]}, {"id": "routines-part2", "videos": ["routines-part2.mp4"]},
+                {"id": "poll", "videos": []}, {"id": "../x", "videos": ["sign-in.mp4"]}]
+        (self.folder / "report.json").write_text(json.dumps({"device": "android", "scenarios": rows}))
 
     def tearDown(self):
         self.directory.cleanup()
@@ -473,10 +481,24 @@ class DevicePreviewTests(unittest.TestCase):
             target.write_bytes(MP4)
             return True
 
-        self.assertEqual(self.previews(encode), "May device tests (android): 1 previews made, 2 failed")
-        self.assertEqual(sorted(seen), ["chat.mp4", "notes-part1.mp4", "sign-in.mp4"])
+        self.assertEqual(self.previews(encode), "May device tests (android): 2 previews made, 2 failed")
+        self.assertEqual(sorted(seen), ["chat.mp4", "notes-part1.mp4", "routines-part2.mp4", "sign-in.mp4"])
         self.assertEqual(sorted(p.name for p in self.folder.iterdir() if p.name.endswith(device_tests.PREVIEW)),
-                         ["sign-in.preview.mp4"])
+                         ["routines-part2.preview.mp4", "sign-in.preview.mp4"],
+                         "re-review of #88: an id ending -partN keeps its own preview")
+
+    def test_any_error_is_contained_so_the_seal_always_runs(self):
+        """Re-review of #88: an OSError outside the encoder (stat, unlink, mkdir) failed the step."""
+        def encode(video, target):
+            target.write_bytes(MP4)
+            return True
+
+        with patch("device_tests.Path.stat", side_effect=OSError(5, "I/O error")):
+            self.assertTrue(self.previews(encode).startswith("May device tests (android): "),
+                            "a fixed line, never an exception")
+        with patch("device_tests.previews_in", side_effect=OSError(28, "No space left")):
+            self.assertEqual(self.previews(encode),
+                             "May device tests (android): no previews (an error stopped them; the seal goes on)")
 
     def test_no_encoder_or_no_recording_never_fails_the_job(self):
         with patch("device_tests.ffmpeg_encoder", side_effect=DeviceTestsError("ffmpeg did not install")):
@@ -497,8 +519,10 @@ class DevicePreviewTests(unittest.TestCase):
     def test_ios_compiles_preview_swift_with_the_pinned_xcode(self):
         import device_ios
         built = []
-        encode = device_ios.preview_encoder(self.root / "log", tool=lambda argv, log, env: built.append((argv, env)))
-        argv, env = built[0]
+        encode = device_ios.preview_encoder(self.root / "log", tool=lambda argv, log, env, timeout: built.append(
+            (argv, env, timeout)) or Done(0))
+        argv, env, timeout = built[0]
+        self.assertEqual(timeout, device_ios.COMPILE_SECONDS, "re-review of #88: the compile is bounded")
         self.assertEqual(argv[:3], ["xcrun", "swiftc", "-O"])
         self.assertTrue(argv[-1].endswith("preview.swift") and Path(argv[-1]).is_file())
         self.assertEqual(env["DEVELOPER_DIR"], str(device_ios.renders.XCODE))
@@ -931,6 +955,27 @@ class ReleaseDeviceTests(unittest.TestCase):
         self.assertIn("3 recordings and 1 previews uploaded", out, "previews are never counted as recordings")
         with self.assertRaises(publish.PublishError):
             self.release(FakeRenders(failing=["android-sign-in.mp4"]))
+
+    def test_a_network_error_on_a_preview_never_skips_the_rest_or_the_pruning(self):
+        """Re-review of #88: a reset connection or a short read on a preview propagated past prune_releases."""
+        (self.videos / ("sign-in" + device_tests.PREVIEW)).write_bytes(MP4)
+        (self.videos / ("connections" + device_tests.PREVIEW)).write_bytes(MP4)
+        api = FakeRenders()
+
+        def flaky(method, host, path, token, payload=None, data=None):
+            if path.endswith("android-connections.preview.mp4"):
+                raise http.client.IncompleteRead(b"")
+            if path.endswith("android-sign-in.preview.mp4"):
+                raise ConnectionResetError(104, "reset")
+            return api(method, host, path, token, payload, data)
+
+        try:
+            out = self.release(flaky)
+        except (OSError, http.client.HTTPException) as error:
+            self.fail(f"a preview's network error stopped the release: {type(error).__name__}")
+        self.assertIn("3 recordings and 0 previews uploaded", out)
+        self.assertIn("GET", [c[0] for c in api.calls if c[2].endswith("/releases?per_page=100")],
+                      "the pruning still ran")
 
     def test_the_longest_scenario_ids_preview_is_a_file_and_an_asset_the_release_accepts(self):
         """Review of #88: a long id made "<id>-preview.mp4" too long for DEVICE_FILE, so it never uploaded."""

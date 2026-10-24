@@ -25,6 +25,7 @@ from may-app, and no git or API output.
 
 import argparse
 import html
+import http.client
 import json
 import os
 from pathlib import Path
@@ -662,14 +663,20 @@ def release_device(api=renders_api):
         name = asset_name(device, video.name)
         if name in present:
             continue
+        if video.name.endswith(device_tests.PREVIEW):
+            # Optional: no error on one (a status, a reset connection, a short read) stops the rest or the pruning.
+            try:
+                status, _ = api("POST", UPLOADS, f"/repos/{RENDERS_REPO}/releases/{release}/assets?name={name}", token,
+                                data=video.read_bytes())
+            except (OSError, http.client.HTTPException, PublishError, DsCompileError):
+                status = None
+            previews += status == 201
+            continue
         status, _ = api("POST", UPLOADS, f"/repos/{RENDERS_REPO}/releases/{release}/assets?name={name}", token,
                         data=video.read_bytes())
-        if video.name.endswith(device_tests.PREVIEW):
-            previews += status == 201
-        elif status != 201:
+        if status != 201:
             raise PublishError("A recording could not be uploaded to the may-renders release")
-        else:
-            uploaded += 1
+        uploaded += 1
     kept, removed = prune_releases(token, api)
     print(f"May device tests: {uploaded} recordings and {previews} previews uploaded to the may-renders release for "
           f"device-tests/{run}/ ({kept} releases kept, {removed} removed)")

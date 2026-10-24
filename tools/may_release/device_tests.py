@@ -715,14 +715,20 @@ MAX_PREVIEW = 20 * 1024 * 1024
 
 
 def preview_sources(folder):
-    """(scenario, recording) for each scenario's recording in a device folder: its first part when it has several."""
-    for video in sorted(folder.iterdir()) if folder.is_dir() else []:
-        name = video.name
-        if name.endswith(PREVIEW) or re.search(r"-part[0-9]{1,2}\.mp4$", name) and not name.endswith("-part1.mp4"):
+    """(scenario, recording) for each scenario the device report recorded, keyed by the report's own rows (never
+    worked out from a file name, which an id ending "-partN" would confuse): its first recording."""
+    try:
+        rows = json.loads((folder / "report.json").read_text())["scenarios"]
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return
+    for row in rows if isinstance(rows, list) else []:
+        videos = row.get("videos") if isinstance(row, dict) else None
+        if not (isinstance(row.get("id") if isinstance(row, dict) else None, str) and SCENARIO_ID.fullmatch(row["id"])
+                and isinstance(videos, list) and videos and isinstance(videos[0], str)):
             continue
-        match = re.fullmatch(r"([a-z0-9][a-z0-9-]{0,47}?)(?:-part1)?\.mp4", name)
-        if match and video.is_file() and not video.is_symlink():
-            yield match.group(1), video
+        video = folder / videos[0]
+        if video.parent == folder and video.suffix == ".mp4" and video.is_file() and not video.is_symlink():
+            yield row["id"], video
 
 
 def ffmpeg_encoder(root, log):
@@ -745,16 +751,31 @@ def ffmpeg_encoder(root, log):
 
 def make_previews(platform="android", encoder=None):
     """A PREVIEW_WIDTH-wide, silent preview of each scenario's recording, beside it in the run folder before the seal.
-    Its own step, with no secret. Nothing here ever fails the job: a preview that will not make is left out, and the
-    board shows the end screen instead."""
+    Its own step, with no secret, which the workflow also lets fail (continue-on-error) and bounds (timeout-minutes),
+    so the seal always runs. Nothing here ever fails the job: a preview that will not make is left out, and the board
+    shows the end screen instead."""
     require_step_secrets(())
+    try:
+        made, failed = previews_in(platform, encoder)
+    except Exception:
+        print(f"May device tests ({platform}): no previews (an error stopped them; the seal goes on)")
+        return
+    if made is None:
+        print(f"May device tests ({platform}): no recordings, so no previews")
+    elif failed is None:
+        print(f"May device tests ({platform}): no previews (the encoder is unavailable)")
+    else:
+        print(f"May device tests ({platform}): {made} previews made, {failed} failed")
+
+
+def previews_in(platform, encoder):
+    """(made, failed); (None, None) with no recording; (0, None) when the encoder is unavailable."""
     root = runner_root()
     runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
     folder = runs[0] / platform if len(runs) == 1 else None
     sources = list(preview_sources(folder)) if folder else []
     if not sources:
-        print(f"May device tests ({platform}): no recordings, so no previews")
-        return
+        return None, None
     log = root / "may-private" / "previews.log"
     log.parent.mkdir(mode=0o700, exist_ok=True)
     try:
@@ -766,22 +787,24 @@ def make_previews(platform="android", encoder=None):
             else:
                 encoder = ffmpeg_encoder(root, log)
     except Exception:
-        print(f"May device tests ({platform}): no previews (the encoder is unavailable)")
-        return
+        return 0, None
     made = failed = 0
     for scenario, video in sources:
         target = folder / (scenario + PREVIEW)
         try:
-            ok = encoder(video, target)
+            ok = encoder(video, target) and target.is_file() and not target.is_symlink() and \
+                target.stat().st_size <= MAX_PREVIEW and target.read_bytes()[4:8] == b"ftyp"
         except Exception:
             ok = False
-        if ok and target.is_file() and not target.is_symlink() and target.stat().st_size <= MAX_PREVIEW and \
-                target.read_bytes()[4:8] == b"ftyp":
+        if ok:
             made += 1
         else:
-            target.unlink(missing_ok=True)
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
             failed += 1
-    print(f"May device tests ({platform}): {made} previews made, {failed} failed")
+    return made, failed
 
 
 def seal(platform="android"):

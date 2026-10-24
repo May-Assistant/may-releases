@@ -1252,6 +1252,11 @@ DEVICE_DOWNLOAD = ("name: may-device-{}-${{{{ github.run_attempt }}}}\n"
                    "          path: ${{{{ runner.temp }}}}/may-device-download\n")
 DEVICE_CONDITIONS = ["if: always()", "if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}",
                      "if: always()"]
+# The previews step (the flow board's): optional and bounded in each device job, so the seal always runs after it.
+PREVIEW_STEP = ("      - name: Make a 270px preview of each recording, with no secret\n"
+                "        # Optional and bounded: the seal and the handover always run after it.\n"
+                "        continue-on-error: true\n        timeout-minutes: 25\n"
+                "        run: python3 -I -S -B tools/may_release/device_tests.py previews{}\n")
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
 DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"
 # The repository's Claude token (as claude-code-review.yml's): each device job's agent (its scenarios step) and judge
@@ -1318,7 +1323,9 @@ def device_tests_workflow_problems(text):
             any(DEVICE_DOWNLOAD.format(device) not in job_text(text, "publish") for device in ("android", "ios")):
         found.append(name + "hands over something other than exactly one encrypted report per device")
     if re.findall(r"(?m)^\s+(if: .+)$", text) != DEVICE_CONDITIONS or re.search(r"(?m)^\s*(defaults|shell):", text) or \
-            text.count("continue-on-error: true") != 2 or \
+            text.count("continue-on-error: true") != 4 or \
+            any(PREVIEW_STEP.format(platform) not in job_text(text, job)
+                for job, platform in (("android", ""), ("ios", " --platform ios"))) or \
             re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["120", "120", "30"]:
         found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
     steps = {job: dict(job_steps(text, job)[1]) for job in jobs}
