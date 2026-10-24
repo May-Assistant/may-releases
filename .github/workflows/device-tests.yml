@@ -94,6 +94,12 @@ jobs:
         continue-on-error: true
         timeout-minutes: 8
         run: python3 -I -S -B tools/may_release/device_tests.py previews
+      - name: Render the flow prototypes' expected screens, with no secret and no network
+        # Optional and bounded: may-app's stdlib build of this commit's prototypes and the image's Chrome, run as a
+        # user of their own with no network; the seal and the handover always run after it.
+        continue-on-error: true
+        timeout-minutes: 8
+        run: python3 -I -S -B tools/may_release/device_tests.py prototypes
       - name: Encrypt the report to the renders public key
         env:
           MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}

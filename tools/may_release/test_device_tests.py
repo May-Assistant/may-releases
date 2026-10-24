@@ -704,6 +704,37 @@ class RunTests(unittest.TestCase):
         _, report, _, _ = self.run_it()
         self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass", "the app has the id: it runs")
 
+    def test_maestro_keeps_its_debug_output_out_of_the_runners_home_and_it_is_removed(self):
+        """The coordinator's review of #104: Maestro records each flow's evaluated commands (the test session among
+        them) under HOME/.maestro, and a later step runs may-app code on the same runner."""
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        self.run_it()
+        home = str(self.root / "may-maestro-home")
+        isolated = {(env.get("HOME"), env.get("XDG_STATE_HOME"), env.get("MAESTRO_OPTS")) for env in self.maestro_envs}
+        self.assertEqual(isolated, {(home, home, "-Duser.home=" + home)},
+                         "every Maestro call, with or without a session: Java reads user.home from passwd, not HOME")
+        self.assertFalse((self.root / "may-maestro-home").exists(), "removed at the run's end")
+
+    def test_a_maestro_tests_folder_in_the_runners_own_home_is_removed_too(self):
+        """Second security review of #104: Maestro 2.8.0 falls back to user.home/.maestro/tests."""
+        with tempfile.TemporaryDirectory() as directory:
+            root, passwd, home = (Path(directory) / name for name in ("root", "passwd", "home"))
+            for folder in (root / "may-maestro-home", passwd / ".maestro" / "tests", home / ".maestro" / "tests"):
+                folder.mkdir(parents=True)
+            (passwd / ".maestro" / "tests" / "commands.json").write_text("{}")
+            (passwd / ".maestro" / "config").write_text("kept")
+
+            class Entry:
+                pw_dir = str(passwd)
+
+            with patch("device_tests.pwd.getpwuid", return_value=Entry()), \
+                    patch("device_tests.Path.home", return_value=home):
+                device_tests.forget_maestro_home(root)
+            self.assertFalse((root / "may-maestro-home").exists())
+            self.assertFalse((passwd / ".maestro" / "tests").exists(), "the passwd home, which Java reads")
+            self.assertFalse((home / ".maestro" / "tests").exists(), "and $HOME's")
+            self.assertTrue((passwd / ".maestro" / "config").is_file(), "only the debug output goes")
+
     def test_flow_tags_reads_the_header_alone(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "f.yaml"
@@ -1336,6 +1367,27 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(lines[-1], "May device tests: the flow board is device-tests/board/ in may-renders, without "
                                     "notes (may-app's board-notes.json is malformed)")
         self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
+
+    def test_the_flow_prototypes_reach_the_board_and_a_bad_one_never_stops_the_publish(self):
+        flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
+        path = {"flow": "sign-in-out", "board": "2", "cases": [{"id": "main", "name": "Sign in", "goal": "Sign in."}],
+                "steps": [{"n": 1, "platform": "both", "action": "assert", "target": {"id": "demo-signin"},
+                           "expect": "The sign-in screen."}]}
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        try:
+            self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
+                                        (RUN + "/android/path-2.json", json.dumps(path).encode()),
+                                        (RUN + "/android/path-3.json", b'{"flow": '),
+                                        (RUN + "/android/proto-2-android-1.png", png),
+                                        (RUN + "/android/proto-2-ios-1.png", b"GIF89a not a png")])
+        except publish.PublishError as error:
+            self.fail(f"a bad prototype file stopped device-open: {error}")
+        work, _, _ = self.push_for_board()
+        page = (work / "device-tests" / "board" / "index.html").read_text()
+        data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
+        self.assertEqual(data["expected"]["2"]["screens"], {"android": {"1": "expected/2/android/1.png"}, "ios": {}})
+        self.assertEqual((work / "device-tests" / "board" / "expected" / "2" / "android" / "1.png").read_bytes(), png)
+        self.assertNotIn("3", data["expected"], "the malformed path is dropped")
 
     def test_deeply_nested_may_app_json_never_stops_the_publish(self):
         """Re-review of #86: 200,000 "[" raised RecursionError, which escaped extract() and stopped device-open."""
