@@ -53,8 +53,7 @@ JUDGE_PROMPT = (
     "The agent's own report: outcome {outcome}, after {actions} actions. Its summary:\n{summary}\n\n"
     "The screen as the agent left it, read when it finished (accessibility hierarchy, one element per line):\n"
     "{hierarchy}\n\n"
-    "May's server, for each message this run sent with its tag (delivery codes only; none when the goal sends "
-    "nothing): {delivery}\n\n"
+    "May's server, for each message this run sent with its tag (delivery codes only): {delivery}\n\n"
     "verdict is pass only if the hierarchy and the report together show the goal achieved; otherwise fail. A "
     "delivery code of succeeded is the server's record that May answered this run's message. note says why in at "
     "most three sentences.")
@@ -171,13 +170,23 @@ def redacted(text):
     return kept.decode("utf-8", "replace").strip()
 
 
+def delivery_text(agent):
+    """The judge's line on the server's delivery codes: the goal sends nothing, the chats were not read, or the codes."""
+    codes = agent.get("delivery")
+    if not agent.get("sends"):
+        return "none: the goal sends no message"
+    if not isinstance(codes, list):
+        return "not read: the chats could not be read"
+    return ", ".join(code for code in codes if isinstance(code, str)) or "none found"
+
+
 def judge(cli, goal, tag, agent, work, token, model):
     """The judge's verdict on one agent run: ("pass" | "fail" | "rate_limited" | "error", note)."""
     work = fresh(work)
     prompt = JUDGE_PROMPT.format(goal=goal.replace("{tag}", tag), outcome=agent.get("outcome") or "none",
                                  actions=agent.get("actions", 0), summary=redacted(agent.get("summary")) or "(none)",
                                  hierarchy=agent.get("hierarchy") or "(none)",
-                                 delivery=", ".join(agent.get("delivery") or []) or "none")
+                                 delivery=delivery_text(agent))
     command = base_command(cli, prompt, model) + ["--json-schema", JUDGE_SCHEMA]
     try:
         with (work / "judge.json").open("wb") as out, (work / "judge.err").open("wb") as err:

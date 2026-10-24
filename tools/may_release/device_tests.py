@@ -165,7 +165,7 @@ UNFINISHED = "the agent did not finish"
 BLOCKED = "the agent reported it was blocked"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
-DELIVERY_FAILED = "May's server recorded a failed reply"
+DELIVERY_FAILED = "May's server did not record a succeeded reply"
 UNCONFIGURED = "server checks not configured"
 SMOKE_MAESTRO = "Maestro did not drive the app"
 SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
@@ -1253,9 +1253,10 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     accounts.report("android")
 
 
-def combined(entry, record, judged):
+def combined(entry, record, judged, sends=False):
     """An agent scenario's verdict from its run, the judge and the server truth; the smoke scenario's from Maestro, its
-    agent run and the judge, never "pass"."""
+    agent run and the judge, never "pass". For one that sends May a message (sends), the server's delivery codes
+    outrank the screen: every code must be succeeded, and chats that could not be read leave it not judged."""
     if entry.get("maestro") is False:
         return {"verdict": "fail", "reason": SMOKE_MAESTRO}
     if record.get("state") == "rate_limited" or judged[0] == "rate_limited":
@@ -1264,9 +1265,14 @@ def combined(entry, record, judged):
         return {"verdict": "fail", "reason": BLOCKED}
     if record.get("outcome") != "completed":
         return {"verdict": "fail", "reason": UNFINISHED}
-    # The server's record outranks the screen: a failed reply is a fail, whatever the judge read on screen.
-    if any(code.startswith("failed") for code in entry.get("delivery", [])):
-        return {"verdict": "fail", "reason": DELIVERY_FAILED}
+    # The server's record outranks the screen (the May chat shows earlier runs' replies too): anything but succeeded
+    # for every tagged message, or none at all, is a fail, whatever the judge read on screen.
+    if sends:
+        codes = entry.get("delivery")
+        if codes is None:
+            return {"verdict": "fail", "reason": NOT_JUDGED}
+        if not codes or any(code != "succeeded" for code in codes):
+            return {"verdict": "fail", "reason": DELIVERY_FAILED}
     if judged[0] != "pass":
         return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
     if "maestro" in entry:
@@ -1284,11 +1290,14 @@ MAX_AGENT_SUMMARY = 300
 
 
 def sealed_agent(record):
-    summary, _ = kept_lines(str(record.get("summary") or "").encode(), "")
+    # Line by line, then joined into one line and redacted again: joining could make a secret-shaped line of two
+    # harmless ones ("may_token:" and an opaque value), which publish would refuse with the whole report.
+    lines, _ = kept_lines(str(record.get("summary") or "").encode(), "")
+    summary, _ = kept_lines(" ".join(lines.decode("utf-8", "replace").split()).encode(), "")
     actions = record.get("actions")
     return {"outcome": record.get("outcome") if record.get("outcome") in ("completed", "blocked") else None,
             "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MAX_ACTIONS else 0,
-            "summary": " ".join(summary.decode("utf-8", "replace").split())[:MAX_AGENT_SUMMARY]}
+            "summary": summary.decode("utf-8", "replace").strip()[:MAX_AGENT_SUMMARY]}
 
 
 def judge_scenarios(judged_by=device_agent.judge, platform="android"):
@@ -1308,6 +1317,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         stored = {}
     records = stored.get("agents", {}) if isinstance(stored, dict) else {}
     goals = {row["id"]: row["goal"] for row in scenarios("all", platform) if row["driver"] == "agent"}
+    sending = {row["id"] for row in scenarios("all", platform) if sends_messages(row)}
     goals.update((row["id"], row["goal"]) for row in smoke_rows(platform))
     pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
     token = model = None
@@ -1321,13 +1331,13 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         judged = ("skipped", "")
         if record.get("state") != "rate_limited" and record.get("outcome") == "completed":
             try:
-                # Its delivery codes alone, never a message's text.
-                evidence = dict(record, delivery=[code for code in entry.get("delivery", []) if isinstance(code, str)])
+                # Its delivery codes alone, never a message's text; None when its chats could not be read.
+                evidence = dict(record, sends=entry["id"] in sending, delivery=entry.get("delivery"))
                 judged = judged_by(cli, goals[entry["id"]], stored.get("tag", ""), evidence,
                                    private / "judge" / entry["id"], token, model)
             except (OSError, subprocess.SubprocessError, KeyError):
                 judged = ("error", "")
-        verdict_reason = combined(entry, record, judged)
+        verdict_reason = combined(entry, record, judged, entry["id"] in sending)
         entry["agent"] = sealed_agent(record)
         entry["verdict"] = verdict_reason["verdict"]
         entry.pop("reason", None)

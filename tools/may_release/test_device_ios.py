@@ -164,7 +164,7 @@ class RunTests(Workspace):
                                      deleted_by=lambda base, token: self.deleted.append(token) or True,
                                      calls_left=calls_left or (lambda base, token: 100),
                                      delivered=lambda base, token, tag: self.delivered.append(token) or
-                                     [device_tests.NONE_STORED])
+                                     ["succeeded"])
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             if "CLAUDE_CODE_OAUTH_TOKEN" in environ:
                 os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = environ["CLAUDE_CODE_OAUTH_TOKEN"]
@@ -274,7 +274,7 @@ class RunTests(Workspace):
         self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("chat", "ui-pass"),
                                                                                          ("poll", "pass")])
         self.assertEqual(self.delivered, [TOKEN + "1", TOKEN + "2"], "each scenario's messages, with its own session")
-        self.assertEqual([row.get("delivery") for row in report["scenarios"]], [[device_tests.NONE_STORED]] * 2)
+        self.assertEqual([row.get("delivery") for row in report["scenarios"]], [["succeeded"]] * 2)
         self.assertIn("May device tests (ios): the test session's cleanup removed 2 tagged items", out)
 
     def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):

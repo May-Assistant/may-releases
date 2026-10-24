@@ -177,6 +177,16 @@ class ScenarioTests(unittest.TestCase):
         for stale in ("Notes tab", "Take notes"):
             self.assertNotIn(stale, goal)
 
+    def test_every_text_a_goal_asks_the_agent_to_type_is_text_type_accepts(self):
+        """The security read of #110: "I'd" and "I'll" were refused by type, so the agent could never send them."""
+        typed = []
+        for row in device_tests.scenarios("all"):
+            typed += re.findall(r"(?:this message|type): (.+?\.) (?:When|Then|Instead)", row.get("goal", ""))
+        self.assertGreaterEqual(len(typed), 6)
+        for text in typed:
+            with self.subTest(text=text):
+                self.assertTrue(device_tests.device_mcp.TEXT.fullmatch(text.replace("{tag}", "qa-40123018291")))
+
     def test_chat_goals_name_the_existing_may_chat_and_never_the_plus_button(self):
         """Run 40119835677: "start a new chat" sent the agent to +, which makes agents, tasks and projects."""
         for scenario in ("chat", "poll", "poll-skip", "routines"):
@@ -195,8 +205,8 @@ class ScenarioTests(unittest.TestCase):
         goals = {row["id"]: row["goal"] for row in device_tests.scenarios("chat,poll,poll-skip", "android")}
         self.assertIn("Reply with the word received", goals["chat"])
         for scenario in ("poll", "poll-skip"):
-            self.assertIn("which fruit I'd like as a snack, with three choices, tag {tag}", goals[scenario])
-        self.assertIn("I'll answer myself: apples, {tag}", goals["poll-skip"])
+            self.assertIn("which fruit I would like as a snack, with three choices, tag {tag}", goals[scenario])
+        self.assertIn("I will answer myself: apples, {tag}", goals["poll-skip"])
         for scenario, goal in goals.items():
             with self.subTest(scenario=scenario):
                 self.assertNotRegex(goal.lower(), r"\b(week|feel|feeling|mood|stress|worr)", "no personal or feelings topic")
@@ -269,6 +279,34 @@ class SealedAgentTests(unittest.TestCase):
         self.assertTrue(publish.agent_ok(sealed))
         odd = device_tests.sealed_agent({"outcome": "finished", "summary": 7, "actions": "80"})
         self.assertEqual(odd, {"outcome": None, "actions": 0, "summary": "7"})
+
+    def test_joining_redacted_lines_never_makes_a_secret_shaped_summary(self):
+        """The security read of #110: "may_token:" and an opaque value, harmless line by line, joined into one."""
+        sealed = device_tests.sealed_agent({"outcome": "blocked", "actions": 3,
+                                            "summary": "Tapped send.\nmay_token:\nZm9vYmFyYmF6cXV4cXV1eHF1dXg\nNo reply."})
+        self.assertTrue(publish.agent_ok(sealed), "publish never refuses a report for a summary the writer sealed")
+        self.assertEqual(device_tests.kept_lines(sealed["summary"].encode(), ""), (sealed["summary"].encode(), 0))
+        self.assertNotIn("Zm9vYmFy", sealed["summary"])
+        kept = device_tests.sealed_agent({"summary": "Opened the May chat.\nTyped the message.\nTapped send."})
+        self.assertEqual(kept["summary"], "Opened the May chat. Typed the message. Tapped send.")
+
+    def test_a_scenario_that_sends_passes_only_when_every_reply_succeeded(self):
+        """The security read of #110: the May chat shows earlier runs' replies, so the screen alone can't pass it."""
+        record, judged = {"state": "ok", "outcome": "completed"}, ("pass", "")
+        for codes, reason in ((["cancelled"], device_tests.DELIVERY_FAILED), (["queued"], device_tests.DELIVERY_FAILED),
+                              (["running"], device_tests.DELIVERY_FAILED), (["no run"], device_tests.DELIVERY_FAILED),
+                              ([device_tests.NONE_STORED], device_tests.DELIVERY_FAILED),
+                              ([], device_tests.DELIVERY_FAILED),
+                              (["succeeded", "failed (model_rejected_request)"], device_tests.DELIVERY_FAILED),
+                              (None, device_tests.NOT_JUDGED)):
+            with self.subTest(codes=codes):
+                entry = {"server": []} if codes is None else {"server": [], "delivery": codes}
+                self.assertEqual(device_tests.combined(entry, record, judged, sends=True),
+                                 {"verdict": "fail", "reason": reason})
+        self.assertEqual(device_tests.combined({"server": [], "delivery": ["succeeded", "succeeded"]}, record, judged,
+                                               sends=True)["verdict"], "ui-pass")
+        self.assertEqual(device_tests.combined({"server": []}, record, judged)["verdict"], "ui-pass",
+                         "a scenario that sends nothing has no codes to wait for")
 
     def test_publish_refuses_a_sealed_account_out_of_shape(self):
         good = {"outcome": "completed", "actions": 3, "summary": "ok"}

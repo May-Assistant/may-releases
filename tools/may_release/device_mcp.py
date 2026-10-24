@@ -13,7 +13,7 @@ read or write a file, or reach the network itself.
   `maestro hierarchy`. Coordinates are the screenshot's pixels, as on Android; they become iOS points by the ratio of
   the screenshot's width to the hierarchy's root. back is a swipe in from the left edge.
 
-- type takes plain text only (letters, digits, spaces and . , ? ! : - _ @), so nothing reaches adb's shell as a
+- type takes plain text only (letters, digits, spaces and . , ! : - _ @; never ? or *, a glob in the device shell), so nothing reaches adb's shell as a
   command.
 - At most MAX_ACTIONS look or act calls; after that every call but done answers that the limit is reached.
 - done records the agent's own outcome (completed or blocked) and a short summary to MAY_DEVICE_AGENT_RESULT, which
@@ -38,7 +38,8 @@ MAX_ACTIONS = 80
 MAX_HIERARCHY = 40_000
 MAX_SUMMARY = 1000
 MAX_FIELD = 300
-TEXT = re.compile(r"[A-Za-z0-9 .,?!:@_-]{1,200}")
+# No ? or *: the device's shell would read them as a glob in input text's argument.
+TEXT = re.compile(r"[A-Za-z0-9 .,!:@_-]{1,200}")
 # A line that could carry a session or a credential is dropped whole. Every pattern stays inside one line ([ \t],
 # never \s), so a line kept here is a line publish keeps. Dropped:
 SECRET_LINE = re.compile(
@@ -80,7 +81,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "tap", "description": "Tap the screen at pixel x, y",
      "inputSchema": {"type": "object", "required": ["x", "y"], "properties": {"x": COORD, "y": COORD}}},
-    {"name": "type", "description": ("Type text into the focused field: letters, digits, spaces and . , ? ! : - _ @ "
+    {"name": "type", "description": ("Type text into the focused field: letters, digits, spaces and . , ! : - _ @ "
                                      "only, up to 200 characters"),
      "inputSchema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}},
     {"name": "swipe", "description": "Swipe from x1, y1 to x2, y2 over ms milliseconds (scroll with this)",
