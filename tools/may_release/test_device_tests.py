@@ -662,8 +662,23 @@ class PublishDeviceTests(unittest.TestCase):
             self.fail(f"a malformed board-notes.json stopped device-open: {error}")
         self.assertTrue((tree / "README.md").is_file())
         work, lines, _ = self.push_for_board()
-        self.assertEqual(lines[-1], "May device tests: the flow board is device-tests/board/ in may-renders")
+        # Re-review of #86: the log says the board went without the dropped notes.
+        self.assertEqual(lines[-1], "May device tests: the flow board is device-tests/board/ in may-renders, without "
+                                    "notes (may-app's board-notes.json is malformed)")
         self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
+
+    def test_deeply_nested_may_app_json_never_stops_the_publish(self):
+        """Re-review of #86: 200,000 "[" raised RecursionError, which escaped extract() and stopped device-open."""
+        try:
+            self.assertFalse(publish.is_json(b"[" * 200000))
+        except RecursionError:
+            self.fail("deep nesting escaped is_json")
+        try:
+            tree, _ = self.open_with(self.GOOD + [(RUN + "/android/board-notes.json", b"[" * 200000),
+                                                  (RUN + "/android/flows.json", b"{" * 200000)])
+        except (publish.PublishError, RecursionError) as error:
+            self.fail(f"deeply nested may-app JSON stopped device-open: {type(error).__name__}")
+        self.assertTrue((tree / "README.md").is_file())
 
     def test_a_board_that_fails_never_costs_the_run_its_publishing(self):
         """Review of #86: any error in the board skips the board alone."""
