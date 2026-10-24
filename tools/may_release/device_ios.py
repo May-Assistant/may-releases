@@ -219,6 +219,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     cli = install(root) if agents else None
     tag, since = device_tests.run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     env = xcode()
+    maestro_env = dict(env, MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
+                       HOME=str(device_tests.maestro_home(root)))
     at("booting the simulator")
     udid = boot(log, env)
     results, records, cleaned_count = [], {}, None
@@ -269,14 +271,13 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                     passed = not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format",
                                                 "junit", "--output", str(folder / (row["id"] + ".xml"))], log,
                                                env=device_tests.with_session(
-                                                   dict(env, MAESTRO_CLI_NO_ANALYTICS="1",
-                                                        MAESTRO_DISABLE_UPDATE_CHECK="true"), token),
+                                                   maestro_env, token),
                                                timeout=device_tests.FLOW_SECONDS).returncode
                 except subprocess.SubprocessError:
                     passed = False
             device_tests.finish_onboarding(row, source, "ios", lambda path: not renders.quiet(
                 [str(launcher), "--device", udid, "test", str(path)], log,
-                env=dict(env, MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true"),
+                env=maestro_env,
                 timeout=device_tests.ONBOARDING_SECONDS).returncode)
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
@@ -322,6 +323,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     finally:
         accounts.abandon(base)
         token = secret = ""
+        device_tests.forget_maestro_home(root)
         renders.quiet(["xcrun", "simctl", "shutdown", udid], log, env=env)
     at("writing the report")
     report = {"run": folder.parent.name, "device": "ios", "scenarios": results}

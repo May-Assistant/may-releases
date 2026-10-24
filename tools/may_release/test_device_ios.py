@@ -236,6 +236,13 @@ class RunTests(Workspace):
             "an id in Android's sources alone is not in iOS's")
         self.assertEqual(len(minted), 1, "no session is minted for the failed scenario")
 
+    def test_maestro_keeps_its_debug_output_out_of_the_runners_home_on_ios_too(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        calls, minted, report, _, _ = self.run_it()
+        homes = {env.get("HOME") for argv, env in calls if "test" in argv and "--device" in argv}
+        self.assertEqual(homes, {str(self.root / "may-maestro-home")})
+        self.assertFalse((self.root / "may-maestro-home").exists(), "removed at the run's end")
+
     def test_a_switched_off_scenario_is_skipped(self):
         calls, minted, report, _, _ = self.run_it(env={"MAY_DEVICE_TESTS_SKIP": "sign-in"})
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]][0],

@@ -168,12 +168,13 @@ def checked_path(data, board_id):
 
 def expected_from(run_folder, target):
     """This run's checked paths and their screens, written to target (EXPECTED/): {board id: path with "screens"}, or
-    None when the run brought no path (the board keeps its last set). A malformed path, or a screen that is not a
-    small PNG, is left out."""
+    None when the run brought no path or no screen (a render that failed): the board then keeps its last set. A
+    malformed path, or a screen that is not a small PNG, is left out."""
     android = run_folder / "android"
     files = sorted(android.glob("path-*.json")) if android.is_dir() else []
     if not any(PATH_FILE.fullmatch(path.name) for path in files):
         return None
+    final, target = target, target.with_name(target.name + ".new")
     shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True)
     expected = {}
@@ -196,7 +197,12 @@ def expected_from(run_folder, target):
             shutil.copyfile(shot, target / board_id / platform / f"{n}.png")
             screens[platform][n] = f"{EXPECTED}/{board_id}/{platform}/{n}.png"
         expected[board_id] = dict(checked, screens=screens)
+    if not any(path["screens"][platform] for path in expected.values() for platform in path["screens"]):
+        shutil.rmtree(target, ignore_errors=True)
+        return None
     (target / "paths.json").write_text(json.dumps(expected, indent=2) + "\n")
+    shutil.rmtree(final, ignore_errors=True)
+    target.rename(final)
     return expected
 
 

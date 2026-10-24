@@ -422,6 +422,15 @@ class ExpectedTests(BoardCase):
         self.assertEqual(kept["2"]["main"]["name"], "Sign in")
         self.assertTrue((self.base / board.BOARD / board.EXPECTED / "2" / "android" / "1.png").is_file())
 
+    def test_a_run_whose_render_failed_keeps_the_last_good_screens(self):
+        """The coordinator's review of #104: a run that brings paths but no screen must not wipe the last set."""
+        self.write_run(folder(1), {"path-2.json": PATH, "proto-2-android-1.png": PNG_BYTES})
+        self.write_run(folder(2), {"path-2.json": PATH})
+        kept = self.data(folder(2))[0]["expected"]
+        self.assertIn("2", kept)
+        self.assertEqual(kept["2"]["screens"]["android"], {"1": "expected/2/android/1.png"})
+        self.assertTrue((self.base / board.BOARD / board.EXPECTED / "2" / "android" / "1.png").is_file())
+
     def test_the_page_shows_expected_beside_the_recording_with_its_bar_under_it(self):
         template = board.TEMPLATE.read_text()
         well = template[template.index("function expectedWell("):template.index("function hasExpected(")]

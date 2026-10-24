@@ -1259,8 +1259,8 @@ PREVIEW_STEP = ("      - name: Make a 270px preview of each recording, with no s
                 "        run: python3 -I -S -B tools/may_release/device_tests.py previews{}\n")
 # The flow prototypes' screens (device_prototypes.py): the Android job alone, optional and bounded the same way.
 PROTOTYPE_STEP = ("      - name: Render the flow prototypes' expected screens, with no secret and no network\n"
-                  "        # Optional and bounded: may-app's stdlib build of this commit's prototypes, shot by the image's "
-                  "Chrome with\n        # every host name unresolvable; the seal and the handover always run after it.\n"
+                  "        # Optional and bounded: may-app's stdlib build of this commit's prototypes and the image's Chrome, "
+                  "run as a\n        # user of their own with no network; the seal and the handover always run after it.\n"
                   "        continue-on-error: true\n        timeout-minutes: 8\n"
                   "        run: python3 -I -S -B tools/may_release/device_tests.py prototypes\n")
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"

@@ -677,6 +677,15 @@ class RunTests(unittest.TestCase):
         _, report, _, _ = self.run_it()
         self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass", "the app has the id: it runs")
 
+    def test_maestro_keeps_its_debug_output_out_of_the_runners_home_and_it_is_removed(self):
+        """The coordinator's review of #104: Maestro records each flow's evaluated commands (the test session among
+        them) under HOME/.maestro, and a later step runs may-app code on the same runner."""
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        self.run_it()
+        homes = {env.get("HOME") for env in self.maestro_envs}
+        self.assertEqual(homes, {str(self.root / "may-maestro-home")}, "every Maestro call, with or without a session")
+        self.assertFalse((self.root / "may-maestro-home").exists(), "removed at the run's end")
+
     def test_flow_tags_reads_the_header_alone(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "f.yaml"

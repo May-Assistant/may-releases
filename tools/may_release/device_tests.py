@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -104,6 +105,29 @@ SESSION_SECONDS = 30 * 60
 # makes each MAESTRO_-prefixed variable a flow variable, so a flow reads it as ${MAESTRO_MAY_TEST_SESSION} (run
 # 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in).
 MAESTRO_SESSION = "MAESTRO_MAY_TEST_SESSION"
+# Maestro gets a HOME of its own under the runner's temp folder, never the runner's: its debug output holds each flow's
+# evaluated commands, the test session among them, and later steps run may-app code on the same runner. It is removed
+# at the run's end; on Android it carries the runner's adb key pair, which the emulator trusts.
+MAESTRO_HOME = "may-maestro-home"
+
+
+def maestro_home(root):
+    """A fresh, private HOME for Maestro (with the runner's adb keys when there are some)."""
+    home = root / MAESTRO_HOME
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(mode=0o700)
+    keys = Path.home() / ".android"
+    for name in ("adbkey", "adbkey.pub"):
+        if (keys / name).is_file() and not (keys / name).is_symlink():
+            (home / ".android").mkdir(mode=0o700, exist_ok=True)
+            shutil.copyfile(keys / name, home / ".android" / name)
+    return home
+
+
+def forget_maestro_home(root):
+    shutil.rmtree(root / MAESTRO_HOME, ignore_errors=True)
+
+
 # may-app's subflow that taps a signed-in account through onboarding ("Hi, I'm May") to Chats, run before each agent
 # scenario: the shared test account lands in onboarding, not Chats (run 40046272749), and the agent starts from launch.
 ONBOARDING, ONBOARDING_SECONDS = "subflows/finish-onboarding.yaml", 180
@@ -741,9 +765,6 @@ def board_inputs(source, folder):
         path = source / name
         if path.is_file() and not path.is_symlink() and path.stat().st_size <= board.MAX_INPUT:
             shutil.copyfile(path, folder / target)
-    if folder.name == "android":
-        # The flow prototypes' expected paths, once a run (board.py reads the Android folder's).
-        device_prototypes.copy_paths(source, folder)
 
 
 # A flow's own tags name the platforms it is written for; a scenario whose flow is not tagged for this job's platform is
@@ -989,7 +1010,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
         show_touches(adb, env, log, True)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
-                                ANDROID_HOME=str(flows.sdk()))
+                                ANDROID_HOME=str(flows.sdk()), HOME=str(maestro_home(root)))
         budget = (budgeted or Budget)()
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
@@ -1076,6 +1097,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     finally:
         accounts.abandon(base)
         token = secret = ""
+        forget_maestro_home(root)
         show_touches(adb, env, log, False)
         emulator.terminate()
         try:
@@ -1272,18 +1294,23 @@ def ffmpeg_encoder(root, log):
     return encode
 
 
-def render_prototypes(rendered=device_prototypes.render):
-    """The flow prototypes' expected screens (device_prototypes.py), into the Android run folder before the seal. Its own
-    step, with no secret, which the workflow also lets fail and bounds; nothing here ever fails the job."""
+def render_prototypes(copied=device_prototypes.copy_paths, rendered=device_prototypes.render):
+    """The flow prototypes' paths and expected screens (device_prototypes.py), into the Android run folder before the
+    seal. Its own step, with no secret, which the workflow also lets fail and bounds; nothing here ever fails the job."""
     require_step_secrets(())
     try:
         root = runner_root()
         runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
         folder = runs[0] / "android" if len(runs) == 1 else None
-        work = root / "may-private" / "prototypes"
-        work.mkdir(mode=0o700, parents=True, exist_ok=True)
-        made, failed = rendered(root / "may-source", folder, work, work / "build.log") if folder and folder.is_dir() \
-            else (None, None)
+        if not (folder and folder.is_dir()):
+            made = failed = None
+        else:
+            copied(root / "may-source", folder)
+            scratch = root / "may-private" / "prototypes"
+            scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Outside the runner's home: the render user reads only this.
+            stage = Path(tempfile.mkdtemp(prefix="may-render-")) / "prototypes"
+            made, failed = rendered(root / "may-source", folder, stage, scratch)
     except Exception:
         print("May device tests (android): no prototype screens (an error stopped them; the seal goes on)")
         return
