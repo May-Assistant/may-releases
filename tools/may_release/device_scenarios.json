@@ -40,7 +40,7 @@
     "id": "notes",
     "title": "Add a note to a new agenda task",
     "driver": "agent",
-    "goal": "In May Playground, open Agenda and add a new task titled {tag} task. Open that task, open its Notes tab and add a note that says: {tag} note from the device test. Make sure the note is saved and shown on the {tag} task.",
+    "goal": "In May Playground, open Agenda and add a new task titled {tag} task. Open that task. On its Details, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on the {tag} task.",
     "platforms": [
       "android",
       "ios"
