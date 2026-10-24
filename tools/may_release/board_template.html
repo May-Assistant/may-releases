@@ -112,6 +112,23 @@ button { font: inherit; color: inherit; }
 .play { position: absolute; inset: 0; margin: auto; width: 56px; height: 56px; border-radius: 50%; border: 2px solid #ffffff; background: rgba(1,4,9,.55); cursor: pointer; }
 .play::after { content: ""; position: absolute; left: 21px; top: 16px; border-style: solid; border-width: 10px 0 10px 16px; border-color: transparent transparent transparent #ffffff; }
 .play:hover { background: var(--accent); border-color: var(--accent); }
+/* Expected | Recording (review pages 1.1): side by side in a wide card, one at a time with a toggle in a narrow one. */
+.card { container-type: inline-size; }
+.pair { display: grid; grid-template-columns: minmax(0, 1fr); }
+.pair .well-h { display: none; padding: 6px 14px; font-size: 12px; font-weight: 600; color: var(--fg-muted); background: var(--canvas-subtle); }
+.pair[data-view="expected"] .rec, .pair[data-view="recording"] .exp { display: none; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-left: auto; }
+.seg button { border: 0; background: none; padding: 2px 8px; font-size: 12px; cursor: pointer; color: var(--fg-muted); }
+.seg button[aria-pressed="true"] { background: var(--selected); color: var(--fg); font-weight: 600; }
+@container (min-width: 560px) {
+  .pair { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .pair .well-h { display: block; }
+  .pair[data-view] .rec, .pair[data-view] .exp { display: block; }
+  .card-h .seg { display: none; }
+}
+.xbar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--fg-muted); }
+.xbar button { border: 1px solid var(--border); background: var(--canvas); border-radius: 6px; min-width: 28px; height: 26px; cursor: pointer; color: var(--fg); }
+.xbar .xt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-b { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 4px; }
 .card-b strong { font-size: 14px; }
 .card-b p { margin: 0; color: var(--fg-muted); }
@@ -256,7 +273,46 @@ button { font: inherit; color: inherit; }
     if (!any) nav.appendChild(el('li', { class: 'muted', style: 'padding:8px', text: 'No flows in this view.' }));
   }
 
-  function card(sid, p) {
+  // The flow prototype's main path for one platform (D.expected, from may-app's paths): its steps in order, each with
+  // its rendered screen when there is one, played by the bar under it.
+  var timers = [];
+  function expectedSteps(x, p) {
+    var byN = {};
+    x.steps.forEach(function (s) { if (s.platform === p || (s.platform === 'both' && !byN[s.n])) byN[s.n] = s; });
+    return Object.keys(byN).map(Number).sort(function (a, b) { return a - b; }).map(function (n) { return byN[n]; });
+  }
+  function expectedWell(x, p) {
+    var steps = expectedSteps(x, p), at = 0, timer = null;
+    var ph = el('div', { class: 'phone', style: 'aspect-ratio: ' + (p === 'android' ? '412 / 915' : '393 / 852') });
+    var text = el('span', { class: 'xt' });
+    var play = el('button', { type: 'button', 'aria-label': 'Play the expected path' });
+    function show() {
+      var s = steps[at], src = (x.screens[p] || {})[String(s.n)];
+      ph.innerHTML = '';
+      ph.appendChild(src ? el('img', { src: src, alt: PL[p] + ' expected screen, step ' + s.n })
+        : el('div', { class: 'empty' }, [el('strong', { text: 'No picture for this step' }), s.expect]));
+      text.textContent = 'Step ' + (at + 1) + ' of ' + steps.length + ': ' + s.expect;
+      text.title = s.expect;
+    }
+    function stop() { if (timer) { clearInterval(timer); timer = null; } play.textContent = '▶'; }
+    function go(i) { at = (i + steps.length) % steps.length; show(); }
+    play.addEventListener('click', function () {
+      if (timer) { stop(); return; }
+      play.textContent = '❚❚';
+      timer = setInterval(function () { if (at + 1 >= steps.length) { stop(); return; } go(at + 1); }, 1500);
+      timers.push(function () { stop(); });
+    });
+    var prev = el('button', { type: 'button', 'aria-label': 'Previous step', text: '‹' });
+    var next = el('button', { type: 'button', 'aria-label': 'Next step', text: '›' });
+    prev.addEventListener('click', function () { stop(); go(at - 1); });
+    next.addEventListener('click', function () { stop(); go(at + 1); });
+    stop(); show();
+    return el('div', { class: 'exp' }, [el('div', { class: 'well-h', text: 'Expected' }), el('div', { class: 'player' }, [ph]),
+      el('div', { class: 'xbar' }, [prev, play, next, text])]);
+  }
+  function hasExpected(x, p) { return !!(x && expectedSteps(x, p).length); }
+
+  function card(sid, p, x) {
     var r = R(p + '/' + sid), st = r ? r.verdict : 'none';
     var ph = el('div', { class: 'phone', style: 'aspect-ratio: ' + (p === 'android' ? '720 / 1600' : '332 / 720') }), pl = el('div', { class: 'player' }, [ph]);
     if (r && r.preview) {
@@ -278,9 +334,19 @@ button { font: inherit; color: inherit; }
     }
     var links = el('div', { class: 'links' });
     if (r && r.video) { var dl = el('a', { class: 'btn btn-sm', href: r.video, target: '_blank', rel: 'noopener' }); dl.innerHTML = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.8L8 10.3l3.5-3.5M2.5 13.5h11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'; dl.appendChild(document.createTextNode('Download recording')); links.appendChild(dl); }
+    var media = pl, seg = null;
+    if (hasExpected(x, p)) {
+      media = el('div', { class: 'pair', 'data-view': 'recording' }, [el('div', { class: 'rec' }, [el('div', { class: 'well-h', text: 'Recording' }), pl]), expectedWell(x, p)]);
+      seg = el('span', { class: 'seg', role: 'group', 'aria-label': 'Show' });
+      ['recording', 'expected'].forEach(function (v) {
+        var b = el('button', { type: 'button', 'aria-pressed': String(v === 'recording'), text: v === 'recording' ? 'Recording' : 'Expected' });
+        b.addEventListener('click', function () { media.setAttribute('data-view', v); [].forEach.call(seg.childNodes, function (c) { c.setAttribute('aria-pressed', String(c === b)); }); });
+        seg.appendChild(b);
+      });
+    }
     return el('div', { class: 'card' }, [
-      el('div', { class: 'card-h' }, [PL[p], el('span', { class: 'label ' + st }, [icon(st), r ? (st === 'pass' ? 'Passed' : st === 'fail' ? 'Failed' : LBL[st]) : 'Not run'])]),
-      pl,
+      el('div', { class: 'card-h' }, [PL[p], seg, el('span', { class: 'label ' + st }, [icon(st), r ? (st === 'pass' ? 'Passed' : st === 'fail' ? 'Failed' : LBL[st]) : 'Not run'])]),
+      media,
       el('div', { class: 'card-b' }, [r && r.headline ? el('strong', { text: r.headline }) : null, r && r.note ? el('p', { text: r.note }) : null, links])
     ]);
   }
@@ -314,7 +380,9 @@ button { font: inherit; color: inherit; }
 
   function render() {
     var f = byId[current]; main.innerHTML = '';
+    timers.splice(0).forEach(function (t) { t(); });
     if (!f) return;
+    var x = (D.expected || {})[f.parent || f.id] || null;
     var content = el('div', { class: 'content' });
     var back = el('button', { type: 'button', class: 'btn back', text: '‹ All flows' });
     back.addEventListener('click', function () { split.classList.remove('detail'); window.scrollTo(0, 0); });
@@ -328,6 +396,9 @@ button { font: inherit; color: inherit; }
     content.appendChild(el('div', { class: 'd-title' }, [el('h2', { text: f.title }), el('span', { class: 'tally', text: tally })]));
     if (!f.scenarios.length) {
       content.appendChild(el('div', { class: 'card' }, [el('div', { class: 'card-b' }, [el('strong', { text: 'No recorded test yet' }), el('p', { text: 'This flow joins the nightly run once its test is written.' })])]));
+      if (x) content.appendChild(el('div', { class: 'cards' }, ['android', 'ios'].filter(function (p) { return hasExpected(x, p); }).map(function (p) {
+        return el('div', { class: 'card' }, [el('div', { class: 'card-h' }, [PL[p] + ' · expected']), expectedWell(x, p)]);
+      })));
     } else {
       var rows = kids(f).filter(function (c) { return c.scenario_row; });
       if (rows.length) {
@@ -340,7 +411,7 @@ button { font: inherit; color: inherit; }
       } else {
         var sid = f.scenarios[0];
         content.appendChild(history(sid));
-        content.appendChild(el('div', { class: 'cards' }, [card(sid, 'android'), card(sid, 'ios')]));
+        content.appendChild(el('div', { class: 'cards' }, [card(sid, 'android', x), card(sid, 'ios', x)]));
       }
     }
     var ol = null;

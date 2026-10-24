@@ -71,7 +71,8 @@ DEVICES = ("android", "ios")
 BOARD_INPUTS, BOARD, DROPPED = ("flows.json", "board-notes.json"), "may-device-board", ".dropped"
 DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.preview\.mp4|\.xml|"
                          r"\.diag\.txt)|report\.json|"
-                         + "|".join(re.escape(name) for name in BOARD_INPUTS))
+                         + "|".join(re.escape(name) for name in BOARD_INPUTS) + "|" + board.PATH_FILE.pattern + "|" +
+                         board.SHOT_FILE.pattern)
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS)
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
@@ -198,6 +199,11 @@ def extract(archive, members, destination):
             path.mkdir(mode=0o700)
             continue
         data = archive.extractfile(member).read()
+        # The flow prototypes' paths and screens are optional too: a bad one is dropped (board.py checks the rest).
+        if board.PATH_FILE.fullmatch(path.name) and not is_json(data) or \
+                board.SHOT_FILE.fullmatch(path.name) and (not data.startswith(PNG) or len(data) > board.MAX_SHOT):
+            dropped.append(path.name)
+            continue
         if path.name in BOARD_INPUTS and not is_json(data):
             # may-app's board files are optional: a malformed one costs the board its content, never the run.
             dropped.append(path.name)

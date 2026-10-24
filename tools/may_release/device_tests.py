@@ -41,12 +41,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -60,6 +62,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import board
 import device_agent
 from device_agent import AgentError
+import device_prototypes
 import flows
 from gate import AGE_RECIPIENT
 from prepare import head_revision
@@ -103,9 +106,46 @@ SESSION_SECONDS = 30 * 60
 # makes each MAESTRO_-prefixed variable a flow variable, so a flow reads it as ${MAESTRO_MAY_TEST_SESSION} (run
 # 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in).
 MAESTRO_SESSION = "MAESTRO_MAY_TEST_SESSION"
+# Maestro gets a home of its own under the runner's temp folder, never the runner's: its debug output holds each flow's
+# evaluated commands, the test session among them, and later steps run may-app code on the same runner. It is removed
+# at the run's end; on Android it carries the runner's adb key pair, which the emulator trusts. Maestro writes that
+# output under $XDG_STATE_HOME/maestro, else Java's user.home, which Java reads from the passwd entry, not $HOME (second
+# security review of #104), so maestro_isolation sets all three; any ~/.maestro/tests a run leaves is removed too.
+MAESTRO_HOME = "may-maestro-home"
+
+
+def maestro_home(root):
+    """A fresh, private HOME for Maestro (with the runner's adb keys when there are some)."""
+    home = root / MAESTRO_HOME
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(mode=0o700)
+    keys = Path.home() / ".android"
+    for name in ("adbkey", "adbkey.pub"):
+        if (keys / name).is_file() and not (keys / name).is_symlink():
+            (home / ".android").mkdir(mode=0o700, exist_ok=True)
+            shutil.copyfile(keys / name, home / ".android" / name)
+    return home
+
+
+def maestro_isolation(home):
+    """The environment that keeps Maestro's state and debug output in home: HOME, XDG_STATE_HOME and, through the
+    launcher's MAESTRO_OPTS, Java's user.home."""
+    return {"HOME": str(home), "XDG_STATE_HOME": str(home), "MAESTRO_OPTS": f"-Duser.home={home}"}
+
+
+def forget_maestro_home(root):
+    shutil.rmtree(root / MAESTRO_HOME, ignore_errors=True)
+    # Java's user.home (the passwd entry) and $HOME, in case either Maestro call ever wrote there.
+    for home in {Path(pwd.getpwuid(os.getuid()).pw_dir), Path.home()}:
+        shutil.rmtree(home / ".maestro" / "tests", ignore_errors=True)
+
+
 # may-app's subflow that taps a signed-in account through onboarding ("Hi, I'm May") to Chats, run before each agent
 # scenario: the shared test account lands in onboarding, not Chats (run 40046272749), and the agent starts from launch.
 ONBOARDING, ONBOARDING_SECONDS = "subflows/finish-onboarding.yaml", 180
+# A row whose "onboarding" is RECORD is the onboarding scenario itself: the subflow is not run before it, so its agent and
+# recording start at onboarding's first step. Only a fresh agent row may say so (the shared account is past onboarding).
+RECORD = "record"
 # Each device job has 120 minutes (device-tests.yml). Its build takes about 7, and after the scenarios come the judge
 # (up to device_agent.JUDGE_SECONDS for each agent scenario that ran), the seal and the handover. The scenarios and
 # their judging get RUN_BUDGET_SECONDS from the run step's start, so the job always seals and publishes what ran
@@ -231,6 +271,8 @@ def scenarios(selection="all", platform="android"):
                 and isinstance(row.get("title"), str) and
                 isinstance(row.get("platforms"), list) and set(row["platforms"]) <= set(PLATFORMS) and
                 isinstance(row.get("outward"), bool) and isinstance(row.get("fresh", False), bool) and
+                ("onboarding" not in row or row["onboarding"] == RECORD and driver == "agent" and
+                 row.get("fresh") is True) and
                 isinstance(row.get("server"), list) and
                 all(isinstance(c, dict) and isinstance(c.get("get"), str) and SERVER_PATH.fullmatch(c["get"]) and
                     c.get("expect") == 200 for c in row["server"])):
@@ -1022,14 +1064,19 @@ def cap(row, agent_seconds=device_agent.AGENT_SECONDS):
     """The longest a scenario may take: its Maestro flow's timeout, or the agent's."""
     if row["driver"] == "maestro":
         return FLOW_SECONDS
-    return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" else 0)
+    return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" and not records_onboarding(row) else 0)
+
+
+def records_onboarding(row):
+    """Whether the scenario records onboarding itself, so no subflow runs before it."""
+    return row.get("onboarding") == RECORD
 
 
 def finish_onboarding(row, source, platform, drive):
     """may-app's ONBOARDING subflow before an agent scenario, so the agent starts from Chats; drive(flow) is the
     platform's Maestro call, true when the flow passed. Without the subflow (an older may-app) or when it does not
-    pass, the agent starts where the app is, and the public log says so."""
-    if row["driver"] != "agent":
+    pass, the agent starts where the app is, and the public log says so. A row that records onboarding gets none."""
+    if row["driver"] != "agent" or records_onboarding(row):
         return
     flow, scenario = source / FLOWS_DIR / ONBOARDING, row["id"]
     if not flow.is_file() or flow.is_symlink():
@@ -1096,7 +1143,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         show_touches(adb, env, log, True)
         diagnostics = (diagnosed or Diagnostics)(adb, env)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
-                                ANDROID_HOME=str(flows.sdk()))
+                                ANDROID_HOME=str(flows.sdk()), **maestro_isolation(maestro_home(root)))
         budget = (budgeted or Budget)()
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
@@ -1184,6 +1231,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     finally:
         accounts.abandon(base)
         token = secret = ""
+        forget_maestro_home(root)
         show_touches(adb, env, log, False)
         emulator.terminate()
         try:
@@ -1386,6 +1434,42 @@ def ffmpeg_encoder(root, log):
     return encode
 
 
+def render_prototypes(copied=device_prototypes.copy_paths, rendered=device_prototypes.render):
+    """The flow prototypes' paths and expected screens (device_prototypes.py), into the Android run folder before the
+    seal. Its own step, with no secret, which the workflow also lets fail and bounds; nothing here ever fails the job."""
+    require_step_secrets(())
+    try:
+        root = runner_root()
+        runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
+        folder = runs[0] / "android" if len(runs) == 1 else None
+        if not (folder and folder.is_dir()):
+            made = failed = None
+        else:
+            copied(root / "may-source", folder)
+            scratch = root / "may-private" / "prototypes"
+            scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Outside the runner's home: the render user reads only this, and none of private.
+            private = (root, *(root / name for name in ("may-claude", "may-source", "may-private", MAESTRO_HOME)),
+                       *(home / name for home in {Path(pwd.getpwuid(os.getuid()).pw_dir), Path.home()}
+                         for name in (".maestro", ".android")))
+            parent = Path(tempfile.mkdtemp(prefix="may-render-"))
+            try:
+                made, failed = rendered(root / "may-source", folder, parent / "prototypes", scratch, private=private)
+            finally:
+                # The stage itself is removed by the render; its empty temporary folder goes here.
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
+    except Exception:
+        print("May device tests (android): no prototype screens (an error stopped them; the seal goes on)")
+        return
+    if made is None:
+        print("May device tests (android): no prototype screens (no named path, or the build or Chrome is unavailable)")
+    else:
+        print(f"May device tests (android): {made} prototype screens rendered, {failed} failed")
+
+
 def make_previews(platform="android", encoder=None):
     """A PREVIEW_WIDTH-wide, silent preview of each scenario's recording, beside it in the run folder before the seal.
     Its own step, with no secret, which the workflow also lets fail (continue-on-error) and bounds (timeout-minutes),
@@ -1499,7 +1583,7 @@ def verdict(platform="android"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("build", "run", "judge", "previews", "seal", "verdict"))
+    parser.add_argument("command", choices=("build", "run", "judge", "previews", "prototypes", "seal", "verdict"))
     parser.add_argument("--scenarios", default="all")
     parser.add_argument("--platform", choices=PLATFORMS, default="android")
     args = parser.parse_args()
@@ -1518,7 +1602,7 @@ if __name__ == "__main__":
             build()
         else:
             {"judge": lambda: judge_scenarios(platform=args.platform), "seal": lambda: seal(args.platform),
-             "previews": lambda: make_previews(args.platform),
+             "previews": lambda: make_previews(args.platform), "prototypes": render_prototypes,
              "verdict": lambda: verdict(args.platform)}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None

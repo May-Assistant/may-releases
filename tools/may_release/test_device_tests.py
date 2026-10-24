@@ -152,8 +152,8 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "notes", "poll",
-                               "poll-skip", "routines"])
+        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "onboarding", "chat", "notes",
+                               "poll", "poll-skip", "routines"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ids, "both devices run all")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
@@ -213,6 +213,24 @@ class ScenarioTests(unittest.TestCase):
                 path.write_text(json.dumps([dict(agent, **change)]))
                 with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
                     device_tests.scenarios()
+
+    def test_only_a_fresh_agent_row_records_onboarding(self):
+        onboarding = device_tests.scenarios("onboarding")[0]
+        self.assertEqual((onboarding["driver"], onboarding["fresh"], onboarding["onboarding"]),
+                         ("agent", True, device_tests.RECORD))
+        for row, change in ((onboarding, {"fresh": False}), (onboarding, {"onboarding": "skip"}),
+                            (onboarding, {"onboarding": True}), (dict(onboarding), {"fresh": None}),
+                            (device_tests.scenarios("sign-in")[0], {"fresh": True, "onboarding": "record"})):
+            row = {key: value for key, value in dict(row, **change).items() if value is not None}
+            with self.subTest(change=change, driver=row["driver"]), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "s.json"
+                path.write_text(json.dumps([row]))
+                with patch("device_tests.SCENARIOS", path):
+                    try:
+                        device_tests.scenarios()
+                    except DeviceTestsError:
+                        continue
+                self.fail(f"a row with {change} was accepted")
 
 
 class FakeReply(io.BytesIO):
@@ -386,6 +404,9 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(device_tests.cap({"driver": "agent"}, device_agent.IOS_AGENT_SECONDS),
                          device_agent.IOS_AGENT_SECONDS + device_tests.ONBOARDING_SECONDS)
         self.assertEqual(device_tests.cap({"driver": device_tests.SMOKE}), device_agent.AGENT_SECONDS)
+        # The row that records onboarding runs no subflow, so its cap holds none.
+        self.assertEqual(device_tests.cap({"driver": "agent", "onboarding": device_tests.RECORD}),
+                         device_agent.AGENT_SECONDS)
 
     def test_the_budget_leaves_the_job_time_to_build_seal_and_publish(self):
         workflow = (Path(device_tests.__file__).parent.parent.parent / ".github/workflows/device-tests.yml").read_text()
@@ -452,6 +473,12 @@ class OnboardingTests(unittest.TestCase):
                 self.assertEqual(self.finish({"id": "chat", "driver": "agent"}, passed)[1],
                                  "May device tests (android): chat: the onboarding subflow did not pass; the agent "
                                  "starts where it stopped\n")
+
+    def test_the_row_that_records_onboarding_gets_no_subflow(self):
+        self.flow.write_text("appId: x\n")
+        row = device_tests.scenarios("onboarding")[0]
+        self.assertEqual(self.finish(row), ([], ""), "the subflow would skip the onboarding being recorded")
+        self.assertEqual(self.finish(dict(row, id="chat", onboarding=None)), ([self.flow], ""))
 
 
 class FlowIdTests(unittest.TestCase):
@@ -698,6 +725,37 @@ class RunTests(unittest.TestCase):
         (self.source / "android/app/src/main/SignIn.kt").write_text('val tag = "demo-sign-in"\n')
         _, report, _, _ = self.run_it()
         self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass", "the app has the id: it runs")
+
+    def test_maestro_keeps_its_debug_output_out_of_the_runners_home_and_it_is_removed(self):
+        """The coordinator's review of #104: Maestro records each flow's evaluated commands (the test session among
+        them) under HOME/.maestro, and a later step runs may-app code on the same runner."""
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        self.run_it()
+        home = str(self.root / "may-maestro-home")
+        isolated = {(env.get("HOME"), env.get("XDG_STATE_HOME"), env.get("MAESTRO_OPTS")) for env in self.maestro_envs}
+        self.assertEqual(isolated, {(home, home, "-Duser.home=" + home)},
+                         "every Maestro call, with or without a session: Java reads user.home from passwd, not HOME")
+        self.assertFalse((self.root / "may-maestro-home").exists(), "removed at the run's end")
+
+    def test_a_maestro_tests_folder_in_the_runners_own_home_is_removed_too(self):
+        """Second security review of #104: Maestro 2.8.0 falls back to user.home/.maestro/tests."""
+        with tempfile.TemporaryDirectory() as directory:
+            root, passwd, home = (Path(directory) / name for name in ("root", "passwd", "home"))
+            for folder in (root / "may-maestro-home", passwd / ".maestro" / "tests", home / ".maestro" / "tests"):
+                folder.mkdir(parents=True)
+            (passwd / ".maestro" / "tests" / "commands.json").write_text("{}")
+            (passwd / ".maestro" / "config").write_text("kept")
+
+            class Entry:
+                pw_dir = str(passwd)
+
+            with patch("device_tests.pwd.getpwuid", return_value=Entry()), \
+                    patch("device_tests.Path.home", return_value=home):
+                device_tests.forget_maestro_home(root)
+            self.assertFalse((root / "may-maestro-home").exists())
+            self.assertFalse((passwd / ".maestro" / "tests").exists(), "the passwd home, which Java reads")
+            self.assertFalse((home / ".maestro" / "tests").exists(), "and $HOME's")
+            self.assertTrue((passwd / ".maestro" / "config").is_file(), "only the debug output goes")
 
     def test_flow_tags_reads_the_header_alone(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1344,6 +1402,27 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(lines[-1], "May device tests: the flow board is device-tests/board/ in may-renders, without "
                                     "notes (may-app's board-notes.json is malformed)")
         self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
+
+    def test_the_flow_prototypes_reach_the_board_and_a_bad_one_never_stops_the_publish(self):
+        flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
+        path = {"flow": "sign-in-out", "board": "2", "cases": [{"id": "main", "name": "Sign in", "goal": "Sign in."}],
+                "steps": [{"n": 1, "platform": "both", "action": "assert", "target": {"id": "demo-signin"},
+                           "expect": "The sign-in screen."}]}
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        try:
+            self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
+                                        (RUN + "/android/path-2.json", json.dumps(path).encode()),
+                                        (RUN + "/android/path-3.json", b'{"flow": '),
+                                        (RUN + "/android/proto-2-android-1.png", png),
+                                        (RUN + "/android/proto-2-ios-1.png", b"GIF89a not a png")])
+        except publish.PublishError as error:
+            self.fail(f"a bad prototype file stopped device-open: {error}")
+        work, _, _ = self.push_for_board()
+        page = (work / "device-tests" / "board" / "index.html").read_text()
+        data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
+        self.assertEqual(data["expected"]["2"]["screens"], {"android": {"1": "expected/2/android/1.png"}, "ios": {}})
+        self.assertEqual((work / "device-tests" / "board" / "expected" / "2" / "android" / "1.png").read_bytes(), png)
+        self.assertNotIn("3", data["expected"], "the malformed path is dropped")
 
     def test_deeply_nested_may_app_json_never_stops_the_publish(self):
         """Re-review of #86: 200,000 "[" raised RecursionError, which escaped extract() and stopped device-open."""
