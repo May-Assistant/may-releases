@@ -1194,7 +1194,7 @@ def renders_workflow_problems(text):
 RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)",
                         "not_ios", "len(entries)"}
 PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices",
-                        "uploaded", "kept", "removed"}
+                        "uploaded", "kept", "removed", "previews"}
 
 
 def renders_print_problems(root):
@@ -1222,7 +1222,7 @@ DEVICE_RUNS = [
     "python3 -I -S -B tools/may_release/toolchain.py age",
     'python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"',
     DEVICE_TOOL + "build", "|", DEVICE_TOOL + 'run --scenarios "$MAY_SCENARIOS"', DEVICE_TOOL + "judge",
-    DEVICE_TOOL + "seal", DEVICE_TOOL + "verdict",
+    DEVICE_TOOL + "previews", DEVICE_TOOL + "seal", DEVICE_TOOL + "verdict",
     'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
     '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-avd" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
     '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
@@ -1230,7 +1230,7 @@ DEVICE_RUNS = [
     "python3 -I -S -B tools/may_release/toolchain.py age",
     'python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"',
     IOS_TOOL.format("build"), DEVICE_TOOL + 'run --platform ios --scenarios "$MAY_SCENARIOS"',
-    IOS_TOOL.format("judge"), IOS_TOOL.format("seal"), IOS_TOOL.format("verdict"),
+    IOS_TOOL.format("judge"), IOS_TOOL.format("previews"), IOS_TOOL.format("seal"), IOS_TOOL.format("verdict"),
     'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
     '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
     '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
@@ -1252,6 +1252,11 @@ DEVICE_DOWNLOAD = ("name: may-device-{}-${{{{ github.run_attempt }}}}\n"
                    "          path: ${{{{ runner.temp }}}}/may-device-download\n")
 DEVICE_CONDITIONS = ["if: always()", "if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}",
                      "if: always()"]
+# The previews step (the flow board's): optional and bounded in each device job, so the seal always runs after it.
+PREVIEW_STEP = ("      - name: Make a 270px preview of each recording, with no secret\n"
+                "        # Optional and bounded: the seal and the handover always run after it.\n"
+                "        continue-on-error: true\n        timeout-minutes: 25\n"
+                "        run: python3 -I -S -B tools/may_release/device_tests.py previews{}\n")
 DEVICE_SIGNIN = "MAY_TEST_SIGNIN_SECRET"
 DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"
 # The repository's Claude token (as claude-code-review.yml's): each device job's agent (its scenarios step) and judge
@@ -1318,7 +1323,9 @@ def device_tests_workflow_problems(text):
             any(DEVICE_DOWNLOAD.format(device) not in job_text(text, "publish") for device in ("android", "ios")):
         found.append(name + "hands over something other than exactly one encrypted report per device")
     if re.findall(r"(?m)^\s+(if: .+)$", text) != DEVICE_CONDITIONS or re.search(r"(?m)^\s*(defaults|shell):", text) or \
-            text.count("continue-on-error: true") != 2 or \
+            text.count("continue-on-error: true") != 4 or \
+            any(PREVIEW_STEP.format(platform) not in job_text(text, job)
+                for job, platform in (("android", ""), ("ios", " --platform ios"))) or \
             re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["120", "120", "30"]:
         found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
     steps = {job: dict(job_steps(text, job)[1]) for job in jobs}
@@ -1357,6 +1364,7 @@ def device_tests_workflow_problems(text):
 
 
 DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count", "platform",
+                       "made",
                        "smoke_passed", "stage", "detail"}
 
 

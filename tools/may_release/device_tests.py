@@ -717,6 +717,106 @@ def smoke_rows(platform):
     return scenarios(",".join(ids), platform) if ids else []
 
 
+# The flow board's previews (board.py): made here, in the device job that already runs may-app code, never in the
+# publish job that holds the publish secrets (review of may-releases #88). A dot is never in a scenario id, so a
+# preview never shares a name with a recording; publish.py only checks and uploads them.
+PREVIEW, PREVIEW_WIDTH, PREVIEW_SECONDS = ".preview.mp4", 270, 300
+MAX_PREVIEW = 20 * 1024 * 1024
+
+
+def preview_sources(folder):
+    """(scenario, recording) for each scenario the device report recorded, keyed by the report's own rows (never
+    worked out from a file name, which an id ending "-partN" would confuse): its first recording."""
+    try:
+        rows = json.loads((folder / "report.json").read_text())["scenarios"]
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return
+    for row in rows if isinstance(rows, list) else []:
+        videos = row.get("videos") if isinstance(row, dict) else None
+        if not (isinstance(row.get("id") if isinstance(row, dict) else None, str) and SCENARIO_ID.fullmatch(row["id"])
+                and isinstance(videos, list) and videos and isinstance(videos[0], str)):
+            continue
+        video = folder / videos[0]
+        if video.parent == folder and video.suffix == ".mp4" and video.is_file() and not video.is_symlink():
+            yield row["id"], video
+
+
+def ffmpeg_encoder(root, log):
+    """Ubuntu's ffmpeg from apt (its current, patched build; apt checks the archive's signature): the function that
+    makes one preview. Raises DeviceTestsError when it will not install."""
+    env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C"}
+    for argv in (["sudo", "apt-get", "update", "-qq"],
+                 ["sudo", "apt-get", "install", "-y", "-qq", "--no-install-recommends", "ffmpeg"]):
+        if flows.run_private(argv, log, env=env, check=False, timeout=600):
+            raise DeviceTestsError("ffmpeg did not install")
+
+    def encode(video, target):
+        return not flows.run_private(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(video), "-an", "-vf",
+             f"scale={PREVIEW_WIDTH}:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "32", "-pix_fmt",
+             "yuv420p", "-movflags", "+faststart", "-n", str(target)], log, env=env, check=False,
+            timeout=PREVIEW_SECONDS)
+    return encode
+
+
+def make_previews(platform="android", encoder=None):
+    """A PREVIEW_WIDTH-wide, silent preview of each scenario's recording, beside it in the run folder before the seal.
+    Its own step, with no secret, which the workflow also lets fail (continue-on-error) and bounds (timeout-minutes),
+    so the seal always runs. Nothing here ever fails the job: a preview that will not make is left out, and the board
+    shows the end screen instead."""
+    require_step_secrets(())
+    try:
+        made, failed = previews_in(platform, encoder)
+    except Exception:
+        print(f"May device tests ({platform}): no previews (an error stopped them; the seal goes on)")
+        return
+    if made is None:
+        print(f"May device tests ({platform}): no recordings, so no previews")
+    elif failed is None:
+        print(f"May device tests ({platform}): no previews (the encoder is unavailable)")
+    else:
+        print(f"May device tests ({platform}): {made} previews made, {failed} failed")
+
+
+def previews_in(platform, encoder):
+    """(made, failed); (None, None) with no recording; (0, None) when the encoder is unavailable."""
+    root = runner_root()
+    runs = [path for path in (root / OUT).iterdir() if path.is_dir()] if (root / OUT).is_dir() else []
+    folder = runs[0] / platform if len(runs) == 1 else None
+    sources = list(preview_sources(folder)) if folder else []
+    if not sources:
+        return None, None
+    log = root / "may-private" / "previews.log"
+    log.parent.mkdir(mode=0o700, exist_ok=True)
+    try:
+        if encoder is None:
+            if platform == "ios":
+                sys.modules.setdefault("device_tests", sys.modules[__name__])
+                import device_ios
+                encoder = device_ios.preview_encoder(log)
+            else:
+                encoder = ffmpeg_encoder(root, log)
+    except Exception:
+        return 0, None
+    made = failed = 0
+    for scenario, video in sources:
+        target = folder / (scenario + PREVIEW)
+        try:
+            ok = encoder(video, target) and target.is_file() and not target.is_symlink() and \
+                target.stat().st_size <= MAX_PREVIEW and target.read_bytes()[4:8] == b"ftyp"
+        except Exception:
+            ok = False
+        if ok:
+            made += 1
+        else:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            failed += 1
+    return made, failed
+
+
 def seal(platform="android"):
     """One tar of the run folder, encrypted to MAY_RENDERS_RECIPIENT; nothing in the clear leaves the runner."""
     require_step_secrets(())
@@ -764,7 +864,7 @@ def verdict(platform="android"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("build", "run", "judge", "seal", "verdict"))
+    parser.add_argument("command", choices=("build", "run", "judge", "previews", "seal", "verdict"))
     parser.add_argument("--scenarios", default="all")
     parser.add_argument("--platform", choices=PLATFORMS, default="android")
     args = parser.parse_args()
@@ -783,6 +883,7 @@ if __name__ == "__main__":
             build()
         else:
             {"judge": lambda: judge_scenarios(platform=args.platform), "seal": lambda: seal(args.platform),
+             "previews": lambda: make_previews(args.platform),
              "verdict": lambda: verdict(args.platform)}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None
