@@ -124,9 +124,11 @@ class RunTests(Workspace):
                 Path(argv[-1]).write_bytes(png())
             return Done(1 if maestro_fails and "test" in argv and "--device" in argv else 0)
 
-        def mint(base, secret):
-            minted.append(secret)
+        def mint(base, secret, fresh=False):
+            minted.append("fresh" if fresh else secret)
             return TOKEN + str(len(minted))
+
+        self.deleted = []
 
         environ = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin", **(env or {})}
@@ -141,6 +143,7 @@ class RunTests(Workspace):
                                      cleaned=lambda base, token, since, tag: 2,
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
                                      install=lambda root: root / "may-claude" / "claude", budgeted=budgeted,
+                                     deleted_by=lambda base, token: self.deleted.append(token) or True,
                                      delivered=lambda base, token, tag: self.delivered.append(token) or
                                      [device_tests.NONE_STORED])
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
@@ -226,6 +229,39 @@ class RunTests(Workspace):
         self.assertEqual(self.delivered, [TOKEN + "1", TOKEN + "2"], "each scenario's messages, with its own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]], [[device_tests.NONE_STORED]] * 2)
         self.assertIn("May device tests (ios): the test session's cleanup removed 2 tagged items", out)
+
+    def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
+        """Run 40046272749: the shared account lands in onboarding, not Chats; may-app's subflow taps through it."""
+        (self.source / device_tests.FLOWS_DIR / "subflows").mkdir()
+        subflow = self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING
+        subflow.write_text("appId: x\n")
+        order = []
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            order.append("agent")
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        calls, _, _, out, _ = self.run_it(
+            selection="chat", agent=agent,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
+        tests = [argv for argv, _ in calls if argv[0] == "/fake/maestro"]
+        self.assertEqual(tests, [["/fake/maestro", "--device", UDID, "test", str(subflow)]])
+        self.assertEqual(self.maestro_timeouts, [device_tests.ONBOARDING_SECONDS])
+        self.assertEqual(order, ["agent"])
+        self.assertNotIn("onboarding subflow", out, "a subflow that passed says nothing")
+
+    def test_fresh_scenarios_delete_their_own_accounts_on_ios_too(self):
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        _, minted, report, out, _ = self.run_it(
+            selection="chat,poll", agent=agent,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5",
+                 device_tests.FRESH: "all"})
+        self.assertEqual(minted, ["fresh", "fresh"], "no shared session, not even for a cleanup")
+        self.assertEqual(self.deleted, [TOKEN + "1", TOKEN + "2"])
+        self.assertIn("May device tests (ios): 2 fresh test accounts were deleted by their cleanup", out)
+        self.assertNotIn("the test session's cleanup", out)
 
     def test_refusals(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),

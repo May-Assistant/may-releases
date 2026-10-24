@@ -80,6 +80,7 @@ jobs:
           MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
           MAY_DEVICE_TESTS_OUTWARD: ${{ vars.MAY_DEVICE_TESTS_OUTWARD }}
           MAY_DEVICE_TESTS_SKIP: ${{ vars.MAY_DEVICE_TESTS_SKIP }}
+          MAY_DEVICE_TESTS_FRESH: ${{ vars.MAY_DEVICE_TESTS_FRESH }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}
         run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"
@@ -141,6 +142,7 @@ jobs:
           MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
           MAY_DEVICE_TESTS_OUTWARD: ${{ vars.MAY_DEVICE_TESTS_OUTWARD }}
           MAY_DEVICE_TESTS_SKIP: ${{ vars.MAY_DEVICE_TESTS_SKIP }}
+          MAY_DEVICE_TESTS_FRESH: ${{ vars.MAY_DEVICE_TESTS_FRESH }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}
         run: python3 -I -S -B tools/may_release/device_tests.py run --platform ios --scenarios "$MAY_SCENARIOS"
