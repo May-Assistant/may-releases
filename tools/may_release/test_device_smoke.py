@@ -18,7 +18,7 @@ from device_tests import DeviceTestsError
 import publish
 from test_device_agent import MODEL, OAUTH, record
 from test_device_ios import Done, FakeRecorder as FakeIosRecorder, UDID
-from test_device_tests import FakeRecorder, MP4, RECIPIENT, RUN, SHA, TOKEN, device_tar
+from test_device_tests import FLOW, FakeRecorder, MP4, RECIPIENT, RUN, SHA, TOKEN, device_tar
 from test_renders import png
 
 NO_STAGING = {"MAY_TEST_SIGNIN_SECRET": None, "MAY_STAGING_API_URL": None}
@@ -32,7 +32,7 @@ class Workspace(unittest.TestCase):
         (self.source / "android/app/build/outputs/apk/playground/debug").mkdir(parents=True)
         (self.source / device_tests.APK).write_bytes(b"apk")
         (self.source / device_tests.FLOWS_DIR).mkdir(parents=True)
-        (self.source / device_tests.FLOWS_DIR / "sign-in.yaml").write_text("appId: x\n")
+        (self.source / device_tests.FLOWS_DIR / "sign-in.yaml").write_text(FLOW)
         app = self.root / device_ios.APP
         app.mkdir(parents=True)
         (app / "Info.plist").write_bytes(b"plist")
