@@ -37,6 +37,32 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/device-tests.yml"
 RECIPIENT = "age1" + "q" * 58
 TOKEN = "session-token-" + "x" * 30
+
+
+def no_network(opener, request, *args, **kwargs):
+    url = getattr(request, "full_url", str(request))
+    raise AssertionError("a device test reached the network: " + url.split("?")[0])
+
+
+def network_tripwire():
+    """For each device test module's setUpModule: every real urlopen (OpenerDirector.open, which the readers' bound
+    defaults reach too) fails the test, so a reader a test forgot to fake never calls staging."""
+    return patch("urllib.request.OpenerDirector.open", no_network)
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
+
+
+# Marks a line the fake adb shell read on stdin, in a run's recorded calls: never an argument.
+STDIN = "<adb shell stdin>"
 # A flow written for both devices, as may-app tags it.
 FLOW = "appId: x\nname: A flow\ntags:\n  - android\n  - ios\n---\n- launchApp\n"
 MP4 = b"\0\0\0\x18ftypmp42" + b"\0" * 32
@@ -397,6 +423,8 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.adb_shell", side_effect=lambda adb, env, log, line: calls.append(
+                    [STDIN, *line.split()]) or 0), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \
@@ -440,7 +468,10 @@ class RunTests(unittest.TestCase):
     def test_signs_in_runs_each_flow_records_and_reports(self):
         calls, report, out, run = self.run_it()
         start = [argv for argv in calls if "start" in argv][0]
+        self.assertEqual(start[0], STDIN, "the start is read on adb shell's stdin")
         self.assertEqual(start[-3:], ["--es", "may_test_session", TOKEN])
+        argvs = [argv for argv in calls if argv[0] != STDIN]
+        self.assertNotIn(TOKEN, json.dumps(argvs), "the session is in no argument the job builds")
         self.assertEqual([row["id"] for row in report["scenarios"]], ["sign-in", "connections"])
         sign_in, connections = report["scenarios"]
         self.assertEqual((sign_in["verdict"], sign_in["videos"], sign_in["screenshots"]),
@@ -543,12 +574,14 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.adb_shell", return_value=0), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.device_agent.settings", return_value=("t", "m")), \
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", return_value=None), \
                 patch("device_tests.head_revision", return_value=SHA), patch("sys.stdout", new_callable=io.StringIO):
             device_tests.run_scenarios("chat", minted=lambda base, secret: TOKEN, agent=agent,
-                                       install=lambda root: root / "claude", cleaned=lambda *args: 0)
+                                       install=lambda root: root / "claude", cleaned=lambda *args: 0,
+                                       delivered=lambda *args: None)
         driven = [argv for argv, _ in calls if argv[0] in ("/fake/maestro", "agent")]
         self.assertEqual(driven, [["/fake/maestro", "--device", device_tests.SERIAL, "test",
                                    str(self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING)], ["agent"]])

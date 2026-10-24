@@ -18,6 +18,18 @@ import device_tests
 from device_tests import DeviceTestsError
 from test_device_agent import OAUTH, fake_cli_package
 from test_device_smoke import NO_STAGING, Workspace
+from test_device_tests import network_tripwire
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
 
 TOOL = Path(device_tests.__file__)
 
@@ -66,6 +78,7 @@ class FailureLineTests(Workspace):
             with self.environ(NO_STAGING), patch("device_tests.boot", return_value=("/sdk/adb", Emulator(), {})), \
                     patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                     patch("device_tests.flows.run_private", return_value=0), \
+                    patch("device_tests.adb_shell", return_value=0), \
                     patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                     patch("device_tests.Recorder"), patch("device_tests.head_revision", return_value="a" * 40):
                 device_tests.run_scenarios("smoke", agent=broken, install=lambda root: root / "claude")
@@ -110,31 +123,68 @@ class AndroidLaunchTests(unittest.TestCase):
     """Smoke run 39677407348 failed at "smoke: launching the app": the start now names MainActivity, retries once."""
 
     def launch(self, token, codes):
-        calls, slept = [], []
+        self.argvs, starts, slept = [], [], []
 
         def private(argv, log, *, cwd=None, env=None, check=True, timeout=None):
-            calls.append(list(argv))
-            if check:
-                self.fail("a start that fails must not raise a tool error: " + " ".join(argv[2:4]))
-            return codes.pop(0) if "start" in argv else 0
+            self.argvs.append(list(argv))
+            return 0
+
+        def shell(adb, env, log, line):
+            self.argvs.append([adb, "shell"])
+            starts.append(line)
+            return codes.pop(0)
 
         with patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.adb_shell", side_effect=shell), \
                 patch("device_tests.flows.sleep", side_effect=slept.append):
             try:
                 device_tests.launch("/sdk/adb", {}, token, Path("/dev/null"))
                 raised = None
             except DeviceTestsError as error:
                 raised = error.args[0]
-        return [argv for argv in calls if "start" in argv], slept, raised
+        return starts, slept, raised
 
     def test_the_start_names_main_activity_with_or_without_a_session(self):
-        starts, slept, raised = self.launch("token-" + "x" * 30, [0])
-        self.assertEqual(starts, [["/sdk/adb", "shell", "am", "start", "-W", "-n",
-                                   "io.github.mayassistant.may.playground/io.github.mayassistant.may.MainActivity",
-                                   "--es", "may_test_session", "token-" + "x" * 30]])
+        token = "token-" + "x" * 30
+        starts, slept, raised = self.launch(token, [0])
+        self.assertEqual(starts, ["am start -W -n io.github.mayassistant.may.playground/io.github.mayassistant.may."
+                                  "MainActivity --es may_test_session " + token + "\n"])
         self.assertEqual((slept, raised), ([], None))
+        self.assertNotIn(token, json.dumps(self.argvs), "the session is in no argument the runner's process list shows")
         starts, _, _ = self.launch("", [0])
-        self.assertEqual(starts[0][-2:], ["-n", device_tests.APP_ID + "/" + device_tests.ACTIVITY])
+        self.assertEqual(starts[0], "am start -W -n " + device_tests.APP_ID + "/" + device_tests.ACTIVITY + "\n")
+
+    def test_a_hung_start_is_a_failed_attempt_and_retried_once(self):
+        def run(argv, **kwargs):
+            if not hasattr(run, "hung"):
+                run.hung = True
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        slept, real = [], device_tests.adb_shell
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "log"
+            with patch("device_tests.flows.run_private", return_value=0), \
+                    patch("device_tests.flows.sleep", side_effect=slept.append), \
+                    patch("device_tests.adb_shell", side_effect=lambda adb, env, log_, line: real(adb, env, log_, line, run=run)):
+                try:
+                    device_tests.launch("/sdk/adb", {}, "token-" + "x" * 30, log)
+                except subprocess.TimeoutExpired:
+                    self.fail("a hung start stopped the run instead of counting as a failed attempt")
+            self.assertEqual(slept, [device_tests.LAUNCH_RETRY_SECONDS], "one retry after the hung attempt")
+            self.assertIn(b"adb shell timed out", log.read_bytes())
+
+    def test_adb_shell_takes_the_line_on_stdin_alone(self):
+        seen = {}
+
+        def run(argv, **kwargs):
+            seen.update(argv=argv, input=kwargs.get("input"), stdin=kwargs.get("stdin"))
+            return subprocess.CompletedProcess(argv, 3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            code = device_tests.adb_shell("/sdk/adb", {}, Path(directory) / "log", "am start x --es k secret\n", run=run)
+        self.assertEqual((code, seen), (3, {"argv": ["/sdk/adb", "shell"], "input": b"am start x --es k secret\n",
+                                             "stdin": None}))
 
     def test_one_retry_then_a_readable_stop(self):
         starts, slept, raised = self.launch("", [1, 0])

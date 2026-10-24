@@ -17,8 +17,19 @@ import device_ios
 import device_tests
 from device_tests import DeviceTestsError
 import renders
-from test_device_tests import FLOW, MP4, SHA, TOKEN
+from test_device_tests import network_tripwire, FLOW, MP4, SHA, TOKEN
 from test_renders import png
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
 
 UDID = "0A1B2C3D-0000-4000-8000-000000000001"
 

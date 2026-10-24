@@ -18,8 +18,19 @@ from device_tests import DeviceTestsError
 import publish
 from test_device_agent import MODEL, OAUTH, record
 from test_device_ios import Done, FakeRecorder as FakeIosRecorder, UDID
-from test_device_tests import FLOW, FakeRecorder, MP4, RECIPIENT, RUN, SHA, TOKEN, device_tar
+from test_device_tests import network_tripwire, FLOW, STDIN, FakeRecorder, MP4, RECIPIENT, RUN, SHA, TOKEN, device_tar
 from test_renders import png
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
 
 NO_STAGING = {"MAY_TEST_SIGNIN_SECRET": None, "MAY_STAGING_API_URL": None}
 
@@ -88,6 +99,8 @@ class Workspace(unittest.TestCase):
         with self.environ(env), patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.adb_shell", side_effect=lambda adb, env, log, line: self.calls.append(
+                    [STDIN, *line.split()]) or 0), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \

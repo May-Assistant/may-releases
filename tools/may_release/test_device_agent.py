@@ -21,8 +21,19 @@ import device_tests
 import publish
 import review
 import store
-from test_device_tests import FakeRecorder, SHA, TOKEN
+from test_device_tests import network_tripwire, STDIN, FakeRecorder, SHA, TOKEN
 from test_renders import png
+
+
+TRIPWIRE = network_tripwire()
+
+
+def setUpModule():
+    TRIPWIRE.start()
+
+
+def tearDownModule():
+    TRIPWIRE.stop()
 
 OAUTH = "sk-ant-oat01-" + "o" * 40
 MODEL = "claude-sonnet-5-5"
@@ -107,6 +118,8 @@ class AgentRunTests(unittest.TestCase):
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.adb_shell", side_effect=lambda adb, env, log, line: calls.append(
+                    [STDIN, *line.split()]) or 0), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \
