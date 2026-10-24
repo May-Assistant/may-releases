@@ -235,6 +235,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                                                timeout=device_tests.FLOW_SECONDS).returncode
                 except subprocess.SubprocessError:
                     passed = False
+            device_tests.finish_onboarding(row, source, "ios", lambda path: not renders.quiet(
+                [str(launcher), "--device", udid, "test", str(path)], log,
+                env=dict(env, MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true"),
+                timeout=device_tests.ONBOARDING_SECONDS).returncode)
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),

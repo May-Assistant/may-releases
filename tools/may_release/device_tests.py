@@ -92,6 +92,9 @@ TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{20,4096}")
 # Recordings: about 720p at about 1 Mbps, in screenrecord's 3-minute chunks: under 25 MB a chunk.
 RECORD_SIZE, RECORD_BITRATE, RECORD_SECONDS = "720x1600", "1000000", 180
 FLOW_SECONDS = 600
+# may-app's subflow that taps a signed-in account through onboarding ("Hi, I'm May") to Chats, run before each agent
+# scenario: the shared test account lands in onboarding, not Chats (run 40046272749), and the agent starts from launch.
+ONBOARDING, ONBOARDING_SECONDS = "subflows/finish-onboarding.yaml", 180
 # Each device job has 120 minutes (device-tests.yml). Its build takes about 7, and after the scenarios come the judge
 # (up to device_agent.JUDGE_SECONDS for each agent scenario that ran), the seal and the handover. The scenarios and
 # their judging get RUN_BUDGET_SECONDS from the run step's start, so the job always seals and publishes what ran
@@ -467,7 +470,30 @@ class Budget:
 
 def cap(row, agent_seconds=device_agent.AGENT_SECONDS):
     """The longest a scenario may take: its Maestro flow's timeout, or the agent's."""
-    return FLOW_SECONDS if row["driver"] == "maestro" else agent_seconds
+    if row["driver"] == "maestro":
+        return FLOW_SECONDS
+    return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" else 0)
+
+
+def finish_onboarding(row, source, platform, drive):
+    """may-app's ONBOARDING subflow before an agent scenario, so the agent starts from Chats; drive(flow) is the
+    platform's Maestro call, true when the flow passed. Without the subflow (an older may-app) or when it does not
+    pass, the agent starts where the app is, and the public log says so."""
+    if row["driver"] != "agent":
+        return
+    flow, scenario = source / FLOWS_DIR / ONBOARDING, row["id"]
+    if not flow.is_file() or flow.is_symlink():
+        print(f"May device tests ({platform}): {scenario}: may-app has no onboarding subflow; the agent starts "
+              "from launch")
+        return
+    at(f"{scenario}: onboarding subflow")
+    try:
+        passed = drive(flow)
+    except subprocess.SubprocessError:
+        passed = False
+    if not passed:
+        print(f"May device tests ({platform}): {scenario}: the onboarding subflow did not pass; the agent starts "
+              "where it stopped")
 
 
 def settle(entry, row, passed):
@@ -548,6 +574,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                          str(folder / (row["id"] + ".xml"))], log, env=maestro_env, check=False, timeout=FLOW_SECONDS)
                 except subprocess.TimeoutExpired:
                     passed = False
+            finish_onboarding(row, source, "android", lambda path: not flows.run_private(
+                [str(launcher), "--device", SERIAL, "test", str(path)], log, env=maestro_env, check=False,
+                timeout=ONBOARDING_SECONDS))
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL}

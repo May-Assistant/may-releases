@@ -223,9 +223,12 @@ class BudgetTests(unittest.TestCase):
 
     def test_each_platform_caps_a_scenario_by_its_own_timeout(self):
         self.assertEqual(device_tests.cap({"driver": "maestro"}), device_tests.FLOW_SECONDS)
-        self.assertEqual(device_tests.cap({"driver": "agent"}), device_agent.AGENT_SECONDS)
+        # An agent scenario's cap holds the onboarding subflow run before it.
+        self.assertEqual(device_tests.cap({"driver": "agent"}),
+                         device_agent.AGENT_SECONDS + device_tests.ONBOARDING_SECONDS)
         self.assertEqual(device_tests.cap({"driver": "agent"}, device_agent.IOS_AGENT_SECONDS),
-                         device_agent.IOS_AGENT_SECONDS)
+                         device_agent.IOS_AGENT_SECONDS + device_tests.ONBOARDING_SECONDS)
+        self.assertEqual(device_tests.cap({"driver": device_tests.SMOKE}), device_agent.AGENT_SECONDS)
 
     def test_the_budget_leaves_the_job_time_to_build_seal_and_publish(self):
         workflow = (Path(device_tests.__file__).parent.parent.parent / ".github/workflows/device-tests.yml").read_text()
@@ -233,6 +236,57 @@ class BudgetTests(unittest.TestCase):
         job = min(int(minutes) for minutes in timeouts[:2]) * 60
         self.assertLessEqual(device_tests.RUN_BUDGET_SECONDS + 10 * 60 + 8 * 60, job,
                              "the build (about 8 minutes) and 10 minutes to seal and hand over must fit too")
+
+
+class OnboardingTests(unittest.TestCase):
+    """Run 40046272749: the signed-in shared account lands in onboarding ("Hi, I'm May"), not Chats, so each agent
+    scenario first runs may-app's subflow that taps through it."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.source = Path(self.directory.name)
+        (self.source / device_tests.FLOWS_DIR / "subflows").mkdir(parents=True)
+        self.flow = self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def finish(self, row, passed=True):
+        driven = []
+
+        def drive(flow):
+            driven.append(flow)
+            if isinstance(passed, Exception):
+                raise passed
+            return passed
+
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            device_tests.finish_onboarding(row, self.source, "android", drive)
+        return driven, out.getvalue()
+
+    def test_an_agent_scenario_runs_the_subflow_first(self):
+        self.flow.write_text("appId: x\n")
+        self.assertEqual(self.finish({"id": "chat", "driver": "agent"}), ([self.flow], ""))
+
+    def test_a_maestro_or_smoke_scenario_does_not(self):
+        self.flow.write_text("appId: x\n")
+        for driver in ("maestro", device_tests.SMOKE):
+            with self.subTest(driver=driver):
+                self.assertEqual(self.finish({"id": "sign-in", "driver": driver}), ([], ""))
+
+    def test_without_the_subflow_the_agent_starts_from_launch_and_says_so(self):
+        self.assertEqual(self.finish({"id": "chat", "driver": "agent"}), (
+            [], "May device tests (android): chat: may-app has no onboarding subflow; the agent starts from launch\n"))
+        self.flow.symlink_to(self.source / "elsewhere.yaml")
+        self.assertEqual(self.finish({"id": "chat", "driver": "agent"})[0], [], "a symlinked subflow is not run")
+
+    def test_a_subflow_that_fails_or_times_out_is_said_and_the_agent_still_runs(self):
+        self.flow.write_text("appId: x\n")
+        for passed in (False, subprocess.TimeoutExpired("maestro", 1)):
+            with self.subTest(passed=passed):
+                self.assertEqual(self.finish({"id": "chat", "driver": "agent"}, passed)[1],
+                                 "May device tests (android): chat: the onboarding subflow did not pass; the agent "
+                                 "starts where it stopped\n")
 
 
 class RunTests(unittest.TestCase):
@@ -344,6 +398,41 @@ class RunTests(unittest.TestCase):
             self.assertEqual(report["scenarios"][0]["verdict"], "skipped")
             _, report, _, _ = self.run_it()
             self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass")
+
+    def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
+        (self.source / device_tests.FLOWS_DIR / "subflows").mkdir()
+        (self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING).write_text("appId: x\n")
+        calls = []
+
+        class Process:
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def private(argv, log, *, cwd=None, env=None, check=True, timeout=None):
+            calls.append((list(argv), timeout))
+            return 0
+
+        def agent(cli, goal, tag, device, folder, token, model, **kwargs):
+            calls.append((["agent"], None))
+            return {}
+
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
+                patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
+                patch("device_tests.device_agent.settings", return_value=("t", "m")), \
+                patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", return_value=None), \
+                patch("device_tests.head_revision", return_value=SHA), patch("sys.stdout", new_callable=io.StringIO):
+            device_tests.run_scenarios("chat", minted=lambda base, secret: TOKEN, agent=agent,
+                                       install=lambda root: root / "claude", cleaned=lambda *args: 0)
+        driven = [argv for argv, _ in calls if argv[0] in ("/fake/maestro", "agent")]
+        self.assertEqual(driven, [["/fake/maestro", "--device", device_tests.SERIAL, "test",
+                                   str(self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING)], ["agent"]])
+        self.assertIn(device_tests.ONBOARDING_SECONDS, [timeout for argv, timeout in calls if argv[0] == "/fake/maestro"])
 
     def test_refusals_before_anything_runs(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),

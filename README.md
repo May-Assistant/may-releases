@@ -730,7 +730,8 @@ Without `MAY_RENDERS_RECIPIENT`, the workflow renders and counts, seals nothing 
    - `seal --platform ios` and `verdict --platform ios`, as Android's, as the artifact `may-device-ios-<attempt>`.
    - **Time budget, on both platforms:**
      - The scenarios and their judging share `RUN_BUDGET_SECONDS` (100 minutes) from the run step's start, inside each job's 120 minutes.
-     - A scenario starts only when its own cap still fits, together with the judging (`JUDGE_SECONDS` for each agent scenario started, its own included). A Maestro flow's cap is `FLOW_SECONDS`; an agent's is `AGENT_SECONDS` on Android and `IOS_AGENT_SECONDS` on iOS.
+     - A scenario starts only when its own cap still fits, together with the judging (`JUDGE_SECONDS` for each agent scenario started, its own included). A Maestro flow's cap is `FLOW_SECONDS`; an agent's is `AGENT_SECONDS` on Android and `IOS_AGENT_SECONDS` on iOS, plus `ONBOARDING_SECONDS` for its onboarding subflow.
+     - Before each agent scenario, on both platforms, the run plays may-app's `tools/device-tests/flows/subflows/finish-onboarding.yaml` (bounded by `ONBOARDING_SECONDS`), which taps the signed-in shared account through onboarding to Chats (run 40046272749: it landed in onboarding, not Chats). Without the subflow (an older may-app), or when it does not pass, the agent starts where the app is and the log says so in a fixed line; the report is unchanged.
      - A scenario that wouldn't fit is skipped with "the run's time budget left no room for it". It is reported as skipped, so the job always seals and hands over what ran.
      - The iOS Maestro flow is now bounded by `FLOW_SECONDS` too.
 4. **publish**, on a fresh Linux runner that runs no may-app code:

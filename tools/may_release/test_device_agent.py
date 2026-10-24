@@ -132,6 +132,9 @@ class AgentRunTests(unittest.TestCase):
                                                             {"get": "/v1/agents", "status": 200, "pass": True}])
         self.assertEqual(report["scenarios"][0]["notes"], "fine <b>")
         self.assertEqual(run_out.splitlines(), [
+            # This may-app fixture has no onboarding subflow, so each agent starts from launch and the log says so.
+            *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"
+              for scenario in ("chat", "notes", "routines")],
             "May device tests (android): 3 scenarios ran; verdicts follow the judge step",
             "May device tests (android): the test session's cleanup removed 3 tagged items"])
         self.assertEqual(judge_out.splitlines(), [

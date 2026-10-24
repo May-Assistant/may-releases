@@ -218,6 +218,26 @@ class RunTests(Workspace):
                                                                                          ("poll", "pass")])
         self.assertIn("May device tests (ios): the test session's cleanup removed 2 tagged items", out)
 
+    def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
+        """Run 40046272749: the shared account lands in onboarding, not Chats; may-app's subflow taps through it."""
+        (self.source / device_tests.FLOWS_DIR / "subflows").mkdir()
+        subflow = self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING
+        subflow.write_text("appId: x\n")
+        order = []
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            order.append("agent")
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        calls, _, _, out, _ = self.run_it(
+            selection="chat", agent=agent,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
+        tests = [argv for argv, _ in calls if argv[0] == "/fake/maestro"]
+        self.assertEqual(tests, [["/fake/maestro", "--device", UDID, "test", str(subflow)]])
+        self.assertEqual(self.maestro_timeouts, [device_tests.ONBOARDING_SECONDS])
+        self.assertEqual(order, ["agent"])
+        self.assertNotIn("onboarding subflow", out, "a subflow that passed says nothing")
+
     def test_refusals(self):
         for env, message in (({"MAY_TEST_SIGNIN_SECRET": None}, "MAY_TEST_SIGNIN_SECRET is not set"),
                              ({"MAY_STAGING_API_URL": "http://staging.example"}, "MAY_STAGING_API_URL is not https://staging-api.usemay.co"),
