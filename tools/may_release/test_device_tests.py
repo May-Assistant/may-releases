@@ -1,6 +1,7 @@
 """May Playground device tests (device-tests.yml): gate.py --action device-tests, prepare.py on main's head,
 device_tests.py and publish.py device-open / device-push. Everything Android, GitHub and staging is faked."""
 
+import ast
 import io
 import json
 import os
@@ -428,6 +429,55 @@ class ToolTests(unittest.TestCase):
                 with patch("device_tests.flows.run_private", side_effect=private):
                     self.assertEqual(recorder.stop(folder), names)
             self.assertIn(["/sdk/adb", "shell", "pkill", "-2", "screenrecord"], pulled)
+
+
+class ReasonTests(unittest.TestCase):
+    """Run 40057045702: a full run's iOS budget-skipped row carried a reason publish.py did not accept, so device-open
+    refused the whole report and nothing was published."""
+
+    def written_reasons(self):
+        """Every reason device_tests.py can write into a report row, read from its source."""
+        tree = ast.parse(Path(device_tests.__file__).read_text())
+        values = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                                                    and t.slice.value == "reason" for t in node.targets):
+                values.append(node.value)
+            if isinstance(node, ast.keyword) and node.arg == "reason":
+                values.append(node.value)
+            if isinstance(node, ast.Dict):
+                values += [v for k, v in zip(node.keys, node.values) if isinstance(k, ast.Constant) and k.value == "reason"]
+        reasons = set()
+        for value in values:
+            if isinstance(value, ast.Constant):
+                reasons.add(value.value)
+            elif isinstance(value, ast.Name):
+                reasons.add(getattr(device_tests, value.id))
+            elif isinstance(value, ast.IfExp):
+                reasons |= {getattr(device_tests, v.id) if isinstance(v, ast.Name) else v.value
+                            for v in (value.body, value.orelse)}
+            else:
+                reasons.add(ast.unparse(value))  # a reason worked out at run time must be added here by hand
+        # The judge step copies combined()'s reason, whose own values are read above from its returned dicts.
+        return reasons - {None, "verdict_reason['reason']"}
+
+    def test_every_reason_a_device_job_writes_is_one_publish_accepts(self):
+        written = self.written_reasons()
+        self.assertIn(device_tests.BUDGET, written)
+        self.assertEqual(written - set(publish.REASONS), set())
+
+    def test_a_budget_skipped_row_passes_the_publish_check(self):
+        report = {"device": "ios", "scenarios": [{"id": "poll-skip", "title": "x", "verdict": "skipped",
+                                                    "reason": device_tests.BUDGET, "videos": [], "screenshots": [],
+                                                    "server": []}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps(report))
+            try:
+                _, rows = publish.device_report(path, set(), {"poll-skip": "Skip May's question"})
+            except publish.PublishError as error:
+                self.fail(f"device-open refused a budget-skipped row: {error}")
+        self.assertEqual(rows[0]["reason"], device_tests.BUDGET)
 
 
 class SealVerdictTests(unittest.TestCase):
