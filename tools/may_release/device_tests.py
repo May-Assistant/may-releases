@@ -41,6 +41,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -375,14 +376,23 @@ def launch(adb, env, token, log):
     39677407348 failed at this start. One retry after LAUNCH_RETRY_SECONDS, for an activity manager still settling
     just after boot; a second failure stops the run."""
     flows.run_private([adb, "shell", "am", "force-stop", APP_ID], log, env=env, check=False)
-    start = [adb, "shell", "am", "start", "-W", "-n", APP_ID + "/" + ACTIVITY] + \
-        (["--es", "may_test_session", token] if token else [])
+    # The session goes to the emulator's shell on adb's stdin, never in an argument the runner's process list shows.
+    start = " ".join(["am", "start", "-W", "-n", APP_ID + "/" + ACTIVITY] +
+                     (["--es", "may_test_session", shlex.quote(token)] if token else [])) + "\n"
     for attempt in range(2):
-        if not flows.run_private(start, log, env=env, check=False):
+        if not adb_shell(adb, env, log, start):
             return
         if not attempt:
             flows.sleep(LAUNCH_RETRY_SECONDS)
     raise DeviceTestsError("May Playground did not start on the emulator after one retry")
+
+
+def adb_shell(adb, env, log, line, run=subprocess.run):
+    """`adb shell` running the one command line it reads on stdin: its exit status (the command's). Its output goes to
+    the private log alone."""
+    with log.open("ab") as output:
+        return run([adb, "shell"], env=env, input=line.encode(), stdout=output, stderr=subprocess.STDOUT,
+                   timeout=120).returncode
 
 
 class Recorder:
