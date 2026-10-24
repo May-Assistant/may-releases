@@ -178,12 +178,14 @@ def is_json(data):
 
 def diagnostics_ok(data):
     """An Android scenario's diagnostics (device_tests.Diagnostics): small UTF-8 text with no line that could carry a
-    session, checked again here."""
+    session or a credential and no unmasked email address, checked again here."""
     try:
         data.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    return len(data) <= device_tests.MAX_DIAG and not device_tests.SECRET_LINE.search(data)
+    # A masked address (***@domain) is left as it is by EMAIL; any other is refused.
+    return len(data) <= device_tests.MAX_DIAG and not device_tests.SECRET_LINE.search(data) and \
+        device_tests.EMAIL.sub(device_tests.MASKED, data) == data
 
 
 def extract(archive, members, destination):

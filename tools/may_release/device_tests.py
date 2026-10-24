@@ -657,7 +657,14 @@ DIAG = ".diag.txt"
 LOGCAT_LINES, MAX_DIAG, DIAG_SECONDS = 2000, 512 * 1024, 60
 LOG_BUFFERS = "main,system,crash"
 ANR, CRASH = "data_app_anr", "data_app_crash"
-SECRET_LINE = re.compile(rb"(?i)authorization|bearer|may_test_session|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+# A line that could carry a session or a credential is dropped whole: an Authorization or Bearer header, a refresh
+# token, a cookie, the launch's session extra, a JWT, or any may_* key with a long opaque value.
+SECRET_LINE = re.compile(rb"(?i)authorization|bearer|refresh_token|cookie|may_test_session|"
+                         rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
+                         rb"\bmay_[a-z0-9_]+[\"']?\s*[=:]\s*[\"']?[A-Za-z0-9+/_.~-]{20,}")
+# An email address keeps its domain alone.
+EMAIL = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24})")
+MASKED = rb"***@\1"
 
 
 def adb_output(adb, env, argv):
@@ -671,11 +678,13 @@ def adb_output(adb, env, argv):
 
 
 def kept_lines(data, token):
-    """data without any line that could carry the session: the token itself, an Authorization or Bearer header, the
-    launch's session extra, or anything shaped like a JWT."""
+    """(data without any line that could carry the session or a credential (SECRET_LINE, or the token itself), with
+    each email address masked to its domain, the number of lines dropped)."""
     secret = token.encode() if token else None
-    return b"".join(line for line in data.splitlines(keepends=True)
-                    if not SECRET_LINE.search(line) and not (secret and secret in line))
+    lines = data.splitlines(keepends=True)
+    kept = [EMAIL.sub(MASKED, line) if b"@" in line else line
+            for line in lines if not SECRET_LINE.search(line) and not (secret and secret in line)]
+    return b"".join(kept), len(lines) - len(kept)
 
 
 class Diagnostics:
@@ -685,6 +694,7 @@ class Diagnostics:
         self.adb, self.env = adb, env
         self.seen = {tag: len(self.entries(tag)) for tag in (ANR, CRASH)}
         self.kept = self.anrs = self.crashes = 0
+        self.dropped = {}  # scenario: lines dropped, for the public log's counts
 
     def entries(self, tag):
         data = adb_output(self.adb, self.env, ["shell", "dumpsys", "dropbox", "--print", tag]) or b""
@@ -703,8 +713,8 @@ class Diagnostics:
         log = adb_output(self.adb, self.env, ["logcat", "-d", "-t", str(LOGCAT_LINES), "-b", LOG_BUFFERS])
         adb_output(self.adb, self.env, ["logcat", "-b", LOG_BUFFERS, "-c"])
         # The stacks first, at most half; the log's newest lines fill the rest.
-        stacks = kept_lines(b"".join(found), token)[:MAX_DIAG // 2]
-        logcat = kept_lines(log or b"", token)
+        (stacks, from_stacks), (logcat, from_log) = kept_lines(b"".join(found), token), kept_lines(log or b"", token)
+        stacks = stacks[:MAX_DIAG // 2]
         room = MAX_DIAG - len(stacks) - 64  # the section header's room
         logcat = logcat[len(logcat) - room:] if len(logcat) > room else logcat
         if not (stacks or logcat):
@@ -717,6 +727,7 @@ class Diagnostics:
         except OSError:
             return
         self.kept += 1
+        self.dropped[scenario] = from_stacks + from_log
 
 
 def screenshot(adb, env, path, log):
@@ -1189,6 +1200,8 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     kept, anrs, crashes = diagnostics.kept, diagnostics.anrs, diagnostics.crashes
     print(f"May device tests (android): diagnostics kept for {kept} scenarios ({anrs} with an ANR, {crashes} with a "
           "crash)")
+    for scenario, dropped in diagnostics.dropped.items():
+        print(f"May device tests (android): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:
         print(f"May device tests (android): the test session's cleanup removed {cleaned_count} tagged items")
     elif accounts.shared:

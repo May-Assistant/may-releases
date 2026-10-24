@@ -1369,7 +1369,7 @@ def device_tests_workflow_problems(text):
 
 DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count", "platform",
                        "made", "deleted", "kept", "status",
-                       "smoke_passed", "stage", "detail", "missing", "anrs", "crashes"}
+                       "smoke_passed", "stage", "detail", "missing", "anrs", "crashes", "dropped"}
 
 
 def device_tests_print_problems(root):

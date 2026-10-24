@@ -649,11 +649,11 @@ class RunTests(unittest.TestCase):
 
         class Fake:
             def __init__(self, adb, env):
-                self.kept, self.anrs, self.crashes = 0, 0, 0
+                self.kept, self.anrs, self.crashes, self.dropped = 0, 0, 0, {}
 
             def keep(self, folder, scenario, token):
                 kept.append((folder.name, scenario, token))
-                self.kept, self.anrs = self.kept + 1, 1
+                self.kept, self.anrs, self.dropped[scenario] = self.kept + 1, 1, 2
 
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         _, _, out, _ = self.run_it(diagnosed=Fake)
@@ -661,6 +661,8 @@ class RunTests(unittest.TestCase):
                          "after each scenario's recording, with its session so its lines are dropped")
         self.assertIn("May device tests (android): diagnostics kept for 2 scenarios (1 with an ANR, 0 with a crash)",
                       out)
+        self.assertIn("May device tests (android): sign-in diagnostics: 2 lines dropped", out)
+        self.assertIn("May device tests (android): connections diagnostics: 2 lines dropped", out)
         self.assertNotIn(TOKEN, out)
 
     def test_the_flow_gets_the_session_in_maestros_environment_never_as_an_argument(self):
@@ -1446,6 +1448,32 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(clears), 2)
         self.assertTrue(all(dump < clear for dump, clear in zip(dumps, clears)), "the log is cleared once read")
         self.assertIn(["logcat", "-d", "-t", "2000", "-b", "main,system,crash"], emulator.calls)
+
+    def test_no_credential_survives_and_email_addresses_keep_their_domain_alone(self):
+        """Coordinator, 24 Oct: refresh tokens, cookies, may_* keys with opaque values, and email addresses."""
+        opaque = "Zm9vYmFyYmF6cXV4cXV1eHF1dXg"
+        log = ("I/May: refresh_token=" + opaque + "\n"
+               "D/OkHttp: Set-Cookie: sid=" + opaque + "; HttpOnly\n"
+               "D/OkHttp: Cookie: sid=" + opaque + "\n"
+               "D/May: may_agent_key=" + opaque + "\n"
+               'D/May: {"may_device_token": "' + opaque + '"}\n'
+               "I/May: signed in as sam.avery+qa@example.com from qa-40113277692@staging.may.example\n"
+               "I/May: may_screen=chats\n"
+               "I/Choreographer: Skipped 42 frames\n").encode()
+        emulator = FakeEmulator(log=log)
+        with patch("device_tests.subprocess.run", side_effect=emulator):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            diagnostics.keep(self.folder, "sign-in", TOKEN)
+        text = (self.folder / "sign-in.diag.txt").read_text()
+        for secret in (opaque, "sam.avery", "qa-40113277692@", "Cookie"):
+            self.assertNotIn(secret, text)
+        self.assertIn("signed in as ***@example.com from ***@staging.may.example", text)
+        self.assertIn("may_screen=chats", text, "a short may_* value is no credential")
+        self.assertIn("Skipped 42 frames", text)
+        self.assertEqual(diagnostics.dropped, {"sign-in": 5})
+        self.assertTrue(publish.diagnostics_ok(text.encode()))
+        self.assertFalse(publish.diagnostics_ok(b"I/May: sam@example.com\n"), "an unmasked address is refused")
+        self.assertFalse(publish.diagnostics_ok(b"Cookie: x\n"))
 
     def test_a_file_stays_within_its_size_with_the_stacks_and_the_newest_log_lines(self):
         emulator = FakeEmulator(crashes=[])
