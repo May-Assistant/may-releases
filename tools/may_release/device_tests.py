@@ -720,21 +720,29 @@ class Diagnostics:
 
     def __init__(self, adb, env):
         self.adb, self.env = adb, env
-        self.seen = {tag: len(self.entries(tag)) for tag in (ANR, CRASH)}
+        self.seen = {tag: set(self.entries(tag)) for tag in (ANR, CRASH)}
         self.kept = self.anrs = self.crashes = 0
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
 
     def entries(self, tag):
+        """{header line: entry} for the dropbox's entries of tag now; {} when it could not be read. Each entry is known
+        by its own timestamped header, so a failed read or the dropbox's rotation never makes old entries new."""
         data = adb_output(self.adb, self.env, ["shell", "dumpsys", "dropbox", "--print", tag]) or b""
-        header = re.compile(rb"(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} " + tag.encode() + rb"\b")
-        return [entry.strip() for entry in re.split(rb"(?m)^={20,}\s*$", data) if header.search(entry)]
+        header = re.compile(rb"(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} " + tag.encode() + rb"\b.*$")
+        found = {}
+        for entry in re.split(rb"(?m)^={20,}[ \t]*$", data):
+            match = header.search(entry)
+            if match:
+                found[match.group(0)] = entry.strip()
+        return found
 
     def keep(self, folder, scenario, token):
         """Writes <scenario>.diag.txt when there is anything to keep; never an error."""
         found = []
         for tag in (ANR, CRASH):
             entries = self.entries(tag)
-            new, self.seen[tag] = entries[self.seen[tag]:], len(entries)
+            new = [entry for key, entry in entries.items() if key not in self.seen[tag]]
+            self.seen[tag] |= set(entries)
             found += [b"== " + tag.encode() + b" ==\n" + entry + b"\n" for entry in new]
             self.anrs += tag == ANR and bool(new)
             self.crashes += tag == CRASH and bool(new)
@@ -1190,7 +1198,6 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
             entry["videos"] = recorder.stop(folder)
-            diagnostics.keep(folder, row["id"], token)
             for check in row["server"]:
                 status = checked(base, token, check["get"])
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
@@ -1204,6 +1211,8 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 codes = delivered(base, token, tag)
                 if codes is not None:
                     entry["delivery"] = codes
+            # After the server reads, which need the session while it lasts: a slow dumpsys costs them nothing.
+            diagnostics.keep(folder, row["id"], token)
             accounts.finish(row, base, token)
             settle(entry, row, passed if flow is not None else None)
             token = ""
@@ -1281,10 +1290,18 @@ MAX_AGENT_SUMMARY = 300
 
 
 def sealed_agent(record):
-    # Line by line, then joined into one line and redacted again: joining could make a secret-shaped line of two
-    # harmless ones ("may_token:" and an opaque value), which publish would refuse with the whole report.
-    lines, _ = kept_lines(str(record.get("summary") or "").encode(), "")
-    summary, _ = kept_lines(" ".join(lines.decode("utf-8", "replace").split()).encode(), "")
+    # Line by line, a dropped line that ends in its key (":" or "=") taking the next non-blank line with it, its
+    # value ("may_token:" then an opaque value); then joined into one line and redacted again, since joining could
+    # make a secret-shaped line of two harmless ones, which publish would refuse with the whole report.
+    lines, after = [], False
+    for line in str(record.get("summary") or "").splitlines():
+        if not line.strip():
+            continue
+        kept, dropped = kept_lines(line.encode(), "")
+        if not dropped and not after:
+            lines.append(kept.decode("utf-8", "replace"))
+        after = bool(dropped) and line.rstrip().endswith((":", "="))
+    summary, _ = kept_lines(" ".join(" ".join(lines).split()).encode(), "")
     actions = record.get("actions")
     return {"outcome": record.get("outcome") if record.get("outcome") in ("completed", "blocked") else None,
             "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MAX_ACTIONS else 0,
@@ -1334,8 +1351,9 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         entry.pop("reason", None)
         if verdict_reason["reason"]:
             entry["reason"] = verdict_reason["reason"]
-        if judged[1]:
-            entry["notes"] = judged[1]
+        note = device_agent.redacted(judged[1])
+        if note:
+            entry["notes"] = note
     token = ""
     path.write_text(json.dumps(report, indent=2) + "\n")
     (private / VERDICTS).unlink(missing_ok=True)

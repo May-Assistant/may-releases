@@ -40,14 +40,27 @@ MAX_SUMMARY = 1000
 MAX_FIELD = 300
 # No ? or *: the device's shell would read them as a glob in input text's argument.
 TEXT = re.compile(r"[A-Za-z0-9 .,!:@_-]{1,200}")
-# A line that could carry a session or a credential is dropped whole: an Authorization or Bearer header, a refresh
-# token, a cookie, the launch's session extra, a JWT, or any may_* key with a long opaque value.
-SECRET_LINE = re.compile(rb"(?i)authorization|bearer|refresh_token|cookie|may_test_session|"
-                         rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
-                         rb"\bmay_[a-z0-9_]+[\"']?\s*[=:]\s*[\"']?[A-Za-z0-9+/_.~-]{20,}")
-# An email address keeps its domain alone.
-EMAIL = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24})")
-MASKED = rb"***@\1"
+# A line that could carry a session or a credential is dropped whole. Every pattern stays inside one line ([ \t],
+# never \s), so a line kept here is a line publish keeps. Dropped:
+SECRET_LINE = re.compile(
+    rb"(?i)"
+    # headers and named credentials: Authorization, Bearer, cookies, API keys, Anthropic and Google keys;
+    rb"authorization|bearer|cookie|x-api-key|api[_-]?key|sk-ant-|AIza[0-9A-Za-z_-]{20}|"
+    # prefixed opaque keys whatever their length: sk_live_, pk_test_, rk_, ghp_, gho_, xoxb-, ...;
+    rb"\b(?:sk|pk|rk|whsec|ghp|gho|ghs|ghu|github_pat|xox[abpr])[_-](?:live_|test_)?[A-Za-z0-9_-]{12,}|"
+    # any token, secret, password, session, key or signature set to a value: token=, "access_token":, secret=, ...;
+    rb"\b(?:[a-z0-9]+[_-])*(?:token|secret|password|passwd|session|key|sig|signature|credential)[\"']?[ \t]*[:=]|"
+    # a URL's query naming one, or an OAuth code;
+    rb"[?&](?:access_token|refresh_token|id_token|token|code|key|session|sig|signature|auth)=|"
+    # May's own keys, plain, dashed or URL-encoded (may_test_session, may-key, may%5Ftest%5Fsession);
+    rb"may(?:_|-|%5f)[a-z0-9_%-]*(?:key|token|secret|session)|"
+    # a JWT, a long hex run, or a long base64 run with no keyword at all.
+    rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|\b[0-9a-f]{32,}\b|[A-Za-z0-9+/_-]{40,}={0,2}")
+# An email address keeps its domain alone, @ or URL-encoded %40, a dotted domain or localhost. It starts where no
+# address character (or a mask) comes before it, so masking twice changes nothing.
+EMAIL = re.compile(rb"(?<![A-Za-z0-9._%+'!*@-])[A-Za-z0-9._%+'!-]{1,256}(@|%40)"
+                   rb"((?:[A-Za-z0-9-]{1,63}\.){1,8}[A-Za-z]{2,24}|localhost)\b", re.IGNORECASE)
+MASKED = rb"***\1\2"
 
 
 def kept_lines(data, token):
@@ -55,7 +68,7 @@ def kept_lines(data, token):
     each email address masked to its domain, the number of lines dropped)."""
     secret = token.encode() if token else None
     lines = data.splitlines(keepends=True)
-    kept = [EMAIL.sub(MASKED, line) if b"@" in line else line
+    kept = [EMAIL.sub(MASKED, line) if b"@" in line or b"%40" in line.lower() else line
             for line in lines if not SECRET_LINE.search(line) and not (secret and secret in line)]
     return b"".join(kept), len(lines) - len(kept)
 COORD = {"type": "integer", "minimum": 0, "maximum": 4000}
@@ -281,7 +294,9 @@ def call(name, args, config):
         if not text:
             return True, [{"type": "text", "text": "No hierarchy this time; take a screenshot instead"}]
         config["hierarchy"] = text
-        return False, [{"type": "text", "text": text}]
+        # What the agent reads goes through the same redaction as everything else it sees.
+        kept, _ = kept_lines(text.encode(), "")
+        return False, [{"type": "text", "text": kept.decode("utf-8", "replace")}]
     ints = {key: args.get(key) for key in ("x", "y", "x1", "y1", "x2", "y2", "ms", "seconds")}
     if any(value is not None and (type(value) is not int or not 0 <= value <= 4000) for value in ints.values()):
         return True, [{"type": "text", "text": "Coordinates and times are whole numbers in range"}]

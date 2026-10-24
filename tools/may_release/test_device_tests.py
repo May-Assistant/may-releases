@@ -287,6 +287,10 @@ class SealedAgentTests(unittest.TestCase):
         self.assertTrue(publish.agent_ok(sealed), "publish never refuses a report for a summary the writer sealed")
         self.assertEqual(device_tests.kept_lines(sealed["summary"].encode(), ""), (sealed["summary"].encode(), 0))
         self.assertNotIn("Zm9vYmFy", sealed["summary"])
+        spaced = device_tests.sealed_agent({"summary": "Tapped send.\nmay_token:\n\n  Zm9vYmFyYmF6cXV4cXV1eHF1dXg\nNo reply."})
+        self.assertEqual(spaced["summary"], "Tapped send. No reply.", "a blank line never separates a key from its value")
+        whole = device_tests.sealed_agent({"summary": "Tapped send.\nmay_token: Zm9vYmFyYmF6cXV4cXV1eHF1dXg\nNo reply."})
+        self.assertEqual(whole["summary"], "Tapped send. No reply.", "a line holding its own value takes nothing more")
         kept = device_tests.sealed_agent({"summary": "Opened the May chat.\nTyped the message.\nTapped send."})
         self.assertEqual(kept["summary"], "Opened the May chat. Typed the message. Tapped send.")
 
@@ -1561,6 +1565,13 @@ class FakeEmulator:
         return subprocess.CompletedProcess(argv, 0, out, b"")
 
 
+def dropbox_at(*entries, tag="data_app_anr"):
+    """A dropbox print of (minute, body) entries, each with its own timestamped header."""
+    sep = b"=" * 40 + b"\n"
+    return b"".join(sep + b"2026-10-24 17:%02d:00 " % minute + tag.encode() + b" (text, 100 bytes)\n" + body + b"\n"
+                    for minute, body in entries)
+
+
 class DiagnosticsTests(unittest.TestCase):
     """Coordinator, 24 Oct: sign-out's recording showed "May Playground isn't responding"; M needs its stack."""
 
@@ -1601,6 +1612,46 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(clears), 2)
         self.assertTrue(all(dump < clear for dump, clear in zip(dumps, clears)), "the log is cleared once read")
         self.assertIn(["logcat", "-d", "-t", "2000", "-b", "main,system,crash"], emulator.calls)
+
+    # Lines that passed both kept_lines and diagnostics_ok before #108's security read; each is dropped now.
+    GAPS = ('{"token":"Zm9vYmFy"}', '{"access_token": "abc"}', "GET /oauth/cb?access_token=abc&x=1",
+            "GET /oauth/cb?code=4/0Adeu5", "x-api-key: abc", "using sk-ant-api03-abcdef", "AIzaSyA1234567890abcdefghij",
+            "secret=abc", "password=hunter2", "session=deadbeef", "digest 0123456789abcdef0123456789abcdef",
+            "blob QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaA==", "may-key=1", "x may%5Ftest%5Fsession y",
+            "may_test_session=abc", "id_token=abc",
+            # From the security read of #110: prefixed opaque keys, which no session token passed in would catch.
+            "charge with sk_live_51HabcdefGHIJKLMNOP", "pk_test_TYooMQauvdEDq54NiTphI7jx",
+            "clone ghp_16C7e42F292c6912E7710c838347Ae178B4a", "post xoxb-123456789012-abcdef")
+
+    def test_each_reported_gap_is_dropped_by_the_writer_and_refused_by_publish(self):
+        """The coordinator's security read of #108: one test per pattern, in both places."""
+        for line in self.GAPS:
+            with self.subTest(line=line):
+                kept, dropped = device_tests.kept_lines(line.encode() + b"\n", "")
+                self.assertEqual((kept, dropped), (b"", 1))
+                self.assertFalse(publish.diagnostics_ok(line.encode() + b"\n"))
+
+    def test_every_address_keeps_its_domain_alone_and_masking_twice_changes_nothing(self):
+        for line, masked in (("mail sam%40example.com", "mail ***%40example.com"),
+                             ("from o'brien@example.com", "from ***@example.com"),
+                             ("from a!b@example.com", "from ***@example.com"),
+                             ("to " + "q.r" * 30 + "@example.com", "to ***@example.com"),
+                             ("dev user@localhost here", "dev ***@localhost here"),
+                             ("odd a@b.cc@d.ee", "odd ***@b.cc@d.ee")):
+            with self.subTest(line=line):
+                kept, _ = device_tests.kept_lines(line.encode() + b"\n", "")
+                self.assertEqual(kept, masked.encode() + b"\n")
+                self.assertEqual(device_tests.kept_lines(kept, ""), (kept, 0), "masking twice changes nothing")
+                self.assertTrue(publish.diagnostics_ok(kept), "a file the writer made is never refused")
+
+    def test_publish_judges_line_by_line_as_the_writer_does(self):
+        """A pattern spanning a newline made publish refuse a file the writer had kept."""
+        kept, _ = device_tests.kept_lines(b"I/May: may_screen =\nZm9vYmFyYmF6cXV4cXV1eHF1dXg\nok\n", "")
+        self.assertTrue(publish.diagnostics_ok(kept))
+        stack = (b'"main" prio=5 tid=1 Blocked\n  | group="main" sCount=1 obj=0x72a3b8f0 self=0xb400007a1c2c5c00\n'
+                 b"  at io.github.mayassistant.may.ui.ChatScreenKt$ChatScreen$1.invoke(ChatScreen.kt:123)\n"
+                 b"I/InputDispatcher: KeyEvent { action=ACTION_DOWN, keyCode=KEYCODE_BACK }\n")
+        self.assertEqual(device_tests.kept_lines(stack, ""), (stack, 0), "an ANR's main thread survives whole")
 
     def test_no_credential_survives_and_email_addresses_keep_their_domain_alone(self):
         """Coordinator, 24 Oct: refresh tokens, cookies, may_* keys with opaque values, and email addresses."""
@@ -1648,6 +1699,30 @@ class DiagnosticsTests(unittest.TestCase):
         data = (self.folder / "chat.diag.txt").read_bytes()
         self.assertLessEqual(len(data), device_tests.MAX_DIAG, "each stray byte becomes three once replaced")
         data.decode("utf-8")
+
+    def test_a_failed_read_or_the_dropboxs_rotation_never_makes_old_entries_new(self):
+        """The security read of #108: one failed dumpsys reset the count, so the next scenario took every old entry."""
+        answers = {"data_app_anr": dropbox_at((1, b"old one"), (2, b"old two"))}
+
+        def run(argv, **kwargs):
+            out = answers.get(argv[5], b"") if argv[1:5] == ["shell", "dumpsys", "dropbox", "--print"] else b""
+            if out is None:
+                raise subprocess.TimeoutExpired(argv, 60)
+            return subprocess.CompletedProcess(argv, 0, out, b"")
+
+        with patch("device_tests.subprocess.run", side_effect=run):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            answers["data_app_anr"] = None  # dumpsys hangs once
+            diagnostics.keep(self.folder, "sign-in", "")
+            answers["data_app_anr"] = dropbox_at((2, b"old two"), (3, b"new three"))  # rotated: old one gone
+            diagnostics.keep(self.folder, "chat", "")
+        kept = self.folder / "chat.diag.txt"
+        self.assertTrue(kept.is_file(), "the new entry is kept")
+        text = kept.read_text()
+        self.assertIn("new three", text)
+        for old in ("old one", "old two"):
+            self.assertNotIn(old, text)
+        self.assertEqual(diagnostics.anrs, 1)
 
     def test_an_emulator_that_does_not_answer_never_stops_the_run(self):
         with patch("device_tests.subprocess.run", side_effect=FakeEmulator(fail=True)):
