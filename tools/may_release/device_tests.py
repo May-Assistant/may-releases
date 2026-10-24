@@ -648,6 +648,77 @@ class Recorder:
         return names
 
 
+# Each Android scenario's diagnostics (coordinator, 24 Oct: sign-out's recording showed "May Playground isn't
+# responding"): any ANR or crash the system's dropbox kept since the scenario before, then the emulator's last
+# LOGCAT_LINES (cleared after, so each file is its own scenario's), as <scenario>.diag.txt in the sealed run folder.
+# The dropbox, not /data/anr: the shell user reads it without `adb root`, which would restart adbd under Maestro. A
+# line that could carry the session is dropped; the public log gives counts alone.
+DIAG = ".diag.txt"
+LOGCAT_LINES, MAX_DIAG, DIAG_SECONDS = 2000, 512 * 1024, 60
+LOG_BUFFERS = "main,system,crash"
+ANR, CRASH = "data_app_anr", "data_app_crash"
+SECRET_LINE = re.compile(rb"(?i)authorization|bearer|may_test_session|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+
+
+def adb_output(adb, env, argv):
+    """One adb command's output, or None when it failed or did not finish within DIAG_SECONDS: never an error."""
+    try:
+        done = subprocess.run([adb, *argv], capture_output=True, stdin=subprocess.DEVNULL, env=env,
+                              timeout=DIAG_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 and isinstance(done.stdout, bytes) else None
+
+
+def kept_lines(data, token):
+    """data without any line that could carry the session: the token itself, an Authorization or Bearer header, the
+    launch's session extra, or anything shaped like a JWT."""
+    secret = token.encode() if token else None
+    return b"".join(line for line in data.splitlines(keepends=True)
+                    if not SECRET_LINE.search(line) and not (secret and secret in line))
+
+
+class Diagnostics:
+    """The dropbox's ANR and crash entries already there at the start are counted, so each scenario keeps its own."""
+
+    def __init__(self, adb, env):
+        self.adb, self.env = adb, env
+        self.seen = {tag: len(self.entries(tag)) for tag in (ANR, CRASH)}
+        self.kept = self.anrs = self.crashes = 0
+
+    def entries(self, tag):
+        data = adb_output(self.adb, self.env, ["shell", "dumpsys", "dropbox", "--print", tag]) or b""
+        header = re.compile(rb"(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} " + tag.encode() + rb"\b")
+        return [entry.strip() for entry in re.split(rb"(?m)^={20,}\s*$", data) if header.search(entry)]
+
+    def keep(self, folder, scenario, token):
+        """Writes <scenario>.diag.txt when there is anything to keep; never an error."""
+        found = []
+        for tag in (ANR, CRASH):
+            entries = self.entries(tag)
+            new, self.seen[tag] = entries[self.seen[tag]:], len(entries)
+            found += [b"== " + tag.encode() + b" ==\n" + entry + b"\n" for entry in new]
+            self.anrs += tag == ANR and bool(new)
+            self.crashes += tag == CRASH and bool(new)
+        log = adb_output(self.adb, self.env, ["logcat", "-d", "-t", str(LOGCAT_LINES), "-b", LOG_BUFFERS])
+        adb_output(self.adb, self.env, ["logcat", "-b", LOG_BUFFERS, "-c"])
+        # The stacks first, at most half; the log's newest lines fill the rest.
+        stacks = kept_lines(b"".join(found), token)[:MAX_DIAG // 2]
+        logcat = kept_lines(log or b"", token)
+        room = MAX_DIAG - len(stacks) - 64  # the section header's room
+        logcat = logcat[len(logcat) - room:] if len(logcat) > room else logcat
+        if not (stacks or logcat):
+            return
+        # UTF-8 throughout, still within MAX_DIAG once any stray byte is replaced.
+        text = (stacks + (b"== logcat ==\n" + logcat if logcat else b"")).decode("utf-8", "replace").encode()
+        text = text[:MAX_DIAG].decode("utf-8", "ignore").encode()
+        try:
+            (folder / f"{scenario}{DIAG}").write_bytes(text)
+        except OSError:
+            return
+        self.kept += 1
+
+
 def screenshot(adb, env, path, log):
     with path.open("wb") as output, log.open("ab") as errors:
         result = subprocess.run([adb, "exec-out", "screencap", "-p"], stdout=output, stderr=errors,
@@ -687,9 +758,37 @@ def boot(root, log):
             emulator.kill()
             raise DeviceTestsError("The emulator did not boot; no scenario ran")
         time.sleep(5)
+    settle_boot(adb, env, log)
     for setting in ANIMATION_SETTINGS:
         flows.run_private([adb, "shell", "settings", "put", "global", setting, ANIMATION_SCALE], log, env=env)
     return adb, emulator, env
+
+
+# After sys.boot_completed, the emulator is still starting services and compiling apps: dev.bootcomplete, then a
+# one-minute load average under SETTLE_LOAD, before the app is installed and launched (coordinator, 24 Oct: an "isn't
+# responding" in the first scenario). At most SETTLE_SECONDS; an emulator that never settles still runs.
+SETTLE_SECONDS, SETTLE_LOAD, SETTLE_POLL = 120, 2.0, 5
+
+
+def settle_boot(adb, env, log, clock=time.monotonic, sleep=time.sleep):
+    deadline = clock() + SETTLE_SECONDS
+    while True:
+        ready = adb_output(adb, env, ["shell", "getprop", "dev.bootcomplete"])
+        load = adb_output(adb, env, ["shell", "cat", "/proc/loadavg"])
+        try:
+            quiet = float(load.split()[0]) < SETTLE_LOAD
+        except (AttributeError, IndexError, ValueError):
+            quiet = False
+        if ready is not None and ready.strip() == b"1" and quiet:
+            settled = True
+            break
+        if clock() >= deadline:
+            settled = False
+            break
+        sleep(SETTLE_POLL)
+    with log.open("ab") as output:
+        output.write(b"emulator settled\n" if settled else b"emulator did not settle; going on\n")
+    return settled
 
 
 def maestro(root, private, log):
@@ -952,7 +1051,7 @@ def settle(entry, row, passed):
 
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
-                  deleted_by=delete_fresh, calls_left=model_calls_left):
+                  deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -984,6 +1083,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         at("installing the app")
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
         show_touches(adb, env, log, True)
+        diagnostics = (diagnosed or Diagnostics)(adb, env)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()))
         budget = (budgeted or Budget)()
@@ -1046,6 +1146,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
             entry["videos"] = recorder.stop(folder)
+            diagnostics.keep(folder, row["id"], token)
             for check in row["server"]:
                 status = checked(base, token, check["get"])
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
@@ -1085,6 +1186,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     write_private(private / VERDICTS, json.dumps([entry["verdict"] for entry in results]).encode())
     ran = sum(1 for entry in results if entry["verdict"] != "skipped")
     print(f"May device tests (android): {ran} scenarios ran; verdicts follow the judge step")
+    kept, anrs, crashes = diagnostics.kept, diagnostics.anrs, diagnostics.crashes
+    print(f"May device tests (android): diagnostics kept for {kept} scenarios ({anrs} with an ANR, {crashes} with a "
+          "crash)")
     if cleaned_count is not None:
         print(f"May device tests (android): the test session's cleanup removed {cleaned_count} tagged items")
     elif accounts.shared:

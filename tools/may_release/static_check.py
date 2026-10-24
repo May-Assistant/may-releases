@@ -1197,7 +1197,7 @@ def renders_workflow_problems(text):
 RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)",
                         "not_ios", "len(entries)"}
 PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices",
-                        "uploaded", "kept", "removed", "previews"}
+                        "uploaded", "kept", "removed", "previews", "diagnostics"}
 
 
 def renders_print_problems(root):
@@ -1369,7 +1369,7 @@ def device_tests_workflow_problems(text):
 
 DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count", "platform",
                        "made", "deleted", "kept", "status",
-                       "smoke_passed", "stage", "detail", "missing"}
+                       "smoke_passed", "stage", "detail", "missing", "anrs", "crashes"}
 
 
 def device_tests_print_problems(root):
