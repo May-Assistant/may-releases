@@ -155,7 +155,9 @@ class RunTests(Workspace):
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.head_revision", return_value=SHA), patch("device_ios.Recorder", FakeRecorder), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.signed_out = []
             device_ios.run_scenarios(selection, minted=mint, checked=lambda base, token, path: 200,
+                                     revoked_by=lambda base, token: self.signed_out.append(token) or True,
                                      truth=lambda base, token, path, tag: (200, True),
                                      asked=lambda base, token, state, tag: (200, True),
                                      cleaned=lambda base, token, since, tag: 2,
@@ -197,6 +199,7 @@ class RunTests(Workspace):
                           ("ui-pass", ["connections.mp4"], ["connections-end.png"])])
         self.assertEqual(out.splitlines(), [
             "May device tests (ios): 2 scenarios ran; verdicts follow the judge step",
+            "May device tests (ios): 2 test sessions were signed out at their end",
             "May device tests (ios): sign-in: ui-pass", "May device tests (ios): connections: ui-pass",
             "May device tests (ios): 0 passed, 2 passed on screen alone (server checks not configured), 0 failed, "
             "0 skipped"])
@@ -276,6 +279,8 @@ class RunTests(Workspace):
         self.assertEqual(self.delivered, [TOKEN + "1", TOKEN + "2"], "each scenario's messages, with its own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]], [["succeeded"]] * 2)
         self.assertIn("May device tests (ios): the test session's cleanup removed 2 tagged items", out)
+        self.assertEqual(self.signed_out, [TOKEN + "1", TOKEN + "2", TOKEN + "3"],
+                         "each scenario's shared session, then the cleanup's, signed out")
 
     def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
         """Run 40046272749: the shared account lands in onboarding, not Chats; may-app's subflow taps through it."""

@@ -3,6 +3,7 @@ device_tests.py and publish.py device-open / device-push. Everything Android, Gi
 
 import ast
 import http.client
+import inspect
 import io
 import json
 import os
@@ -18,6 +19,7 @@ from unittest.mock import patch
 import urllib.error
 
 import device_agent
+import device_ios
 import device_tests
 from device_tests import DeviceTestsError
 import gate
@@ -320,6 +322,84 @@ class SealedAgentTests(unittest.TestCase):
                     dict(good, outcome="finished"), dict(good, actions=999), dict(good, extra=1), "ok"):
             with self.subTest(bad=bad):
                 self.assertFalse(publish.agent_ok(bad))
+
+
+class RevokeTests(unittest.TestCase):
+    """Each shared-account session is signed out at its end, so none outlives the run."""
+
+    def test_signs_out_this_session_alone_and_counts_204_or_401_as_done(self):
+        sent = []
+
+        def answer(status):
+            def post(request, timeout):
+                sent.append(request)
+                if status == 204:
+                    reply = FakeReply(b"")
+                    reply.status = 204
+                    return reply
+                raise urllib.error.HTTPError(request.full_url, status, "", {}, None)
+            return post
+
+        self.assertTrue(device_tests.revoke("https://staging.example", TOKEN, post=answer(204)))
+        self.assertTrue(device_tests.revoke("https://staging.example", TOKEN, post=answer(401)), "already gone")
+        for status in (403, 500):
+            self.assertFalse(device_tests.revoke("https://staging.example", TOKEN, post=answer(status)))
+        request = sent[0]
+        self.assertEqual((request.get_method(), request.full_url), ("POST", "https://staging.example/v1/auth/logout"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + TOKEN)
+        self.assertEqual(request.data, b"{}", "this session alone: never everywhere")
+        self.assertNotIn(TOKEN, request.full_url)
+
+    def test_no_answer_is_a_session_left_to_expire_never_an_error(self):
+        def down(request, timeout):
+            raise urllib.error.URLError("down")
+
+        def slow(request, timeout):
+            raise TimeoutError()
+
+        self.assertFalse(device_tests.revoke("https://staging.example", TOKEN, post=down))
+        self.assertFalse(device_tests.revoke("https://staging.example", TOKEN, post=slow))
+
+    def test_a_run_stopped_part_way_still_signs_out_every_shared_session_and_counts_them(self):
+        rows = [{"id": "chat", "driver": "agent"}, {"id": "notes", "driver": "agent"}]
+        minted = iter(["one", "two", "three"])
+        signed_out = []
+        with patch.dict(os.environ, {}, clear=True):
+            accounts = device_tests.Accounts(rows, lambda base, secret, **k: next(minted), lambda *a: True,
+                                             revoked_by=lambda base, token: signed_out.append(token) or token != "two")
+            first = accounts.session(rows[0], "https://staging.example", "s", {})
+            accounts.finish(rows[0], "https://staging.example", first)
+            self.assertEqual(signed_out, ["one"], "at its own scenario's end, not the run's")
+            accounts.session(rows[1], "https://staging.example", "s", {})  # stopped before its finish
+            accounts.track(next(minted))
+            self.assertEqual(accounts.session({"id": "smoke", "driver": device_tests.SMOKE}, "b", "s", {}), "")
+            accounts.abandon("https://staging.example")
+            accounts.abandon("https://staging.example")
+        self.assertEqual(signed_out, ["one", "two", "three"], "each once, the smoke run's empty session never")
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            accounts.report("android")
+        self.assertEqual(out.getvalue().splitlines(), [
+            "May device tests (android): 2 test sessions were signed out at their end",
+            "May device tests (android): 1 test sessions' sign-out did not answer; they expire on their own"])
+        self.assertNotIn(TOKEN, out.getvalue())
+
+
+    def test_the_runs_sign_out_through_revoke_unless_a_test_says_otherwise(self):
+        for runner in (device_tests.run_scenarios, device_ios.run_scenarios, device_tests.Accounts):
+            with self.subTest(runner=runner.__qualname__):
+                self.assertIs(inspect.signature(runner).parameters["revoked_by"].default, device_tests.revoke)
+
+    def test_a_fresh_accounts_session_is_deleted_with_its_account_never_signed_out(self):
+        row = {"id": "onboarding", "driver": "agent"}
+        signed_out, deleted = [], []
+        with patch.dict(os.environ, {device_tests.FRESH: "onboarding"}, clear=True):
+            accounts = device_tests.Accounts([row], lambda base, secret, **k: "fresh-token",
+                                             lambda base, token: deleted.append(token) or True,
+                                             revoked_by=lambda base, token: signed_out.append(token) or True)
+            token = accounts.session(row, "https://staging.example", "s", {})
+            accounts.finish(row, "https://staging.example", token)
+            accounts.abandon("https://staging.example")
+        self.assertEqual((deleted, signed_out), (["fresh-token"], []))
 
 
 class MintTests(unittest.TestCase):
@@ -688,9 +768,11 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.signed_out = []
             device_tests.run_scenarios(selection, minted=lambda base, secret: TOKEN,
                                        checked=lambda base, token, path: status, budgeted=budgeted,
-                                       diagnosed=diagnosed)
+                                       diagnosed=diagnosed,
+                                       revoked_by=lambda base, token: self.signed_out.append(token) or True)
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             device_tests.judge_scenarios(judged_by=lambda *args: self.fail("judged a Maestro scenario"))
         runs = list((self.root / device_tests.OUT).iterdir())
@@ -740,6 +822,7 @@ class RunTests(unittest.TestCase):
                          ("fail", "may-app has no Maestro flow for this scenario"))
         self.assertEqual(out.splitlines(), [
             "May device tests (android): 2 scenarios ran; verdicts follow the judge step",
+            "May device tests (android): 1 test sessions were signed out at their end",
             "May device tests (android): sign-in: ui-pass", "May device tests (android): connections: fail",
             "May device tests (android): 0 passed, 1 passed on screen alone (server checks not configured), 1 failed, "
             "0 skipped"])
@@ -905,6 +988,7 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", return_value=None), \
                 patch("device_tests.head_revision", return_value=SHA), patch("sys.stdout", new_callable=io.StringIO):
             device_tests.run_scenarios("chat", minted=lambda base, secret: TOKEN, agent=agent,
+                                       revoked_by=lambda base, token: True,
                                        install=lambda root: root / "claude", cleaned=lambda *args: 0,
                                        delivered=lambda *args: None, calls_left=lambda *args: None)
         driven = [argv for argv, _ in calls if argv[0] in ("/fake/maestro", "agent")]

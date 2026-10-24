@@ -193,7 +193,8 @@ def launch(udid, env, token, log):
 def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check, truth=device_tests.tagged,
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
                   install=device_agent.install, budgeted=None, delivered=None,
-                  deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left):
+                  deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
+                  revoked_by=device_tests.revoke):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -208,7 +209,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         raise DeviceTestsError("The Playground app is not built")
     base = device_tests.staging(secret, staged)
     outward = os.environ.get(device_tests.OUTWARD, "").strip() != "off"
-    skipped, accounts = device_tests.switched_off(), device_tests.Accounts(chosen, minted, deleted_by, "ios")
+    skipped, accounts = device_tests.switched_off(), device_tests.Accounts(chosen, minted, deleted_by, "ios", revoked_by)
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
     folder.mkdir(parents=True, mode=0o700)
     device_tests.board_inputs(source, folder)
@@ -316,7 +317,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         if accounts.shared:
             at("cleanup")
             try:
-                token = minted(base, secret)
+                token = accounts.track(minted(base, secret))  # signed out by abandon, below
             except device_tests.MintFailed:
                 token = ""  # read as a cleanup that did not answer: the report is kept
             cleaned_count = cleaned(base, token, since, tag) if token else None

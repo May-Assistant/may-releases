@@ -132,7 +132,9 @@ class AgentRunTests(unittest.TestCase):
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.signed_out = []
             device_tests.run_scenarios(selection, minted=mint, checked=lambda *a: 200,
+                                       revoked_by=lambda base, token: self.signed_out.append(token) or True,
                                        truth=lambda base, token, path, tag: truth,
                                        asked=asked or (lambda base, token, state, tag: truth),
                                        cleaned=clean, agent=agent, deleted_by=delete,
@@ -184,7 +186,10 @@ class AgentRunTests(unittest.TestCase):
             *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"
               for scenario in ("chat", "notes", "routines")],
             "May device tests (android): 3 scenarios ran; verdicts follow the judge step",
-            "May device tests (android): the test session's cleanup removed 3 tagged items"])
+            "May device tests (android): the test session's cleanup removed 3 tagged items",
+            "May device tests (android): 4 test sessions were signed out at their end"])
+        self.assertEqual(self.signed_out, [TOKEN + "1", TOKEN + "2", TOKEN + "3", TOKEN + "4"],
+                         "each scenario's shared session at its end, then the cleanup's: none outlives the run")
         self.assertEqual(judge_out.splitlines(), [
             "May device tests (android): chat: ui-pass", "May device tests (android): notes: ui-pass",
             "May device tests (android): routines: pass",
