@@ -44,6 +44,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from ds_compile import API, DsCompileError, MAX_BODY, post_once, request, run_url
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import GITHUB_HOST_KEY
+import board
 import device_tests
 from renders import PNG, RECIPIENT
 from review_mcp import FOOTER, holds
@@ -64,7 +65,11 @@ KINDS = ("ios", "android", "sheet")
 RUN_FOLDER = re.compile(r"(?:[0-9]{8}-)?[0-9a-f]{12}")
 DEVICE_RUN = re.compile(r"[0-9]{8}-[0-9a-f]{12}")
 DEVICES = ("android", "ios")
-DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.xml)|report\.json")
+# may-app's flows and board notes, sealed by each device job and set aside by device-open for the flow board
+# (board.py), never committed.
+BOARD_INPUTS, BOARD, DROPPED = ("flows.json", "board-notes.json"), "may-device-board", ".dropped"
+DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.xml)|report\.json|"
+                         + "|".join(re.escape(name) for name in BOARD_INPUTS))
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS)
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
@@ -156,13 +161,28 @@ def checked_members(archive, folder, layout=allowed, required="index.html"):
     return members
 
 
+def is_json(data):
+    try:
+        json.loads(data)
+    except (ValueError, RecursionError):  # deep nesting raises RecursionError, not ValueError
+        return False
+    return True
+
+
 def extract(archive, members, destination):
+    """The checked members, written under destination; returns the names of may-app board files it dropped as not
+    JSON."""
+    dropped = []
     for member in sorted(members, key=lambda m: m.name.count("/")):
         path = destination.joinpath(*member.name.split("/"))
         if member.isdir():
             path.mkdir(mode=0o700)
             continue
         data = archive.extractfile(member).read()
+        if path.name in BOARD_INPUTS and not is_json(data):
+            # may-app's board files are optional: a malformed one costs the board its content, never the run.
+            dropped.append(path.name)
+            continue
         # "x": created here, never an existing file or a link to one.
         with path.open("xb") as output:
             output.write(data)
@@ -173,10 +193,11 @@ def extract(archive, members, destination):
         if path.name in ("screens.json", "report.json"):
             try:
                 json.loads(data)
-            except ValueError:
+            except (ValueError, RecursionError):
                 raise PublishError("The manifest copy is not JSON") from None
         if path.name in ("index.html", "README.md") and re.search(rb"(?i)<\s*(script|iframe|object|embed)|javascript:", data):
             raise PublishError("The contact sheet holds active content")
+    return dropped
 
 
 def open_renders(sha):
@@ -254,10 +275,10 @@ def runs_after(existing, entry):
     return runs[:KEEP], [run["folder"] for run in runs[KEEP:]]
 
 
-def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git):
+def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git, extra=None):
     """Add tree as prefix + folder in may-renders' main, record entry first in prefix + runs.json, remove the run
-    folders beyond the newest KEEP there, and push main (never by force; the first push creates it). Returns
-    (kept, removed)."""
+    folders beyond the newest KEEP there, let extra(base) add to the commit, and push main (never by force; the first
+    push creates it). Returns (kept, removed, extra's result)."""
     root = runner_root()
     private = root / "may-private"
     private.mkdir(mode=0o700, exist_ok=True)
@@ -294,6 +315,7 @@ def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git):
                 shutil.rmtree(base / old, ignore_errors=True)
         shutil.copytree(tree, base / folder, symlinks=False)
         index.write_text(json.dumps(kept, indent=2) + "\n")
+        added = extra(base) if extra else None
         (work / "README.md").write_text(README)
         run_git(["add", "-A", "--", "."], log, env, work)
         run_git([*AUTHOR, "commit", "-q", "-m", message], log, env, work)
@@ -301,7 +323,7 @@ def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git):
     finally:
         key.unlink(missing_ok=True)
         known.unlink(missing_ok=True)
-    return kept, removed
+    return kept, removed, added
 
 
 def write_key():
@@ -330,7 +352,7 @@ def push(sha, pr=None, run_git=git):
         return
     number = pull_number(pr) if pr is not None else None
     entry = {"folder": folder, "source_sha": sha, "pull": number, "run": run_id()}
-    kept, removed = publish_tree(tree, "", folder, entry, f"Renders of may-app {sha}", key_text, run_git)
+    kept, removed, _ = publish_tree(tree, "", folder, entry, f"Renders of may-app {sha}", key_text, run_git)
     print(f"May iOS renders published to may-renders as {folder}/ ({len(kept)} run folders kept, "
           f"{len(removed)} removed)")
 
@@ -350,7 +372,7 @@ def device_report(path, files, titles):
     from this repository's own scenario list, never the report."""
     try:
         report = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         raise PublishError("A device report is not JSON") from None
     rows = report.get("scenarios") if isinstance(report, dict) else None
     if not isinstance(rows, list) or report.get("device") not in DEVICES:
@@ -425,6 +447,11 @@ def device_pages(run, reports, note):
     return "\n".join(lines) + "\n", "\n".join(html_parts) + "\n"
 
 
+def scenario_titles():
+    return {row["id"]: row["title"] for platform in DEVICES for row in
+            device_tests.scenarios("all", platform) + device_tests.smoke_rows(platform)}
+
+
 def open_device():
     """Each device's sealed report (may-device-download/<device>.age), decrypted, checked and extracted into one run
     folder, with README.md and index.html built here from the checked reports."""
@@ -441,8 +468,7 @@ def open_device():
         raise PublishError("MAY_RENDERS_RECIPIENT is not set to an age public key in may-device-tests")
     if len(lines) != 1 or not AGE_IDENTITY.fullmatch(lines[0]):
         raise PublishError("The renders decryption key is malformed (MAY_RENDERS_DECRYPT_KEY in may-device-tests)")
-    titles = {row["id"]: row["title"] for platform in DEVICES for row in
-              device_tests.scenarios("all", platform) + device_tests.smoke_rows(platform)}
+    titles = scenario_titles()
     private, tree = root / "may-private", root / TREE
     private.mkdir(mode=0o700, exist_ok=True)
     tree.mkdir(mode=0o700)
@@ -462,12 +488,20 @@ def open_device():
                     runs.add(run)
                     members = [m for m in checked_members(archive, run, device_layout, "report.json")
                                if not (m.isdir() and m.name == run and (tree / run).exists())]
-                    extract(archive, members, tree)
+                    for name in extract(archive, members, tree):
+                        # device-push reads this, so the log says the board went without the dropped file.
+                        (private / BOARD).mkdir(mode=0o700, exist_ok=True)
+                        (private / BOARD / f"{device}-{name}{DROPPED}").touch()
             except tarfile.TarError:
                 raise PublishError("A device report is not a readable archive") from None
             finally:
                 plain.unlink(missing_ok=True)
             folder = tree / run / device
+            # The board's inputs leave the tree here: they are read by device-push, never committed.
+            (private / BOARD).mkdir(mode=0o700, exist_ok=True)
+            for name in BOARD_INPUTS:
+                if (folder / name).is_file():
+                    (folder / name).rename(private / BOARD / f"{device}-{name}")
             reports[device] = device_report(folder / "report.json", {p.name for p in folder.iterdir()}, titles)[1]
         run = runs.pop()
         # Checked as MP4s above, then moved out of the tree: recordings never enter may-renders history; device-release
@@ -481,6 +515,7 @@ def open_device():
             run_url(os.environ), attempt if re.fullmatch(r"[1-9][0-9]{0,3}", attempt) else "<attempt>"))
         (tree / run / "README.md").write_text(readme)
         (tree / run / "index.html").write_text(page)
+        write_private(private / BOARD / "reports.json", json.dumps(reports).encode())
     except BaseException:
         shutil.rmtree(tree, ignore_errors=True)
         raise
@@ -503,9 +538,36 @@ def push_device(run_git=git):
         return
     folder = runs[0].name
     entry = {"folder": folder, "run": run_id()}
-    kept, removed = publish_tree(runs[0], DEVICE_PREFIX, folder, entry, f"Device tests {folder}", key_text, run_git)
+    inputs = root / "may-private" / BOARD
+    # The reports device-open checked (the recordings have left the tree since, so they are not checked again).
+    reports = board.read_json(inputs / "reports.json") or {}
+    # Android's copy of may-app's files first, else iOS's: both jobs check out the same commit.
+    found = {name: next((board.read_json(inputs / f"{device}-{name}") for device in DEVICES
+                         if (inputs / f"{device}-{name}").is_file()), None) for name in BOARD_INPUTS}
+
+    def build_board(base):
+        # The board never costs the run its publishing: any error in it skips the board alone (the log says so).
+        try:
+            return board.update(base, folder, entry["run"], reports, found["flows.json"], found["board-notes.json"],
+                                asset_url, KEEP, scenario_titles(), notes_dropped=notes_dropped)
+        except Exception:
+            return "error"
+
+    notes_dropped = found["board-notes.json"] is None and \
+        any((inputs / f"{device}-board-notes.json{DROPPED}").exists() for device in DEVICES)
+    kept, removed, built = publish_tree(runs[0], DEVICE_PREFIX, folder, entry, f"Device tests {folder}", key_text,
+                                        run_git, extra=build_board)
     print(f"May device tests published to may-renders as device-tests/{folder}/ ({len(kept)} run folders kept, "
           f"{len(removed)} removed)")
+    if built == "written":
+        print("May device tests: the flow board is device-tests/board/ in may-renders")
+    elif built == "no notes":
+        print("May device tests: the flow board is device-tests/board/ in may-renders, without notes (may-app's "
+              "board-notes.json is malformed)")
+    elif built == "no flows":
+        print("May device tests: no flow board (may-app's flows.json is missing or malformed)")
+    else:
+        print("May device tests: no flow board (it could not be built; the run is published)")
 
 
 def renders_api(method, host, path, token, payload=None, data=None):

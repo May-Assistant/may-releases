@@ -41,6 +41,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -54,6 +55,7 @@ import zipfile
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import board
 import device_agent
 from device_agent import AgentError
 import flows
@@ -64,6 +66,7 @@ import toolchain
 
 SCENARIOS = Path(__file__).resolve().parent / "device_scenarios.json"
 FLOWS_DIR = "tools/device-tests/flows"
+BOARD_FLOWS, BOARD_NOTES = "docs/evidence/flows.json", "docs/evidence/board-notes.json"
 SCENARIO_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
 FLOW_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\.yaml")
 SERVER_PATH = re.compile(r"/v1/[a-z0-9/_-]{1,120}")
@@ -448,6 +451,15 @@ def with_session(env, token):
     return dict(env, **{MAESTRO_SESSION: token}) if token else dict(env)
 
 
+def board_inputs(source, folder):
+    """may-app's flows and the lanes' curated board text, copied into the sealed report for the publish job, which
+    runs no may-app code (board.py checks both)."""
+    for name, target in ((BOARD_FLOWS, "flows.json"), (BOARD_NOTES, "board-notes.json")):
+        path = source / name
+        if path.is_file() and not path.is_symlink() and path.stat().st_size <= board.MAX_INPUT:
+            shutil.copyfile(path, folder / target)
+
+
 def scenario_flow(row, source, private):
     """The Maestro flow a scenario runs: may-app's for a Maestro row, SMOKE_FLOW for the smoke row, none for an agent."""
     if row["driver"] == "maestro":
@@ -510,6 +522,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     skipped = switched_off()
     folder = root / OUT / run_folder(source) / "android"
     folder.mkdir(parents=True, mode=0o700)
+    board_inputs(source, folder)
     log = private / "device-run.log"
     at("downloading Maestro")
     launcher = maestro(root, private, log)

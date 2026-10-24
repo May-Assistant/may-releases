@@ -651,8 +651,96 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
         self.assertFalse((work / "device-tests" / RUN / "android" / "sign-in.mp4").exists())
         self.assertEqual([argv for argv in calls if argv[0] == "push"], [["push", "--quiet", "origin", "HEAD:refs/heads/main"]])
-        self.assertEqual(out.getvalue().strip(), f"May device tests published to may-renders as device-tests/{RUN}/ (10 run folders "
-                                      "kept, 1 removed)")
+        self.assertEqual(out.getvalue().splitlines(), [
+            f"May device tests published to may-renders as device-tests/{RUN}/ (10 run folders kept, 1 removed)",
+            "May device tests: no flow board (may-app's flows.json is missing or malformed)"])
+        # The run is recorded in the board's history even without a board, its end screen kept beside it.
+        history = json.loads((work / "device-tests" / "history.json").read_text())
+        self.assertEqual([(item["folder"], item["run"]) for item in history], [(RUN, "9")])
+        self.assertTrue((work / "device-tests" / "board" / "media" / RUN / "android" / "sign-in-end.png").is_file())
+
+    def test_the_flow_board_is_built_from_the_sealed_may_app_files_which_are_never_committed(self):
+        flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
+        notes = {"results": {"android/sign-in": {"headline": "Signs in"}}}
+        tree, _ = self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
+                                              (RUN + "/android/board-notes.json", json.dumps(notes).encode())])
+        self.assertFalse((tree / "android" / "flows.json").exists())
+        self.assertFalse((tree / "android" / "board-notes.json").exists())
+        work = self.root / "may-publish-git"
+
+        def git(argv, log, env, cwd, capture=False):
+            if argv[0] == "init":
+                Path(argv[-1]).mkdir()
+            return b""
+
+        key = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "A" * 120 + "\n-----END OPENSSH PRIVATE KEY-----"
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_APP_RENDERS_WRITE_KEY": key,
+                                     "GITHUB_RUN_ID": "9"}, clear=True), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            publish.push_device(run_git=git)
+        self.assertEqual(out.getvalue().splitlines()[-1], "May device tests: the flow board is device-tests/board/ in may-renders")
+        page = (work / "device-tests" / "board" / "index.html").read_text()
+        data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
+        self.assertEqual(data["results"][RUN]["android/sign-in"]["verdict"], "pass", "ui-pass from the report")
+        self.assertIn("latest", data["results"])
+        self.assertEqual(data["results"]["latest"]["android/sign-in"]["headline"], "Signs in")
+        self.assertFalse(list((work / "device-tests").rglob("flows.json")), "may-app's files are never committed")
+
+    def push_for_board(self):
+        work = self.root / "may-publish-git"
+
+        def git(argv, log, env, cwd, capture=False):
+            if argv[0] == "init":
+                Path(argv[-1]).mkdir()
+            return b""
+
+        key = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "A" * 120 + "\n-----END OPENSSH PRIVATE KEY-----"
+        calls = []
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_APP_RENDERS_WRITE_KEY": key,
+                                     "GITHUB_RUN_ID": "9"}, clear=True), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            publish.push_device(run_git=lambda argv, *a, **k: calls.append(argv) or git(argv, *a, **k))
+        return work, out.getvalue().splitlines(), calls
+
+    def test_a_malformed_may_app_board_file_never_stops_the_publish(self):
+        """Review of #86: one trailing comma in board-notes.json raised in extract(), so nothing was published."""
+        flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
+        try:
+            tree, _ = self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
+                                                  (RUN + "/android/board-notes.json", b'{"banner": {},}')])
+        except publish.PublishError as error:
+            self.fail(f"a malformed board-notes.json stopped device-open: {error}")
+        self.assertTrue((tree / "README.md").is_file())
+        work, lines, _ = self.push_for_board()
+        # Re-review of #86: the log says the board went without the dropped notes.
+        self.assertEqual(lines[-1], "May device tests: the flow board is device-tests/board/ in may-renders, without "
+                                    "notes (may-app's board-notes.json is malformed)")
+        self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
+
+    def test_deeply_nested_may_app_json_never_stops_the_publish(self):
+        """Re-review of #86: 200,000 "[" raised RecursionError, which escaped extract() and stopped device-open."""
+        try:
+            self.assertFalse(publish.is_json(b"[" * 200000))
+        except RecursionError:
+            self.fail("deep nesting escaped is_json")
+        try:
+            tree, _ = self.open_with(self.GOOD + [(RUN + "/android/board-notes.json", b"[" * 200000),
+                                                  (RUN + "/android/flows.json", b"{" * 200000)])
+        except (publish.PublishError, RecursionError) as error:
+            self.fail(f"deeply nested may-app JSON stopped device-open: {type(error).__name__}")
+        self.assertTrue((tree / "README.md").is_file())
+
+    def test_a_board_that_fails_never_costs_the_run_its_publishing(self):
+        """Review of #86: any error in the board skips the board alone."""
+        self.open_with(self.GOOD)
+        with patch("board.update", side_effect=IndexError("month 13")):
+            try:
+                work, lines, calls = self.push_for_board()
+            except IndexError:
+                self.fail("a board error stopped device-push")
+        self.assertEqual(lines[-1], "May device tests: no flow board (it could not be built; the run is published)")
+        self.assertIn(["push", "--quiet", "origin", "HEAD:refs/heads/main"], calls)
+        self.assertTrue((work / "device-tests" / RUN / "README.md").is_file())
 
     def test_nothing_sealed_publishes_nothing(self):
         (self.root / publish.DEVICE_DOWNLOAD / "android.age").unlink()
