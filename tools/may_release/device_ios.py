@@ -187,6 +187,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     skipped = device_tests.switched_off()
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
     folder.mkdir(parents=True, mode=0o700)
+    device_tests.board_inputs(source, folder)
     log = private / "device-run.log"
     at("downloading Maestro")
     launcher = device_tests.maestro(root, private, log)
