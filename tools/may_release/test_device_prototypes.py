@@ -188,6 +188,20 @@ class RenderTests(Fixture):
         self.assertIn(["sudo", "-n", "chown", "-R", f"{RENDER_USER}:", str(self.stage)], commands)
         self.assertEqual(commands[-1], ["sudo", "-n", "rm", "-rf", "--", str(self.stage)], "removed at the end")
 
+    def test_the_render_user_can_reach_the_stage(self):
+        """A fresh temporary folder is 0700, the runner's alone: the render user could not open build.py in it."""
+        self.write_path(path())
+        self.stage.parent.mkdir(mode=0o700)
+        seen = []
+        host = FakeHost()
+
+        def run(argv, **kwargs):
+            if "chown" in argv:
+                seen.append(self.stage.parent.stat().st_mode & 0o777)
+            return host(argv, **kwargs)
+        self.render(run)
+        self.assertEqual(seen, [0o755])
+
     def test_each_call_is_bounded_and_no_shot_starts_after_the_steps_time(self):
         self.write_path(path())
         host = FakeHost()

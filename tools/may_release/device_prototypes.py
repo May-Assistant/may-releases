@@ -148,6 +148,7 @@ def stage_for(source, stage, jobs, run):
     False when that cannot be done."""
     shutil.rmtree(stage, ignore_errors=True)
     shutil.copytree(source / PROTOTYPES, stage, symlinks=False, ignore=shutil.ignore_patterns("pages"))
+    stage.parent.chmod(0o755)  # a fresh temporary folder is the runner's alone: the render user must pass through it
     for _, slug, platform, n in jobs:
         (stage / "profiles" / f"{slug}-{platform}-{n}").mkdir(parents=True)
     # Handed to the render user; readable by all, so the runner reads the shots back (prototypes hold no secret).
