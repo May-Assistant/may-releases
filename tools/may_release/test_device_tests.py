@@ -303,6 +303,23 @@ class RunTests(unittest.TestCase):
         self.assertIn("May device tests (android): connections: skipped", out)
         self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "skipped"])
 
+    def test_each_recording_shows_where_taps_land(self):
+        """Samuel, 24 Oct: Android's show_touches on before the scenarios and off after, never stopping the run."""
+        calls, _, _, _ = self.run_it()
+        on = ["/sdk/adb", "shell", "settings", "put", "system", "show_touches", "1"]
+        off = on[:-1] + ["0"]
+        self.assertIn(on, calls)
+        self.assertIn(off, calls)
+        install = next(i for i, argv in enumerate(calls) if "install" in argv)
+        first_start = next(i for i, argv in enumerate(calls) if "start" in argv)
+        self.assertLess(install, calls.index(on))
+        self.assertLess(calls.index(on), first_start, "on before any scenario launches")
+        self.assertLess(max(i for i, argv in enumerate(calls) if "start" in argv), calls.index(off))
+        self.assertLess(calls.index(off), calls.index(["terminate"]), "off before the emulator stops")
+        with patch("device_tests.flows.run_private", return_value=1) as private:
+            device_tests.show_touches("/sdk/adb", {}, Path("/log"), True)
+        self.assertIs(private.call_args.kwargs["check"], False, "a setting that will not take never stops the run")
+
     def test_signs_in_runs_each_flow_records_and_reports(self):
         calls, report, out, run = self.run_it()
         start = [argv for argv in calls if "start" in argv][0]

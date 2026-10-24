@@ -37,6 +37,8 @@ MAX_RECORDING = 38 * 1024 * 1024
 # presets as MPEG-4 at 720p and 540p.
 CONVERSIONS = (("PresetAppleM4V720pHD", ".m4v"), ("Preset1280x720", ".mp4"), ("Preset960x540", ".mp4"))
 STOP_SECONDS = 30
+# A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
+SHOW_TOUCHES = ("-MayShowTouches", "YES")
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
 # (errSecMissingEntitlement) and the app signed out with "Something went wrong on this device" (run 40035089599).
@@ -161,9 +163,10 @@ def boot(log, env):
 
 def launch(udid, env, token, log):
     """The app, stopped and started again with a fresh test session in its launch environment (never an argument);
-    signed out, with no token (the smoke scenario)."""
+    signed out, with no token (the smoke scenario). SHOW_TOUCHES draws each tap in the app (may-app #1194, May
+    Playground alone), as Android's show_touches does, since the simulator's recording never shows touches."""
     renders.quiet(["xcrun", "simctl", "terminate", udid, BUNDLE], log, env=env)
-    launched = renders.quiet(["xcrun", "simctl", "launch", udid, BUNDLE], log,
+    launched = renders.quiet(["xcrun", "simctl", "launch", udid, BUNDLE, *SHOW_TOUCHES], log,
                              env=dict(env, SIMCTL_CHILD_MAY_TEST_SESSION=token) if token else env)
     if launched.returncode:
         raise DeviceTestsError("May Playground did not launch on the simulator")

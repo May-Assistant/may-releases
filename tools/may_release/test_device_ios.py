@@ -153,7 +153,9 @@ class RunTests(Workspace):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text("appId: x\n")
         calls, minted, report, out, run = self.run_it()
         launches = [(argv, env) for argv, env in calls if argv[:3] == ["xcrun", "simctl", "launch"]]
-        self.assertEqual([argv for argv, _ in launches], [["xcrun", "simctl", "launch", UDID, device_ios.BUNDLE]] * 2)
+        # may-app #1194's in-app touch overlay, as a launch argument (Samuel, 24 Oct); the session stays out of argv.
+        self.assertEqual([argv for argv, _ in launches],
+                         [["xcrun", "simctl", "launch", UDID, device_ios.BUNDLE, "-MayShowTouches", "YES"]] * 2)
         self.assertEqual([env.get("SIMCTL_CHILD_MAY_TEST_SESSION") for _, env in launches], [TOKEN + "1", TOKEN + "2"])
         self.assertTrue(all(TOKEN not in " ".join(argv) for argv, _ in calls), "the token is never an argument")
         self.assertEqual(minted, ["s" * 32] * 2)
