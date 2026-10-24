@@ -67,6 +67,9 @@ MANIFEST = EVIDENCE + "/screens.json"
 FRAME = (1179, 2556)
 MODES = ("light", "dark")
 SCREEN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+# A design-system component name, as screens.json gives it (e.g. AgendaScreen, ApprovalCard), or "?" for a
+# row whose component is not named yet, shown as-is.
+COMPONENT = re.compile(r"[A-Z][A-Za-z0-9]{0,63}|\?")
 # Relative to EVIDENCE; one leading "../" reaches a sibling evidence folder (docs/evidence/<other>/), never further.
 EVIDENCE_PATH = re.compile(r"(?:\.\./[A-Za-z0-9_][A-Za-z0-9_-]{0,63}/)?[A-Za-z0-9_][A-Za-z0-9_./-]{0,239}\.png")
 MAX_LOG = 8 * 1024 * 1024
@@ -258,9 +261,14 @@ def manifest_rows(source):
         if not (isinstance(title, str) and 0 < len(title) <= 200) or \
                 not (spec is None or isinstance(spec, str) and len(spec) <= 300):
             raise RendersError("A screens manifest title or spec is malformed")
+        # The row's design-system component (may-app #1150's naming, every row since #1164): optional, so an
+        # older commit still renders.
+        component = row.get("component")
+        if not (component is None or isinstance(component, str) and COMPONENT.fullmatch(component)):
+            raise RendersError("A screens manifest component is malformed")
         ids.add(screen)
         note = row.get("note")
-        checked.append({"id": screen, "title": title, "spec": spec or "",
+        checked.append({"id": screen, "title": title, "spec": spec or "", "component": component or "",
                         "note": note if isinstance(note, str) and len(note) <= 300 else "",
                         "android": evidence_paths(row.get("android"), "Android"),
                         "ios": evidence_paths(row.get("ios", {}), "iOS")})
@@ -289,7 +297,8 @@ def snapshot_rows(snapshots):
         names = []
     pattern = re.compile(f"({SCREEN_ID.pattern})-(?:{'|'.join(MODES)})\\.png")
     ids = list(dict.fromkeys(m.group(1) for m in map(pattern.fullmatch, names) if m))[:MAX_SCREENS]
-    return [{"id": screen, "title": screen, "spec": "", "note": "", "android": {mode: None for mode in MODES},
+    return [{"id": screen, "title": screen, "spec": "", "component": "", "note": "",
+             "android": {mode: None for mode in MODES},
              "ios": {mode: f"ios/{screen}-{mode}.png" for mode in MODES}} for screen in ids]
 
 
@@ -378,7 +387,8 @@ def page(sha, ds_sha, rows, expected, stitched, manifest=True):
             sheet = f'<br><a href="sheet/{key}.png">side by side</a>' if key in stitched else ""
             # GitHub sizes README images by attribute only (it drops style), so each carries width="300".
             android, ios = android.replace(' alt=', ' width="300" alt='), ios.replace(' alt=', ' width="300" alt=')
-            parts.append(f"<tr><td>{html.escape(row['title'])}<br><small>{html.escape(row['id'])} "
+            component = f" · <code>{html.escape(row['component'])}</code>" if row.get("component") else ""
+            parts.append(f"<tr><td>{html.escape(row['title'])}<br><small>{html.escape(row['id'])}{component} "
                          f"{html.escape(row['spec'])}</small>{sheet}</td>"
                          f"<td>{html.escape(entry['mode'])}</td><td>{android}</td><td>{ios}</td></tr>")
     parts.append("</table>")
