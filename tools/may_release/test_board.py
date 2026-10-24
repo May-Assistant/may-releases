@@ -79,8 +79,9 @@ class HistoryTests(unittest.TestCase):
                                            "ios": [row("sign-in", "fail", video=False, reason="r")]}, NOW)
         self.assertEqual(new["when"], "24 Oct, 03:03 UTC")
         self.assertEqual(new["results"], {
-            "android/sign-in": {"verdict": "pass", "reason": None, "shot": "sign-in-end.png", "videos": ["sign-in.mp4"]},
-            "ios/sign-in": {"verdict": "fail", "reason": "r", "shot": "sign-in-end.png", "videos": []}})
+            "android/sign-in": {"verdict": "pass", "reason": None, "shot": "sign-in-end.png", "videos": ["sign-in.mp4"],
+                                "preview": False},
+            "ios/sign-in": {"verdict": "fail", "reason": "r", "shot": "sign-in-end.png", "videos": [], "preview": False}})
 
     def test_history_keeps_the_newest_runs_and_drops_malformed_entries(self):
         old = [board.entry(folder(n), str(n), {"android": [row("sign-in", "pass")]}, NOW) for n in range(70, 0, -1)]
@@ -95,7 +96,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual([item["run"] for item in again[:2]], ["72", "70"], "a re-run replaces its folder's entry")
 
 
-class BoardTests(unittest.TestCase):
+class BoardCase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.base = Path(self.directory.name)
@@ -116,6 +117,9 @@ class BoardTests(unittest.TestCase):
         blob = page.split('<script type="application/json" id="board-data">')[1].split("</script>")[0]
         return json.loads(blob), page
 
+
+
+class BoardTests(BoardCase):
     def test_the_board_takes_verdicts_from_the_reports_and_notes_on_the_newest_run_alone(self):
         self.assertEqual(self.run_folder(folder(1), {"android": [row("sign-in", "pass")]}), "written")
         self.assertEqual(self.run_folder(folder(2), {"android": [row("sign-in", "ui-pass"), row("chat", "fail")],
@@ -216,6 +220,28 @@ class BoardTests(unittest.TestCase):
         data = json.loads((self.base / board.BOARD / "index.html").read_text()
                           .split('id="board-data">')[1].split("</script>")[0])
         self.assertIsNone(data["flows"][0]["means"])
+
+
+class PreviewTests(BoardCase):
+    def test_previews_are_expected_beside_the_page_for_the_kept_runs_alone_and_listed_with_their_assets(self):
+        for n in range(1, 13):
+            reports = {"android": [row("sign-in", "pass")], "ios": [row("sign-in", "pass")]}
+            for device, rows in reports.items():
+                (self.base / folder(n) / device).mkdir(parents=True)
+            board.update(self.base, folder(n), str(n), reports, FLOWS, NOTES, url, 10, TITLES, now=NOW,
+                         previews={"android/sign-in"})
+        data, _ = self.data(folder(12))
+        newest, oldest = data["results"][folder(12)], data["results"][folder(1)]
+        self.assertEqual(newest["android/sign-in"]["preview"], f"media/{folder(12)}/android-sign-in-preview.mp4")
+        self.assertNotIn("preview", newest["ios/sign-in"], "no preview was made for iOS")
+        self.assertNotIn("preview", oldest["android/sign-in"], "an archived run has no release, so no preview")
+        listed = json.loads((self.base / board.BOARD / board.MEDIA / "previews.json").read_text())
+        self.assertEqual(len(listed), 10)
+        self.assertEqual(listed[f"media/{folder(12)}/android-sign-in-preview.mp4"],
+                         {"tag": f"device-tests-{folder(12)}", "asset": "android-sign-in-preview.mp4"})
+        self.assertEqual(publish.asset_name("android", "sign-in-preview.mp4"), "android-sign-in-preview.mp4",
+                         "the asset device-release uploads is the one listed")
+        self.assertFalse(list((self.base / board.BOARD).rglob("*.mp4")), "no video in git")
 
 
 class DeviceInputTests(unittest.TestCase):

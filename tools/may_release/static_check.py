@@ -1194,7 +1194,7 @@ def renders_workflow_problems(text):
 RENDERS_PRINT_VALUES = {"len(rendered)", "len(expected)", "modes", "wrong", "others", "android", "rows", "len(stitched)",
                         "not_ios", "len(entries)"}
 PUBLISH_PRINT_VALUES = {"folder", "pngs", "len(kept)", "len(removed)", "number", "run", "scenarios", "devices",
-                        "uploaded", "kept", "removed"}
+                        "uploaded", "kept", "removed", "made", "failed"}
 
 
 def renders_print_problems(root):
@@ -1235,8 +1235,10 @@ DEVICE_RUNS = [
     '"$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-maestro" "$RUNNER_TEMP/may-claude" '
     '"$RUNNER_TEMP/may-device-out" "$RUNNER_TEMP/may-device-sealed"',
     # publish
-    "python3 -I -S -B tools/may_release/toolchain.py age",
-    "python3 -I -S -B tools/may_release/publish.py device-open", "python3 -I -S -B tools/may_release/publish.py device-push",
+    "python3 -I -S -B tools/may_release/toolchain.py age", "python3 -I -S -B tools/may_release/toolchain.py ffmpeg",
+    "python3 -I -S -B tools/may_release/publish.py device-open",
+    "python3 -I -S -B tools/may_release/publish.py device-previews",
+    "python3 -I -S -B tools/may_release/publish.py device-push",
     "python3 -I -S -B tools/may_release/publish.py device-release",
     'rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-device-download" "$RUNNER_TEMP/may-publish-tree" '
     '"$RUNNER_TEMP/may-publish-git"']

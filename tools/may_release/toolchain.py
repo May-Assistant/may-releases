@@ -11,6 +11,11 @@ was recorded on 2026-10-13:
 - age v1.3.1 (linux amd64, darwin arm64): each archive passed
   `sigsum-verify -k age-sigsum-key.pub -P sigsum-generic-2025-1` against its
   published .proof, using the key in age's SIGSUM.md.
+- ffmpeg 7:6.1.1-3ubuntu5 (Ubuntu 24.04, recorded 2026-10-24): no static build
+  has a stable URL with a published checksum, so the device-tests publish job
+  installs Ubuntu's own package at this exact version with apt, which checks the
+  archive's signature, and refuses any other version afterwards (APT_PINS). It
+  makes the flow board's recording previews.
 
 Tools land under $RUNNER_TEMP/may-tools. Scripts call them by absolute path.
 """
@@ -21,6 +26,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import subprocess
 import sys
 import tarfile
 import urllib.request
@@ -43,6 +49,26 @@ TOOLS = {
         "https://github.com/FiloSottile/age/releases/download/v1.3.1/age-v1.3.1-darwin-arm64.tar.gz",
         "01120ea2cbf0463d4c6bd767f99f3271bbed1cdc8a9aa718a76ba1fe4f01998b", "age"),
 }
+
+
+# Ubuntu packages installed at an exact version from the runner's signed archive (Linux only).
+APT_PINS = {"ffmpeg": "7:6.1.1-3ubuntu5"}
+
+
+def apt_install(name, run=subprocess.run):
+    """APT_PINS[name] from Ubuntu's archive (apt checks its signature), quietly, then its version checked."""
+    if name not in APT_PINS or platform.system() != "Linux":
+        raise StoreError("No pinned package for this runner")
+    env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C"}
+    for argv in (["sudo", "apt-get", "update", "-qq"],
+                 ["sudo", "apt-get", "install", "-y", "-qq", "--no-install-recommends", f"{name}={APT_PINS[name]}"]):
+        if run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env,
+               timeout=600).returncode:
+            raise StoreError("The pinned package did not install")
+    found = run(["dpkg-query", "-W", "-f=${Version}", name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, env=env, timeout=60)
+    if found.returncode or found.stdout.decode(errors="replace") != APT_PINS[name]:
+        raise StoreError("The installed package is not the pinned version")
 
 
 def tools_root():
@@ -98,10 +124,19 @@ def install(name, system=None, machine=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("tool", choices=("jdk", "age"))
+    parser.add_argument("tool", choices=("jdk", "age", "ffmpeg"))
     parser.add_argument("--export", action="store_true",
                         help="add to GITHUB_PATH (and JAVA_HOME to GITHUB_ENV); for no-secret jobs only")
     args = parser.parse_args()
+    if args.tool == "ffmpeg":
+        try:
+            apt_install("ffmpeg")
+        except StoreError as error:
+            raise SystemExit("Pinned package install refused: " + error.args[0]) from None
+        except Exception:
+            raise SystemExit("Pinned package install failed") from None
+        print("Pinned ffmpeg installed from Ubuntu's signed archive")
+        raise SystemExit(0)
     try:
         home = install(args.tool)
         if args.export:

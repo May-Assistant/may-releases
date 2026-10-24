@@ -188,6 +188,8 @@ jobs:
           permission-contents: write
       - name: Install pinned age
         run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Install Ubuntu's ffmpeg at its pinned version, before any step that uses a secret
+        run: python3 -I -S -B tools/may_release/toolchain.py ffmpeg
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         # Nothing to download (no recipient yet, or the device job stopped first) is reported by the next step.
         continue-on-error: true
@@ -204,6 +206,8 @@ jobs:
           MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
           MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
         run: python3 -I -S -B tools/may_release/publish.py device-open
+      - name: Make a 270px preview of each recording, with no secret
+        run: python3 -I -S -B tools/may_release/publish.py device-previews
       - name: Push the run folder to may-renders
         env:
           MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}

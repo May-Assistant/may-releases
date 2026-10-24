@@ -12,7 +12,9 @@ A flow with several tests gets one nested row per test (<flow>-<scenario>, title
 list), each with its own state; the flow's own page lists them.
 
 The run history (device-tests/history.json) keeps HISTORY runs, newest first, each with its verdicts and its end
-screenshots copied to device-tests/board/media/<folder>/, so they outlive the run folder (publish.KEEP). A run older than
+screenshots copied to device-tests/board/media/<folder>/, so they outlive the run folder (publish.KEEP). Previews
+(270px, silent) are release assets, never in git: the page expects each at media/<folder>/<device>-<scenario>-preview.mp4
+and media/previews.json says which release asset holds it; a preview that is absent falls back to the end screen. A run older than
 the KEEP newest has lost its release, so the board shows it as Archived: verdict and end screen, no recording.
 """
 import datetime
@@ -119,8 +121,9 @@ def checked_notes(data):
     return {"banner": banner, "flows": flows, "results": results, "scenario_titles": titles}
 
 
-def entry(folder, run, reports, now):
-    """This run's history entry from the checked device reports ({device: rows})."""
+def entry(folder, run, reports, now, previews=frozenset()):
+    """This run's history entry from the checked device reports ({device: rows}); previews holds the
+    "<device>/<scenario>" whose preview was made."""
     results = {}
     for device, rows in reports.items():
         for row in rows:
@@ -130,7 +133,8 @@ def entry(folder, run, reports, now):
             results[f"{device}/{row['id']}"] = {
                 "verdict": VERDICTS[row["verdict"]], "reason": row["reason"] or None,
                 "shot": shots[0] if shots else None,
-                "videos": [v for v in row["videos"] if VIDEO.fullmatch(v)]}
+                "videos": [v for v in row["videos"] if VIDEO.fullmatch(v)],
+                "preview": f"{device}/{row['id']}" in previews}
     return {"folder": folder, "run": run, "when": f"{now.day} {MONTHS[now.month - 1]}, {now:%H:%M} UTC",
             "results": results}
 
@@ -152,7 +156,8 @@ def history_entries(existing):
                     (result.get("shot") is None or isinstance(result["shot"], str) and SHOT.fullmatch(result["shot"])) and \
                     isinstance(result.get("videos"), list) and \
                     all(isinstance(v, str) and VIDEO.fullmatch(v) for v in result["videos"]):
-                results[key] = {k: result.get(k) for k in ("verdict", "reason", "shot", "videos")}
+                results[key] = dict({k: result.get(k) for k in ("verdict", "reason", "shot", "videos")},
+                                    preview=result.get("preview") is True)
         kept.append({"folder": item["folder"], "run": item.get("run"), "when": item["when"], "results": results})
     return kept
 
@@ -204,6 +209,8 @@ def payload(flows, notes, entries, asset_url, keep, titles):
                 row["thumb"] = f"{MEDIA}/{item['folder']}/{device}/{result['shot']}"
             if result["videos"] and not archived:
                 row["video"] = asset_url(item["folder"], device, result["videos"][0])
+            if result["preview"] and not archived:
+                row["preview"] = preview_path(item["folder"], key)
             if result["reason"]:
                 row["note"] = result["reason"]
             if item is newest:
@@ -239,6 +246,23 @@ def flow_row(flow, extra, newest, entries):
             (f", run {passed['run']}" if passed["run"] else "") if passed else None}
 
 
+def preview_path(folder, key):
+    """Where the page expects a preview: fixed, relative, below the board; the file itself is a release asset."""
+    return f"{MEDIA}/{folder}/{preview_asset(key)}"
+
+
+def preview_asset(key):
+    device, scenario = key.split("/")
+    return f"{device}-{scenario}-preview.mp4"
+
+
+def previews_list(entries, keep):
+    """media/previews.json: for each preview the page expects, the release (tag) and asset that hold it, so the
+    coordinator can download them into the folder before uploading it. The newest keep runs alone have releases."""
+    return {preview_path(item["folder"], key): {"tag": f"device-tests-{item['folder']}", "asset": preview_asset(key)}
+            for item in entries[:keep] for key, result in sorted(item["results"].items()) if result["preview"]}
+
+
 def page(data, banner, when):
     """board.html: the template with its data as JSON, every "<" escaped so no value can close the script."""
     blob = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e") \
@@ -249,7 +273,7 @@ def page(data, banner, when):
         .replace("{{BANNER}}", flash).replace("{{DATA}}", blob)
 
 
-def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, titles, now=None):
+def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, titles, now=None, previews=frozenset()):
     """Record this run in base/history.json, copy its end screenshots from base/folder to base/BOARD/MEDIA/folder,
     drop those beyond HISTORY and write base/BOARD/index.html. Returns "written", "no notes" (written without the
     malformed board-notes.json) or "no flows" (not written: flows.json missing or malformed)."""
@@ -259,7 +283,7 @@ def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, 
         existing = json.loads(index.read_text()) if index.is_file() and not index.is_symlink() else []
     except (OSError, ValueError):
         existing = []
-    new = entry(folder, run, reports, now)
+    new = entry(folder, run, reports, now, previews)
     entries, removed = history_after(existing, new)
     for device_key, result in new["results"].items():
         device = device_key.split("/")[0]
@@ -281,7 +305,8 @@ def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, 
         notes, word = checked_notes(notes_data if notes_data is not None else {}), "written"
     except BoardError:
         notes, word = checked_notes({}), "no notes"
-    (base / BOARD).mkdir(exist_ok=True)
+    (base / BOARD / MEDIA).mkdir(parents=True, exist_ok=True)
+    (base / BOARD / MEDIA / "previews.json").write_text(json.dumps(previews_list(entries, keep), indent=2) + "\n")
     (base / BOARD / "index.html").write_text(page(payload(flows, notes, entries, asset_url, keep, titles),
                                                   notes["banner"], new["when"]))
     return word

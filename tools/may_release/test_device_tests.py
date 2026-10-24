@@ -38,6 +38,11 @@ TOKEN = "session-token-" + "x" * 30
 MP4 = b"\0\0\0\x18ftypmp42" + b"\0" * 32
 
 
+class Done:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
 class GateTests(unittest.TestCase):
     def test_dispatch_and_the_nightly_schedule_from_main_alone(self):
         self.assertEqual(validate_run(REPO, MAIN, DISPATCH, SHA, "device-tests"), "may-device-tests")
@@ -634,6 +639,47 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(data["results"][RUN]["android/sign-in"]["verdict"], "pass", "ui-pass from the report")
         self.assertEqual(data["results"][RUN]["android/sign-in"]["headline"], "Signs in")
         self.assertFalse(list((work / "device-tests").rglob("flows.json")), "may-app's files are never committed")
+
+    def test_previews_are_made_beside_each_scenarios_first_recording_and_the_board_points_at_them(self):
+        """The flow board's previews (Samuel, 24 Oct): 270px, silent, release assets, never in git."""
+        flows = {"flows": [{"id": "2", "title": "Sign in and out", "scenarios": ["sign-in"], "components": []}]}
+        self.open_with(self.GOOD + [(RUN + "/android/flows.json", json.dumps(flows).encode()),
+                                    (RUN + "/android/notes-part1.mp4", MP4), (RUN + "/android/notes-part2.mp4", MP4)])
+        videos = self.root / "may-private" / publish.VIDEOS / RUN / "android"
+        calls = []
+
+        def ffmpeg(argv, stdout, stderr, stdin, env, timeout):
+            calls.append(argv)
+            if "notes-part1.mp4" in argv[argv.index("-i") + 1]:
+                return Done(1)  # one failure: no preview, and the run goes on
+            Path(argv[-1]).write_bytes(MP4)
+            return Done(0)
+
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            publish.make_previews(run=ffmpeg)
+        self.assertEqual(out.getvalue().strip(), "May device tests: 1 previews made, 1 failed")
+        self.assertEqual(sorted(Path(argv[argv.index("-i") + 1]).name for argv in calls),
+                         ["notes-part1.mp4", "sign-in.mp4"], "each scenario's first recording alone")
+        self.assertIn("scale=270:-2", calls[0])
+        self.assertIn("-an", calls[0])
+        self.assertEqual(sorted(p.name for p in videos.iterdir() if p.name.endswith("-preview.mp4")),
+                         ["sign-in-preview.mp4"])
+        work = self.root / "may-publish-git"
+
+        def git(argv, log, env, cwd, capture=False):
+            if argv[0] == "init":
+                Path(argv[-1]).mkdir()
+            return b""
+
+        key = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "A" * 120 + "\n-----END OPENSSH PRIVATE KEY-----"
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_APP_RENDERS_WRITE_KEY": key,
+                                     "GITHUB_RUN_ID": "9"}, clear=True), patch("sys.stdout", new_callable=io.StringIO):
+            publish.push_device(run_git=git)
+        page = (work / "device-tests" / "board" / "index.html").read_text()
+        data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
+        self.assertEqual(data["results"][RUN]["android/sign-in"]["preview"], f"media/{RUN}/android-sign-in-preview.mp4")
+        self.assertFalse(list((work / "device-tests").rglob("*.mp4")), "no video in may-renders' git")
 
     def test_nothing_sealed_publishes_nothing(self):
         (self.root / publish.DEVICE_DOWNLOAD / "android.age").unlink()
