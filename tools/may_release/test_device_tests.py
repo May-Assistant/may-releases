@@ -152,7 +152,8 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "connections", "chat", "notes", "poll", "poll-skip", "routines"])
+        self.assertEqual(ids, ["sign-in", "connections", "onboarding", "chat", "notes", "poll", "poll-skip",
+                               "routines"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ids, "both devices run all")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
@@ -203,6 +204,24 @@ class ScenarioTests(unittest.TestCase):
                 path.write_text(json.dumps([dict(agent, **change)]))
                 with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
                     device_tests.scenarios()
+
+    def test_only_a_fresh_agent_row_records_onboarding(self):
+        onboarding = device_tests.scenarios("onboarding")[0]
+        self.assertEqual((onboarding["driver"], onboarding["fresh"], onboarding["onboarding"]),
+                         ("agent", True, device_tests.RECORD))
+        for row, change in ((onboarding, {"fresh": False}), (onboarding, {"onboarding": "skip"}),
+                            (onboarding, {"onboarding": True}), (dict(onboarding), {"fresh": None}),
+                            (device_tests.scenarios("sign-in")[0], {"fresh": True, "onboarding": "record"})):
+            row = {key: value for key, value in dict(row, **change).items() if value is not None}
+            with self.subTest(change=change, driver=row["driver"]), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "s.json"
+                path.write_text(json.dumps([row]))
+                with patch("device_tests.SCENARIOS", path):
+                    try:
+                        device_tests.scenarios()
+                    except DeviceTestsError:
+                        continue
+                self.fail(f"a row with {change} was accepted")
 
 
 class FakeReply(io.BytesIO):
@@ -347,6 +366,9 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(device_tests.cap({"driver": "agent"}, device_agent.IOS_AGENT_SECONDS),
                          device_agent.IOS_AGENT_SECONDS + device_tests.ONBOARDING_SECONDS)
         self.assertEqual(device_tests.cap({"driver": device_tests.SMOKE}), device_agent.AGENT_SECONDS)
+        # The row that records onboarding runs no subflow, so its cap holds none.
+        self.assertEqual(device_tests.cap({"driver": "agent", "onboarding": device_tests.RECORD}),
+                         device_agent.AGENT_SECONDS)
 
     def test_the_budget_leaves_the_job_time_to_build_seal_and_publish(self):
         workflow = (Path(device_tests.__file__).parent.parent.parent / ".github/workflows/device-tests.yml").read_text()
@@ -413,6 +435,12 @@ class OnboardingTests(unittest.TestCase):
                 self.assertEqual(self.finish({"id": "chat", "driver": "agent"}, passed)[1],
                                  "May device tests (android): chat: the onboarding subflow did not pass; the agent "
                                  "starts where it stopped\n")
+
+    def test_the_row_that_records_onboarding_gets_no_subflow(self):
+        self.flow.write_text("appId: x\n")
+        row = device_tests.scenarios("onboarding")[0]
+        self.assertEqual(self.finish(row), ([], ""), "the subflow would skip the onboarding being recorded")
+        self.assertEqual(self.finish(dict(row, id="chat", onboarding=None)), ([self.flow], ""))
 
 
 class RunTests(unittest.TestCase):

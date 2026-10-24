@@ -105,6 +105,9 @@ MAESTRO_SESSION = "MAESTRO_MAY_TEST_SESSION"
 # may-app's subflow that taps a signed-in account through onboarding ("Hi, I'm May") to Chats, run before each agent
 # scenario: the shared test account lands in onboarding, not Chats (run 40046272749), and the agent starts from launch.
 ONBOARDING, ONBOARDING_SECONDS = "subflows/finish-onboarding.yaml", 180
+# A row whose "onboarding" is RECORD is the onboarding scenario itself: the subflow is not run before it, so its agent and
+# recording start at onboarding's first step. Only a fresh agent row may say so (the shared account is past onboarding).
+RECORD = "record"
 # Each device job has 120 minutes (device-tests.yml). Its build takes about 7, and after the scenarios come the judge
 # (up to device_agent.JUDGE_SECONDS for each agent scenario that ran), the seal and the handover. The scenarios and
 # their judging get RUN_BUDGET_SECONDS from the run step's start, so the job always seals and publishes what ran
@@ -230,6 +233,8 @@ def scenarios(selection="all", platform="android"):
                 and isinstance(row.get("title"), str) and
                 isinstance(row.get("platforms"), list) and set(row["platforms"]) <= set(PLATFORMS) and
                 isinstance(row.get("outward"), bool) and isinstance(row.get("fresh", False), bool) and
+                ("onboarding" not in row or row["onboarding"] == RECORD and driver == "agent" and
+                 row.get("fresh") is True) and
                 isinstance(row.get("server"), list) and
                 all(isinstance(c, dict) and isinstance(c.get("get"), str) and SERVER_PATH.fullmatch(c["get"]) and
                     c.get("expect") == 200 for c in row["server"])):
@@ -798,14 +803,19 @@ def cap(row, agent_seconds=device_agent.AGENT_SECONDS):
     """The longest a scenario may take: its Maestro flow's timeout, or the agent's."""
     if row["driver"] == "maestro":
         return FLOW_SECONDS
-    return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" else 0)
+    return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" and not records_onboarding(row) else 0)
+
+
+def records_onboarding(row):
+    """Whether the scenario records onboarding itself, so no subflow runs before it."""
+    return row.get("onboarding") == RECORD
 
 
 def finish_onboarding(row, source, platform, drive):
     """may-app's ONBOARDING subflow before an agent scenario, so the agent starts from Chats; drive(flow) is the
     platform's Maestro call, true when the flow passed. Without the subflow (an older may-app) or when it does not
-    pass, the agent starts where the app is, and the public log says so."""
-    if row["driver"] != "agent":
+    pass, the agent starts where the app is, and the public log says so. A row that records onboarding gets none."""
+    if row["driver"] != "agent" or records_onboarding(row):
         return
     flow, scenario = source / FLOWS_DIR / ONBOARDING, row["id"]
     if not flow.is_file() or flow.is_symlink():
