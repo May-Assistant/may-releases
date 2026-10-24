@@ -220,8 +220,8 @@ class AgentRunTests(unittest.TestCase):
             delivered=lambda base, token, tag: next(codes))
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("fail", device_tests.DELIVERY_FAILED), ("ui-pass", device_tests.UNCONFIGURED), ("pass", None)])
-        self.assertEqual([evidence.get("delivery") for evidence in seen["evidence"]],
-                         [["failed (model_rejected_request)"], [], ["succeeded"]],
+        self.assertEqual([(evidence.get("sends"), evidence.get("delivery")) for evidence in seen["evidence"]],
+                         [(True, ["failed (model_rejected_request)"]), (False, None), (True, ["succeeded"])],
                          "each scenario's own codes, and nothing for one that sends no message")
         self.assertIn("May device tests (android): chat: fail", judge_out)
         prompt = device_agent.JUDGE_PROMPT.format(goal="g", outcome="completed", actions=1, summary="s",
@@ -728,16 +728,16 @@ class AgentRunnerTests(unittest.TestCase):
             seen["prompt"] = command[command.index("-p") + 1]
             stdout.write(json.dumps({"is_error": False, "structured_output": {"verdict": "pass", "note": ""}}).encode())
 
-        evidence = dict(record(), delivery=["failed (model_rejected_request)", "succeeded"])
-        with patch("device_agent.subprocess.run", side_effect=run):
-            device_agent.judge(Path("/cli/claude"), "Do {tag}", "qa-12345678", evidence, self.root / "judge", OAUTH,
-                               MODEL)
-        self.assertIn("(delivery codes only; none when the goal sends nothing): failed (model_rejected_request), "
-                      "succeeded", seen["prompt"])
-        with patch("device_agent.subprocess.run", side_effect=run):
-            device_agent.judge(Path("/cli/claude"), "Do {tag}", "qa-12345678", record(), self.root / "judge", OAUTH,
-                               MODEL)
-        self.assertIn("sends nothing): none", seen["prompt"])
+        for evidence, line in (
+                (dict(record(), sends=True, delivery=["failed (model_rejected_request)", "succeeded"]),
+                 "failed (model_rejected_request), succeeded"),
+                (dict(record(), sends=True, delivery=None), "not read: the chats could not be read"),
+                (dict(record(), sends=True, delivery=[]), "none found"),
+                (record(), "none: the goal sends no message")):
+            with self.subTest(line=line), patch("device_agent.subprocess.run", side_effect=run):
+                device_agent.judge(Path("/cli/claude"), "Do {tag}", "qa-12345678", evidence, self.root / "judge",
+                                   OAUTH, MODEL)
+                self.assertIn("(delivery codes only): " + line + "\n", seen["prompt"])
 
     def test_the_judge_has_no_tool_and_answers_in_the_schema(self):
         seen = {}
@@ -872,7 +872,8 @@ class DeviceServerTests(unittest.TestCase):
         self.assertIn("text='Chats'", stored["hierarchy"])
 
     def test_type_takes_plain_text_alone(self):
-        for text in ("a; reboot", "$(id)", "a`b`", "it's", "a|b", "a\nb", "x" * 201, "", "a>b", "a&b", 7):
+        for text in ("a; reboot", "$(id)", "a`b`", "it's", "a|b", "a\nb", "x" * 201, "", "a>b", "a&b", 7,
+                     "why?", "a*b", "/sdcard/*"):
             with self.subTest(text=text):
                 failed, _ = self.call("type", text=text)
                 self.assertTrue(failed)
