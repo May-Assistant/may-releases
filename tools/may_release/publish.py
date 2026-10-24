@@ -160,6 +160,14 @@ def checked_members(archive, folder, layout=allowed, required="index.html"):
     return members
 
 
+def is_json(data):
+    try:
+        json.loads(data)
+    except ValueError:
+        return False
+    return True
+
+
 def extract(archive, members, destination):
     for member in sorted(members, key=lambda m: m.name.count("/")):
         path = destination.joinpath(*member.name.split("/"))
@@ -167,6 +175,8 @@ def extract(archive, members, destination):
             path.mkdir(mode=0o700)
             continue
         data = archive.extractfile(member).read()
+        if path.name in BOARD_INPUTS and not is_json(data):
+            continue  # may-app's board files are optional: a malformed one costs the board its content, never the run
         # "x": created here, never an existing file or a link to one.
         with path.open("xb") as output:
             output.write(data)
@@ -174,7 +184,7 @@ def extract(archive, members, destination):
             raise PublishError("A render is not a PNG")
         if path.suffix == ".mp4" and data[4:8] != b"ftyp":
             raise PublishError("A recording is not an MP4")
-        if path.name in ("screens.json", "report.json", *BOARD_INPUTS):
+        if path.name in ("screens.json", "report.json"):
             try:
                 json.loads(data)
             except ValueError:
@@ -524,10 +534,17 @@ def push_device(run_git=git):
     # Android's copy of may-app's files first, else iOS's: both jobs check out the same commit.
     found = {name: next((board.read_json(inputs / f"{device}-{name}") for device in DEVICES
                          if (inputs / f"{device}-{name}").is_file()), None) for name in BOARD_INPUTS}
-    kept, removed, built = publish_tree(
-        runs[0], DEVICE_PREFIX, folder, entry, f"Device tests {folder}", key_text, run_git,
-        extra=lambda base: board.update(base, folder, entry["run"], reports, found["flows.json"],
-                                        found["board-notes.json"], asset_url, KEEP, scenario_titles()))
+
+    def build_board(base):
+        # The board never costs the run its publishing: any error in it skips the board alone (the log says so).
+        try:
+            return board.update(base, folder, entry["run"], reports, found["flows.json"], found["board-notes.json"],
+                                asset_url, KEEP, scenario_titles())
+        except Exception:
+            return "error"
+
+    kept, removed, built = publish_tree(runs[0], DEVICE_PREFIX, folder, entry, f"Device tests {folder}", key_text,
+                                        run_git, extra=build_board)
     print(f"May device tests published to may-renders as device-tests/{folder}/ ({len(kept)} run folders kept, "
           f"{len(removed)} removed)")
     if built == "written":
@@ -535,8 +552,10 @@ def push_device(run_git=git):
     elif built == "no notes":
         print("May device tests: the flow board is device-tests/board/ in may-renders, without notes (may-app's "
               "board-notes.json is malformed)")
-    else:
+    elif built == "no flows":
         print("May device tests: no flow board (may-app's flows.json is missing or malformed)")
+    else:
+        print("May device tests: no flow board (it could not be built; the run is published)")
 
 
 def renders_api(method, host, path, token, payload=None, data=None):

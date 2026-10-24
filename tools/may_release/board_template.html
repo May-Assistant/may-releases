@@ -173,7 +173,8 @@ button { font: inherit; color: inherit; }
   var D = JSON.parse(document.getElementById('board-data').textContent);
   var B = JSON.parse(document.getElementById('board-banner').textContent);
   // The run shown: the newest unless a history dot was chosen. Its results, by platform/scenario.
-  var view = D.current;
+  // 'latest' (each test's newest result from any run) unless a run's dot was chosen.
+  var view = 'latest';
   function R(key) { return (D.results[view] || {})[key] || null; }
   function runOf(folder) { return D.runs.filter(function (x) { return x.folder === folder; })[0] || null; }
   var LBL = { pass: 'Passing', partial: 'Partly passing', fail: 'Failing', skipped: 'Switched off', none: 'No test yet' };
@@ -296,8 +297,10 @@ button { font: inherit; color: inherit; }
       dots.appendChild(d);
     });
     var shown = runOf(view);
+    var latest = view === 'latest' ? el('span', { text: 'Latest result' }) : el('button', { type: 'button', class: 'btn btn-sm', text: 'Show the latest result' });
+    if (view !== 'latest') latest.addEventListener('click', function () { view = 'latest'; render(); });
     return el('div', { class: 'hist' }, [el('span', { text: 'Runs' }), dots,
-      shown ? el('span', { text: shown.date + (shown.run ? ' · Run ' + shown.run : '') + (view === D.current ? ' (newest)' : '') }) : null,
+      shown ? el('span', { text: shown.date + (shown.run ? ' · Run ' + shown.run : '') }) : latest, shown ? latest : null,
       shown && shown.archived ? el('span', { class: 'archived-note', text: 'Archived: the recordings were pruned; the verdict and end screen are kept.' }) : null]);
   }
 
@@ -366,7 +369,7 @@ button { font: inherit; color: inherit; }
   }
 
   function select(id, user) {
-    current = id; view = D.current; if (byId[id] && byId[id].parent) open[byId[id].parent] = true;
+    current = id; view = 'latest'; if (byId[id] && byId[id].parent) open[byId[id].parent] = true;
     renderNav(); render(); store('flowCurrent', id);
     if (user) { split.classList.add('detail'); if (window.matchMedia('(max-width: 760px)').matches) window.scrollTo(0, 0); }
   }
