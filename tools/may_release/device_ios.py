@@ -190,7 +190,8 @@ def launch(udid, env, token, log):
 
 def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check, truth=device_tests.tagged,
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
-                  install=device_agent.install, budgeted=None, delivered=None):
+                  install=device_agent.install, budgeted=None, delivered=None,
+                  deleted_by=device_tests.delete_fresh):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -204,7 +205,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         raise DeviceTestsError("The Playground app is not built")
     base = device_tests.staging(secret, staged)
     outward = os.environ.get(device_tests.OUTWARD, "").strip() != "off"
-    skipped = device_tests.switched_off()
+    skipped, accounts = device_tests.switched_off(), device_tests.Accounts(chosen, minted, deleted_by)
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
     folder.mkdir(parents=True, mode=0o700)
     device_tests.board_inputs(source, folder)
@@ -243,7 +244,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if flow is not None and device_tests.untagged(row, flow, "ios"):
                 entry["reason"] = device_tests.UNTAGGED["ios"]
                 continue
-            token = minted(base, secret) if row["driver"] != device_tests.SMOKE else ""
+            token = accounts.session(row, base, secret, entry)
+            if token is None:
+                continue
             at(f"{row['id']}: launching the app")
             launch(udid, env, token, log)
             recorder = Recorder(udid, env, row["id"], private, log)
@@ -260,6 +263,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                                                timeout=device_tests.FLOW_SECONDS).returncode
                 except subprocess.SubprocessError:
                     passed = False
+            device_tests.finish_onboarding(row, source, "ios", lambda path: not renders.quiet(
+                [str(launcher), "--device", udid, "test", str(path)], log,
+                env=dict(env, MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true"),
+                timeout=device_tests.ONBOARDING_SECONDS).returncode)
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
@@ -291,13 +298,15 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 codes = delivered(base, token, tag)
                 if codes is not None:
                     entry["delivery"] = codes
+            accounts.finish(row, base, token)
             token = ""
             device_tests.settle(entry, row, passed if flow is not None else None)
-        if any(row["driver"] == "agent" for row in chosen):
+        if accounts.shared:
             at("cleanup")
             token = minted(base, secret)
             cleaned_count = cleaned(base, token, since, tag)
     finally:
+        accounts.abandon(base)
         token = secret = ""
         renders.quiet(["xcrun", "simctl", "shutdown", udid], log, env=env)
     at("writing the report")
@@ -309,5 +318,6 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     print(f"May device tests (ios): {ran} scenarios ran; verdicts follow the judge step")
     if cleaned_count is not None:
         print(f"May device tests (ios): the test session's cleanup removed {cleaned_count} tagged items")
-    elif any(row["driver"] == "agent" for row in chosen):
+    elif accounts.shared:
         print("May device tests (ios): the test session's cleanup did not answer; tagged items may remain")
+    accounts.report("ios")
