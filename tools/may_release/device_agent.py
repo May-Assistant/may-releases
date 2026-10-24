@@ -36,7 +36,9 @@ OAUTH, MODEL_VAR = "CLAUDE_CODE_OAUTH_TOKEN", "MAY_DEVICE_TESTS_MODEL"
 MODEL = re.compile(r"claude-[a-z0-9][a-z0-9.-]{0,60}")
 SERVER = Path(__file__).resolve().parent / "device_mcp.py"
 # iOS acts are a Maestro run each, several seconds apiece, so its agent has longer.
-AGENT_SECONDS, IOS_AGENT_SECONDS, JUDGE_SECONDS = 15 * 60, 25 * 60, 5 * 60
+# IOS_AGENT_SECONDS leaves room inside one test session (device_tests.SESSION_SECONDS) for the launch, recording and
+# server reads, so a session never ends mid-scenario (run 40063426822; the coordinator kept sessions at 30 minutes).
+AGENT_SECONDS, IOS_AGENT_SECONDS, JUDGE_SECONDS = 15 * 60, 20 * 60, 5 * 60
 RATE_LIMITED = ("blocking_limit", "rapid_refill_breaker")
 AGENT_PROMPT = (
     "You are testing the May Playground app on an Android emulator, signed in to a staging test account. You have "

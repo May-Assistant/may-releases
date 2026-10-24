@@ -124,6 +124,19 @@ class ScenarioTests(unittest.TestCase):
         with self.assertRaises(DeviceTestsError):
             device_tests.scenarios("sign-in,unknown")
 
+    def test_the_notes_scenario_writes_into_its_own_tagged_task(self):
+        """Run 40063426822: "the first item you see" was the shared account's, so the note joined the previous run's."""
+        goal = device_tests.scenarios("notes")[0]["goal"]
+        self.assertIn("add a new task titled {tag} task", goal)
+        self.assertIn("on the {tag} task", goal)
+        self.assertNotIn("first item", goal)
+
+    def test_every_agent_scenario_fits_inside_one_test_session(self):
+        """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
+        each agent's cap leaves ten minutes for the launch, recording, stop and server reads."""
+        for seconds in (device_agent.AGENT_SECONDS, device_agent.IOS_AGENT_SECONDS):
+            self.assertLessEqual(seconds + 10 * 60, device_tests.SESSION_SECONDS)
+
     def test_malformed_rows_are_refused(self):
         good = device_tests.scenarios()[0]
         for change in ({"id": "Sign In"}, {"flow": "../x.yaml"}, {"driver": "shell"}, {"platforms": ["web"]},
