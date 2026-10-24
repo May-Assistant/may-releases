@@ -550,12 +550,14 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.adb_shell", return_value=0), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.device_agent.settings", return_value=("t", "m")), \
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", return_value=None), \
                 patch("device_tests.head_revision", return_value=SHA), patch("sys.stdout", new_callable=io.StringIO):
             device_tests.run_scenarios("chat", minted=lambda base, secret: TOKEN, agent=agent,
-                                       install=lambda root: root / "claude", cleaned=lambda *args: 0)
+                                       install=lambda root: root / "claude", cleaned=lambda *args: 0,
+                                       delivered=lambda *args: None)
         driven = [argv for argv, _ in calls if argv[0] in ("/fake/maestro", "agent")]
         self.assertEqual(driven, [["/fake/maestro", "--device", device_tests.SERIAL, "test",
                                    str(self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING)], ["agent"]])
