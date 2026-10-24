@@ -218,12 +218,52 @@ class BoardTests(BoardCase):
                dict(good, folder="20260230-" + "c" * 12)]
         self.assertEqual([item["folder"] for item in board.history_entries(bad + [good])], [folder(1)])
 
-    def test_media_of_runs_no_longer_in_the_history_is_removed_even_after_a_reset(self):
+    def media(self):
+        return sorted(p.name for p in (self.base / board.BOARD / board.MEDIA).iterdir() if p.is_dir())
+
+    def test_media_of_runs_no_longer_in_the_history_is_removed(self):
+        """Review of #86: a run dropped from history.json as malformed left its media behind."""
         self.run_folder(folder(1), {"android": [row("sign-in", "pass")]})
-        (self.base / "history.json").write_text("not json")  # a reset or a broken history
+        broken = json.loads((self.base / "history.json").read_text())
+        broken[0]["folder"] = "20261399-" + "f" * 12  # malformed: dropped on read
+        (self.base / "history.json").write_text(json.dumps(broken))
         self.run_folder(folder(2), {"android": [row("sign-in", "pass")]})
-        self.assertEqual(sorted(p.name for p in (self.base / board.BOARD / board.MEDIA).iterdir() if p.is_dir()),
-                         [folder(2)])
+        self.assertEqual(self.media(), [folder(2)])
+
+    def test_a_missing_or_unreadable_history_never_deletes_past_media(self):
+        """Re-review of #86: an unreadable history.json was read as empty, and every run's media was pruned."""
+        self.run_folder(folder(1), {"android": [row("sign-in", "pass")]})
+        (self.base / "history.json").write_text("not json")
+        self.run_folder(folder(2), {"android": [row("sign-in", "pass")]})
+        self.assertEqual(self.media(), [folder(1), folder(2)])
+        (self.base / "history.json").unlink()
+        self.run_folder(folder(3), {"android": [row("sign-in", "pass")]})
+        self.assertEqual(self.media(), [folder(1), folder(2), folder(3)])
+
+    def test_a_failure_part_way_leaves_the_board_and_history_as_they_were(self):
+        """Re-review of #86: a failure inside update() left history.json and media changed beside a stale page."""
+        self.run_folder(folder(1), {"android": [row("sign-in", "pass")]})
+        before = {p.relative_to(self.base): p.read_bytes() for p in self.base.rglob("*") if p.is_file()
+                  and (p.name == "history.json" or board.BOARD in p.relative_to(self.base).parts)}
+        (self.base / folder(2) / "android").mkdir(parents=True)
+        (self.base / folder(2) / "android" / "sign-in-end.png").write_bytes(b"\x89PNG")
+        with patch("board.page", side_effect=RuntimeError("part way")), self.assertRaises(RuntimeError):
+            board.update(self.base, folder(2), "2", {"android": [row("sign-in", "fail")]}, FLOWS, NOTES, url, 10,
+                         TITLES, now=NOW)
+        after = {p.relative_to(self.base): p.read_bytes() for p in self.base.rglob("*") if p.is_file()
+                 and (p.name == "history.json" or board.BOARD in p.relative_to(self.base).parts)}
+        self.assertEqual(after, before)
+        self.assertEqual(sorted(p.name for p in self.base.iterdir() if p.name.startswith(".")), [],
+                         "nothing staged is left for git add -A")
+
+    def test_deeply_nested_json_is_read_as_absent(self):
+        """Re-review of #86: deep nesting raises RecursionError, which is not ValueError."""
+        deep = self.base / "deep.json"
+        deep.write_text("[" * 200000)
+        try:
+            self.assertIsNone(board.read_json(deep))
+        except RecursionError:
+            self.fail("deep nesting escaped read_json")
 
     def test_a_banner_naming_a_placeholder_leaves_the_page_whole(self):
         """Review of #86: the banner was filled in before the data, so "{{DATA}}" in it took the data blob."""

@@ -1,6 +1,7 @@
 """May Playground device tests (device-tests.yml): gate.py --action device-tests, prepare.py on main's head,
 device_tests.py and publish.py device-open / device-push. Everything Android, GitHub and staging is faked."""
 
+import ast
 import io
 import json
 import os
@@ -435,6 +436,55 @@ class ToolTests(unittest.TestCase):
             self.assertIn(["/sdk/adb", "shell", "pkill", "-2", "screenrecord"], pulled)
 
 
+class ReasonTests(unittest.TestCase):
+    """Run 40057045702: a full run's iOS budget-skipped row carried a reason publish.py did not accept, so device-open
+    refused the whole report and nothing was published."""
+
+    def written_reasons(self):
+        """Every reason device_tests.py can write into a report row, read from its source."""
+        tree = ast.parse(Path(device_tests.__file__).read_text())
+        values = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                                                    and t.slice.value == "reason" for t in node.targets):
+                values.append(node.value)
+            if isinstance(node, ast.keyword) and node.arg == "reason":
+                values.append(node.value)
+            if isinstance(node, ast.Dict):
+                values += [v for k, v in zip(node.keys, node.values) if isinstance(k, ast.Constant) and k.value == "reason"]
+        reasons = set()
+        for value in values:
+            if isinstance(value, ast.Constant):
+                reasons.add(value.value)
+            elif isinstance(value, ast.Name):
+                reasons.add(getattr(device_tests, value.id))
+            elif isinstance(value, ast.IfExp):
+                reasons |= {getattr(device_tests, v.id) if isinstance(v, ast.Name) else v.value
+                            for v in (value.body, value.orelse)}
+            else:
+                reasons.add(ast.unparse(value))  # a reason worked out at run time must be added here by hand
+        # The judge step copies combined()'s reason, whose own values are read above from its returned dicts.
+        return reasons - {None, "verdict_reason['reason']"}
+
+    def test_every_reason_a_device_job_writes_is_one_publish_accepts(self):
+        written = self.written_reasons()
+        self.assertIn(device_tests.BUDGET, written)
+        self.assertEqual(written - set(publish.REASONS), set())
+
+    def test_a_budget_skipped_row_passes_the_publish_check(self):
+        report = {"device": "ios", "scenarios": [{"id": "poll-skip", "title": "x", "verdict": "skipped",
+                                                    "reason": device_tests.BUDGET, "videos": [], "screenshots": [],
+                                                    "server": []}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps(report))
+            try:
+                _, rows = publish.device_report(path, set(), {"poll-skip": "Skip May's question"})
+            except publish.PublishError as error:
+                self.fail(f"device-open refused a budget-skipped row: {error}")
+        self.assertEqual(rows[0]["reason"], device_tests.BUDGET)
+
+
 class SealVerdictTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -708,8 +758,23 @@ class PublishDeviceTests(unittest.TestCase):
             self.fail(f"a malformed board-notes.json stopped device-open: {error}")
         self.assertTrue((tree / "README.md").is_file())
         work, lines, _ = self.push_for_board()
-        self.assertEqual(lines[-1], "May device tests: the flow board is device-tests/board/ in may-renders")
+        # Re-review of #86: the log says the board went without the dropped notes.
+        self.assertEqual(lines[-1], "May device tests: the flow board is device-tests/board/ in may-renders, without "
+                                    "notes (may-app's board-notes.json is malformed)")
         self.assertTrue((work / "device-tests" / RUN / "android" / "sign-in-end.png").is_file())
+
+    def test_deeply_nested_may_app_json_never_stops_the_publish(self):
+        """Re-review of #86: 200,000 "[" raised RecursionError, which escaped extract() and stopped device-open."""
+        try:
+            self.assertFalse(publish.is_json(b"[" * 200000))
+        except RecursionError:
+            self.fail("deep nesting escaped is_json")
+        try:
+            tree, _ = self.open_with(self.GOOD + [(RUN + "/android/board-notes.json", b"[" * 200000),
+                                                  (RUN + "/android/flows.json", b"{" * 200000)])
+        except (publish.PublishError, RecursionError) as error:
+            self.fail(f"deeply nested may-app JSON stopped device-open: {type(error).__name__}")
+        self.assertTrue((tree / "README.md").is_file())
 
     def test_a_board_that_fails_never_costs_the_run_its_publishing(self):
         """Review of #86: any error in the board skips the board alone."""

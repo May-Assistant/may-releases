@@ -56,7 +56,7 @@ def read_json(path):
         return None
     try:
         return json.loads(path.read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # deep nesting raises RecursionError, not ValueError
         return None
 
 
@@ -309,45 +309,80 @@ def page(data, banner, when):
     return re.sub(r"\{\{(RUN_WHEN|BANNER|DATA)\}\}", lambda match: values[match.group(1)], TEMPLATE.read_text())
 
 
-def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, titles, now=None, previews=frozenset()):
+def update(base, folder, run, reports, flows_data, notes_data, asset_url, keep, titles, now=None, notes_dropped=False,
+           previews=frozenset()):
     """Record this run in base/history.json, copy its end screenshots from base/folder to base/BOARD/MEDIA/folder,
     drop those beyond HISTORY and write base/BOARD/index.html. Returns "written", "no notes" (written without the
-    malformed board-notes.json) or "no flows" (not written: flows.json missing or malformed)."""
+    lanes' notes: board-notes.json was malformed here, or notes_dropped when device-open dropped it) or "no flows"
+    (no page: flows.json missing or malformed).
+
+    All of it is built beside the board and swapped in at the end, so a failure part way leaves the board and
+    history.json exactly as they were."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
-    index = base / "history.json"
-    try:
-        existing = json.loads(index.read_text()) if index.is_file() and not index.is_symlink() else []
-    except (OSError, ValueError):
-        existing = []
+    index, board, staging, old = base / "history.json", base / BOARD, base / ".board-staging", base / ".board-old"
+    # Media is pruned against the history only when history.json was read: a missing or unreadable one is never
+    # taken for an empty history (that would delete every run's media).
+    existing, read = [], False
+    if index.is_file() and not index.is_symlink():
+        try:
+            existing, read = json.loads(index.read_text()), True
+        except (OSError, ValueError, RecursionError):
+            pass
     new = entry(folder, run, reports, now, previews)
     entries, _ = history_after(existing, new)
-    for device_key, result in new["results"].items():
-        device = device_key.split("/")[0]
-        source = base / folder / device / result["shot"] if result["shot"] else None
-        if source and source.is_file() and not source.is_symlink():
-            target = base / BOARD / MEDIA / folder / device
-            target.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target / result["shot"])
+    for path in (staging, old):
+        shutil.rmtree(path, ignore_errors=True)
+    try:
+        if board.is_dir() and not board.is_symlink():
+            shutil.copytree(board, staging, symlinks=True)
         else:
-            result["shot"] = None
-    # Media of every run no longer in the history goes: those just dropped, and any a reset or malformed history.json
-    # left behind.
-    kept = {item["folder"] for item in entries}
-    media = base / BOARD / MEDIA
-    for old in list(media.iterdir()) if media.is_dir() else []:
-        if old.is_dir() and old.name not in kept:
-            shutil.rmtree(old, ignore_errors=True)
-    index.write_text(json.dumps(entries, indent=2) + "\n")
-    try:
-        flows = checked_flows(flows_data)
-    except BoardError:
-        return "no flows"
-    try:
-        notes, word = checked_notes(notes_data if notes_data is not None else {}), "written"
-    except BoardError:
-        notes, word = checked_notes({}), "no notes"
-    (base / BOARD / MEDIA).mkdir(parents=True, exist_ok=True)
-    (base / BOARD / MEDIA / "previews.json").write_text(json.dumps(previews_list(entries, keep), indent=2) + "\n")
-    (base / BOARD / "index.html").write_text(page(payload(flows, notes, entries, asset_url, keep, titles),
-                                                  notes["banner"], new["when"]))
+            staging.mkdir()
+        for device_key, result in new["results"].items():
+            device = device_key.split("/")[0]
+            source = base / folder / device / result["shot"] if result["shot"] else None
+            if source and source.is_file() and not source.is_symlink():
+                target = staging / MEDIA / folder / device
+                target.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target / result["shot"])
+            else:
+                result["shot"] = None
+        # Media of every run no longer in the history goes: those just dropped, and any a malformed entry left behind.
+        kept = {item["folder"] for item in entries}
+        media = staging / MEDIA
+        for gone in list(media.iterdir()) if read and media.is_dir() else []:
+            if gone.is_dir() and gone.name not in kept:
+                shutil.rmtree(gone)
+        try:
+            flows = checked_flows(flows_data)
+        except BoardError:
+            flows, word = None, "no flows"
+        if flows is not None:
+            try:
+                notes, word = checked_notes(notes_data if notes_data is not None else {}), "written"
+            except BoardError:
+                notes, word = checked_notes({}), "no notes"
+            if notes_dropped:
+                word = "no notes"
+            (staging / MEDIA).mkdir(exist_ok=True)
+            (staging / MEDIA / "previews.json").write_text(json.dumps(previews_list(entries, keep), indent=2) + "\n")
+            (staging / "index.html").write_text(page(payload(flows, notes, entries, asset_url, keep, titles),
+                                                     notes["banner"], new["when"]))
+        history = base / ".history.json.new"
+        history.write_text(json.dumps(entries, indent=2) + "\n")
+        # The swap: nothing above touched the board or history.json.
+        if board.exists():
+            board.rename(old)
+        try:
+            staging.rename(board)
+        except BaseException:
+            if old.exists():
+                old.rename(board)
+            raise
+        history.replace(index)
+    finally:
+        for path in (staging, old, base / ".history.json.new"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
     return word

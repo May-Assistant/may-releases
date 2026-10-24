@@ -67,14 +67,15 @@ DEVICE_RUN = re.compile(r"[0-9]{8}-[0-9a-f]{12}")
 DEVICES = ("android", "ios")
 # may-app's flows and board notes, sealed by each device job and set aside by device-open for the flow board
 # (board.py), never committed.
-BOARD_INPUTS, BOARD = ("flows.json", "board-notes.json"), "may-device-board"
+BOARD_INPUTS, BOARD, DROPPED = ("flows.json", "board-notes.json"), "may-device-board", ".dropped"
 DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.xml)|report\.json|"
                          + "|".join(re.escape(name) for name in BOARD_INPUTS))
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
 VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS)
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
            device_tests.UNCONFIGURED, device_tests.RATE_LIMITED, device_tests.UNFINISHED, device_tests.BLOCKED,
-           device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO)
+           device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO,
+           device_tests.BUDGET)
 MAX_NOTES = 600
 # The sealed device artifact's retention (device-tests.yml): the recordings' fallback when the release upload fails.
 VIDEO_DAYS = 7
@@ -165,12 +166,15 @@ def checked_members(archive, folder, layout=allowed, required="index.html"):
 def is_json(data):
     try:
         json.loads(data)
-    except ValueError:
+    except (ValueError, RecursionError):  # deep nesting raises RecursionError, not ValueError
         return False
     return True
 
 
 def extract(archive, members, destination):
+    """The checked members, written under destination; returns the names of may-app board files it dropped as not
+    JSON."""
+    dropped = []
     for member in sorted(members, key=lambda m: m.name.count("/")):
         path = destination.joinpath(*member.name.split("/"))
         if member.isdir():
@@ -178,7 +182,9 @@ def extract(archive, members, destination):
             continue
         data = archive.extractfile(member).read()
         if path.name in BOARD_INPUTS and not is_json(data):
-            continue  # may-app's board files are optional: a malformed one costs the board its content, never the run
+            # may-app's board files are optional: a malformed one costs the board its content, never the run.
+            dropped.append(path.name)
+            continue
         # "x": created here, never an existing file or a link to one.
         with path.open("xb") as output:
             output.write(data)
@@ -189,10 +195,11 @@ def extract(archive, members, destination):
         if path.name in ("screens.json", "report.json"):
             try:
                 json.loads(data)
-            except ValueError:
+            except (ValueError, RecursionError):
                 raise PublishError("The manifest copy is not JSON") from None
         if path.name in ("index.html", "README.md") and re.search(rb"(?i)<\s*(script|iframe|object|embed)|javascript:", data):
             raise PublishError("The contact sheet holds active content")
+    return dropped
 
 
 def open_renders(sha):
@@ -367,7 +374,7 @@ def device_report(path, files, titles):
     from this repository's own scenario list, never the report."""
     try:
         report = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         raise PublishError("A device report is not JSON") from None
     rows = report.get("scenarios") if isinstance(report, dict) else None
     if not isinstance(rows, list) or report.get("device") not in DEVICES:
@@ -483,7 +490,10 @@ def open_device():
                     runs.add(run)
                     members = [m for m in checked_members(archive, run, device_layout, "report.json")
                                if not (m.isdir() and m.name == run and (tree / run).exists())]
-                    extract(archive, members, tree)
+                    for name in extract(archive, members, tree):
+                        # device-push reads this, so the log says the board went without the dropped file.
+                        (private / BOARD).mkdir(mode=0o700, exist_ok=True)
+                        (private / BOARD / f"{device}-{name}{DROPPED}").touch()
             except tarfile.TarError:
                 raise PublishError("A device report is not a readable archive") from None
             finally:
@@ -598,10 +608,13 @@ def push_device(run_git=git):
         # The board never costs the run its publishing: any error in it skips the board alone (the log says so).
         try:
             return board.update(base, folder, entry["run"], reports, found["flows.json"], found["board-notes.json"],
-                                asset_url, KEEP, scenario_titles(), previews=previews)
+                                asset_url, KEEP, scenario_titles(), notes_dropped=notes_dropped,
+                                previews=previews)
         except Exception:
             return "error"
 
+    notes_dropped = found["board-notes.json"] is None and \
+        any((inputs / f"{device}-board-notes.json{DROPPED}").exists() for device in DEVICES)
     kept, removed, built = publish_tree(runs[0], DEVICE_PREFIX, folder, entry, f"Device tests {folder}", key_text,
                                         run_git, extra=build_board)
     print(f"May device tests published to may-renders as device-tests/{folder}/ ({len(kept)} run folders kept, "
