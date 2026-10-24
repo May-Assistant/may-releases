@@ -61,7 +61,7 @@ class AgentRunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
-                      asked=None, exhausted=False, delivered=None, calls_left=None):
+                      asked=None, exhausted=False, delivered=None, calls_left=None, fail_mint=()):
         calls, minted, seen = [], [], {}
         self.last_seen = seen
 
@@ -85,7 +85,13 @@ class AgentRunTests(unittest.TestCase):
             path.write_bytes(png())
             return path.name
 
+        failures = list(fail_mint)
+
         def mint(base, secret, fresh=False):
+            status = failures.pop(0) if failures else None
+            if status is not None:
+                seen.setdefault("mint_failed", []).append(status)
+                raise device_tests.MintFailed(status)
             if fresh and exhausted:
                 seen.setdefault("refused", []).append(secret)
                 raise (device_tests.FreshRefused if exhausted == "not fresh" else device_tests.FreshExhausted)("no")
@@ -118,6 +124,7 @@ class AgentRunTests(unittest.TestCase):
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
+                patch("device_tests.flows.sleep", side_effect=lambda s: seen.setdefault("slept", []).append(s)), \
                 patch("device_tests.adb_shell", side_effect=lambda adb, env, log, line: calls.append(
                     [STDIN, *line.split()]) or 0), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
@@ -323,6 +330,75 @@ class AgentRunTests(unittest.TestCase):
                          [device_tests.MODEL_CAP, device_tests.UNCONFIGURED])
         self.assertEqual(seen.get("deleted"), [TOKEN + "1", TOKEN + "2"],
                          "chat's fresh account is deleted when it is skipped, before notes' is minted")
+
+    def test_a_mint_that_fails_once_is_retried_and_the_scenario_runs(self):
+        try:
+            _, minted, seen, report, _, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3,
+                                                               fail_mint=(None, 502))
+        except device_tests.DeviceTestsError as error:
+            self.fail("a mint that failed once stopped the run: " + error.args[0])
+        self.assertEqual(seen["mint_failed"], [502])
+        self.assertEqual(seen.get("slept"), [device_tests.MINT_RETRY_SECONDS], "one pause, then the one retry")
+        self.assertEqual([row.get("reason") for row in report["scenarios"]],
+                         [device_tests.UNCONFIGURED, device_tests.UNCONFIGURED, None])
+
+    def test_a_mint_that_fails_twice_skips_its_scenario_alone_and_the_report_is_kept(self):
+        """Run 40077167994: one failed mint 50 minutes into the iOS run stopped it, and the report was lost."""
+        try:
+            _, _, seen, report, run_out, _ = self.run_and_judge([record()] * 2, [("pass", "")] * 2,
+                                                                fail_mint=(None, 429, 429))
+        except device_tests.DeviceTestsError as error:
+            self.fail("a failed mint stopped the run: " + error.args[0])
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", "ui-pass", device_tests.UNCONFIGURED), ("notes", "skipped", device_tests.MINT_FAILED),
+            ("routines", "pass", None)])
+        self.assertIn("May device tests (android): notes: staging did not mint a session (HTTP status 429, 0 for no "
+                      "reply), twice; the scenario is skipped", run_out)
+        self.assertEqual(len(seen["goals"]), 2, "notes' agent never ran")
+
+    def test_a_skipped_scenario_leaves_no_session_for_the_next_one(self):
+        """Coordinator, review of the mint fix: each scenario's session stays empty until its own mint succeeds."""
+        import shutil
+        # (fresh, failed mints in order, the sessions launched, the fresh accounts deleted)
+        cases = (({}, (None, 503, 503), [TOKEN + "1", TOKEN + "2"], None),
+                 ({device_tests.FRESH: "all"}, (None, 503, 503), [TOKEN + "1", TOKEN + "2"], [TOKEN + "1", TOKEN + "2"]),
+                 ({device_tests.FRESH: "all"}, (None, None, 503, 503), [TOKEN + "1", TOKEN + "2"],
+                  [TOKEN + "1", TOKEN + "2"]))
+        for env, fails, launched, deleted in cases:
+            shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
+            for name in (device_tests.VERDICTS, device_tests.AGENTS):
+                (self.private / name).unlink(missing_ok=True)
+            with self.subTest(fresh=bool(env), fails=fails):
+                try:
+                    calls, _, seen, _, _, _ = self.run_and_judge([record()] * 2, [("pass", "")] * 2, env=env,
+                                                                 fail_mint=fails)
+                except IndexError:
+                    self.fail("a scenario whose session was not minted ran")
+                starts = [argv[-1] for argv in calls if argv and argv[0] == STDIN and "start" in argv]
+                self.assertEqual(starts, launched, "each scenario launches with its own session; a skipped one never does")
+                self.assertEqual(seen.get("deleted"), deleted, "only the accounts actually minted are deleted, once each")
+
+    def test_a_refused_secret_still_stops_the_run_and_says_its_status(self):
+        import shutil
+        for status in device_tests.MINT_FATAL:
+            shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
+            for name in (device_tests.VERDICTS, device_tests.AGENTS):
+                (self.private / name).unlink(missing_ok=True)
+            with self.subTest(status=status):
+                with self.assertRaises(device_tests.MintFailed) as stopped:
+                    self.run_and_judge([record()] * 3, [("pass", "")] * 3, fail_mint=(status,))
+                self.assertEqual(stopped.exception.args[0],
+                                 f"The staging test session could not be minted (HTTP {status})")
+
+    def test_a_cleanup_whose_session_is_not_minted_keeps_the_report(self):
+        try:
+            _, _, seen, report, run_out, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3,
+                                                                fail_mint=(None, None, None, 503))
+        except device_tests.DeviceTestsError as error:
+            self.fail("the cleanup's failed mint stopped the run: " + error.args[0])
+        self.assertNotIn("cleanup", seen, "no cleanup without a session")
+        self.assertIn("the test session's cleanup did not answer; tagged items may remain", run_out)
+        self.assertEqual(len(report["scenarios"]), 3)
 
     def test_a_cleanup_that_does_not_answer_is_said(self):
         _, _, _, _, run_out, _ = self.run_and_judge([record()] * 3, [("pass", "")] * 3, cleaned=None)

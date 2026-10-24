@@ -270,6 +270,23 @@ class MintTests(unittest.TestCase):
             with self.subTest(env=env, row=row), patch.dict(os.environ, env, clear=True):
                 self.assertIs(device_tests.wants_fresh(row, device_tests.fresh_switch()), fresh)
 
+    def test_a_failed_mint_names_its_status_alone(self):
+        def refused(status):
+            def answer(request, timeout):
+                raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+            return answer
+
+        def offline(request, timeout):
+            raise urllib.error.URLError("down")
+
+        for post, status, words in ((refused(429), 429, "HTTP 429"), (refused(502), 502, "HTTP 502"),
+                                    (offline, 0, "no reply")):
+            with self.subTest(words=words), self.assertRaises(device_tests.MintFailed) as failed:
+                device_tests.mint("https://s", "s" * 32, post)
+            self.assertEqual(failed.exception.status, status)
+            self.assertEqual(failed.exception.args[0], f"The staging test session could not be minted ({words})")
+            self.assertNotIn("s" * 32, failed.exception.args[0])
+
     def test_server_check_status(self):
         def refused(request, timeout):
             raise urllib.error.HTTPError(request.full_url, 401, "no", {}, None)
