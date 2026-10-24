@@ -152,7 +152,8 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "connections", "chat", "notes", "poll", "poll-skip", "routines"])
+        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "notes", "poll",
+                               "poll-skip", "routines"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ids, "both devices run all")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
@@ -453,6 +454,63 @@ class OnboardingTests(unittest.TestCase):
                                  "starts where it stopped\n")
 
 
+class FlowIdTests(unittest.TestCase):
+    """A Maestro flow's ids against the app's own sources, so a flow naming an id the app lacks never runs."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def write(self, relative, text):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_a_flow_and_the_flows_it_runs_give_their_ids(self):
+        self.write("flows/start.yaml", 'appId: x\n---\n- tapOn:\n    id: "demo-start"\n- runFlow: start.yaml\n')
+        self.write("flows/sub/finish.yaml", "appId: x\n---\n- assertVisible:\n    id: demo-done  # the end\n")
+        self.write("outside.yaml", "appId: x\n---\n- tapOn:\n    id: demo-outside\n")
+        flow = self.write("flows/main.yaml", "\n".join((
+            "appId: x", "---", "- runFlow: start.yaml", "- runFlow: sub/finish.yaml", "- runFlow: ../outside.yaml",
+            "- extendedWaitUntil:", "    visible:", "      id: 'demo-list|demo-empty'", "# id: demo-commented",
+            "- tapOn: \"Settings\"", "")))
+        self.assertEqual(device_tests.flow_ids(flow), {"demo-start", "demo-done", "demo-list|demo-empty"},
+                         "a loop, a comment, a label and a flow outside the folder give nothing")
+
+    def test_the_app_literals_leave_test_code_out(self):
+        self.write("android/app/src/main/Rows.kt", 'val tag = "demo.row.${c.wire}"\nval wire = "calendar"\n'
+                                                     'val name = "$title"\nval quote = "say \\"hi\\""\n')
+        self.write("ios/App/Shared/Rows.swift", 'let tag = "demo.cell.\\(row.wire)"\n')
+        for test in ("android/app/src/test/T.kt", "android/app/src/testPlayground/T.kt", "android/app/src/androidTest/T.kt",
+                     "android/flows/src/F.kt", "ios/App/Snapshots/S.swift", "ios/AppTests/T.swift",
+                     "android/app/src/main/RowsTest.kt", "ios/App/Shared/RowsTests.swift"):
+            self.write(test, 'val only = "demo-test-only"\n')
+        whole, starts = device_tests.app_literals([self.root / "android", self.root / "ios"])
+        self.assertEqual(whole, {"calendar", 'say \\"hi\\"'})
+        self.assertEqual(starts, {"demo.row.", "demo.cell."})
+
+    def test_an_id_is_there_as_a_literal_or_a_fixed_start_and_a_literal_remainder(self):
+        literals = ({"demo-root", "demo-list", "calendar"}, {"demo.row."})
+        self.assertEqual(device_tests.lacking_ids({"demo-root", "demo.row.calendar", "demo-list"}, literals), [])
+        self.assertEqual(device_tests.lacking_ids({"demo-rootX", "demo.row.calendarX", "demo-list|demo-gone",
+                                                   "demo-.*", "demo-(a|b)"}, literals),
+                         ["demo-gone", "demo-rootX", "demo.row.calendarX"],
+                         "a misspelt id, a row id with a misspelt remainder and a missing alternative are caught; "
+                         "an id using pattern syntax is not checked")
+
+    def test_a_platform_reads_may_app_and_its_design_system(self):
+        self.write("may-source/android/app/src/main/A.kt", 'val a = "demo-app"\n')
+        self.write(f"{device_tests.DESIGN_SYSTEM}/android/components/src/main/B.kt", 'val b = "demo-ds"\n')
+        self.write("may-source/ios/App/C.swift", 'let c = "demo-ios"\n')
+        literals = device_tests.app_sources(self.root, "android")
+        self.assertEqual(literals()[0], {"demo-app", "demo-ds"})
+        self.assertIs(literals(), literals(), "read once a run")
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -585,6 +643,19 @@ class RunTests(unittest.TestCase):
             ("sign-in", "skipped", "skipped (flow not tagged for android)"), ("connections", "ui-pass", device_tests.UNCONFIGURED)])
         self.assertNotIn(str(flow), " ".join(" ".join(argv) for argv in calls), "the untagged flow never ran")
 
+    def test_a_flow_naming_an_id_the_app_lacks_fails_and_never_runs(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        flow = self.source / device_tests.FLOWS_DIR / "sign-in.yaml"
+        flow.write_text(FLOW + "- tapOn:\n    id: \"demo-sign-in\"\n")
+        calls, report, _, _ = self.run_it()
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("sign-in", "fail", device_tests.FLOW_IDS), ("connections", "ui-pass", device_tests.UNCONFIGURED)])
+        self.assertNotIn(str(flow), " ".join(" ".join(argv) for argv in calls), "the flow never ran")
+        (self.source / "android/app/src/main/SignIn.kt").parent.mkdir(parents=True)
+        (self.source / "android/app/src/main/SignIn.kt").write_text('val tag = "demo-sign-in"\n')
+        _, report, _, _ = self.run_it()
+        self.assertEqual(report["scenarios"][0]["verdict"], "ui-pass", "the app has the id: it runs")
+
     def test_flow_tags_reads_the_header_alone(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "f.yaml"
@@ -603,7 +674,7 @@ class RunTests(unittest.TestCase):
     def test_a_failing_flow_and_server_checks(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         listed = json.loads(device_tests.SCENARIOS.read_text())
-        listed[1]["server"] = [{"get": "/v1/connections", "expect": 200}]
+        next(row for row in listed if row["id"] == "connections")["server"] = [{"get": "/v1/connections", "expect": 200}]
         path = self.root / "scenarios.json"
         path.write_text(json.dumps(listed))
         with patch("device_tests.SCENARIOS", path):
@@ -1062,7 +1133,7 @@ class PublishDeviceTests(unittest.TestCase):
         self.assertEqual(out.strip(), f"May device tests decrypted and checked: run folder device-tests/{RUN}/ with 2 "
                                       "scenario reports from 1 devices")
         readme = (tree / "README.md").read_text()
-        self.assertIn("## sign-in: Sign in with a staging test session", readme)
+        self.assertIn("## sign-in: Sign in with an injected test session", readme)
         self.assertIn("**android: ui-pass** (server checks not configured)", readme)
         self.assertIn('<img src="android/sign-in-end.png" width="300">', readme)
         self.assertIn("[Recording: sign-in.mp4](https://github.com/May-Assistant/may-renders/releases/download/device-tests-" + RUN + "/android-sign-in.mp4)", readme)

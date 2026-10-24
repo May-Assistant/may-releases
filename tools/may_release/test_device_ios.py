@@ -225,6 +225,17 @@ class RunTests(Workspace):
             ("sign-in", "ui-pass", device_tests.UNCONFIGURED), ("connections", "skipped", "skipped (flow not tagged for ios)")])
         self.assertEqual(len(minted), 1, "no session is minted for the skipped scenario")
 
+    def test_a_flow_naming_an_id_the_app_lacks_fails_on_ios_too(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(
+            FLOW + "- assertVisible:\n    id: demo-connections\n")
+        (self.source / "android/app/src/main/A.kt").parent.mkdir(parents=True, exist_ok=True)
+        (self.source / "android/app/src/main/A.kt").write_text('val tag = "demo-connections"\n')
+        calls, minted, report, _, _ = self.run_it()
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("sign-in", "ui-pass", device_tests.UNCONFIGURED), ("connections", "fail", device_tests.FLOW_IDS)],
+            "an id in Android's sources alone is not in iOS's")
+        self.assertEqual(len(minted), 1, "no session is minted for the failed scenario")
+
     def test_a_switched_off_scenario_is_skipped(self):
         calls, minted, report, _, _ = self.run_it(env={"MAY_DEVICE_TESTS_SKIP": "sign-in"})
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]][0],

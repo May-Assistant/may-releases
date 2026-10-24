@@ -203,6 +203,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     claude = device_agent.settings(os.environ) if agents else (os.environ.pop(device_agent.OAUTH, ""), None)
     root = runner_root()
     source, private = root / "may-source", root / "may-private"
+    literals = device_tests.app_sources(root, "ios")
     if not (root / APP / "Info.plist").is_file():
         raise DeviceTestsError("The Playground app is not built")
     base = device_tests.staging(secret, staged)
@@ -245,6 +246,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 continue
             if flow is not None and device_tests.untagged(row, flow, "ios"):
                 entry["reason"] = device_tests.UNTAGGED["ios"]
+                continue
+            if flow is not None and device_tests.flow_lacks_ids(row, flow, literals, "ios"):
+                entry.update(verdict="fail", reason=device_tests.FLOW_IDS)
                 continue
             token = accounts.session(row, base, secret, entry)
             if token is None:

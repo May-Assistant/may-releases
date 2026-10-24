@@ -36,6 +36,7 @@ server's guard for test sessions as the backstop.
 
 import argparse
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -786,6 +787,88 @@ def scenario_flow(row, source, private):
     return None
 
 
+# Every id a Maestro scenario's flow (and the flows it runs) taps or waits on must be in the app's own sources for the
+# job's platform: may-app's and its design system's Kotlin or Swift, test code left out. A flow naming one that is not
+# fails without being driven (FLOW_IDS), and the log gives a count alone. An id is there as a string literal, or as a
+# literal's fixed start before an interpolation ("connections.row.${c.wire}") whose remainder is itself a literal
+# ("google_calendar"), so a misspelt row id is still caught.
+FLOW_IDS = "the flow names an id the app's sources lack"
+DESIGN_SYSTEM = "may-design-system"
+SOURCE_SUFFIXES = (".kt", ".swift")
+FLOW_ID = re.compile(r"\s*(?:-\s+)?id:\s*([\"']?)([^\"'#\s]+)\1\s*(?:#.*)?")
+RUN_FLOW = re.compile(r"\s*-\s+runFlow:\s*([\"']?)([A-Za-z0-9_./-]+\.yaml)\1\s*(?:#.*)?")
+LITERAL = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
+ID_PATTERN = re.compile(r"[\\*+?()\[\]{}^$]")
+INTERPOLATION = re.compile(r"\$\{|\$[A-Za-z_]|\\\(")
+
+
+def flow_ids(flow, seen=None):
+    """The ids a flow and every flow it runs (runFlow, beside it) name, as written."""
+    seen = set() if seen is None else seen
+    if flow in seen or not flow.is_file() or flow.is_symlink():
+        return set()
+    seen.add(flow)
+    ids = set()
+    for line in flow.read_text(errors="replace")[:MAX_FLOW_BYTES].splitlines():
+        if (found := FLOW_ID.fullmatch(line)):
+            ids.add(found.group(2))
+        elif (nested := RUN_FLOW.fullmatch(line)) and ".." not in Path(nested.group(2)).parts:
+            ids |= flow_ids(flow.parent / nested.group(2), seen)
+    return ids
+
+
+def app_literals(roots):
+    """The string literals in the Kotlin and Swift under roots, test code left out: (whole literals, fixed starts of
+    interpolated ones)."""
+    whole, starts = set(), set()
+    for root in roots:
+        for path in sorted(root.rglob("*")) if root.is_dir() else []:
+            if path.suffix not in SOURCE_SUFFIXES or path.is_symlink() or not path.is_file() or test_code(
+                    path.relative_to(root)):
+                continue
+            for literal in LITERAL.findall(path.read_text(errors="replace")):
+                cut = INTERPOLATION.search(literal)
+                if cut is None:
+                    whole.add(literal)
+                elif cut.start():
+                    starts.add(literal[:cut.start()])
+    return whole, starts
+
+
+def test_code(relative):
+    """Whether a source file is test code (a test source set or target, a snapshot target, the emulator flows module),
+    whose literals say nothing about the app."""
+    folders = relative.parts[:-1]
+    return (relative.stem.endswith(("Test", "Tests")) or "flows" in folders or "Snapshots" in folders or
+            any(part.startswith(("test", "androidTest")) or part.endswith("Tests") for part in folders))
+
+
+def lacking_ids(ids, literals):
+    """The ids no literal (or fixed start plus a literal remainder) accounts for. Maestro reads an id as a regular
+    expression: each alternative of an a|b id must be there, and an id using any other pattern syntax is not checked."""
+    whole, starts = literals
+    names = {name for i in ids if not ID_PATTERN.search(i) for name in i.split("|")}
+    return sorted(n for n in names if n not in whole and not any(n.startswith(s) and n[len(s):] in whole for s in starts))
+
+
+def app_sources(root, platform):
+    """The literals of a platform's app code, read once a run and only when asked: may-app's and its design system's
+    android/ or ios/ on the runner."""
+    return functools.cache(lambda: app_literals([folder / platform for folder in (root / "may-source",
+                                                                                   root / DESIGN_SYSTEM)]))
+
+
+def flow_lacks_ids(row, flow, literals, platform):
+    """Whether a Maestro scenario's flow names an id the app's sources lack (literals() reads them): the scenario fails
+    with FLOW_IDS, never driven, and the public log gives the count alone."""
+    if row["driver"] != "maestro":
+        return False
+    scenario, missing = row["id"], len(lacking_ids(flow_ids(flow), literals()))
+    if missing:
+        print(f"May device tests ({platform}): {scenario}: {missing} id(s) its flow names are not in the app's sources")
+    return bool(missing)
+
+
 class Budget:
     """RUN_BUDGET_SECONDS from the run's start: a scenario starts only when its own cap, the judging of every agent
     scenario started so far and its own judging still fit."""
@@ -855,6 +938,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     claude = device_agent.settings(os.environ) if agents else (os.environ.pop(device_agent.OAUTH, ""), None)
     root = runner_root()
     source, private = root / "may-source", root / "may-private"
+    literals = app_sources(root, "android")
     if not source.is_dir() or not (source / APK).is_file():
         raise DeviceTestsError("The Playground app is not built")
     base = staging(secret, staged)
@@ -898,6 +982,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 continue
             if flow is not None and untagged(row, flow, "android"):
                 entry["reason"] = UNTAGGED["android"]
+                continue
+            if flow is not None and flow_lacks_ids(row, flow, literals, "android"):
+                entry.update(verdict="fail", reason=FLOW_IDS)
                 continue
             # A fresh session per scenario: one lasts SESSION_SECONDS and has no refresh. The smoke scenario has none.
             token = accounts.session(row, base, secret, entry)
