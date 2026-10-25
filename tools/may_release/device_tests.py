@@ -757,14 +757,28 @@ LOG_BUFFERS = "main,system,crash"
 ANR, CRASH = "data_app_anr", "data_app_crash"
 
 
+MAX_COMMAND_OUTPUT = 16 * 1024 * 1024
+
+
+def bounded_output(argv, env, seconds=DIAG_SECONDS, limit=MAX_COMMAND_OUTPUT):
+    """(exit status, at most limit bytes of its output) for one diagnostics command, or None when it could not start
+    or did not finish within seconds. The output goes to a file, never a pipe, in a session of its own: after
+    subprocess.run's kill a pipe is read to its end, which waits on any child still holding it (the simulator's own
+    log, adb's), while a file is never waited on (the security read of #115)."""
+    with tempfile.TemporaryFile() as output:
+        try:
+            done = subprocess.run(argv, stdout=output, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env,
+                                  start_new_session=True, timeout=seconds)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        output.seek(0)
+        return done.returncode, output.read(limit)
+
+
 def adb_output(adb, env, argv):
     """One adb command's output, or None when it failed or did not finish within DIAG_SECONDS: never an error."""
-    try:
-        done = subprocess.run([adb, *argv], capture_output=True, stdin=subprocess.DEVNULL, env=env,
-                              timeout=DIAG_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return done.stdout if done.returncode == 0 and isinstance(done.stdout, bytes) else None
+    done = bounded_output([adb, *argv], env)
+    return done[1] if done is not None and done[0] == 0 else None
 
 
 class Diagnostics:

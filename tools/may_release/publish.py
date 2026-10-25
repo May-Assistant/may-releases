@@ -404,6 +404,8 @@ def agent_ok(agent):
     """A report row's sealed agent account (device_tests.sealed_agent): its fixed shape, the summary capped and with
     nothing kept_lines would drop or mask. It stays in report.json; the pages never show it."""
     summary = agent.get("summary") if isinstance(agent, dict) else None
+    # A report sealed before hierarchy_failure was (#116) has no such key: read as null, never as malformed.
+    agent = {"hierarchy_failure": None, **agent} if isinstance(agent, dict) else agent
     return (isinstance(agent, dict) and set(agent) == {"outcome", "actions", "summary", "hierarchy_failure"} and
             agent["outcome"] in ("completed", "blocked", None) and type(agent["actions"]) is int and
             agent["hierarchy_failure"] in (*device_tests.device_mcp.DUMP_FAILURES, None) and

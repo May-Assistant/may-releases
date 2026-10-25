@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -338,9 +339,11 @@ class SealedAgentTests(unittest.TestCase):
         for bad in (dict(good, summary="x" * (device_tests.MAX_AGENT_SUMMARY + 1)),
                     dict(good, summary="Cookie: sid=1"), dict(good, summary="sam@example.com"),
                     dict(good, outcome="finished"), dict(good, actions=999), dict(good, extra=1), "ok",
-                    dict(good, hierarchy_failure="<script>"), {k: v for k, v in good.items() if k != "hierarchy_failure"}):
+                    dict(good, hierarchy_failure="<script>")):
             with self.subTest(bad=bad):
                 self.assertFalse(publish.agent_ok(bad))
+        older = {k: v for k, v in good.items() if k != "hierarchy_failure"}
+        self.assertTrue(publish.agent_ok(older), "a report sealed before #116 reads as null, not malformed")
 
 
 class RevokeTests(unittest.TestCase):
@@ -549,7 +552,7 @@ class BootTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.flows.sdk_tool", side_effect=lambda home, tool: str(home / tool)), \
-                patch("device_tests.subprocess.run", return_value=Done()), \
+                patch("device_tests.subprocess.run", side_effect=lambda argv, **k: answered(argv, k, 0, b"1\n")), \
                 patch("device_tests.subprocess.Popen", return_value=Emulator()), \
                 patch("device_tests.flows.run_private", side_effect=private):
             root = Path(directory)
@@ -1650,6 +1653,15 @@ def dropbox(*entries, tag="data_app_anr"):
         for i, body in enumerate(entries))
 
 
+def answered(argv, kwargs, status, out):
+    """A fake subprocess.run's answer, its output written where bounded_output reads it (a file), else as stdout."""
+    target = kwargs.get("stdout")
+    if hasattr(target, "write"):
+        target.write(out)
+        return subprocess.CompletedProcess(argv, status, None, None)
+    return subprocess.CompletedProcess(argv, status, out, b"")
+
+
 class FakeEmulator:
     """adb as Diagnostics and settle_boot see it: dropbox entries, a log, and every call."""
 
@@ -1665,7 +1677,7 @@ class FakeEmulator:
             out = dropbox(*self.anrs) if argv[5] == "data_app_anr" else dropbox(*self.crashes, tag="data_app_crash")
         elif argv[1:3] == ["logcat", "-d"]:
             out = self.log
-        return subprocess.CompletedProcess(argv, 0, out, b"")
+        return answered(argv, kwargs, 0, out)
 
 
 def dropbox_at(*entries, tag="data_app_anr"):
@@ -1811,7 +1823,7 @@ class DiagnosticsTests(unittest.TestCase):
             out = answers.get(argv[5], b"") if argv[1:5] == ["shell", "dumpsys", "dropbox", "--print"] else b""
             if out is None:
                 raise subprocess.TimeoutExpired(argv, 60)
-            return subprocess.CompletedProcess(argv, 0, out, b"")
+            return answered(argv, kwargs, 0, out)
 
         with patch("device_tests.subprocess.run", side_effect=run):
             diagnostics = device_tests.Diagnostics("/sdk/adb", {})
@@ -1839,7 +1851,7 @@ class DiagnosticsTests(unittest.TestCase):
                                                b"1\n", b"1.20 2.00 1.00 3/400 99\n"])
 
         def run(argv, **kwargs):
-            return subprocess.CompletedProcess(argv, 0, next(answers), b"")
+            return answered(argv, kwargs, 0, next(answers))
 
         log = self.folder / "log"
         with patch("device_tests.subprocess.run", side_effect=run):
@@ -1853,8 +1865,7 @@ class DiagnosticsTests(unittest.TestCase):
         now = [0]
 
         def run(argv, **kwargs):
-            return subprocess.CompletedProcess(argv, 0, b"1\n" if "getprop" in argv else b"8.00 8.00 8.00 3/400 99\n",
-                                               b"")
+            return answered(argv, kwargs, 0, b"1\n" if "getprop" in argv else b"8.00 8.00 8.00 3/400 99\n")
 
         log = self.folder / "log"
         with patch("device_tests.subprocess.run", side_effect=run):
@@ -1868,7 +1879,7 @@ class DiagnosticsTests(unittest.TestCase):
         with patch("device_tests.settle_boot") as settle, \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.flows.sdk_tool", side_effect=lambda home, tool: str(home / tool)), \
-                patch("device_tests.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"1\n")), \
+                patch("device_tests.subprocess.run", side_effect=lambda argv, **k: answered(argv, k, 0, b"1\n")), \
                 patch("device_tests.subprocess.Popen"), patch("device_tests.flows.run_private", return_value=0):
             device_tests.boot(self.folder, self.folder / "log")
         self.assertEqual(settle.call_count, 1)
@@ -2060,6 +2071,32 @@ class ReleaseDeviceTests(unittest.TestCase):
             with self.subTest(path=path), patch("urllib.request.urlopen", side_effect=AssertionError("network")), \
                     self.assertRaises(PublishError):
                 publish.renders_api(method, host, path, self.TOKEN)
+
+
+class BoundedOutputTests(unittest.TestCase):
+    """The security read of #115: subprocess.run's kill-then-communicate waits for every holder of the output pipe."""
+
+    def test_a_child_still_holding_the_output_never_blocks_the_read(self):
+        started = time.monotonic()
+        self.assertEqual(device_tests.bounded_output(["sh", "-c", "sleep 4 & echo kept"], {"PATH": "/usr/bin:/bin"}),
+                         (0, b"kept\n"))
+        self.assertLess(time.monotonic() - started, 3, "a pipe would have waited for the background sleep")
+
+    def test_one_that_runs_too_long_is_killed_whole_and_read_as_no_answer(self):
+        started = time.monotonic()
+        self.assertIsNone(device_tests.bounded_output(["sh", "-c", "sleep 30 & sleep 30"], {"PATH": "/usr/bin:/bin"},
+                                                      seconds=1))
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNone(device_tests.bounded_output(["/no/such/tool"], {}), "one that cannot start")
+
+    def test_the_output_is_capped_and_adb_reads_only_a_clean_exit(self):
+        self.assertEqual(device_tests.bounded_output(["sh", "-c", "printf 0123456789"], {"PATH": "/usr/bin:/bin"},
+                                                     limit=4), (0, b"0123"))
+        with patch("device_tests.bounded_output", return_value=(1, b"error")):
+            self.assertIsNone(device_tests.adb_output("/sdk/adb", {}, ["logcat", "-d"]))
+        with patch("device_tests.bounded_output", return_value=(0, b"lines")) as bounded:
+            self.assertEqual(device_tests.adb_output("/sdk/adb", {"A": "1"}, ["logcat", "-d"]), b"lines")
+        bounded.assert_called_once_with(["/sdk/adb", "logcat", "-d"], {"A": "1"})
 
 
 class WorkflowPinTests(unittest.TestCase):

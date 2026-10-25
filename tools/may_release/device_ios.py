@@ -42,6 +42,8 @@ STOP_SECONDS = 30
 # stuck scenario, the one most worth watching, kept no recording. Then its last part alone is converted, as long as the
 # smallest whole conversion suggests will fit (with TAIL_MARGIN to spare), and never less than MIN_TAIL_SECONDS.
 TAIL_MARGIN, MIN_TAIL_SECONDS = 0.8, 60
+# One avconvert, however long the recording, never holds the job (the security read of #116).
+CONVERT_SECONDS = 600
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
@@ -148,16 +150,12 @@ class Recorder:
         outcomes, smallest = [], None  # smallest: (bytes, preset, suffix) of a conversion that was over the cap
         for preset, suffix in CONVERSIONS:
             converted = self.private / (self.scenario + "-converted" + suffix)
-            with self.log.open("ab") as output:
-                failed = subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted),
-                                         "--preset", preset, "--replace"], stdout=output, stderr=output,
-                                        stdin=subprocess.DEVNULL, env=self.env).returncode
+            failed = self.convert(["--preset", preset], converted)
             if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
                 converted.replace(out)
                 self.raw.unlink(missing_ok=True)
                 return [out.name]
-            outcomes.append(f"{preset} " + (f"failed (exit {failed})" if failed else
-                                            f"{megabytes(converted)} MB" if converted.is_file() else "wrote no file"))
+            outcomes.append(f"{preset} " + outcome(failed, converted))
             if not failed and converted.is_file() and (smallest is None or converted.stat().st_size < smallest[0]):
                 smallest = (converted.stat().st_size, preset, suffix)
             converted.unlink(missing_ok=True)
@@ -166,39 +164,54 @@ class Recorder:
             self.raw.replace(out)
             self.kept = f"unconverted: no conversion fit the cap ({tried}){self.length()}"
             return [out.name]
-        tail = self.tail(out, seconds, smallest)
+        tail, tried_tail = self.tail(out, seconds, smallest)
         if tail:
             self.raw.unlink(missing_ok=True)
             self.kept = f"as its last {tail} s alone: the whole did not fit the cap ({tried}){self.length()}"
             return [out.name]
         size = megabytes(self.raw) if self.raw.is_file() else 0
         self.raw.unlink(missing_ok=True)
-        self.dropped = f"no conversion fit the cap ({tried}) and the original is {size} MB, over it{self.length()}"
+        self.dropped = (f"no conversion fit the cap ({tried}) and the original is {size} MB, over it" +
+                        (f"; {tried_tail}" if tried_tail else "") + self.length())
         return []
 
+    def convert(self, options, converted):
+        """One avconvert of the raw recording to converted: its exit status, or "timed out" past CONVERT_SECONDS."""
+        with self.log.open("ab") as output:
+            try:
+                return subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted), *options,
+                                       "--replace"], stdout=output, stderr=output, stdin=subprocess.DEVNULL,
+                                      env=self.env, timeout=CONVERT_SECONDS).returncode
+            except subprocess.TimeoutExpired:
+                return "timed out"
+
     def tail(self, out, seconds, smallest):
-        """The recording's last part converted to out with smallest's preset, sized to fit the cap: its length in
-        seconds, or 0 when there is none to try or it did not fit either."""
+        """The recording's last part converted to out with smallest's preset, sized to fit the cap: (its length in
+        seconds, or 0 when none was kept; how a tail that was tried and refused came out, for the log, or None)."""
         if smallest is None or not self.raw.is_file():
-            return 0
+            return 0, None
         size, preset, suffix = smallest
         tail = max(MIN_TAIL_SECONDS, int(seconds * MAX_RECORDING * TAIL_MARGIN / size))
         if tail >= seconds:
-            return 0
+            return 0, None
         converted = self.private / (self.scenario + "-tail" + suffix)
-        with self.log.open("ab") as output:
-            failed = subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted), "--preset",
-                                     preset, "--start", str(seconds - tail), "--duration", str(tail), "--replace"],
-                                    stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=self.env).returncode
+        failed = self.convert(["--preset", preset, "--start", str(seconds - tail), "--duration", str(tail)], converted)
         if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
             converted.replace(out)
-            return tail
+            return tail, None
+        tried = f"its last {tail} s alone: {outcome(failed, converted)}"
         converted.unlink(missing_ok=True)
-        return 0
+        return 0, tried
 
 
 def megabytes(path):
     return path.stat().st_size // (1024 * 1024)
+
+
+def outcome(failed, converted):
+    """One conversion's outcome for the public log, in fixed words and MB."""
+    return (f"failed (exit {failed})" if type(failed) is int and failed else "failed (timed out)" if failed else
+            f"{megabytes(converted)} MB" if converted.is_file() else "wrote no file")
 
 
 # may-app #1272: the debug Playground's main-thread watchdog logs one line per stall of 250 ms or more, alone in its
@@ -208,17 +221,18 @@ STALL = re.compile(rb"main-thread stall ([0-9]{1,7}) ms")
 # The simulator's crash reports land in the host's own folder; only the Playground's process is kept.
 CRASH_REPORTS = Path.home() / "Library" / "Logs" / "DiagnosticReports"
 CRASH_REPORT = re.compile(r"MayPlayground[-_][A-Za-z0-9._-]{1,120}\.(?:ips|crash)")
+# The file name alone is not proof (the security read of #115): a report is kept only when its own header names the
+# Playground's bundle id, as an .ips report's JSON first line ("bundleID") or a .crash report's Identifier line does.
+OWN_REPORT = re.compile(rb'"bundleID"[ \t]*:[ \t]*"' + re.escape(BUNDLE.encode()) + rb'"|^Identifier:[ \t]+' +
+                        re.escape(BUNDLE.encode()) + rb"[ \t]*\r?$", re.MULTILINE)
+REPORT_HEAD = 16 * 1024
 
 
 def show_log(udid, env, start):
     """The simulator's unified log since start, the watchdog's lines alone; b"" when it could not be read."""
-    try:
-        done = subprocess.run(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact", "--start", start,
-                               "--predicate", WATCHDOG], capture_output=True, stdin=subprocess.DEVNULL, env=env,
-                              timeout=device_tests.DIAG_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return b""
-    return done.stdout[:device_tests.MAX_DIAG] if isinstance(done.stdout, bytes) else b""
+    done = device_tests.bounded_output(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
+                                        "--start", start, "--predicate", WATCHDOG], env, limit=device_tests.MAX_DIAG)
+    return b"" if done is None else done[1]
 
 
 class Diagnostics:
@@ -252,9 +266,11 @@ class Diagnostics:
                 self.seen.add(path)
                 try:
                     with path.open("rb") as report:
-                        found.append(b"== crash ==\n" + report.read(device_tests.MAX_DIAG // 2) + b"\n")
+                        data = report.read(device_tests.MAX_DIAG // 2)
                 except OSError:
                     continue
+                if OWN_REPORT.search(data[:REPORT_HEAD]):
+                    found.append(b"== crash ==\n" + data + b"\n")
         self.crashes += bool(found)
         lines = [line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
                  .splitlines(keepends=True) if STALL.search(line)]
