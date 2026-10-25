@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: all
+      ios_reduce_motion:
+        description: Turn on Reduce Motion in the iOS simulator before the app starts (to compare iOS runs with and without it)
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "17 3 * * *"
 permissions:
@@ -151,6 +156,7 @@ jobs:
           MAY_DEVICE_TESTS_FRESH: ${{ vars.MAY_DEVICE_TESTS_FRESH }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}
+          MAY_IOS_REDUCE_MOTION: ${{ inputs.ios_reduce_motion }}
         run: python3 -I -S -B tools/may_release/device_tests.py run --platform ios --scenarios "$MAY_SCENARIOS"
       - name: Judge the agent scenarios
         env:

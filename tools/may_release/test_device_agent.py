@@ -159,7 +159,12 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([argv[-1] for argv in starts], [TOKEN + "1", TOKEN + "2", TOKEN + "3"])
         self.assertEqual(len([argv for argv in calls if "force-stop" in argv]), 3)
         goals = seen["goals"]
-        self.assertEqual({tag for _, tag, _, _, _ in goals}, {"qa-39557415738"})
+        self.assertEqual([tag for _, tag, _, _, _ in goals],
+                         ["qa-39557415738-chat", "qa-39557415738-notes", "qa-39557415738-routines"],
+                         "each scenario's own tag (coordinator, 25 Oct)")
+        self.assertEqual([tag for _, tag, _, _ in seen["judged"]],
+                         ["qa-39557415738-chat", "qa-39557415738-notes", "qa-39557415738-routines"],
+                         "the judge reads the goal with the same tag the agent had")
         self.assertEqual([(token, model) for _, _, token, model, _ in goals], [(OAUTH, MODEL)] * 3)
         self.assertTrue(all("{tag}" in goal for goal, *_ in goals), "the goal goes to the agent with its placeholder")
         self.assertNotIn("MAY_TEST_SIGNIN_SECRET", seen["environ"])
@@ -177,7 +182,8 @@ class AgentRunTests(unittest.TestCase):
                          [{"outcome": "completed", "actions": 7, "summary": "saw it"}] * 3,
                          "the agent's own account, sealed into the private report")
         self.assertNotIn("saw it", run_out + judge_out, "never in the public log")
-        self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738"), (TOKEN + "3", "qa-39557415738")],
+        self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738-chat"),
+                                                 (TOKEN + "3", "qa-39557415738-routines")],
                          "chat and routines send May a message: their messages are read with their own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
                          [["succeeded"], None, ["succeeded"]])
@@ -274,7 +280,7 @@ class AgentRunTests(unittest.TestCase):
                                                        selection="poll,poll-skip", asked=ask)
         except (KeyError, TypeError) as error:
             self.fail("a question truth row was not read as a question: " + type(error).__name__)
-        self.assertEqual(asked, [("answered", "qa-39557415738"), ("closed", "qa-39557415738")])
+        self.assertEqual(asked, [("answered", "qa-39557415738-poll"), ("closed", "qa-39557415738-poll-skip")])
         self.assertEqual([(row["verdict"], row.get("reason"), row["server"]) for row in report["scenarios"]], [
             ("pass", None, [{"get": "/v1/agents", "status": 200, "pass": True}]),
             ("fail", device_tests.NO_TRUTH, [{"get": "/v1/agents", "status": 200, "pass": False}])])
@@ -372,7 +378,8 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("chat", "skipped", device_tests.MODEL_CAP), ("notes", "ui-pass", device_tests.UNCONFIGURED),
             ("routines", "pass", None)])
-        self.assertEqual([goal[1] for goal in seen["goals"]], ["qa-39557415738"] * 2, "chat's agent never ran")
+        self.assertEqual([goal[1] for goal in seen["goals"]], ["qa-39557415738-notes", "qa-39557415738-routines"],
+                         "chat's agent never ran")
 
     def test_a_fresh_account_skipped_near_the_cap_is_deleted_then_and_there(self):
         try:
@@ -541,6 +548,28 @@ class ServerTruthTests(unittest.TestCase):
             raise urllib.error.HTTPError(request.full_url, 403, "no", {}, None)
 
         self.assertFalse(device_tests.delete_fresh("https://s", TOKEN, refused))
+
+    def test_one_scenarios_delivery_codes_never_count_another_scenarios_messages(self):
+        """Coordinator, 25 Oct (run 40138900610): poll-skip's codes held poll's two messages as well, so a failed poll
+        would fail poll-skip too. Each scenario's tag is its own, and a tag is matched as a whole word."""
+        run = "qa-40138900610"
+        poll, skip = device_tests.scenario_tag(run, {"id": "poll"}), device_tests.scenario_tag(run, {"id": "poll-skip"})
+        self.assertEqual((poll, skip), ("qa-40138900610-poll", "qa-40138900610-poll-skip"))
+        get, _ = chat_server([{"id": "may", "name": "May"}], {"/v1/conversations/may/messages": [
+            {"author": "user", "text": "Ask me one question, tag " + poll, "latest_run": {"status": "failed"}},
+            {"author": "user", "text": "Ask me one question, tag " + skip, "latest_run": {"status": "succeeded"}},
+            {"author": "user", "text": "I will answer myself: apples, " + skip + ".", "latest_run": {"status": "succeeded"}}]})
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, skip, get=get), ["succeeded", "succeeded"])
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, poll, get=get), ["failed"],
+                         "poll's tag is a prefix of poll-skip's, yet never matches it")
+
+    def test_a_tag_is_held_only_as_a_whole_word(self):
+        for text, held in (("tag qa-1-poll", True), ("(qa-1-poll)", True), ("QA-1-POLL.", True), ("qa-1-poll\n", True),
+                           ("tag qa-1-poll-skip", False), ("xqa-1-poll", False), ("qa-1-polls", False),
+                           ("qa-1-poll_2", False)):
+            with self.subTest(text=text):
+                self.assertEqual(device_tests.holds({"body": [text]}, "qa-1-poll"), held)
+        self.assertTrue(device_tests.holds("qa-1-poll-skip task", "qa-1-poll-skip"))
 
     def test_message_codes_are_each_tagged_user_messages_run_status_and_error_code(self):
         tag = "qa-39557415738"
@@ -722,7 +751,14 @@ class AgentRunnerTests(unittest.TestCase):
         found, seen = self.run_agent({"type": "result", "subtype": "success", "is_error": False, "num_turns": 9},
                                      {"outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 12})
         self.assertEqual(found, {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h",
-                                 "actions": 12})
+                                 "actions": 12, "hierarchy_failure": None})
+        for stored, kept in (("no idle state", "no idle state"), ("adb failed", "adb failed"),
+                             ("<script>", None), (7, None)):
+            with self.subTest(stored=stored):
+                found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
+                                          {"outcome": "completed", "summary": "ok", "actions": 1,
+                                           "hierarchy_failure": stored})
+                self.assertEqual(found["hierarchy_failure"], kept, "fixed words alone")
         command = seen["command"]
         self.assertEqual(command[:3], ["/cli/claude", "-p", "Do qa-12345678 now"])
         for flag, value in (("--tools", ""), ("--strict-mcp-config", None), ("--permission-mode", "dontAsk"),
@@ -907,18 +943,94 @@ class DeviceServerTests(unittest.TestCase):
         self.assertNotIn("sam@", stored["hierarchy"])
         self.assertEqual(stored["actions"], 1, "the look at done is not one of the agent's steps")
 
-    def test_with_no_fresh_screen_at_done_the_last_look_is_kept_and_said_so(self):
-        answers = [subprocess.CompletedProcess([], 0, HIERARCHY, b""), subprocess.CompletedProcess([], 1, b"", b"")]
-
+    @staticmethod
+    def device(answers, settings=None, dumps=None, scales=None):
+        """A fake adb: settings get answers from scales ({setting: bytes}, b"1" by default), settings put is recorded
+        in settings, and each uiautomator dump takes the next of answers."""
         def run(argv, capture_output, stdin, timeout):
+            if "settings" in argv:
+                if argv[argv.index("settings") + 1] == "put":
+                    (settings if settings is not None else []).append(tuple(argv[-2:]))
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+                return subprocess.CompletedProcess(argv, 0, (scales or {}).get(argv[-1], b"1\n"), b"")
+            if dumps is not None:
+                dumps.append(argv[argv.index("uiautomator") + 1:])
             return answers.pop(0)
+        return run
 
-        with patch("device_mcp.subprocess.run", side_effect=run):
+    def test_with_no_fresh_screen_at_done_the_last_look_is_kept_and_said_so(self):
+        answers = [subprocess.CompletedProcess([], 0, HIERARCHY, b""), subprocess.CompletedProcess([], 1, b"", b""),
+                   subprocess.CompletedProcess([], 1, b"", b"")]
+        dumps = []
+        run = self.device(answers, dumps=dumps)
+
+        with patch("device_mcp.subprocess.run", side_effect=run), patch("device_mcp.time.sleep") as slept:
             device_mcp.call("hierarchy", {}, self.config)
             device_mcp.call("done", {"outcome": "blocked", "summary": "x"}, self.config)
         stored = json.loads(self.result.read_text())
-        self.assertTrue(stored["hierarchy"].startswith("(no fresh hierarchy at done; the agent's last look follows)"))
+        self.assertTrue(stored["hierarchy"].startswith(
+            "(no fresh hierarchy at done: adb failed; the agent's last look follows)"))
         self.assertIn("text='Chats'", stored["hierarchy"])
+        self.assertEqual(stored["hierarchy_failure"], "adb failed")
+        self.assertEqual(dumps, [["dump", "/dev/tty"], ["dump", "/dev/tty"], ["dump", "--compressed", "/dev/tty"]],
+                         "a failed dump is tried once more, compressed")
+        self.assertEqual([call.args for call in slept.call_args_list],
+                         [(device_mcp.STILL_SECONDS,), (device_mcp.DUMP_RETRY_SECONDS,)])
+
+    def test_the_done_dump_stills_the_animations_and_puts_them_back_after_a_failed_dump(self):
+        """M, 25 Oct: the chat header's mark loops forever, so the dump never sees idle with the animations on."""
+        settings, failed = [], subprocess.CompletedProcess([], 0, b"ERROR: could not get idle state.", b"")
+        scales = {"window_animation_scale": b"1\n", "transition_animation_scale": b"0.5\n",
+                  "animator_duration_scale": b"not a number\n"}
+        with patch("device_mcp.subprocess.run", side_effect=self.device([failed, failed], settings, scales=scales)), \
+                patch("device_mcp.time.sleep"):
+            device_mcp.call("done", {"outcome": "completed", "summary": "x"}, self.config)
+        stilled = [(setting, "0") for setting in device_mcp.ANIMATION_SETTINGS]
+        self.assertEqual(settings, stilled + [("window_animation_scale", "1"), ("transition_animation_scale", "0.5"),
+                                              ("animator_duration_scale", "1")],
+                         "each scale back to what it was (1 when it could not be read), after a failed dump too")
+        self.assertEqual(device_mcp.ANIMATION_SETTINGS, device_tests.ANIMATION_SETTINGS)
+
+    def test_the_scales_are_put_back_even_when_the_dump_raises(self):
+        settings = []
+        with patch("device_mcp.subprocess.run", side_effect=self.device([], settings)), \
+                patch("device_mcp.time.sleep"), patch("device_mcp.android_dump", side_effect=RuntimeError("boom")), \
+                self.assertRaises(RuntimeError):
+            device_mcp.stilled_dump(self.config)
+        self.assertEqual(settings[-3:], [(setting, "1") for setting in device_mcp.ANIMATION_SETTINGS])
+
+    def test_the_agents_own_looks_never_touch_the_animations(self):
+        settings = []
+        with patch("device_mcp.subprocess.run",
+                   side_effect=self.device([subprocess.CompletedProcess([], 0, HIERARCHY, b"")], settings)):
+            device_mcp.call("hierarchy", {}, self.config)
+        self.assertEqual(settings, [], "the recording keeps its motion while the agent works")
+
+    def test_a_dump_that_fails_once_is_retried_and_its_screen_kept(self):
+        """Run 40138900610: the done-time dump came back empty for Android's notes and poll-skip."""
+        answers = [subprocess.CompletedProcess([], 0, b"ERROR: could not get idle state.", b""),
+                   subprocess.CompletedProcess([], 0, HIERARCHY, b"")]
+
+        with patch("device_mcp.subprocess.run", side_effect=self.device(answers)), patch("device_mcp.time.sleep"):
+            device_mcp.call("done", {"outcome": "completed", "summary": "x"}, self.config)
+        stored = json.loads(self.result.read_text())
+        self.assertIn("text='Chats'", stored["hierarchy"])
+        self.assertIsNone(stored["hierarchy_failure"])
+
+    def test_each_dump_failure_is_named_in_fixed_words(self):
+        for answer, why in ((subprocess.CompletedProcess([], 0, b"ERROR: could not get idle state.", b""),
+                             "no idle state"),
+                            (subprocess.CompletedProcess([], 0, b"<hierarchy><node", b""), "unreadable"),
+                            (subprocess.CompletedProcess([], 1, b"", b""), "adb failed")):
+            with self.subTest(why=why), patch("device_mcp.subprocess.run", side_effect=self.device([answer, answer])), \
+                    patch("device_mcp.time.sleep"):
+                config = dict(self.config, hierarchy="")
+                device_mcp.call("done", {"outcome": "completed", "summary": "x"}, config)
+                stored = json.loads(self.result.read_text())
+                self.assertEqual(stored["hierarchy_failure"], why)
+                self.assertIn(why, device_mcp.DUMP_FAILURES)
+                self.assertEqual(stored["hierarchy"], f"(no hierarchy at done: {why}; the agent never read one)",
+                                 "the judge is told why, never handed an empty screen")
 
     def test_the_hierarchy_the_agent_reads_is_redacted(self):
         """The security read of #110: the hierarchy tool gave the agent the tree as it was."""

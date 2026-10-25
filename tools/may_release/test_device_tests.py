@@ -2068,6 +2068,18 @@ class WorkflowPinTests(unittest.TestCase):
         self.assertEqual(static_check.device_tests_workflow_problems(self.text), [])
         self.assertEqual(static_check.device_tests_print_problems(ROOT), [])
 
+    def test_reduce_motion_is_an_optional_boolean_read_by_the_ios_scenarios_step_alone(self):
+        line = "          MAY_IOS_REDUCE_MOTION: ${{ inputs.ios_reduce_motion }}\n"
+        self.assertEqual(self.text.count(line), 1)
+        android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
+        self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, line + line.replace("MAY_IOS", "MAY_ALSO")), "a secret, variable")
+        self.flagged(self.text.replace("        type: boolean\n        default: false\n", "        type: string\n"
+                                       "        default: \"\"\n"), "an optional ios_reduce_motion boolean")
+        self.flagged(self.text.replace("      ios_reduce_motion:\n", "      reduce_motion:\n"),
+                     "an optional ios_reduce_motion boolean")
+
     def test_the_sign_in_secret_stays_in_the_scenarios_step(self):
         line = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"
         step = "      - name: Encrypt the report to the renders public key\n        env:\n"

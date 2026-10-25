@@ -16,7 +16,7 @@ Commands, one per workflow step:
            with it (a Playground-debug-only intent extra), record the screen, run its Maestro flow (may-app's
            FLOWS_DIR) or its agent (device_agent.py: Claude Code driving the emulator through device_mcp.py), take a
            screenshot and read the server: status checks, and for an agent scenario whether K's read endpoints show
-           an item carrying the run's tag (qa-<run id>), or a question card in the tagged chat in a given state. Last, the test session's cleanup removes what the run
+           an item carrying the scenario's tag (qa-<run id>-<scenario id>), or a question card in the tagged chat in a given state. Last, the test session's cleanup removes what the run
            created (POST /v1/auth/test-session/cleanup with the tag). A failed scenario does not fail this step, so
            its evidence is still published; `verdict` fails the job afterwards.
   judge    Claude Code, with no tool, judges each agent run from its goal, the agent's report and the last screen's
@@ -364,11 +364,12 @@ def server_check(base, token, path, get=urllib.request.urlopen):
 
 
 def holds(data, tag, depth=0):
-    """Whether any string in a JSON value holds tag (case-insensitive)."""
+    """Whether any string in a JSON value holds tag (case-insensitive) as a whole word: qa-1-poll is not in
+    qa-1-poll-skip, so one scenario's reads never count another's."""
     if depth > 20:
         return False
     if isinstance(data, str):
-        return tag.lower() in data.lower()
+        return re.search(r"(?<![a-z0-9_-])" + re.escape(tag.lower()) + r"(?![a-z0-9_-])", data.lower()) is not None
     if isinstance(data, dict):
         return any(holds(value, tag, depth + 1) for value in data.values())
     if isinstance(data, list):
@@ -653,6 +654,12 @@ class Accounts:
         if kept:
             print(f"May device tests ({platform}): {kept} fresh test accounts' cleanup did not answer; staging sweeps "
                   "them after 2 hours")
+
+
+def scenario_tag(tag, row):
+    """The run's tag with the scenario's id (qa-<run>-<scenario>), in everything that scenario creates and reads, so
+    poll's messages never count as poll-skip's. The cleanup keeps the run's tag, which every scenario's holds."""
+    return f"{tag}-{row['id']}"
 
 
 def run_tag():
@@ -1216,6 +1223,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 accounts.finish(row, base, token)
                 token = ""
                 continue
+            own = scenario_tag(tag, row)  # the scenario's own tag
             at(f"{row['id']}: launching the app")
             launch(adb, env, token, log)
             recorder = Recorder(adb, env, row["id"], log)
@@ -1236,7 +1244,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL}
-                records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"],
+                records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"],
                                            claude[0], claude[1])
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
@@ -1248,12 +1256,12 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
             for check in row.get("truth", []):
                 if "question" in check:
-                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], tag)
+                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], own)
                 else:
-                    path, (status, found) = check["get"], truth(base, token, check["get"], tag)
+                    path, (status, found) = check["get"], truth(base, token, check["get"], own)
                 entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
             if sends_messages(row):
-                codes = delivered(base, token, tag)
+                codes = delivered(base, token, own)
                 if codes is not None:
                     entry["delivery"] = codes
             # After the server reads, which need the session while it lasts: a slow dumpsys costs them nothing.
@@ -1386,7 +1394,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
             try:
                 # Its delivery codes alone, never a message's text; None when its chats could not be read.
                 evidence = dict(record, sends=entry["id"] in sending, delivery=entry.get("delivery"))
-                judged = judged_by(cli, goals[entry["id"]], stored.get("tag", ""), evidence,
+                judged = judged_by(cli, goals[entry["id"]], scenario_tag(stored.get("tag", ""), entry), evidence,
                                    private / "judge" / entry["id"], token, model)
             except (OSError, subprocess.SubprocessError, KeyError):
                 judged = ("error", "")
