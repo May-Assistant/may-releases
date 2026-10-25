@@ -128,7 +128,7 @@ class FakeRecorder:
 
 class RunTests(Workspace):
     def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None, budgeted=None,
-               calls_left=None, fail_mint=(), diagnosed=None):
+               calls_left=None, fail_mint=(), diagnosed=None, log_config_fails=False):
         calls, minted, self.maestro_timeouts, self.delivered = [], [], [], []
         self.built()
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
@@ -142,6 +142,8 @@ class RunTests(Workspace):
                 self.maestro_timeouts.append(timeout)
             if argv[:4] == ["xcrun", "simctl", "io", UDID] and argv[4] == "screenshot":
                 Path(argv[-1]).write_bytes(png())
+            if log_config_fails and "config" in argv:
+                return Done(1)
             return Done(1 if maestro_fails and "test" in argv and "--device" in argv else 0)
 
         failures = list(fail_mint)
@@ -241,6 +243,25 @@ class RunTests(Workspace):
                 calls, minted, report, out, run = self.run_it(env={device_ios.REDUCE_MOTION: value})
                 self.assertNotIn(reduce, [argv for argv, _ in calls])
                 self.assertNotIn("Reduce Motion", out)
+
+    def test_swiftuis_info_lines_are_persisted_for_that_subsystem_alone_before_the_app_starts(self):
+        """Run 40232904242: the body-change lines stayed in memory alone, so most were gone by the read."""
+        persist = ["xcrun", "simctl", "spawn", UDID, "log", "config", "--subsystem", "com.apple.SwiftUI", "--mode",
+                   "level:info,persist:info"]
+        calls, _, _, out, _ = self.run_it()
+        argvs = [argv for argv, _ in calls]
+        self.assertIn(persist, argvs)
+        self.assertLess(argvs.index(persist), argvs.index(["xcrun", "simctl", "install", UDID,
+                                                          str(self.root / device_ios.APP)]),
+                        "before the app is installed and first started")
+        self.assertEqual([argv for argv in argvs if "config" in argv], [persist], "that subsystem alone")
+        self.assertNotIn("SwiftUI", out, "a config that took says nothing")
+
+    def test_a_log_config_that_fails_is_said_and_never_stops_the_run(self):
+        calls, _, report, out, _ = self.run_it(log_config_fails=True)
+        self.assertIn("May device tests (ios): SwiftUI's body changes are kept for the last minutes alone in this run",
+                      out)
+        self.assertTrue(report["scenarios"], "the run went on")
 
     def test_the_session_goes_in_the_launch_environment_alone_and_fresh_per_scenario(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
@@ -432,7 +453,7 @@ class RunTests(Workspace):
                          "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", "GITHUB_RUN_ID": "39557415738"})
         assert set(devices) == {"poll", "poll-skip"}, devices
         self.assertEqual((devices["poll"].get("MAY_DEVICE_STEPS"), devices["poll-skip"].get("MAY_DEVICE_STEPS")),
-                         (None, "120"), "poll keeps the default, poll-skip has 120 to type its free reply")
+                         ("120", "120"), "both type slowly (run 40232904242: poll ran out at 80)")
 
     def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
         """Run 40046272749: the shared account lands in onboarding, not Chats; may-app's subflow taps through it."""
