@@ -1005,7 +1005,17 @@ class AgentRunnerTests(unittest.TestCase):
         found = device_tests.truth_lines(routines, {"server": [{"get": "/v1/routines", "status": 200, "pass": True},
                                                                {"get": "/v1/agents", "status": 200, "pass": False}]})
         self.assertEqual(found[0], "an item holding the tag is listed by GET /v1/routines: confirmed")
-        self.assertIsNone(device_tests.truth_lines(None, {}) or None)
+        self.assertEqual(device_tests.truth_lines(None, {}), [])
+        unread = (("poll", [{"get": "/v1/agents", "status": 401, "pass": False}],
+                   "May's question card in this run's tagged chat is answered: could not be checked"),
+                  ("chat", [{"get": "/v1/agents", "status": 0, "pass": False}],
+                   "every tagged message this run sent has a succeeded reply: could not be checked"),
+                  ("notes", [{"get": "/v1/commitments", "status": 503, "pass": False}],
+                   "the tagged task holds the goal's note: could not be checked"))
+        for scenario, reads, line in unread:
+            with self.subTest(unread=scenario):
+                self.assertEqual(device_tests.truth_lines(rows[scenario], {"server": reads}), [line],
+                                 "a read the server did not answer checked nothing (the review of #123)")
         self.assertEqual(device_agent.truth_text({}), "none: this scenario has no server read")
 
     def test_the_judges_prompt_holds_the_summary_redacted(self):
@@ -1328,6 +1338,21 @@ class DeviceServerTests(unittest.TestCase):
         self.call("back")
         stored = json.loads(self.result.read_text())
         self.assertEqual((stored["outcome"], stored["summary"]), ("completed", "ok"), "done is never overwritten")
+
+    def test_the_result_is_moved_into_place_whole_and_a_failed_write_keeps_the_last(self):
+        """The review of #124: after a timeout run_agent reads the result while this server may still be writing it."""
+        self.call("back")
+        before = self.result.read_bytes()
+        self.assertEqual(json.loads(before)["actions"], 1)
+        self.assertEqual([path.name for path in self.result.parent.iterdir()], ["result.json"], "nothing left beside it")
+        with patch("device_mcp.json.dump", side_effect=OSError("disk full")):
+            try:
+                self.call("back")
+            except OSError:
+                self.fail("a failed write ended the server")
+        self.assertTrue(self.result.is_file(), "the last result is gone")
+        self.assertEqual(self.result.read_bytes(), before, "the last whole result is kept, never a truncated one")
+        self.assertEqual([path.name for path in self.result.parent.iterdir()], ["result.json"])
 
     def test_android_never_stops_on_refused_acts(self):
         """The fail-fast is iOS's alone (coordinator, 25 Oct)."""
