@@ -21,6 +21,7 @@ import urllib.error
 
 import device_agent
 import device_ios
+import device_mcp
 import device_tests
 from device_tests import DeviceTestsError
 import gate
@@ -283,6 +284,26 @@ class ScenarioTests(unittest.TestCase):
                 path.write_text(json.dumps([dict(agent, **change)]))
                 with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
                     device_tests.scenarios()
+
+    def test_only_an_agent_row_sets_its_own_steps_above_the_default(self):
+        skip = device_tests.scenarios("poll-skip")[0]
+        self.assertEqual(skip.get("steps"), 120, "coordinator, 25 Oct: poll-skip types its free reply in 120 steps")
+        self.assertEqual(skip["goal"].count("I will answer myself: apples, {tag}."), 1, "its messages as they were")
+        for row, change in ((skip, {"steps": device_mcp.MAX_ACTIONS}), (skip, {"steps": device_mcp.MOST_ACTIONS + 1}),
+                            (skip, {"steps": "120"}), (skip, {"steps": 120.0}), (skip, {"steps": True}),
+                            (device_tests.scenarios("sign-in")[0], {"steps": 120})):
+            row = dict(row, **change)
+            with self.subTest(change=change, driver=row["driver"]), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "s.json"
+                path.write_text(json.dumps([row]))
+                with patch("device_tests.SCENARIOS", path):
+                    try:
+                        device_tests.scenarios()
+                    except DeviceTestsError:
+                        continue
+                self.fail(f"a row with {change} was accepted")
+        self.assertEqual(device_tests.steps(skip), {"MAY_DEVICE_STEPS": "120"})
+        self.assertEqual(device_tests.steps(device_tests.scenarios("poll")[0]), {})
 
     def test_only_a_fresh_agent_row_records_onboarding(self):
         onboarding = device_tests.scenarios("onboarding")[0]
@@ -555,6 +576,9 @@ class FakeRecorder:
         self.scenario = scenario
 
     def start(self):
+        pass
+
+    def halt(self):
         pass
 
     def stop(self, folder):

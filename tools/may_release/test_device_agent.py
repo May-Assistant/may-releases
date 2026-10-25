@@ -108,6 +108,7 @@ class AgentRunTests(unittest.TestCase):
         def agent(cli, goal, tag, device, work, token, model):
             # The agent's process never sees the staging secret or the OAuth token in this step's environment.
             seen.setdefault("environ", set(os.environ))
+            seen.setdefault("devices", []).append(device)
             seen.setdefault("goals", []).append((goal, tag, token, model, cli))
             if isinstance(records[len(seen["goals"]) - 1], Exception):
                 raise records[len(seen["goals"]) - 1]
@@ -165,10 +166,10 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(len([argv for argv in calls if "force-stop" in argv]), 3)
         goals = seen["goals"]
         self.assertEqual([tag for _, tag, _, _, _ in goals],
-                         ["qa-39557415738-chat", "qa-39557415738-notes", "qa-39557415738-routines"],
+                         ["qa-39557415738-a-chat", "qa-39557415738-a-notes", "qa-39557415738-a-routines"],
                          "each scenario's own tag (coordinator, 25 Oct)")
         self.assertEqual([tag for _, tag, _, _ in seen["judged"]],
-                         ["qa-39557415738-chat", "qa-39557415738-notes", "qa-39557415738-routines"],
+                         ["qa-39557415738-a-chat", "qa-39557415738-a-notes", "qa-39557415738-a-routines"],
                          "the judge reads the goal with the same tag the agent had")
         self.assertEqual([(token, model) for _, _, token, model, _ in goals], [(OAUTH, MODEL)] * 3)
         self.assertTrue(all("{tag}" in goal for goal, *_ in goals), "the goal goes to the agent with its placeholder")
@@ -176,7 +177,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen["environ"])
         self.assertIn("cleanup", seen, "the test session's cleanup ran")
         self.assertEqual(seen["cleanup"][0], TOKEN + "4")
-        self.assertEqual(seen["cleanup"][2], "qa-39557415738")
+        self.assertEqual(seen["cleanup"][2], "qa-39557415738-a")
         self.assertRegex(seen["cleanup"][1], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual([row["verdict"] for row in report["scenarios"]], ["pass", "pass", "pass"])
         self.assertNotIn("reason", report["scenarios"][0])
@@ -191,8 +192,8 @@ class AgentRunTests(unittest.TestCase):
                          [{"outcome": "completed", "actions": 7, "summary": "saw it", "hierarchy_failure": None}] * 3,
                          "the agent's own account, sealed into the private report")
         self.assertNotIn("saw it", run_out + judge_out, "never in the public log")
-        self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738-chat"),
-                                                 (TOKEN + "3", "qa-39557415738-routines")],
+        self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738-a-chat"),
+                                                 (TOKEN + "3", "qa-39557415738-a-routines")],
                          "chat and routines send May a message: their messages are read with their own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
                          [["succeeded"], None, ["succeeded"]])
@@ -244,8 +245,8 @@ class AgentRunTests(unittest.TestCase):
 
         _, _, _, report, run_out, judge_out = self.run_and_judge(
             [record(), record(), record()], [("pass", "")] * 3, noted=beyond)
-        self.assertEqual(seen_notes, [(TOKEN + "2", "qa-39557415738-notes",
-                                       "qa-39557415738-notes note from the device test")],
+        self.assertEqual(seen_notes, [(TOKEN + "2", "qa-39557415738-a-notes",
+                                       "qa-39557415738-a-notes note from the device test")],
                          "the notes read, with notes' own session, tag and the goal's words")
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("chat", "pass", None), ("notes", device_tests.UNVERIFIED, device_tests.NOT_REACHED),
@@ -285,6 +286,48 @@ class AgentRunTests(unittest.TestCase):
                                                   hierarchy="h", delivery="succeeded")
         self.assertIn("delivery codes only", prompt)
         self.assertIn("read when it finished", prompt)
+
+    def test_the_recording_is_pulled_after_the_server_reads_and_diagnostics(self):
+        """Run 40181517145 (coordinator, 25 Oct): the server reads come before any recording is pulled or
+        converted; the recording itself is ended first, so the reads are not in it."""
+        test = self
+
+        class Fake:
+            def __init__(self, adb, env):
+                self.kept = self.anrs = self.crashes = self.network = 0
+                self.dropped = {}
+
+            def keep(self, folder, scenario, token):
+                test.last_seen.setdefault("order", []).append(("diagnostics", token))
+
+            def report(self, platform):
+                pass
+
+        class Ordered(FakeRecorder):
+            def halt(self):
+                test.last_seen.setdefault("order", []).append(("halt", self.scenario))
+
+            def stop(self, folder):
+                test.last_seen.setdefault("order", []).append(("pull", self.scenario))
+                return super().stop(folder)
+
+        with patch("device_tests.Diagnostics", Fake), patch("test_device_agent.FakeRecorder", Ordered):
+            _, _, seen, report, _, _ = self.run_and_judge([record()], [("pass", "")], selection="chat")
+        self.assertEqual([step for step, _ in seen.get("order", [])], ["halt", "read", "diagnostics", "pull"])
+        self.assertEqual(report["scenarios"][0]["videos"], ["chat.mp4"])
+
+    def test_each_platform_has_its_own_run_tag(self):
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "39557415738"}):
+            android, ios = device_tests.run_tag("android"), device_tests.run_tag("ios")
+        self.assertEqual((android, ios), ("qa-39557415738-a", "qa-39557415738-i"))
+        row = {"id": "notes"}
+        self.assertNotIn(android, device_tests.scenario_tag(ios, row), "Android's cleanup never matches iOS's items")
+        self.assertNotIn(ios, device_tests.scenario_tag(android, row))
+        self.assertTrue(device_tests.holds(device_tests.scenario_tag(android, row) + " task",
+                                           device_tests.scenario_tag(android, row)))
+        self.assertFalse(device_tests.holds(device_tests.scenario_tag(ios, row) + " task",
+                                            device_tests.scenario_tag(android, row)),
+                         "run 40181517145: iOS's notes passed on Android's task")
 
     def test_diagnostics_wait_until_the_server_reads_are_done(self):
         """The security read of #108: a slow dumpsys must not spend the session the server reads still need."""
@@ -326,7 +369,9 @@ class AgentRunTests(unittest.TestCase):
                                                        selection="poll,poll-skip", asked=ask)
         except (KeyError, TypeError) as error:
             self.fail("a question truth row was not read as a question: " + type(error).__name__)
-        self.assertEqual(asked, [("answered", "qa-39557415738-poll"), ("closed", "qa-39557415738-poll-skip")])
+        self.assertEqual(asked, [("answered", "qa-39557415738-a-poll"), ("closed", "qa-39557415738-a-poll-skip")])
+        self.assertEqual([device.get("MAY_DEVICE_STEPS") for device in self.last_seen["devices"]], [None, "120"],
+                         "poll keeps the default, poll-skip has 120 to type its free reply (coordinator, 25 Oct)")
         self.assertEqual([(row["verdict"], row.get("reason"), row["server"]) for row in report["scenarios"]], [
             ("pass", None, [{"get": "/v1/agents", "status": 200, "pass": True}]),
             ("fail", device_tests.NO_TRUTH, [{"get": "/v1/agents", "status": 200, "pass": False}])])
@@ -424,7 +469,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("chat", "skipped", device_tests.MODEL_CAP), ("notes", "pass", None),
             ("routines", "pass", None)])
-        self.assertEqual([goal[1] for goal in seen["goals"]], ["qa-39557415738-notes", "qa-39557415738-routines"],
+        self.assertEqual([goal[1] for goal in seen["goals"]], ["qa-39557415738-a-notes", "qa-39557415738-a-routines"],
                          "chat's agent never ran")
 
     def test_a_fresh_account_skipped_near_the_cap_is_deleted_then_and_there(self):
@@ -1180,6 +1225,29 @@ class DeviceServerTests(unittest.TestCase):
                          ["screenshot", "hierarchy", "tap", "type", "swipe", "back", "wait", "done"])
         self.assertTrue(replies[2]["result"]["isError"])
         self.assertEqual(replies[3]["error"]["code"], -32601)
+
+    def test_a_scenarios_own_step_limit(self):
+        config = device_mcp.settings({"MAY_DEVICE_ADB": "/sdk/adb", "MAY_DEVICE_SERIAL": "emulator-5554",
+                                      "MAY_DEVICE_AGENT_RESULT": str(self.result), "MAY_DEVICE_STEPS": "120"})
+        assert config is not None, "120 steps were refused"
+        self.config = config
+        for _ in range(120):
+            self.assertFalse(self.call("back")[0])
+        failed, content = self.call("back")
+        self.assertTrue(failed)
+        self.assertEqual(content[0]["text"], "The 120-step limit is reached: call done now")
+        self.assertEqual(len(self.adb), 120)
+        self.assertFalse(self.call("done", outcome="completed", summary="typed it")[0])
+        stored = json.loads(self.result.read_text())
+        self.assertEqual(stored["actions"], 120)
+        sealed = device_tests.sealed_agent(stored)
+        self.assertEqual(sealed["actions"], 120, "sealed as taken, not as 0")
+        self.assertTrue(publish.agent_ok(sealed))
+        for steps in ("0", "201", "080", "-1", "12a", "", " 120"):
+            with self.subTest(steps=steps):
+                self.assertIsNone(device_mcp.settings({"MAY_DEVICE_ADB": "/sdk/adb", "MAY_DEVICE_SERIAL":
+                                                       "emulator-5554", "MAY_DEVICE_AGENT_RESULT": "/r",
+                                                       "MAY_DEVICE_STEPS": steps}))
 
     def test_settings_need_an_emulator_serial(self):
         self.assertIsNone(device_mcp.settings({"MAY_DEVICE_ADB": "/sdk/adb", "MAY_DEVICE_SERIAL": "192.168.0.2:5555",
