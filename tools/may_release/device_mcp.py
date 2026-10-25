@@ -18,6 +18,7 @@ read or write a file, or reach the network itself.
 - On iOS, after FAIL_FAST refused acts in a row, every call but done answers that the agent must stop, blocked.
 - At most MAX_ACTIONS look or act calls, or a scenario's own steps (MAY_DEVICE_STEPS, up to MOST_ACTIONS); after
   that every call but done answers that the limit is reached.
+- Every call but done rewrites MAY_DEVICE_AGENT_RESULT as unfinished, with the steps so far and the last hierarchy.
 - done records the agent's own outcome (completed or blocked) and a short summary to MAY_DEVICE_AGENT_RESULT, which
   device_tests.py keeps on the runner (it goes to the encrypted report only). The last hierarchy is kept beside it
   for the judge.
@@ -45,6 +46,7 @@ MOST_ACTIONS = 200
 # scenario spent its whole 20 minutes. After FAIL_FAST refused acts in a row the server stops every call but done, and
 # the agent's result says so (coordinator, 25 Oct). iOS alone.
 FAIL_FAST = 3
+UNFINISHED = "unfinished"  # the result's outcome until done replaces it
 WEDGED_TEXT = f"The device refused {FAIL_FAST} acts in a row: call done now with outcome blocked"
 MAX_HIERARCHY = 40_000
 MAX_SUMMARY = 1000
@@ -400,7 +402,17 @@ def record(config, outcome, summary):
 
 
 def call(name, args, config):
-    """(failed, content) for one tool call."""
+    """(failed, content) for one tool call. After each call but done, the result is rewritten as "unfinished" with
+    the steps so far and the last hierarchy, so an agent that runs out of time still leaves how far it got (run
+    40209923275: iOS notes saved its task, then timed out with nothing recorded; coordinator, 25 Oct)."""
+    failed, content = act(name, args, config)
+    if name != "done" and not config.get("done") and not config.get("wedged"):
+        record(config, UNFINISHED, "")
+    return failed, content
+
+
+def act(name, args, config):
+    """(failed, content) for one tool call, before call() records the progress."""
     if not isinstance(args, dict):
         args = {}
     if name == "done":
@@ -416,6 +428,7 @@ def call(name, args, config):
                                         config["hierarchy"] if config["hierarchy"] else
                                         f"(no hierarchy at done: {why}; the agent never read one)")
         record(config, outcome, summary)
+        config["done"] = True
         return False, [{"type": "text", "text": "Recorded. Stop now."}]
     if name not in {tool["name"] for tool in TOOLS}:
         return True, [{"type": "text", "text": "Unknown tool"}]

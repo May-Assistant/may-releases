@@ -904,6 +904,10 @@ class AgentRunnerTests(unittest.TestCase):
                 found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
                                           {"outcome": "blocked", "summary": "x", "actions": 3, "wedged": stored})
                 self.assertEqual(found.get("wedged"), kept, "the fail-fast's mark, true alone")
+        found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
+                                  {"outcome": "unfinished", "summary": "", "hierarchy": "h", "actions": 9})
+        self.assertEqual((found["outcome"], found["actions"], found["hierarchy"]), (None, 9, "h"),
+                         "a run that never called done keeps its steps and screen, with no outcome of its own")
         command = seen["command"]
         self.assertEqual(command[:3], ["/cli/claude", "-p", "Do qa-12345678 now"])
         for flag, value in (("--tools", ""), ("--strict-mcp-config", None), ("--permission-mode", "dontAsk"),
@@ -1310,6 +1314,20 @@ class DeviceServerTests(unittest.TestCase):
                 self.assertIsNone(device_mcp.settings({"MAY_DEVICE_ADB": "/sdk/adb", "MAY_DEVICE_SERIAL":
                                                        "emulator-5554", "MAY_DEVICE_AGENT_RESULT": "/r",
                                                        "MAY_DEVICE_STEPS": steps}))
+
+    def test_each_call_leaves_the_steps_so_far_until_done(self):
+        """Run 40209923275: iOS notes timed out with nothing recorded; now each call rewrites the result (coordinator,
+        25 Oct)."""
+        self.call("hierarchy")
+        self.call("back")
+        assert self.result.is_file(), "no result after two calls"
+        stored = json.loads(self.result.read_text())
+        self.assertEqual((stored["outcome"], stored["actions"], stored["summary"]), ("unfinished", 2, ""))
+        self.assertIn("Chats", stored["hierarchy"], "the last screen the agent read, for the judge")
+        self.assertFalse(self.call("done", outcome="completed", summary="ok")[0])
+        self.call("back")
+        stored = json.loads(self.result.read_text())
+        self.assertEqual((stored["outcome"], stored["summary"]), ("completed", "ok"), "done is never overwritten")
 
     def test_android_never_stops_on_refused_acts(self):
         """The fail-fast is iOS's alone (coordinator, 25 Oct)."""
