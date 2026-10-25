@@ -24,10 +24,11 @@ It writes nothing to stdout but its JSON-RPC answers, and nothing at all to stde
 """
 
 import base64
+import datetime
 import json
 import os
+import plistlib
 import re
-import struct
 import subprocess
 import sys
 import time
@@ -161,17 +162,29 @@ def flow(config, command):
     path = os.path.join(config["flows"], "act.yaml")
     with open(path, "w", encoding="utf-8") as output:
         output.write(f"appId: {config['bundle']}\n---\n{command}\n")
+    started = utc_now()
     status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], both=True)
     if status:
-        refused(config, command, said)
+        refused(config, command, said, started, utc_now())
     return status
 
 
-def refused(config, command, said):
-    """One refused act's last lines, redacted, added to DRIVER_FILE while it has room; never an error."""
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def stamp(moment):
+    """2026-10-25 03:02:57.755: the form `log show` gives the watchdog's stalls, on the runner's UTC clock."""
+    return moment.strftime("%Y-%m-%d %H:%M:%S.") + f"{moment.microsecond // 1000:03d}"
+
+
+def refused(config, command, said, started, ended):
+    """One refused act's last lines, redacted, added to DRIVER_FILE while it has room; never an error. Its header has
+    the act's start and end in UTC (coordinator, 25 Oct), so the watchdog's stalls line up with the acts."""
     lines, _ = kept_lines(b"".join(said.splitlines(keepends=True)[-DRIVER_LINES:]), "")
     act, _ = kept_lines(command.splitlines()[0].encode(), "")
-    part = b"== refused: " + act.strip() + b" (action " + str(config["actions"]).encode() + b") ==\n" + lines
+    part = (b"== refused: " + act.strip() + b" (action " + str(config["actions"]).encode() + b", " +
+            stamp(started).encode() + b" to " + stamp(ended).encode() + b" UTC) ==\n" + lines)
     path = os.path.join(config["flows"], DRIVER_FILE)
     try:
         if os.path.getsize(path) + len(part) > MAX_DRIVER if os.path.exists(path) else len(part) > MAX_DRIVER:
@@ -205,12 +218,10 @@ def ios_nodes(node, depth=0):
 
 
 def ios_hierarchy(config):
-    """The hierarchy in the screenshot's pixels (the same lines as Android's), and the points-to-pixels scale."""
-    if config["scale"] is None:
-        shot = ios_screenshot(config)
-        if shot is None:
-            return ""
-        width = struct.unpack(">I", shot[16:20])[0]
+    """The hierarchy in the screenshot's pixels (the same lines as Android's); "" when the screen's scale is unknown."""
+    scale = screen_scale(config)
+    if not scale:
+        return ""
     status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy"])
     try:
         tree = json.loads(data[data.find(b"{"):]) if not status else None
@@ -218,11 +229,6 @@ def ios_hierarchy(config):
         tree = None
     nodes = list(ios_nodes(tree))
     boxes = [re.fullmatch(r"\[(-?\d+),(-?\d+)\]\[(\d+),(\d+)\]", str(n.get("bounds", ""))) for n in nodes]
-    if config["scale"] is None:
-        root = max((int(box[3]) for box in boxes if box), default=0)
-        if not root:
-            return ""
-        config["scale"] = width / root
     lines = []
     for attributes, box in zip(nodes, boxes):
         text = str(attributes.get("text") or "")
@@ -231,7 +237,6 @@ def ios_hierarchy(config):
         clickable = attributes.get("clickable") in (True, "true")
         if not (text or desc or rid or clickable) or not box:
             continue
-        scale = config["scale"]
         centre = f"({round((int(box[1]) + int(box[3])) / 2 * scale)}, {round((int(box[2]) + int(box[4])) / 2 * scale)})"
         parts = [f"text={text!r}" if text else "", f"desc={desc!r}" if desc else "", f"id={rid}" if rid else "",
                  "clickable" if clickable else "", centre]
@@ -239,12 +244,49 @@ def ios_hierarchy(config):
     return "\n".join(lines)[:MAX_HIERARCHY]
 
 
-def points(config, x, y):
-    """A screenshot pixel as an iOS point, for Maestro's tapOn and swipe."""
+# Run 40155638626: the scale was the screenshot's width over the hierarchy's widest box, which was about 322 points on
+# a 402-point screen, so it came to 3.75 and every tap the agent took from the screenshot landed at 0.8 of its target
+# (the Agenda tab, about (193, 765), became (153, 613)). The scale is now the simulator's own: its device type's
+# mainScreenScale, which every iPhone has at 2 or 3. Anything else is "scale unknown", and no tap or swipe is guessed.
+NATIVE_SCALES, PROFILE = (2, 3), "Contents/Resources/profile.plist"
+SCALE_UNKNOWN = "scale unknown: the simulator's device type gave no screen scale of 2 or 3"
+
+
+def simctl_json(config, *args):
+    status, data = tool(config, ["xcrun", "simctl", "list", *args, "-j"], timeout=60)
+    try:
+        return json.loads(data) if not status else None
+    except ValueError:
+        return None
+
+
+def screen_scale(config):
+    """The simulator's points-to-pixels scale, read once from its device type's profile; 0 when unknown."""
     if config["scale"] is None:
-        ios_hierarchy(config)
-    scale = config["scale"] or 3
-    return f"{round(x / scale)},{round(y / scale)}"
+        config["scale"] = 0
+        devices, types = simctl_json(config, "devices"), simctl_json(config, "devicetypes")
+        found = [device.get("deviceTypeIdentifier") for runtime in ((devices or {}).get("devices") or {}).values()
+                 if isinstance(runtime, list) for device in runtime
+                 if isinstance(device, dict) and device.get("udid") == config["udid"]]
+        bundles = [kind.get("bundlePath") for kind in (types or {}).get("devicetypes") or []
+                   if isinstance(kind, dict) and found and kind.get("identifier") == found[0]]
+        if bundles and isinstance(bundles[0], str) and bundles[0].endswith(".simdevicetype"):
+            try:
+                with open(os.path.join(bundles[0], PROFILE), "rb") as stream:
+                    scale = plistlib.load(stream).get("mainScreenScale")
+            except (OSError, ValueError, plistlib.InvalidFileException, AttributeError):
+                scale = None
+            if isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale in NATIVE_SCALES:
+                config["scale"] = int(scale)
+        if not config["scale"]:
+            refused(config, SCALE_UNKNOWN, b"", utc_now(), utc_now())
+    return config["scale"]
+
+
+def points(config, x, y):
+    """A screenshot pixel as an iOS point, for Maestro's tapOn and swipe; None when the screen's scale is unknown."""
+    scale = screen_scale(config)
+    return f"{round(x / scale)},{round(y / scale)}" if scale else None
 
 
 def compact(xml):
@@ -431,18 +473,27 @@ def focused_text(xml):
     return "(hidden)" if dropped else kept.decode("utf-8", "replace")[:MAX_FIELD]
 
 
+# Maestro waits after a tap or swipe for the screen to settle; in runs 40148178587 and 40155638626 an iOS tap was
+# COMPLETED and then never returned, and the driver took nothing after it. Each act's settle wait is capped (Maestro
+# calls the cap best effort), so a screen that keeps redrawing cannot hold the act.
+SETTLE_MS = 3000
+
+
 def ios_act(name, args, ints, config):
     """One act on the simulator: a Maestro flow of one fixed command, its values checked here first."""
+    settle = f"\n    waitToSettleTimeoutMs: {SETTLE_MS}"
+    if name in ("tap", "swipe") and not screen_scale(config):
+        return True, [{"type": "text", "text": "The device's screen scale is unknown, so no tap or swipe can be placed"}]
     if name == "tap" and ints["x"] is not None and ints["y"] is not None:
-        command = f'- tapOn:\n    point: "{points(config, ints["x"], ints["y"])}"'
+        command = f'- tapOn:\n    point: "{points(config, ints["x"], ints["y"])}"{settle}'
     elif name == "type" and isinstance(args.get("text"), str) and TEXT.fullmatch(args["text"]):
         # TEXT holds no quote, backslash or newline, so the double-quoted YAML scalar is exactly the text.
         command = f'- inputText: "{args["text"]}"'
     elif name == "swipe" and None not in (ints["x1"], ints["y1"], ints["x2"], ints["y2"]):
         command = (f'- swipe:\n    start: "{points(config, ints["x1"], ints["y1"])}"\n'
-                   f'    end: "{points(config, ints["x2"], ints["y2"])}"\n    duration: {ints["ms"] or 300}')
+                   f'    end: "{points(config, ints["x2"], ints["y2"])}"\n    duration: {ints["ms"] or 300}{settle}')
     elif name == "back":
-        command = '- swipe:\n    start: "1%,50%"\n    end: "80%,50%"\n    duration: 300'
+        command = f'- swipe:\n    start: "1%,50%"\n    end: "80%,50%"\n    duration: 300{settle}'
     else:
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
     status = flow(config, command)

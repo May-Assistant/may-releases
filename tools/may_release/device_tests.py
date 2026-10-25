@@ -759,6 +759,11 @@ DIAG = ".diag.txt"
 LOGCAT_LINES, MAX_DIAG, DIAG_SECONDS = 2000, 512 * 1024, 60
 LOG_BUFFERS = "main,system,crash"
 ANR, CRASH = "data_app_anr", "data_app_crash"
+# may-app #1279: the debug Playground logs each failed request under the MayNetwork tag (method, path template and
+# exception class alone). They get a section of their own ahead of the log, so trimming the log to its newest lines
+# never loses them, and the public log counts them.
+NETWORK_TAG = re.compile(rb"(?:^|[ /])MayNetwork\s*(?:\(\s*[0-9]+\))?:")
+MAX_NETWORK_LINES = 200
 
 
 MAX_COMMAND_OUTPUT = 16 * 1024 * 1024
@@ -791,7 +796,7 @@ class Diagnostics:
     def __init__(self, adb, env):
         self.adb, self.env = adb, env
         self.seen = {tag: set(self.entries(tag)) for tag in (ANR, CRASH)}
-        self.kept = self.anrs = self.crashes = 0
+        self.kept = self.anrs = self.crashes = self.network = 0
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
 
     def entries(self, tag):
@@ -821,18 +826,22 @@ class Diagnostics:
         # The stacks first, at most half; the log's newest lines fill the rest.
         (stacks, from_stacks), (logcat, from_log) = kept_lines(b"".join(found), token), kept_lines(log or b"", token)
         stacks = stacks[:MAX_DIAG // 2]
-        room = MAX_DIAG - len(stacks) - 64  # the section header's room
+        failures = [line for line in logcat.splitlines(keepends=True) if NETWORK_TAG.search(line)]
+        network = b"".join(failures[:MAX_NETWORK_LINES])[:MAX_DIAG // 8]
+        room = MAX_DIAG - len(stacks) - len(network) - 128  # the section headers' room
         logcat = logcat[len(logcat) - room:] if len(logcat) > room else logcat
         if not (stacks or logcat):
             return
         # UTF-8 throughout, still within MAX_DIAG once any stray byte is replaced.
-        text = (stacks + (b"== logcat ==\n" + logcat if logcat else b"")).decode("utf-8", "replace").encode()
+        text = (stacks + (b"== network ==\n" + network if network else b"") +
+                (b"== logcat ==\n" + logcat if logcat else b"")).decode("utf-8", "replace").encode()
         text = text[:MAX_DIAG].decode("utf-8", "ignore").encode()
         try:
             (folder / f"{scenario}{DIAG}").write_bytes(text)
         except OSError:
             return
         self.kept += 1
+        self.network += len(failures)
         self.dropped[scenario] = from_stacks + from_log
 
 
@@ -906,6 +915,26 @@ def settle_boot(adb, env, log, clock=time.monotonic, sleep=time.sleep):
     with log.open("ab") as output:
         output.write(b"emulator settled\n" if settled else b"emulator did not settle; going on\n")
     return settled
+
+
+# Run 40148200485: Android chat, the first scenario after boot, sent nothing to staging for its 99 s and showed "Can't
+# reach May"; notes, next, passed (D's staging read, 25 Oct). Before the first scenario the emulator's network has to
+# be validated: Android's own NetworkMonitor has resolved and reached its probe host, so DNS and the route both work.
+# At most NETWORK_SECONDS; an emulator whose network never validates still runs, and the log says so.
+NETWORK_SECONDS, NETWORK_POLL, NETWORK_PROBE_SECONDS = 60, 3, 10
+VALIDATED = re.compile(rb"Capabilities:[^\n]*(?<![A-Za-z0-9_])VALIDATED(?![A-Za-z0-9_])")
+
+
+def network_ready(adb, env, clock=time.monotonic, sleep=time.sleep):
+    """Seconds until the emulator's network validated, or None when it did not within NETWORK_SECONDS."""
+    start = clock()
+    while True:
+        done = bounded_output([adb, "shell", "dumpsys", "connectivity"], env, seconds=NETWORK_PROBE_SECONDS)
+        if done is not None and done[0] == 0 and VALIDATED.search(done[1]):
+            return int(clock() - start)
+        if clock() - start >= NETWORK_SECONDS:
+            return None
+        sleep(NETWORK_POLL)
 
 
 def maestro(root, private, log):
@@ -1205,6 +1234,13 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         at("installing the app")
         flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
         show_touches(adb, env, log, True)
+        if base:
+            at("waiting for the emulator's network")
+            waited = network_ready(adb, env)
+            if waited is None:
+                print("May device tests (android): network not ready within a minute; going on")
+            else:
+                print(f"May device tests (android): network ready after {waited} s")
         diagnostics = (diagnosed or Diagnostics)(adb, env)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()), **maestro_isolation(maestro_home(root)))
@@ -1311,10 +1347,10 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     write_private(private / VERDICTS, json.dumps([entry["verdict"] for entry in results]).encode())
     ran = sum(1 for entry in results if entry["verdict"] != "skipped")
     print(f"May device tests (android): {ran} scenarios ran; verdicts follow the judge step")
-    kept, anrs, crashes = diagnostics.kept, diagnostics.anrs, diagnostics.crashes
+    kept, anrs, crashes, network = diagnostics.kept, diagnostics.anrs, diagnostics.crashes, diagnostics.network
     if kept:
         print(f"May device tests (android): diagnostics kept for {kept} scenarios ({anrs} with an ANR, {crashes} with "
-              "a crash)")
+              f"a crash, {network} network failures)")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (android): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:

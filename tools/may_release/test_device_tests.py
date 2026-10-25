@@ -782,6 +782,7 @@ class RunTests(unittest.TestCase):
         environ = dict(self.env, **(env or {}))
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
                 patch("device_tests.adb_shell", side_effect=lambda adb, env, log, line: calls.append(
@@ -808,6 +809,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(sign_in["verdict"], "ui-pass")
         self.assertEqual((connections["verdict"], connections["reason"]), ("skipped", device_tests.BUDGET))
         self.assertEqual(len([argv for argv in calls if "start" in argv]), 1, "the second scenario never launched")
+        self.assertIn("May device tests (android): network ready after 4 s\n", out)
         self.assertIn("May device tests (android): 1 scenarios ran; verdicts follow the judge step", out)
         self.assertIn("May device tests (android): connections: skipped", out)
         self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "skipped"])
@@ -843,6 +845,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual((connections["verdict"], connections["reason"]),
                          ("fail", "may-app has no Maestro flow for this scenario"))
         self.assertEqual(out.splitlines(), [
+            "May device tests (android): network ready after 4 s",
             "May device tests (android): 2 scenarios ran; verdicts follow the judge step",
             "May device tests (android): 1 test sessions were signed out at their end",
             "May device tests (android): sign-in: ui-pass", "May device tests (android): connections: fail",
@@ -859,17 +862,18 @@ class RunTests(unittest.TestCase):
 
         class Fake:
             def __init__(self, adb, env):
-                self.kept, self.anrs, self.crashes, self.dropped = 0, 0, 0, {}
+                self.kept, self.anrs, self.crashes, self.network, self.dropped = 0, 0, 0, 0, {}
 
             def keep(self, folder, scenario, token):
                 kept.append((folder.name, scenario, token))
-                self.kept, self.anrs, self.dropped[scenario] = self.kept + 1, 1, 2
+                self.kept, self.anrs, self.network, self.dropped[scenario] = self.kept + 1, 1, self.network + 3, 2
 
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         _, _, out, _ = self.run_it(diagnosed=Fake)
         self.assertEqual(kept, [("android", "sign-in", TOKEN), ("android", "connections", TOKEN)],
                          "after each scenario's recording, with its session so its lines are dropped")
-        self.assertIn("May device tests (android): diagnostics kept for 2 scenarios (1 with an ANR, 0 with a crash)",
+        self.assertIn("May device tests (android): diagnostics kept for 2 scenarios (1 with an ANR, 0 with a crash, "
+                      "6 network failures)",
                       out)
         self.assertIn("May device tests (android): sign-in diagnostics: 2 lines dropped", out)
         self.assertIn("May device tests (android): connections diagnostics: 2 lines dropped", out)
@@ -1002,6 +1006,7 @@ class RunTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.env, clear=True), \
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
                 patch("device_tests.adb_shell", return_value=0), \
@@ -1728,6 +1733,29 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(all(dump < clear for dump, clear in zip(dumps, clears)), "the log is cleared once read")
         self.assertIn(["logcat", "-d", "-t", "2000", "-b", "main,system,crash"], emulator.calls)
 
+    def test_mays_network_failures_get_a_section_the_log_trim_never_loses_and_a_count(self):
+        """may-app #1279: the debug Playground logs each failed request under MayNetwork (no URL, no token)."""
+        failures = ("10-25 01:48:35.120  4315  4390 W MayNetwork: GET /v1/me java.net.UnknownHostException\n"
+                    "W/MayNetwork( 4315): POST /v1/conversations/{id}/messages java.net.SocketTimeoutException\n")
+        filler = "".join(f"10-25 01:49:{i % 60:02d}.000  4315  4331 D EGL_emulation: frame {i} {'drawn on time ' * 15}\n"
+                         for i in range(4000))
+        emulator = FakeEmulator()
+        with patch("device_tests.subprocess.run", side_effect=emulator):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            emulator.log = (failures + "I/Other: NotMayNetwork: not counted\n" +
+                            f"W MayNetwork: GET /v1/me Bearer {TOKEN}\n" + filler).encode()
+            diagnostics.keep(self.folder, "chat", TOKEN)
+        text = (self.folder / "chat.diag.txt").read_text()
+        network, logcat = text.split("== logcat ==\n")
+        self.assertTrue(network.startswith("== network ==\n"))
+        self.assertIn("GET /v1/me java.net.UnknownHostException", network)
+        self.assertIn("SocketTimeoutException", network)
+        self.assertNotIn("UnknownHostException", logcat, "the trimmed log kept only its newest lines")
+        self.assertNotIn(TOKEN, text)
+        self.assertNotIn("NotMayNetwork", network)
+        self.assertEqual(diagnostics.network, 2, "the failure line carrying the session is dropped, not counted")
+        self.assertLessEqual(len(text.encode()), device_tests.MAX_DIAG)
+
     # Lines that passed both kept_lines and diagnostics_ok before #108's security read; each is dropped now.
     GAPS = ('{"token":"Zm9vYmFy"}', '{"access_token": "abc"}', "GET /oauth/cb?access_token=abc&x=1",
             "GET /oauth/cb?code=4/0Adeu5", "x-api-key: abc", "using sk-ant-api03-abcdef", "AIzaSyA1234567890abcdefghij",
@@ -1874,6 +1902,40 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertFalse(settled)
         self.assertEqual(now[0], device_tests.SETTLE_SECONDS)
         self.assertEqual(log.read_bytes(), b"emulator did not settle; going on\n")
+
+    def test_the_first_scenario_waits_for_the_emulators_network_to_validate(self):
+        """Run 40148200485: Android chat, first after boot, sent nothing to staging for 99 s ("Can't reach May")."""
+        waiting = (b"NetworkAgentInfo{network{100} nc{[ Transports: WIFI Capabilities: NOT_METERED&INTERNET&"
+                   b"NOT_RESTRICTED&TRUSTED&NOT_VPN&NOT_ROAMING ]}}\n")
+        validated = waiting.replace(b"NOT_VPN&", b"NOT_VPN&VALIDATED&")
+        now, sleeps, answers, calls = [0], [], iter([waiting, b"", validated]), []
+
+        def run(argv, **kwargs):
+            calls.append(argv[1:])
+            return answered(argv, kwargs, 0, next(answers))
+
+        with patch("device_tests.subprocess.run", side_effect=run):
+            waited = device_tests.network_ready("/sdk/adb", {}, clock=lambda: now[0],
+                                                sleep=lambda seconds: sleeps.append(seconds) or now.__setitem__(0, now[0] + seconds))
+        self.assertEqual(waited, 6)
+        self.assertEqual(sleeps, [3, 3])
+        self.assertEqual(calls, [["shell", "dumpsys", "connectivity"]] * 3)
+
+    def test_a_network_that_never_validates_still_runs_after_the_ceiling(self):
+        now = [0]
+        partial = b"nc{[ Transports: WIFI Capabilities: INTERNET&PARTIAL_CONNECTIVITY&NOT_VALIDATED_X ]}\n"
+        with patch("device_tests.subprocess.run", side_effect=lambda argv, **kwargs: answered(argv, kwargs, 0, partial)):
+            waited = device_tests.network_ready("/sdk/adb", {}, clock=lambda: now[0],
+                                                sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        self.assertIsNone(waited)
+        self.assertEqual(now[0], device_tests.NETWORK_SECONDS)
+
+    def test_a_failed_or_hung_dumpsys_is_not_a_ready_network(self):
+        now = [0]
+        validated = b"nc{[ Transports: WIFI Capabilities: INTERNET&VALIDATED ]}\n"
+        with patch("device_tests.subprocess.run", side_effect=lambda argv, **kwargs: answered(argv, kwargs, 1, validated)):
+            self.assertIsNone(device_tests.network_ready("/sdk/adb", {}, clock=lambda: now[0],
+                                                         sleep=lambda seconds: now.__setitem__(0, now[0] + seconds)))
 
     def test_boot_settles_the_emulator_before_returning(self):
         with patch("device_tests.settle_boot") as settle, \
