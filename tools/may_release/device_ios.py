@@ -41,6 +41,10 @@ STOP_SECONDS = 30
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
+# The coordinator's A/B switch (25 Oct): with ios_reduce_motion dispatched true, the simulator's Reduce Motion is on
+# before the app first starts, which stops the chat header's mark redrawing every frame (N's audit).
+REDUCE_MOTION = "MAY_IOS_REDUCE_MOTION"
+REDUCE_MOTION_ON = ("defaults", "write", "com.apple.Accessibility", "ReduceMotionEnabled", "-bool", "true")
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
 # (errSecMissingEntitlement) and the app signed out with "Something went wrong on this device" (run 40035089599).
@@ -303,6 +307,11 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                        **device_tests.maestro_isolation(device_tests.maestro_home(root)))
     at("booting the simulator")
     udid = boot(log, env)
+    if os.environ.get(REDUCE_MOTION, "").strip() == "true":
+        if renders.quiet(["xcrun", "simctl", "spawn", udid, *REDUCE_MOTION_ON], log, env=env).returncode:
+            print("May device tests (ios): Reduce Motion could not be turned on; the run goes on without it")
+        else:
+            print("May device tests (ios): Reduce Motion is on for this run")
     diagnostics = (diagnosed or Diagnostics)(udid, env)
     results, records, cleaned_count = [], {}, None
     try:
@@ -341,6 +350,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 accounts.finish(row, base, token)
                 token = ""
                 continue
+            own = device_tests.scenario_tag(tag, row)  # the scenario's own tag
             at(f"{row['id']}: launching the app")
             diagnostics.begin()
             launch(udid, env, token, log)
@@ -366,7 +376,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {})}
-                records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"], claude[0],
+                records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"], claude[0],
                                            claude[1], seconds=device_agent.IOS_AGENT_SECONDS)
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
@@ -384,12 +394,12 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
             for check in row.get("truth", []):
                 if "question" in check:
-                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], tag)
+                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], own)
                 else:
-                    path, (status, found) = check["get"], truth(base, token, check["get"], tag)
+                    path, (status, found) = check["get"], truth(base, token, check["get"], own)
                 entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
             if device_tests.sends_messages(row):
-                codes = delivered(base, token, tag)
+                codes = delivered(base, token, own)
                 if codes is not None:
                     entry["delivery"] = codes
             # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
