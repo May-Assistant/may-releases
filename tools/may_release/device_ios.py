@@ -129,17 +129,24 @@ class Recorder:
                                             stdin=subprocess.DEVNULL, env=self.env)
         self.started = time.monotonic()
 
-    def stop(self, folder):
-        if self.process is None:
-            return []
+    def halt(self):
+        """Ends the recording (SIGINT, so simctl finishes its file) ahead of the server reads; stop() converts it.
+        False when the recorder did not stop and was killed."""
+        if self.process is None or self.stopped is not None or self.dropped:
+            return self.process is not None and not self.dropped
         self.process.send_signal(signal.SIGINT)
         try:
             self.process.wait(timeout=STOP_SECONDS)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.dropped = "the recorder did not stop"
-            return []
+            return False
         self.stopped = time.monotonic()
+        return True
+
+    def stop(self, folder):
+        if not self.halt():
+            return []
         seconds = int(self.stopped - self.started) if self.started is not None else 0
         out = folder / (self.scenario + ".mp4")
         # Smoke run 39683880243: the M4V preset's conversion to .mp4 failed. Each preset writes the file type it
@@ -383,7 +390,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     launcher = device_tests.maestro(root, private, log)
     at("installing Claude Code")
     cli = install(root) if agents else None
-    tag, since = device_tests.run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tag, since = device_tests.run_tag("ios"), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     env = xcode()
     maestro_env = dict(env, MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                        **device_tests.maestro_isolation(device_tests.maestro_home(root)))
@@ -457,13 +464,22 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
-                          **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {})}
+                          **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {}),
+                          **device_tests.steps(row)}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"], claude[0],
                                            claude[1], seconds=device_agent.IOS_AGENT_SECONDS)
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
+            recorder.halt()
+            # Run 40181517145: poll's server read came after the conversion, half an hour past its session's mint,
+            # and got 401. The server reads and the diagnostics come first; the conversion, however long, after.
+            device_tests.server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
+            # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
+            diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE)
+            accounts.finish(row, base, token)
+            token = ""
             entry["videos"] = recorder.stop(folder)
             if recorder.dropped:
                 scenario, why = row["id"], recorder.dropped
@@ -471,11 +487,6 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             elif recorder.kept:
                 scenario, why = row["id"], recorder.kept
                 print(f"May device tests (ios): {scenario}: its recording was kept {why}")
-            device_tests.server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
-            # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
-            diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE)
-            accounts.finish(row, base, token)
-            token = ""
             device_tests.settle(entry, row, passed if flow is not None else None)
         if accounts.shared:
             at("cleanup")

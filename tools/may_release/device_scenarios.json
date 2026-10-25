@@ -123,6 +123,7 @@
     "id": "poll-skip",
     "title": "Skip May's question with a free reply",
     "driver": "agent",
+    "steps": 120,
     "goal": "In May Playground, on the Chats screen, open the existing chat named May; do not use the + button, which makes agents, tasks and projects, not chats. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer myself: apples, {tag}. Then check that the question card now shows as skipped, with its choices dimmed.",
     "platforms": [
       "android",

@@ -286,6 +286,8 @@ def scenarios(selection="all", platform="android"):
                 and isinstance(row.get("title"), str) and
                 isinstance(row.get("platforms"), list) and set(row["platforms"]) <= set(PLATFORMS) and
                 isinstance(row.get("outward"), bool) and isinstance(row.get("fresh", False), bool) and
+                ("steps" not in row or driver == "agent" and type(row["steps"]) is int and
+                 device_mcp.MAX_ACTIONS < row["steps"] <= device_mcp.MOST_ACTIONS) and
                 ("onboarding" not in row or row["onboarding"] == RECORD and driver == "agent" and
                  row.get("fresh") is True) and
                 isinstance(row.get("server"), list) and
@@ -714,15 +716,23 @@ class Accounts:
 
 
 def scenario_tag(tag, row):
-    """The run's tag with the scenario's id (qa-<run>-<scenario>), in everything that scenario creates and reads, so
-    poll's messages never count as poll-skip's. The cleanup keeps the run's tag, which every scenario's holds."""
+    """The platform's run tag with the scenario's id (qa-<run>-a-<scenario>), in everything that scenario creates and
+    reads, so poll's messages never count as poll-skip's. The cleanup keeps the platform's tag, which every scenario's
+    on that platform holds."""
     return f"{tag}-{row['id']}"
 
 
-def run_tag():
-    """qa-<GitHub run id>: K's cleanup takes a tag of at least 8 characters, matched in names and titles."""
+# Run 40181517145: both device jobs of one run shared qa-<run>, so iOS's notes found the task Android's notes had
+# saved and passed, and either job's cleanup could remove the other's items mid-run. Each platform's tag is its own.
+PLATFORM_LETTERS = {"android": "a", "ios": "i"}
+
+
+def run_tag(platform):
+    """qa-<GitHub run id>-<a or i>: K's cleanup takes a tag of at least 8 characters, matched in names and titles, so
+    one platform's cleanup never matches the other's (qa-1-a is in no qa-1-i-... title)."""
     run = os.environ.get("GITHUB_RUN_ID", "")
-    return "qa-" + (run if re.fullmatch(r"[1-9][0-9]{4,19}", run) else str(int(time.time())))
+    return "qa-" + (run if re.fullmatch(r"[1-9][0-9]{4,19}", run) else str(int(time.time()))) + "-" + \
+        PLATFORM_LETTERS[platform]
 
 
 def show_touches(adb, env, log, on):
@@ -788,12 +798,18 @@ class Recorder:
         flows.run_private([self.adb, "shell", "mkdir", "-p", "/sdcard/may-rec"], self.log, env=self.env, check=False)
         self.thread.start()
 
-    def stop(self, folder):
+    def halt(self):
+        """Ends the recording, so the server reads that follow it are not recorded; stop() then pulls it."""
+        if self.stopped.is_set():
+            return
         self.stopped.set()
         # SIGINT lets screenrecord finish its file.
         flows.run_private([self.adb, "shell", "pkill", "-2", "screenrecord"], self.log, env=self.env, check=False)
         if self.thread.ident is not None:
             self.thread.join(timeout=30)
+
+    def stop(self, folder):
+        self.halt()
         names = []
         for part in range(1, self.parts + 1):
             name = f"{self.scenario}.mp4" if self.parts == 1 else f"{self.scenario}-part{part}.mp4"
@@ -1213,6 +1229,11 @@ def cap(row, agent_seconds=device_agent.AGENT_SECONDS):
     return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" and not records_onboarding(row) else 0)
 
 
+def steps(row):
+    """The device server's step limit for a row that sets its own (MAY_DEVICE_STEPS), or nothing for the default."""
+    return {"MAY_DEVICE_STEPS": str(row["steps"])} if "steps" in row else {}
+
+
 def records_onboarding(row):
     """Whether the scenario records onboarding itself, so no subflow runs before it."""
     return row.get("onboarding") == RECORD
@@ -1280,7 +1301,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     launcher = maestro(root, private, log)
     at("installing Claude Code")
     cli = install(root) if agents else None
-    tag, since = run_tag(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tag, since = run_tag("android"), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     at("booting the emulator")
     adb, emulator, env = boot(root, log)
     results, records, cleaned_count = [], {}, None
@@ -1351,18 +1372,23 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 timeout=ONBOARDING_SECONDS))
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
-                device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL}
+                device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL,
+                          **steps(row)}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"],
                                            claude[0], claude[1])
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
-            entry["videos"] = recorder.stop(folder)
+            recorder.halt()
+            # Run 40181517145: iOS read poll's server truth half an hour after its session was minted, behind the
+            # recording's conversion, and got 401. The server reads come first, then the diagnostics, and only then
+            # the recording's pull (and on iOS its conversion), on both platforms.
             server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
             # After the server reads, which need the session while it lasts: a slow dumpsys costs them nothing.
             diagnostics.keep(folder, row["id"], token)
             accounts.finish(row, base, token)
+            entry["videos"] = recorder.stop(folder)
             settle(entry, row, passed if flow is not None else None)
             token = ""
         if accounts.shared:
@@ -1457,7 +1483,7 @@ def sealed_agent(record):
     summary, _ = kept_lines(" ".join(" ".join(lines).split()).encode(), "")
     actions = record.get("actions")
     return {"outcome": record.get("outcome") if record.get("outcome") in ("completed", "blocked") else None,
-            "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MAX_ACTIONS else 0,
+            "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MOST_ACTIONS else 0,
             "summary": summary.decode("utf-8", "replace").strip()[:MAX_AGENT_SUMMARY],
             # Why no screen could be read at done (device_mcp.DUMP_FAILURES' fixed words), or None.
             "hierarchy_failure": record.get("hierarchy_failure") if record.get("hierarchy_failure") in

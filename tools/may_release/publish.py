@@ -410,7 +410,7 @@ def agent_ok(agent):
     return (isinstance(agent, dict) and set(agent) == {"outcome", "actions", "summary", "hierarchy_failure"} and
             agent["outcome"] in ("completed", "blocked", None) and type(agent["actions"]) is int and
             agent["hierarchy_failure"] in (*device_tests.device_mcp.DUMP_FAILURES, None) and
-            0 <= agent["actions"] <= device_tests.device_mcp.MAX_ACTIONS and isinstance(summary, str) and
+            0 <= agent["actions"] <= device_tests.device_mcp.MOST_ACTIONS and isinstance(summary, str) and
             len(summary) <= device_tests.MAX_AGENT_SUMMARY and
             device_tests.kept_lines(summary.encode(), "") == (summary.encode(), 0))
 

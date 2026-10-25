@@ -116,6 +116,9 @@ class FakeRecorder:
     def start(self):
         pass
 
+    def halt(self):
+        return True
+
     def stop(self, folder):
         (folder / (self.scenario + ".mp4")).write_bytes(MP4)
         return [self.scenario + ".mp4"]
@@ -146,7 +149,7 @@ class RunTests(Workspace):
             minted.append("fresh" if fresh else secret)
             return TOKEN + str(len(minted))
 
-        self.deleted = []
+        self.deleted, self.cleaned_tags = [], []
 
         environ = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin", **(env or {})}
@@ -162,7 +165,7 @@ class RunTests(Workspace):
                                      truth=lambda base, token, path, tag: (200, True),
                                      noted=lambda base, token, tag, note: (200, "found"),
                                      asked=lambda base, token, state, tag: (200, True),
-                                     cleaned=lambda base, token, since, tag: 2,
+                                     cleaned=lambda base, token, since, tag: self.cleaned_tags.append(tag) or 2,
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
                                      install=lambda root: root / "may-claude" / "claude", budgeted=budgeted,
                                      deleted_by=lambda base, token: self.deleted.append(token) or True,
@@ -332,15 +335,65 @@ class RunTests(Workspace):
                           "MAY_DEVICE_BUNDLE": device_ios.BUNDLE})
         self.assertNotIn(TOKEN, json.dumps(device), "the staging session never reaches the agent")
         self.assertEqual((token[:13], model, seconds, tag), ("sk-ant-oat01-", "claude-sonnet-5-5",
-                                                             device_agent.IOS_AGENT_SECONDS, "qa-39557415738-chat"))
+                                                             device_agent.IOS_AGENT_SECONDS, "qa-39557415738-i-chat"))
         self.assertEqual(len(minted), 3, "one session per scenario and one for the cleanup")
         self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("chat", "pass"),
                                                                                          ("poll", "pass")])
         self.assertEqual(self.delivered, [TOKEN + "1", TOKEN + "2"], "each scenario's messages, with its own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]], [["succeeded"]] * 2)
         self.assertIn("May device tests (ios): the test session's cleanup removed 2 tagged items", out)
+        self.assertEqual(self.cleaned_tags, ["qa-39557415738-i"], "iOS's cleanup never matches Android's items")
         self.assertEqual(self.signed_out, [TOKEN + "1", TOKEN + "2", TOKEN + "3"],
                          "each scenario's shared session, then the cleanup's, signed out")
+
+    def test_the_server_reads_and_diagnostics_come_before_the_conversion(self):
+        """Run 40181517145: poll's read came after a long conversion and got 401 (coordinator, 25 Oct)."""
+        order = []
+
+        class Ordered(FakeRecorder):
+            def halt(self):
+                order.append(("halt", self.scenario))
+                return True
+
+            def stop(self, folder):
+                order.append(("convert", self.scenario))
+                return super().stop(folder)
+
+        class Diagnosed(device_ios.Diagnostics):
+            def keep(self, folder, scenario, token, driver=None):
+                order.append(("diagnostics", scenario))
+                return super().keep(folder, scenario, token, driver)
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        reads = device_tests.server_reads
+
+        def read(row, *args):
+            order.append(("reads", row["id"]))
+            return reads(row, *args)
+
+        with patch("test_device_ios.FakeRecorder", Ordered), patch("device_tests.server_reads", side_effect=read):
+            self.run_it(selection="chat", agent=agent, diagnosed=lambda udid, env: Diagnosed(
+                udid, env, reports=self.root / "no-reports", shown=lambda *a: b""),
+                env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
+                     "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
+        assert order, "the scenario never ran"
+        self.assertEqual(order, [("halt", "chat"), ("reads", "chat"), ("diagnostics", "chat"), ("convert", "chat")])
+
+    def test_poll_skip_gives_the_device_server_its_own_step_limit(self):
+        devices = {}
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            devices[tag.rsplit("-i-", 1)[1]] = device
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        self.run_it(selection="poll,poll-skip", agent=agent,
+                    env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
+                         "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", "GITHUB_RUN_ID": "39557415738"})
+        assert set(devices) == {"poll", "poll-skip"}, devices
+        self.assertEqual((devices["poll"].get("MAY_DEVICE_STEPS"), devices["poll-skip"].get("MAY_DEVICE_STEPS")),
+                         (None, "120"), "poll keeps the default, poll-skip has 120 to type its free reply")
 
     def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
         """Run 40046272749: the shared account lands in onboarding, not Chats; may-app's subflow taps through it."""
