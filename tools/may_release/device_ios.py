@@ -19,13 +19,14 @@ import datetime
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import time
 
 import device_agent
 import device_tests
-from device_tests import DeviceTestsError, at
+from device_tests import DeviceTestsError, at, kept_lines
 import renders
 from store import child_env, require_step_secrets, runner_root, write_private
 
@@ -163,6 +164,84 @@ def megabytes(path):
     return path.stat().st_size // (1024 * 1024)
 
 
+# may-app #1272: the debug Playground's main-thread watchdog logs one line per stall of 250 ms or more, alone in its
+# category. The predicate names the Playground's own subsystem, so the log of no other process is ever read.
+WATCHDOG = 'subsystem == "io.github.mayassistant.may.playground" AND category == "watchdog"'
+STALL = re.compile(rb"main-thread stall ([0-9]{1,7}) ms")
+# The simulator's crash reports land in the host's own folder; only the Playground's process is kept.
+CRASH_REPORTS = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+CRASH_REPORT = re.compile(r"MayPlayground[-_][A-Za-z0-9._-]{1,120}\.(?:ips|crash)")
+
+
+def show_log(udid, env, start):
+    """The simulator's unified log since start, the watchdog's lines alone; b"" when it could not be read."""
+    try:
+        done = subprocess.run(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact", "--start", start,
+                               "--predicate", WATCHDOG], capture_output=True, stdin=subprocess.DEVNULL, env=env,
+                              timeout=device_tests.DIAG_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return b""
+    return done.stdout[:device_tests.MAX_DIAG] if isinstance(done.stdout, bytes) else b""
+
+
+class Diagnostics:
+    """Android's twin (device_tests.Diagnostics): each scenario's main-thread stalls from the watchdog's log, and any
+    new crash report of the Playground's, through the same redaction, as <scenario>.diag.txt. Reports already there at
+    the start are left out, so each scenario keeps its own."""
+
+    def __init__(self, udid, env, reports=CRASH_REPORTS, shown=show_log):
+        self.udid, self.env, self.reports, self.shown = udid, env, reports, shown
+        self.seen = set(self.crash_reports())
+        self.start = None
+        self.kept = self.stalls = self.longest = self.crashes = 0
+        self.dropped = {}  # scenario: lines dropped, for the public log's counts
+
+    def crash_reports(self):
+        try:
+            return sorted(path for path in self.reports.iterdir()
+                          if CRASH_REPORT.fullmatch(path.name) and path.is_file() and not path.is_symlink())
+        except OSError:
+            return []
+
+    def begin(self):
+        """The scenario's start, in the log's own local time."""
+        self.start = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def keep(self, folder, scenario, token):
+        """Writes <scenario>.diag.txt when there is anything to keep; never an error."""
+        found = []
+        for path in self.crash_reports():
+            if path not in self.seen:
+                self.seen.add(path)
+                try:
+                    with path.open("rb") as report:
+                        found.append(b"== crash ==\n" + report.read(device_tests.MAX_DIAG // 2) + b"\n")
+                except OSError:
+                    continue
+        self.crashes += bool(found)
+        lines = [line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
+                 .splitlines(keepends=True) if STALL.search(line)]
+        stalls = [int(STALL.search(line).group(1)) for line in lines]
+        self.stalls += len(stalls)
+        self.longest = max([self.longest, *stalls])
+        # The crash reports first, at most half; the watchdog's newest lines fill the rest.
+        (crashes, from_crashes), (watchdog, from_log) = kept_lines(b"".join(found), token), kept_lines(b"".join(lines),
+                                                                                                         token)
+        crashes = crashes[:device_tests.MAX_DIAG // 2]
+        room = device_tests.MAX_DIAG - len(crashes) - 64  # the section header's room
+        watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
+        if not (crashes or watchdog):
+            return
+        text = (crashes + (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
+        text = text[:device_tests.MAX_DIAG].decode("utf-8", "ignore").encode()
+        try:
+            (folder / f"{scenario}{device_tests.DIAG}").write_bytes(text)
+        except OSError:
+            return
+        self.kept += 1
+        self.dropped[scenario] = from_crashes + from_log
+
+
 def screenshot(udid, env, path, log):
     if renders.quiet(["xcrun", "simctl", "io", udid, "screenshot", "--type=png", str(path)], log,
                      env=env).returncode or not path.is_file():
@@ -194,7 +273,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
                   install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
-                  revoked_by=device_tests.revoke):
+                  revoked_by=device_tests.revoke, diagnosed=None):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -224,6 +303,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                        **device_tests.maestro_isolation(device_tests.maestro_home(root)))
     at("booting the simulator")
     udid = boot(log, env)
+    diagnostics = (diagnosed or Diagnostics)(udid, env)
     results, records, cleaned_count = [], {}, None
     try:
         at("installing the app")
@@ -262,6 +342,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 token = ""
                 continue
             at(f"{row['id']}: launching the app")
+            diagnostics.begin()
             launch(udid, env, token, log)
             recorder = Recorder(udid, env, row["id"], private, log)
             recorder.start()
@@ -311,6 +392,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 codes = delivered(base, token, tag)
                 if codes is not None:
                     entry["delivery"] = codes
+            # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
+            diagnostics.keep(folder, row["id"], token)
             accounts.finish(row, base, token)
             token = ""
             device_tests.settle(entry, row, passed if flow is not None else None)
@@ -333,6 +416,12 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     write_private(private / device_tests.VERDICTS, json.dumps([entry["verdict"] for entry in results]).encode())
     ran = sum(1 for entry in results if entry["verdict"] != "skipped")
     print(f"May device tests (ios): {ran} scenarios ran; verdicts follow the judge step")
+    kept, stalls, longest, crashes = diagnostics.kept, diagnostics.stalls, diagnostics.longest, diagnostics.crashes
+    if kept:
+        print(f"May device tests (ios): diagnostics kept for {kept} scenarios ({stalls} main-thread stalls, the longest "
+              f"{longest} ms; {crashes} with a crash)")
+    for scenario, dropped in diagnostics.dropped.items():
+        print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:
         print(f"May device tests (ios): the test session's cleanup removed {cleaned_count} tagged items")
     elif accounts.shared:
