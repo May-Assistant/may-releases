@@ -51,7 +51,7 @@
     "id": "onboarding",
     "title": "Go through onboarding on a new account",
     "driver": "agent",
-    "goal": "May Playground has just signed in to a new account for device test {tag} and shows its first-run onboarding. Go through onboarding until the Chats screen shows, using only each step's skip or continue button. Do not type anything, connect an account or change a setting. If the system asks for a permission, choose the option that does not allow it. Stop when Chats shows.",
+    "goal": "May Playground has just signed in to a new account for device test {tag} and shows its first-run onboarding. Go through it to the Chats screen: on Hi, I'm May tap Accept and continue; on the email step and on the phone step tap Not now, never making an address or getting a number; on I have my own computer tap Continue; on Connect your apps tap Not now, never connecting an app; on Make me yours tap Purple, then Continue; on Let me reach you tap Turn on notifications and allow it when the system asks; on I'm all set tap Start chatting. Do not type anything or change a setting. Stop when Chats shows.",
     "platforms": [
       "android",
       "ios"
@@ -66,7 +66,7 @@
     "id": "chat",
     "title": "Chat with May and get a reply",
     "driver": "agent",
-    "goal": "In May Playground, on the Chats screen, open the existing chat named May; do not use the + button, which makes agents, tasks and projects, not chats. Send this message: This is device test {tag}. Reply with the word received. Then wait until May's reply appears under your message.",
+    "goal": "In May Playground, on the Chats screen, open the existing chat named May; do not use the + button, which makes agents, tasks and projects, not chats. Tap the Ask May field at the bottom. Send this message: This is device test {tag}. Reply with the word received. Then wait until May's reply is posted under your message and the composer shows Speak again.",
     "platforms": [
       "android",
       "ios"

@@ -196,6 +196,19 @@ class ScenarioTests(unittest.TestCase):
             self.assertIn("open the existing chat named May; do not use the + button", goal)
             self.assertNotIn("start a new chat", goal)
 
+    def test_goals_follow_their_prototypes_main_path_short_of_any_outward_step(self):
+        """Coordinator, 24 Oct: where a flow has a prototype, its scenario follows the main path, so Expected and
+        Recording line up on the board; a step that makes an address, rents a number or connects an app is skipped."""
+        goals = {row["id"]: row["goal"] for row in device_tests.scenarios("chat,onboarding", "android")}
+        for step in ("Tap the Ask May field", "the composer shows Speak again"):
+            self.assertIn(step, goals["chat"])
+        for step in ("tap Accept and continue", "on I have my own computer tap Continue", "tap Purple, then Continue",
+                     "tap Turn on notifications and allow it", "tap Start chatting"):
+            self.assertIn(step, goals["onboarding"])
+        for never in ("never making an address or getting a number", "never connecting an app"):
+            self.assertIn(never, goals["onboarding"])
+        self.assertNotRegex(goals["onboarding"], r"tap (Use this address|Get this number|Allow\b|Connect\b)")
+
     def test_every_agent_scenario_fits_inside_one_test_session(self):
         """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
         each agent's cap leaves ten minutes for the launch, recording, stop and server reads."""
