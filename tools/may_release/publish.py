@@ -63,8 +63,8 @@ SHA = re.compile(r"[0-9a-f]{40}")
 FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,140}\.png")
 KINDS = ("ios", "android", "sheet")
 # A renders run folder (a may-app short SHA) or a device-tests one (<UTC date>-<short SHA>).
-RUN_FOLDER = re.compile(r"(?:[0-9]{8}-)?[0-9a-f]{12}")
-DEVICE_RUN = re.compile(r"[0-9]{8}-[0-9a-f]{12}")
+RUN_FOLDER = re.compile(r"[0-9a-f]{12}|" + board.FOLDER.pattern)
+DEVICE_RUN = board.FOLDER
 DEVICES = ("android", "ios")
 # may-app's flows and board notes, sealed by each device job and set aside by device-open for the flow board
 # (board.py), never committed.
@@ -91,7 +91,7 @@ VIDEO_DAYS = 7
 RELEASE_TOKEN, RENDERS_REPO = "MAY_RENDERS_RELEASE_TOKEN", "May-Assistant/may-renders"
 UPLOADS = "https://uploads.github.com"
 VIDEOS = "may-device-videos"
-RELEASE_TAG = re.compile(r"device-tests-[0-9]{8}-[0-9a-f]{12}")
+RELEASE_TAG = re.compile(r"device-tests-(?:" + board.FOLDER.pattern + ")")
 _RELEASES = r"/repos/" + re.escape(RENDERS_REPO) + r"/releases"
 RELEASE_CALLS = (("POST", API, _RELEASES), ("GET", API, _RELEASES + r"/tags/" + RELEASE_TAG.pattern),
                  ("GET", API, _RELEASES + r"\?per_page=100"),
@@ -404,6 +404,8 @@ def agent_ok(agent):
     """A report row's sealed agent account (device_tests.sealed_agent): its fixed shape, the summary capped and with
     nothing kept_lines would drop or mask. It stays in report.json; the pages never show it."""
     summary = agent.get("summary") if isinstance(agent, dict) else None
+    # A report sealed before hierarchy_failure was (#116) has no such key: read as null, never as malformed.
+    agent = {"hierarchy_failure": None, **agent} if isinstance(agent, dict) else agent
     return (isinstance(agent, dict) and set(agent) == {"outcome", "actions", "summary", "hierarchy_failure"} and
             agent["outcome"] in ("completed", "blocked", None) and type(agent["actions"]) is int and
             agent["hierarchy_failure"] in (*device_tests.device_mcp.DUMP_FAILURES, None) and

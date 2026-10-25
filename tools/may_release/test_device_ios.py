@@ -181,7 +181,7 @@ class RunTests(Workspace):
 
     def test_each_scenarios_diagnostics_are_kept_while_its_session_lasts_and_the_log_gives_counts(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
-        events = []
+        events, drivers = [], []
         test = self
 
         class Keeping(device_ios.Diagnostics):
@@ -193,18 +193,21 @@ class RunTests(Workspace):
                 events.append("begin")
                 super().begin()
 
-            def keep(self, folder, scenario, token):
+            def keep(self, folder, scenario, token, driver=None):
+                drivers.append(driver)
                 events.append(("keep", scenario, token, list(test.signed_out)))
-                super().keep(folder, scenario, token)
+                super().keep(folder, scenario, token, driver)
 
         calls, minted, report, out, run = self.run_it(diagnosed=Keeping)
         self.assertEqual(events, ["begin", ("keep", "sign-in", TOKEN + "1", []),
                                   "begin", ("keep", "connections", TOKEN + "2", [TOKEN + "1"])],
                          "kept before its own sign-out, with its own session for the redaction")
+        self.assertEqual(drivers, [self.private / "agent" / scenario / device_tests.device_mcp.DRIVER_FILE
+                                   for scenario in ("sign-in", "connections")], "each scenario's own agent folder")
         self.assertEqual(sorted(path.name for path in (run / "ios").glob("*" + device_tests.DIAG)),
                          ["connections.diag.txt", "sign-in.diag.txt"])
         self.assertIn("May device tests (ios): diagnostics kept for 2 scenarios (4 main-thread stalls, the longest "
-                      "820 ms; 0 with a crash)", out.splitlines())
+                      "820 ms; 0 with a crash; 0 with refused device acts)", out.splitlines())
         self.assertIn("May device tests (ios): sign-in diagnostics: 0 lines dropped", out.splitlines())
         self.assertNotIn("main-thread stall 300", out, "the public log gives counts alone")
 
@@ -434,7 +437,8 @@ class DiagnosticsTests(Workspace):
         diagnostics = self.diagnostics(reports=reports, shown=self.STALLS + b"Authorization: Bearer " +
                                        TOKEN.encode() + b"\nmain-thread stall 9 ms from sam.avery@example.com\n")
         (reports / "MayPlayground-2026-10-25-001002.ips").write_bytes(
-            b'{"procName":"MayPlayground"}\nThread 0 Crashed:\n0 MayPlayground ChatView.body\n'
+            b'{"app_name":"MayPlayground","bundleID":"io.github.mayassistant.may.playground"}\nThread 0 Crashed:\n'
+            b"0 MayPlayground ChatView.body\n"
             b"cookie: sid=" + TOKEN.encode() + b"\n")
         (reports / "SpringBoard-2026-10-25-001002.ips").write_bytes(b"another process\n")
         folder = self.root / "out"
@@ -459,6 +463,48 @@ class DiagnosticsTests(Workspace):
         diagnostics.keep(folder, "notes", TOKEN)
         self.assertEqual(diagnostics.crashes, 1, "a crash report is kept once, by the scenario it came in")
 
+    def test_a_report_named_for_the_playground_is_kept_only_when_its_header_names_its_bundle(self):
+        """The security read of #115: the file name alone is not proof."""
+        reports = self.root / "reports"
+        reports.mkdir()
+        diagnostics = self.diagnostics(reports=reports, shown=b"")
+        (reports / "MayPlayground-2026-10-25-010000.ips").write_bytes(
+            b'{"app_name":"MayPlayground","bundleID":"com.example.other"}\nsomeone else\n')
+        (reports / "MayPlayground-2026-10-25-010100.crash").write_bytes(
+            b"Process:         MayPlayground [812]\nIdentifier:      io.github.mayassistant.may.playground\n"
+            b"Thread 0 Crashed:: Dispatch queue: com.apple.main-thread\n")
+        (reports / "MayPlayground-2026-10-25-010200.ips").write_bytes(
+            b'{"bundleID":"io.github.mayassistant.may.playground.evil"}\nlookalike\n')
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"Dispatch queue: com.apple.main-thread", text)
+        for absent in (b"someone else", b"lookalike"):
+            self.assertNotIn(absent, text)
+        self.assertEqual(device_ios.BUNDLE, "io.github.mayassistant.may.playground")
+
+    def test_the_refused_acts_driver_lines_land_redacted_in_the_diagnostics(self):
+        """Coordinator, 25 Oct: N reads them; through kept_lines with the session, private, counted in the log."""
+        diagnostics = self.diagnostics(shown=b"")
+        driver = self.root / "driver.txt"
+        driver.write_bytes(b"== refused: - tapOn: (action 7) ==\nTap on point (60,40)... FAILED\n"
+                           b"launch env MAY_TEST_SESSION=" + TOKEN.encode() + b"\nraw " + TOKEN.encode() + b"\n")
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "notes", TOKEN, driver)
+        text = (folder / ("notes" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"== driver ==\n== refused: - tapOn: (action 7) ==\nTap on point (60,40)... FAILED\n", text)
+        self.assertNotIn(TOKEN.encode(), text, "the session itself is dropped too, not only secret-shaped lines")
+        self.assertEqual((diagnostics.drivers, diagnostics.dropped), (1, {"notes": 2}))
+        self.assertTrue(publish.diagnostics_ok(text))
+        link = self.root / "link.txt"
+        link.symlink_to(driver)
+        diagnostics.keep(folder, "chat", TOKEN, link)
+        self.assertFalse((folder / ("chat" + device_tests.DIAG)).exists(), "a link is never read")
+
     def test_nothing_new_writes_nothing(self):
         diagnostics = self.diagnostics(shown=b"Timestamp               Ty Process[PID:TID]\n")
         folder = self.root / "out"
@@ -474,19 +520,16 @@ class DiagnosticsTests(Workspace):
                          'subsystem == "io.github.mayassistant.may.playground" AND category == "watchdog"')
         seen = []
 
-        def run(argv, capture_output, stdin, env, timeout):
-            seen.append((argv, timeout))
-            return Done()
+        def bounded(argv, env, limit):
+            seen.append((argv, limit))
+            return 0, b"main-thread stall 300 ms\n"
 
-        with patch("device_ios.subprocess.run", side_effect=run):
-            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"")
+        with patch("device_tests.bounded_output", side_effect=bounded):
+            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"main-thread stall 300 ms\n")
         self.assertEqual(seen, [(["xcrun", "simctl", "spawn", UDID, "log", "show", "--style", "compact", "--start",
-                                  "2026-10-25 00:10:00", "--predicate", device_ios.WATCHDOG],
-                                 device_tests.DIAG_SECONDS)])
-        with patch("device_ios.subprocess.run", side_effect=subprocess.TimeoutExpired("log", 1)):
-            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"")
-        with patch("device_ios.subprocess.run", side_effect=FileNotFoundError()):
-            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"")
+                                  "2026-10-25 00:10:00", "--predicate", device_ios.WATCHDOG], device_tests.MAX_DIAG)])
+        with patch("device_tests.bounded_output", return_value=None):
+            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"", "no answer in time")
 
     def test_a_link_or_another_name_in_the_reports_folder_is_never_read(self):
         reports = self.root / "reports"
@@ -519,7 +562,10 @@ class RecorderTests(Workspace):
             def wait(self, timeout):
                 return 0
 
-        def run(argv, stdout, stderr, stdin, env):
+        self.timeouts = []
+
+        def run(argv, stdout, stderr, stdin, env, timeout):
+            self.timeouts.append(timeout)
             preset = argv[argv.index("--preset") + 1]
             if "--start" in argv:
                 self.tails.append((preset, Path(argv[argv.index("--output") + 1]).suffix,
@@ -528,6 +574,8 @@ class RecorderTests(Workspace):
             else:
                 presets.append((preset, Path(argv[argv.index("--output") + 1]).suffix))
             code, size = outcomes.get(preset, (1, 0))
+            if code == "hang":
+                raise subprocess.TimeoutExpired(argv, timeout)
             if size:
                 Path(argv[argv.index("--output") + 1]).write_bytes(b"\0" * size)
             return Done(code)
@@ -588,9 +636,12 @@ class RecorderTests(Workspace):
         with patch("device_ios.MAX_RECORDING", 1000):
             names, _, _, folder, recorder, leftovers = self.recorder(
                 {**self.RUN, ("tail", "PresetAppleM4V720pHD"): (0, 900)}, raw=b"\0" * 5474, seconds=1809)
-        # The smallest whole conversion's preset, for the share of the recording that size suggests fits, less a margin.
-        tail = int(1809 * 1000 * device_ios.TAIL_MARGIN / 1290)
-        self.assertEqual(self.tails, [("PresetAppleM4V720pHD", ".m4v", str(1809 - tail), str(tail))])
+        # The smallest whole conversion's preset, for the share of the recording that size suggests fits, less a
+        # fifth: 1809 s x 1000 / 1290 x 0.8 is 1121 s, from 688 s on (the security read of #116: fixed numbers, so a
+        # changed margin is caught).
+        tail = 1121
+        self.assertEqual(self.tails, [("PresetAppleM4V720pHD", ".m4v", "688", "1121")])
+        self.assertEqual(self.timeouts, [device_ios.CONVERT_SECONDS] * 4, "no avconvert holds the job")
         self.assertEqual((names, (folder / "sign-in.mp4").stat().st_size, leftovers), (["sign-in.mp4"], 900, []))
         self.assertEqual(recorder.kept, f"as its last {tail} s alone: the whole did not fit the cap "
                                         "(PresetAppleM4V720pHD 0 MB, Preset1280x720 0 MB, Preset960x540 0 MB) after "
@@ -602,7 +653,19 @@ class RecorderTests(Workspace):
             names, _, _, folder, recorder, leftovers = self.recorder(
                 {**self.RUN, ("tail", "PresetAppleM4V720pHD"): (0, 1200)}, raw=b"\0" * 5474, seconds=1809)
         self.assertEqual((names, list(folder.iterdir()), leftovers, recorder.kept), ([], [], [], None))
-        self.assertTrue(recorder.dropped.startswith("no conversion fit the cap"), recorder.dropped)
+        self.assertEqual(recorder.dropped, "no conversion fit the cap (PresetAppleM4V720pHD 0 MB, Preset1280x720 0 MB, "
+                                           "Preset960x540 0 MB) and the original is 0 MB, over it; its last 1121 s "
+                                           "alone: 0 MB after 1809 s of recording",
+                         "the log says a tail was tried and refused")
+
+    def test_a_conversion_that_hangs_is_given_up_and_named(self):
+        with patch("device_ios.MAX_RECORDING", 1000):
+            names, _, _, folder, recorder, leftovers = self.recorder(
+                {**self.RUN, "PresetAppleM4V720pHD": ("hang", 0), ("tail", "Preset960x540"): ("hang", 0)},
+                raw=b"\0" * 5474, seconds=1809)
+        self.assertEqual((names, leftovers), ([], []))
+        self.assertIn("PresetAppleM4V720pHD failed (timed out)", recorder.dropped)
+        self.assertIn("its last 561 s alone: failed (timed out)", recorder.dropped)
 
     def test_the_last_part_is_never_shorter_than_a_minute_nor_tried_on_a_shorter_recording(self):
         with patch("device_ios.MAX_RECORDING", 1000):

@@ -42,6 +42,8 @@ STOP_SECONDS = 30
 # stuck scenario, the one most worth watching, kept no recording. Then its last part alone is converted, as long as the
 # smallest whole conversion suggests will fit (with TAIL_MARGIN to spare), and never less than MIN_TAIL_SECONDS.
 TAIL_MARGIN, MIN_TAIL_SECONDS = 0.8, 60
+# One avconvert, however long the recording, never holds the job (the security read of #116).
+CONVERT_SECONDS = 600
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
@@ -148,16 +150,12 @@ class Recorder:
         outcomes, smallest = [], None  # smallest: (bytes, preset, suffix) of a conversion that was over the cap
         for preset, suffix in CONVERSIONS:
             converted = self.private / (self.scenario + "-converted" + suffix)
-            with self.log.open("ab") as output:
-                failed = subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted),
-                                         "--preset", preset, "--replace"], stdout=output, stderr=output,
-                                        stdin=subprocess.DEVNULL, env=self.env).returncode
+            failed = self.convert(["--preset", preset], converted)
             if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
                 converted.replace(out)
                 self.raw.unlink(missing_ok=True)
                 return [out.name]
-            outcomes.append(f"{preset} " + (f"failed (exit {failed})" if failed else
-                                            f"{megabytes(converted)} MB" if converted.is_file() else "wrote no file"))
+            outcomes.append(f"{preset} " + outcome(failed, converted))
             if not failed and converted.is_file() and (smallest is None or converted.stat().st_size < smallest[0]):
                 smallest = (converted.stat().st_size, preset, suffix)
             converted.unlink(missing_ok=True)
@@ -166,39 +164,54 @@ class Recorder:
             self.raw.replace(out)
             self.kept = f"unconverted: no conversion fit the cap ({tried}){self.length()}"
             return [out.name]
-        tail = self.tail(out, seconds, smallest)
+        tail, tried_tail = self.tail(out, seconds, smallest)
         if tail:
             self.raw.unlink(missing_ok=True)
             self.kept = f"as its last {tail} s alone: the whole did not fit the cap ({tried}){self.length()}"
             return [out.name]
         size = megabytes(self.raw) if self.raw.is_file() else 0
         self.raw.unlink(missing_ok=True)
-        self.dropped = f"no conversion fit the cap ({tried}) and the original is {size} MB, over it{self.length()}"
+        self.dropped = (f"no conversion fit the cap ({tried}) and the original is {size} MB, over it" +
+                        (f"; {tried_tail}" if tried_tail else "") + self.length())
         return []
 
+    def convert(self, options, converted):
+        """One avconvert of the raw recording to converted: its exit status, or "timed out" past CONVERT_SECONDS."""
+        with self.log.open("ab") as output:
+            try:
+                return subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted), *options,
+                                       "--replace"], stdout=output, stderr=output, stdin=subprocess.DEVNULL,
+                                      env=self.env, timeout=CONVERT_SECONDS).returncode
+            except subprocess.TimeoutExpired:
+                return "timed out"
+
     def tail(self, out, seconds, smallest):
-        """The recording's last part converted to out with smallest's preset, sized to fit the cap: its length in
-        seconds, or 0 when there is none to try or it did not fit either."""
+        """The recording's last part converted to out with smallest's preset, sized to fit the cap: (its length in
+        seconds, or 0 when none was kept; how a tail that was tried and refused came out, for the log, or None)."""
         if smallest is None or not self.raw.is_file():
-            return 0
+            return 0, None
         size, preset, suffix = smallest
         tail = max(MIN_TAIL_SECONDS, int(seconds * MAX_RECORDING * TAIL_MARGIN / size))
         if tail >= seconds:
-            return 0
+            return 0, None
         converted = self.private / (self.scenario + "-tail" + suffix)
-        with self.log.open("ab") as output:
-            failed = subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted), "--preset",
-                                     preset, "--start", str(seconds - tail), "--duration", str(tail), "--replace"],
-                                    stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=self.env).returncode
+        failed = self.convert(["--preset", preset, "--start", str(seconds - tail), "--duration", str(tail)], converted)
         if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
             converted.replace(out)
-            return tail
+            return tail, None
+        tried = f"its last {tail} s alone: {outcome(failed, converted)}"
         converted.unlink(missing_ok=True)
-        return 0
+        return 0, tried
 
 
 def megabytes(path):
     return path.stat().st_size // (1024 * 1024)
+
+
+def outcome(failed, converted):
+    """One conversion's outcome for the public log, in fixed words and MB."""
+    return (f"failed (exit {failed})" if type(failed) is int and failed else "failed (timed out)" if failed else
+            f"{megabytes(converted)} MB" if converted.is_file() else "wrote no file")
 
 
 # may-app #1272: the debug Playground's main-thread watchdog logs one line per stall of 250 ms or more, alone in its
@@ -208,17 +221,18 @@ STALL = re.compile(rb"main-thread stall ([0-9]{1,7}) ms")
 # The simulator's crash reports land in the host's own folder; only the Playground's process is kept.
 CRASH_REPORTS = Path.home() / "Library" / "Logs" / "DiagnosticReports"
 CRASH_REPORT = re.compile(r"MayPlayground[-_][A-Za-z0-9._-]{1,120}\.(?:ips|crash)")
+# The file name alone is not proof (the security read of #115): a report is kept only when its own header names the
+# Playground's bundle id, as an .ips report's JSON first line ("bundleID") or a .crash report's Identifier line does.
+OWN_REPORT = re.compile(rb'"bundleID"[ \t]*:[ \t]*"' + re.escape(BUNDLE.encode()) + rb'"|^Identifier:[ \t]+' +
+                        re.escape(BUNDLE.encode()) + rb"[ \t]*\r?$", re.MULTILINE)
+REPORT_HEAD = 16 * 1024
 
 
 def show_log(udid, env, start):
     """The simulator's unified log since start, the watchdog's lines alone; b"" when it could not be read."""
-    try:
-        done = subprocess.run(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact", "--start", start,
-                               "--predicate", WATCHDOG], capture_output=True, stdin=subprocess.DEVNULL, env=env,
-                              timeout=device_tests.DIAG_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return b""
-    return done.stdout[:device_tests.MAX_DIAG] if isinstance(done.stdout, bytes) else b""
+    done = device_tests.bounded_output(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
+                                        "--start", start, "--predicate", WATCHDOG], env, limit=device_tests.MAX_DIAG)
+    return b"" if done is None else done[1]
 
 
 class Diagnostics:
@@ -230,7 +244,7 @@ class Diagnostics:
         self.udid, self.env, self.reports, self.shown = udid, env, reports, shown
         self.seen = set(self.crash_reports())
         self.start = None
-        self.kept = self.stalls = self.longest = self.crashes = 0
+        self.kept = self.stalls = self.longest = self.crashes = self.drivers = 0
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
 
     def crash_reports(self):
@@ -244,39 +258,53 @@ class Diagnostics:
         """The scenario's start, in the log's own local time."""
         self.start = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    def keep(self, folder, scenario, token):
-        """Writes <scenario>.diag.txt when there is anything to keep; never an error."""
+    def keep(self, folder, scenario, token, driver=None):
+        """Writes <scenario>.diag.txt when there is anything to keep; never an error. driver: the agent's DRIVER_FILE,
+        each refused act's Maestro lines (device_mcp.refused)."""
         found = []
         for path in self.crash_reports():
             if path not in self.seen:
                 self.seen.add(path)
                 try:
                     with path.open("rb") as report:
-                        found.append(b"== crash ==\n" + report.read(device_tests.MAX_DIAG // 2) + b"\n")
+                        data = report.read(device_tests.MAX_DIAG // 2)
                 except OSError:
                     continue
+                if OWN_REPORT.search(data[:REPORT_HEAD]):
+                    found.append(b"== crash ==\n" + data + b"\n")
         self.crashes += bool(found)
         lines = [line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
                  .splitlines(keepends=True) if STALL.search(line)]
         stalls = [int(STALL.search(line).group(1)) for line in lines]
         self.stalls += len(stalls)
         self.longest = max([self.longest, *stalls])
-        # The crash reports first, at most half; the watchdog's newest lines fill the rest.
+        refused = b""
+        try:
+            if driver is not None and driver.is_file() and not driver.is_symlink():
+                with driver.open("rb") as stream:
+                    refused = stream.read(device_tests.device_mcp.MAX_DRIVER)
+        except OSError:
+            refused = b""
+        # The crash reports first, at most half; the refused acts' driver lines, capped where device_mcp wrote them;
+        # the watchdog's newest lines fill the rest. All through kept_lines with the session.
         (crashes, from_crashes), (watchdog, from_log) = kept_lines(b"".join(found), token), kept_lines(b"".join(lines),
                                                                                                          token)
+        refused, from_driver = kept_lines(refused, token)
+        self.drivers += bool(refused)
         crashes = crashes[:device_tests.MAX_DIAG // 2]
-        room = device_tests.MAX_DIAG - len(crashes) - 64  # the section header's room
+        room = device_tests.MAX_DIAG - len(crashes) - len(refused) - 128  # the section headers' room
         watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
-        if not (crashes or watchdog):
+        if not (crashes or refused or watchdog):
             return
-        text = (crashes + (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
+        text = (crashes + (b"== driver ==\n" + refused if refused else b"") +
+                (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
         text = text[:device_tests.MAX_DIAG].decode("utf-8", "ignore").encode()
         try:
             (folder / f"{scenario}{device_tests.DIAG}").write_bytes(text)
         except OSError:
             return
         self.kept += 1
-        self.dropped[scenario] = from_crashes + from_log
+        self.dropped[scenario] = from_crashes + from_driver + from_log
 
 
 def screenshot(udid, env, path, log):
@@ -436,7 +464,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 if codes is not None:
                     entry["delivery"] = codes
             # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
-            diagnostics.keep(folder, row["id"], token)
+            diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE)
             accounts.finish(row, base, token)
             token = ""
             device_tests.settle(entry, row, passed if flow is not None else None)
@@ -460,9 +488,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     ran = sum(1 for entry in results if entry["verdict"] != "skipped")
     print(f"May device tests (ios): {ran} scenarios ran; verdicts follow the judge step")
     kept, stalls, longest, crashes = diagnostics.kept, diagnostics.stalls, diagnostics.longest, diagnostics.crashes
+    drivers = diagnostics.drivers
     if kept:
         print(f"May device tests (ios): diagnostics kept for {kept} scenarios ({stalls} main-thread stalls, the longest "
-              f"{longest} ms; {crashes} with a crash)")
+              f"{longest} ms; {crashes} with a crash; {drivers} with refused device acts)")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:

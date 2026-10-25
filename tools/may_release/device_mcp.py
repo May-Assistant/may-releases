@@ -137,14 +137,23 @@ def adb(config, *args, timeout=60):
     return done.returncode, done.stdout
 
 
-def tool(config, argv, timeout=90):
-    """One simctl or Maestro call for the iOS simulator: (exit status, stdout bytes). Nothing reaches this server's
-    output."""
+def tool(config, argv, timeout=90, both=False):
+    """One simctl or Maestro call for the iOS simulator: (exit status, stdout bytes, or stdout and stderr with both).
+    Nothing reaches this server's output."""
     try:
         done = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout, env=config["env"])
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired as late:
+        return 1, (late.stdout or b"") + (late.stderr or b"") + b"\n(timed out)\n" if both else b""
+    except OSError:
         return 1, b""
-    return done.returncode, done.stdout
+    return done.returncode, done.stdout + done.stderr if both else done.stdout
+
+
+# Coordinator, 25 Oct (runs 40138900610 and 40148178587): iOS notes lost every tap after the Agenda tab, and the
+# driver's own words were never kept. Each refused act's Maestro output, its last DRIVER_LINES lines through kept_lines,
+# is added to DRIVER_FILE beside the agent's result (the first ones, up to MAX_DRIVER bytes), for device_ios to keep in
+# the scenario's private diagnostics.
+DRIVER_FILE, DRIVER_LINES, MAX_DRIVER = "driver.txt", 40, 32 * 1024
 
 
 def flow(config, command):
@@ -152,8 +161,25 @@ def flow(config, command):
     path = os.path.join(config["flows"], "act.yaml")
     with open(path, "w", encoding="utf-8") as output:
         output.write(f"appId: {config['bundle']}\n---\n{command}\n")
-    status, _ = tool(config, [config["maestro"], "--device", config["udid"], "test", path])
+    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], both=True)
+    if status:
+        refused(config, command, said)
     return status
+
+
+def refused(config, command, said):
+    """One refused act's last lines, redacted, added to DRIVER_FILE while it has room; never an error."""
+    lines, _ = kept_lines(b"".join(said.splitlines(keepends=True)[-DRIVER_LINES:]), "")
+    act, _ = kept_lines(command.splitlines()[0].encode(), "")
+    part = b"== refused: " + act.strip() + b" (action " + str(config["actions"]).encode() + b") ==\n" + lines
+    path = os.path.join(config["flows"], DRIVER_FILE)
+    try:
+        if os.path.getsize(path) + len(part) > MAX_DRIVER if os.path.exists(path) else len(part) > MAX_DRIVER:
+            return
+        with open(path, "ab") as output:
+            output.write(part if part.endswith(b"\n") else part + b"\n")
+    except OSError:
+        pass
 
 
 def ios_screenshot(config):

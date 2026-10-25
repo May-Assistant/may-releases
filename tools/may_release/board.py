@@ -29,7 +29,9 @@ TEMPLATE = HERE / "board_template.html"
 HISTORY = 60
 BOARD, MEDIA = "board", "media"
 DEVICES = ("android", "ios")
-FOLDER = re.compile(r"[0-9]{8}-[0-9a-f]{12}")
+# A device-tests run folder: <UTC date>-<may-app short sha>, and since run 40148178587 -<GitHub run id> as well (two
+# runs of one commit on one day overwrote each other's folder); a folder from before has no run id.
+FOLDER = re.compile(r"[0-9]{8}-[0-9a-f]{12}(?:-[1-9][0-9]{4,19})?")
 RUN = re.compile(r"[1-9][0-9]{0,19}")
 FLOW_ID = re.compile(r"[1-9][0-9]{0,2}(?:\.[1-9][0-9]{0,2})?")
 SCENARIO = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
