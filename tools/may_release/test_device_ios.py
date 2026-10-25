@@ -116,6 +116,8 @@ class FakeRecorder:
     def start(self):
         pass
 
+    notes = ()
+
     def halt(self):
         return True
 
@@ -134,6 +136,8 @@ class RunTests(Workspace):
 
         def quiet(argv, log, cwd=None, env=None, capture=False, timeout=None):
             calls.append((list(argv), dict(env or {})))
+            if getattr(self, "quiet_hook", None):
+                self.quiet_hook(argv, log, timeout)  # may raise, as a timed-out run does
             if "test" in argv and "--device" in argv:
                 self.maestro_timeouts.append(timeout)
             if argv[:4] == ["xcrun", "simctl", "io", UDID] and argv[4] == "screenshot":
@@ -198,10 +202,10 @@ class RunTests(Workspace):
                 events.append("begin")
                 super().begin()
 
-            def keep(self, folder, scenario, token, driver=None):
+            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
                 drivers.append(driver)
                 events.append(("keep", scenario, token, list(test.signed_out)))
-                super().keep(folder, scenario, token, driver)
+                super().keep(folder, scenario, token, driver, onboarding)
 
         calls, minted, report, out, run = self.run_it(diagnosed=Keeping)
         self.assertEqual(events, ["begin", ("keep", "sign-in", TOKEN + "1", []),
@@ -351,6 +355,8 @@ class RunTests(Workspace):
         order = []
 
         class Ordered(FakeRecorder):
+            notes = ("part 1 Preset960x540: exit 205; avconvert said: nothing",)
+
             def halt(self):
                 order.append(("halt", self.scenario))
                 return True
@@ -360,9 +366,13 @@ class RunTests(Workspace):
                 return super().stop(folder)
 
         class Diagnosed(device_ios.Diagnostics):
-            def keep(self, folder, scenario, token, driver=None):
+            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
                 order.append(("diagnostics", scenario))
-                return super().keep(folder, scenario, token, driver)
+                return super().keep(folder, scenario, token, driver, onboarding)
+
+            def recording(self, folder, scenario, token, notes):
+                order.append(("recording notes", scenario, list(notes)))
+                return super().recording(folder, scenario, token, notes)
 
         def agent(cli, goal, tag, device, work, token, model, seconds):
             return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
@@ -379,7 +389,9 @@ class RunTests(Workspace):
                 env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
                      "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
         assert order, "the scenario never ran"
-        self.assertEqual(order, [("halt", "chat"), ("reads", "chat"), ("diagnostics", "chat"), ("convert", "chat")])
+        self.assertEqual(order, [("halt", "chat"), ("reads", "chat"), ("diagnostics", "chat"), ("convert", "chat"),
+                                 ("recording notes", "chat", list(Ordered.notes))],
+                         "the recording's notes join the private diag after its conversion")
 
     def test_poll_skip_gives_the_device_server_its_own_step_limit(self):
         devices = {}
@@ -414,6 +426,48 @@ class RunTests(Workspace):
         self.assertEqual(self.maestro_timeouts, [device_tests.ONBOARDING_SECONDS])
         self.assertEqual(order, ["agent"])
         self.assertNotIn("onboarding subflow", out, "a subflow that passed says nothing")
+
+    def test_an_onboarding_subflow_that_does_not_pass_leaves_its_last_lines_in_the_diag(self):
+        """Run 40181517145: chat's and notes' subflow did not pass, with nothing to say where it stopped."""
+        (self.source / device_tests.FLOWS_DIR / "subflows").mkdir()
+        subflow = self.source / device_tests.FLOWS_DIR / device_tests.ONBOARDING
+        subflow.write_text("appId: x\n")
+        kept = []
+
+        class Diagnosed(device_ios.Diagnostics):
+            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
+                kept.append(onboarding)
+                return super().keep(folder, scenario, token, driver, onboarding)
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        def hang(argv, log, timeout):
+            if str(subflow) in argv:
+                with log.open("ab") as output:
+                    output.write(b"".join(b"Maestro %d\n" % n for n in range(60)))
+                raise subprocess.TimeoutExpired(argv, timeout)
+
+        self.quiet_hook = hang
+        _, _, report, out, _ = self.run_it(
+            selection="chat", agent=agent, diagnosed=lambda udid, env: Diagnosed(
+                udid, env, reports=self.root / "no-reports", shown=lambda *a: b""),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
+        assert kept, "no diagnostics were kept"
+        self.assertEqual(kept[0], b"".join(b"Maestro %d\n" % n for n in range(20, 60)), "its last 40 lines")
+        self.assertIn("chat: the onboarding subflow did not pass", out)
+        self.assertNotIn("Maestro 59", out, "never in the public log")
+        self.assertFalse((self.private / "chat-onboarding.log").exists(), "moved into the private run log")
+        self.assertIn(b"Maestro 0\n", (self.private / "device-run.log").read_bytes())
+
+    def test_the_run_prints_both_a_kept_and_a_dropped_part(self):
+        class Both(FakeRecorder):
+            kept, dropped = "part 1: unconverted: no conversion fit the cap", "part 2: the original is 50 MB, over it"
+
+        with patch("test_device_ios.FakeRecorder", Both):
+            _, _, _, out, _ = self.run_it()
+        self.assertIn("sign-in: its recording was dropped (part 2: the original is 50 MB, over it)", out)
+        self.assertIn("sign-in: its recording was kept part 1: unconverted: no conversion fit the cap", out)
 
     def test_fresh_scenarios_delete_their_own_accounts_on_ios_too(self):
         def agent(cli, goal, tag, device, work, token, model, seconds):
@@ -536,6 +590,67 @@ class DiagnosticsTests(Workspace):
         self.assertEqual(diagnostics.spans, {"chat-publish": [2, 520], "chat-inbox": [1, 300], "chat-merge": [1, 260]})
         self.assertIn(b"main-thread span chat-other 900 ms", (folder / ("chat" + device_tests.DIAG)).read_bytes(),
                       "a name not agreed is kept privately, never counted")
+
+    AFTER = b"".join(b"2026-10-25 06:00:%02d.000 Df MayPlayground[1:2] [io.github.mayassistant.may.playground:watchdog] "
+                     b"main-thread %s\n" % (second, line) for second, line in enumerate([
+                         b"stall 900 ms", b"stall-after sync-publish", b"stall 400 ms", b"stall-after view-chat",
+                         b"stall 3800 ms", b"stall-after sync-publish", b"stall 300 ms", b"stall-after not-agreed"]))
+
+    def test_each_stall_after_name_is_counted_and_any_other_as_other(self):
+        """may-app #1309 (N, 25 Oct): the step that ran before each stall, from twelve agreed names."""
+        diagnostics = self.diagnostics(shown=self.AFTER)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        self.assertEqual(diagnostics.after, {"sync-publish": 2, "view-chat": 1, "other": 1})
+        self.assertEqual((diagnostics.stalls, diagnostics.longest), (4, 3800), "a stall-after line is never a stall")
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertEqual([line.split(b"main-thread ")[-1] for line in text.split(b"== watchdog ==\n")[1].splitlines()],
+                         [b"stall 900 ms", b"stall-after sync-publish", b"stall 400 ms", b"stall-after view-chat",
+                          b"stall 3800 ms", b"stall-after sync-publish", b"stall 300 ms", b"stall-after not-agreed"],
+                         "each after its own stall, in the log's order")
+        self.assertEqual(len(device_ios.STALL_AFTER_NAMES), 12)
+
+    def test_the_onboarding_lines_and_the_recording_notes_land_redacted_in_the_diag(self):
+        diagnostics = self.diagnostics()
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        onboarding = b"".join(b"Maestro line %d\n" % n for n in range(39)) + b"Authorization: Bearer " + \
+            TOKEN.encode() + b"\n"
+        diagnostics.keep(folder, "chat", TOKEN, onboarding=onboarding)
+        diagnostics.recording(folder, "chat", "", ["part 1 PresetAppleM4V720pHD: exit 205; avconvert said: "
+                                                   "AVFoundationErrorDomain -11800", "x token " + TOKEN])
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"== onboarding ==\nMaestro line 0\n", text)
+        self.assertIn(b"Maestro line 38\n== watchdog ==", text)
+        self.assertTrue(text.endswith(b"== recording ==\npart 1 PresetAppleM4V720pHD: exit 205; avconvert said: "
+                                      b"AVFoundationErrorDomain -11800\n"), text[-200:])
+        self.assertNotIn(TOKEN.encode(), text)
+        self.assertEqual((diagnostics.kept, diagnostics.dropped["chat"]), (1, 2), "one file, two lines dropped")
+        self.assertTrue(publish.diagnostics_ok(text))
+        diagnostics.recording(folder, "notes", "", ["part 2 Preset960x540: timed out; avconvert said: nothing"])
+        self.assertEqual((folder / ("notes" + device_tests.DIAG)).read_bytes(),
+                         b"== recording ==\npart 2 Preset960x540: timed out; avconvert said: nothing\n")
+        self.assertEqual(diagnostics.kept, 2, "a recording's notes alone make a diag of their own")
+        diagnostics.recording(folder, "poll", "", [])
+        self.assertFalse((folder / ("poll" + device_tests.DIAG)).exists(), "no notes, no file")
+
+    def test_a_full_diag_still_has_room_for_the_onboarding_lines_and_the_recording_notes(self):
+        flood = b"".join(b"2026-10-25 03:12:%02d.000 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:"
+                         b"watchdog] main-thread stall %d ms\n" % (i % 60, 300 + i) for i in range(6000))
+        diagnostics = self.diagnostics(shown=flood)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN, onboarding=b"Maestro: " + b"x" * 100 + b"\n" * 1 + b"y\n" * 9000)
+        diagnostics.recording(folder, "chat", "", ["note %d" % n for n in range(5000)])
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertLessEqual(len(text), device_tests.MAX_DIAG)
+        self.assertIn(b"== recording ==\nnote 0\n", text)
+        self.assertIn(b"main-thread stall 6299 ms\n", text)
+        self.assertTrue(publish.diagnostics_ok(text), "every section ends on a whole line")
 
     def test_a_trimmed_watchdog_log_never_loses_its_spans(self):
         flood = b"".join(b"2026-10-25 03:12:%02d.000 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:"
@@ -708,13 +823,14 @@ class RecorderTests(Workspace):
         folder = self.root / "out"
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir()
-        recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
+        recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log",
+                                       clock=lambda: float(seconds or 0))
         recorder.process = Process()
-        recorder.raw.write_bytes(raw)
+        recorder.raws, recorder.marks = [self.private / "sign-in-recording-1.mov"], [0.0]
+        recorder.raws[0].write_bytes(raw)
         if seconds is not None:
             recorder.started = 0.0
-        with patch("device_ios.subprocess.run", side_effect=run), \
-                patch("device_ios.time.monotonic", return_value=float(seconds or 0)):
+        with patch("device_ios.subprocess.run", side_effect=run):
             names = recorder.stop(folder)
         leftovers = [path.name for path in self.private.iterdir() if path.name.startswith("sign-in-")]
         return names, sent, presets, folder, recorder, leftovers
@@ -804,11 +920,12 @@ class RecorderTests(Workspace):
 
     def test_a_dropped_recording_says_how_long_it_ran(self):
         """The length sets each recording's bitrate against the cap, so the public log carries it in seconds."""
-        recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
-        with patch("device_ios.subprocess.Popen"), patch("device_ios.time.monotonic", side_effect=[100.0, 820.4]), \
-                patch("device_ios.subprocess.run", return_value=Done(1)):
+        ticks = iter([100.0])
+        recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log",
+                                       clock=lambda: next(ticks, 820.4))
+        with patch("device_ios.subprocess.Popen"), patch("device_ios.subprocess.run", return_value=Done(1)):
             recorder.start()
-            recorder.raw.write_bytes(b"\0" * self.BIG)
+            recorder.raws[0].write_bytes(b"\0" * self.BIG)
             self.assertEqual(recorder.stop(self.root), [])
         self.assertTrue((recorder.dropped or "").endswith(" over it after 720 s of recording"), recorder.dropped)
 
@@ -849,6 +966,109 @@ class RecorderTests(Workspace):
             _, _, report, out, _ = RunTests.run_it(self)
         self.assertIn("May device tests (ios): sign-in: its recording was dropped (over the cap at 51 MB)", out)
         self.assertEqual(report["scenarios"][0]["videos"], [])
+
+    def test_the_recording_comes_in_parts_published_as_android_names_them(self):
+        """Run 40181517145's 30-minute recordings failed every preset (coordinator, 25 Oct: 5-minute parts)."""
+        processes, outputs = [], []
+
+        class Process:
+            def __init__(self, argv, **kwargs):
+                outputs.append(Path(argv[-1]))
+                Path(argv[-1]).write_bytes(b"raw")
+                self.signals = []
+                processes.append(self)
+
+            def send_signal(self, number):
+                self.signals.append(number)
+
+            def wait(self, timeout):
+                return 0
+
+        def run(argv, stdout, stderr, stdin, env, timeout):
+            Path(argv[argv.index("--output") + 1]).write_bytes(b"\0" * 100)
+            return Done(0)
+
+        recorder = device_ios.Recorder(UDID, {}, "chat", self.private, self.private / "log", part_seconds=0,
+                                       clock=lambda: 0.0)
+        with patch("device_ios.MAX_PARTS", 3), patch("device_ios.subprocess.Popen", side_effect=Process), \
+                patch("device_ios.subprocess.run", side_effect=run):
+            recorder.start()
+            recorder.thread.join(timeout=10)
+            self.assertTrue(recorder.halt())
+            names = recorder.stop(self.root)
+        self.assertEqual(names, ["chat-part1.mp4", "chat-part2.mp4", "chat-part3.mp4"])
+        self.assertEqual([path.name for path in outputs], ["chat-recording-1.mov", "chat-recording-2.mov",
+                                                           "chat-recording-3.mov"])
+        self.assertEqual([process.signals for process in processes], [[signal.SIGINT]] * 3, "each part ended once")
+        self.assertEqual((recorder.dropped, recorder.kept, recorder.notes), (None, None, []))
+        self.assertEqual([path.name for path in self.private.iterdir() if path.name.startswith("chat-")], [])
+
+    def test_each_part_says_how_it_was_kept_or_dropped(self):
+        folder = self.root / "out"
+        folder.mkdir()
+        recorder = device_ios.Recorder(UDID, {}, "chat", self.private, self.private / "log", clock=lambda: 0.0)
+        recorder.raws = [self.private / "chat-recording-1.mov", self.private / "chat-recording-2.mov",
+                         self.private / "chat-recording-3.mov"]
+        for raw, data in zip(recorder.raws, (b"a", b"b" * 10, b"\0" * self.BIG)):
+            raw.write_bytes(data)
+        recorder.marks, recorder.stopped = [0.0, 300.0, 600.0], 0.0
+        sizes = iter([(0, 100), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0)])
+
+        def run(argv, stdout, stderr, stdin, env, timeout):
+            code, size = next(sizes)
+            if size:
+                Path(argv[argv.index("--output") + 1]).write_bytes(b"\0" * size)
+            stdout.write(b"Error Domain=AVFoundationErrorDomain Code=-11800 \"The operation could not be completed\" "
+                         b"UserInfo={NSUnderlyingError=0x6000 {Error Domain=NSOSStatusErrorDomain Code=-12780}}\n")
+            return Done(code)
+
+        recorder.process = type("P", (), {"send_signal": lambda self, n: None, "wait": lambda self, timeout: 0})()
+        with patch("device_ios.subprocess.run", side_effect=run):
+            names = recorder.stop(folder)
+        self.assertEqual(names, ["chat-part1.mp4", "chat-part2.mp4"])
+        self.assertEqual(recorder.kept, "part 2: unconverted: no conversion fit the cap (PresetAppleM4V720pHD failed "
+                                        "(exit 1), Preset1280x720 failed (exit 1), Preset960x540 failed (exit 1))")
+        self.assertEqual(recorder.dropped, "part 3: no conversion fit the cap (PresetAppleM4V720pHD failed (exit 1), "
+                                           "Preset1280x720 failed (exit 1), Preset960x540 failed (exit 1)) and the "
+                                           "original is 38 MB, over it")
+        self.assertEqual(recorder.notes[0], "part 2 PresetAppleM4V720pHD: exit 1; avconvert said: "
+                                            "AVFoundationErrorDomain -11800, NSOSStatusErrorDomain -12780")
+        self.assertEqual(len(recorder.notes), 6, "each failed conversion, privately")
+
+    def test_the_scenarios_conversions_share_one_budget(self):
+        now = [0.0]
+        timeouts = []
+
+        def run(argv, stdout, stderr, stdin, env, timeout):
+            timeouts.append(timeout)
+            now[0] += 400  # each conversion takes 400 s and fails
+            stdout.write(b"conversion failed\n")
+            return Done(1)
+
+        recorder = device_ios.Recorder(UDID, {}, "chat", self.private, self.private / "log", clock=lambda: now[0])
+        recorder.raws = [self.private / "chat-recording-1.mov", self.private / "chat-recording-2.mov"]
+        for raw in recorder.raws:
+            raw.write_bytes(b"\0" * self.BIG)
+        recorder.marks, recorder.stopped = [0.0, 0.0], 0.0
+        recorder.process = type("P", (), {"send_signal": lambda self, n: None, "wait": lambda self, timeout: 0})()
+        with patch("device_ios.subprocess.run", side_effect=run):
+            self.assertEqual(recorder.stop(self.root), [])
+        self.assertEqual(timeouts, [device_ios.CONVERT_SECONDS, device_ios.CONVERSION_BUDGET_SECONDS - 400],
+                         "the second conversion gets what is left, and none starts after that")
+        self.assertIn("part 1: no conversion fit the cap (PresetAppleM4V720pHD failed (exit 1), Preset1280x720 failed "
+                      "(exit 1), Preset960x540 not tried (the scenario's conversion budget was spent))", recorder.dropped)
+        self.assertIn("part 2: no conversion fit the cap (PresetAppleM4V720pHD not tried", recorder.dropped)
+        self.assertEqual(recorder.notes[:3], ["part 1 PresetAppleM4V720pHD: exit 1; avconvert said: conversion failed",
+                                              "part 1 Preset1280x720: exit 1; avconvert said: conversion failed",
+                                              "part 1 Preset960x540: not tried, the scenario's conversion budget was "
+                                              "spent"])
+
+    def test_avconvert_error_class(self):
+        self.assertEqual(device_ios.error_class(b"Error Domain=AVFoundationErrorDomain Code=-11800 x Error "
+                                                b"Domain=AVFoundationErrorDomain Code=-11800"),
+                         "AVFoundationErrorDomain -11800")
+        self.assertEqual(device_ios.error_class(b"one\n  last words  \n\n"), "last words")
+        self.assertEqual(device_ios.error_class(b""), "nothing")
 
     def test_start_records_the_configured_simulator(self):
         recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
