@@ -332,7 +332,7 @@ class RunTests(Workspace):
             selection="chat,poll", agent=agent,
             env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5",
                  "GITHUB_RUN_ID": "39557415738"})
-        device, token, model, seconds, tag = seen[0]
+        device, token, model, seconds, tag = seen[-1]
         self.assertEqual({key: device[key] for key in ("MAY_DEVICE_PLATFORM", "MAY_DEVICE_UDID", "MAY_DEVICE_MAESTRO",
                                                         "MAY_DEVICE_BUNDLE")},
                          {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": UDID, "MAY_DEVICE_MAESTRO": "/fake/maestro",
@@ -341,14 +341,41 @@ class RunTests(Workspace):
         self.assertEqual((token[:13], model, seconds, tag), ("sk-ant-oat01-", "claude-sonnet-5-5",
                                                              device_agent.IOS_AGENT_SECONDS, "qa-39557415738-i-chat"))
         self.assertEqual(len(minted), 3, "one session per scenario and one for the cleanup")
-        self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("chat", "pass"),
-                                                                                         ("poll", "pass")])
+        self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("poll", "pass"),
+                                                                                         ("chat", "pass")],
+                         "chat runs last on iOS")
         self.assertEqual(self.delivered, [TOKEN + "1", TOKEN + "2"], "each scenario's messages, with its own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]], [["succeeded"]] * 2)
         self.assertIn("May device tests (ios): the test session's cleanup removed 2 tagged items", out)
         self.assertEqual(self.cleaned_tags, ["qa-39557415738-i"], "iOS's cleanup never matches Android's items")
         self.assertEqual(self.signed_out, [TOKEN + "1", TOKEN + "2", TOKEN + "3"],
                          "each scenario's shared session, then the cleanup's, signed out")
+
+    def test_notes_and_chat_run_last_on_ios(self):
+        """Run 40203481816: chat ran second and wedged, so poll and poll-skip found no budget left (coordinator,
+        25 Oct: sign-out, poll, poll-skip, notes, then chat)."""
+        seen = []
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            seen.append(tag.rsplit("-i-", 1)[1])
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        _, _, report, _, _ = self.run_it(
+            selection="chat,notes,poll,poll-skip,sign-out", agent=agent,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5",
+                 "GITHUB_RUN_ID": "39557415738"})
+        self.assertEqual([row["id"] for row in report["scenarios"]], ["sign-out", "poll", "poll-skip", "notes", "chat"])
+        self.assertEqual(seen, ["poll", "poll-skip", "notes", "chat"])
+
+    def test_scenarios_stopped_by_the_fail_fast_are_counted(self):
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            return {"state": "ok", "outcome": "blocked", "summary": "stopped", "hierarchy": "h", "actions": 4,
+                    "wedged": True}
+
+        _, _, _, out, _ = self.run_it(
+            selection="chat,poll", agent=agent,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
+        self.assertIn("May device tests (ios): 2 scenarios stopped after refused device acts in a row (fail-fast)", out)
 
     def test_the_server_reads_and_diagnostics_come_before_the_conversion(self):
         """Run 40181517145: poll's read came after a long conversion and got 401 (coordinator, 25 Oct)."""
@@ -459,6 +486,19 @@ class RunTests(Workspace):
         self.assertNotIn("Maestro 59", out, "never in the public log")
         self.assertFalse((self.private / "chat-onboarding.log").exists(), "moved into the private run log")
         self.assertIn(b"Maestro 0\n", (self.private / "device-run.log").read_bytes())
+
+    def test_the_public_log_never_names_a_changed_property(self):
+        shown = (b"2026-10-25 07:00:01.000 Df MayPlayground[1:2a] [com.apple.SwiftUI:Changed Body Properties] "
+                 b"ChatView: _position changed.\n"
+                 b"2026-10-25 07:00:02.000 Df MayPlayground[1:2a] [io.github.mayassistant.may.playground:watchdog] "
+                 b"main-thread stall 330 ms\n"
+                 b"2026-10-25 07:00:02.000 Df MayPlayground[1:2a] [io.github.mayassistant.may.playground:watchdog] "
+                 b"main-thread stall-after view-chat\n")
+        _, _, _, out, _ = self.run_it(diagnosed=lambda udid, env: device_ios.Diagnostics(
+            udid, env, reports=self.root / "no-reports", shown=lambda *a: shown))
+        self.assertIn("main-thread stall-after view-chat: 1", out)
+        self.assertNotIn("_position", out)
+        self.assertNotIn("ChatView", out)
 
     def test_the_run_prints_both_a_kept_and_a_dropped_part(self):
         class Both(FakeRecorder):
@@ -610,7 +650,43 @@ class DiagnosticsTests(Workspace):
                          [b"stall 900 ms", b"stall-after sync-publish", b"stall 400 ms", b"stall-after view-chat",
                           b"stall 3800 ms", b"stall-after sync-publish", b"stall 300 ms", b"stall-after not-agreed"],
                          "each after its own stall, in the log's order")
-        self.assertEqual(len(device_ios.STALL_AFTER_NAMES), 12)
+        self.assertEqual(len(device_ios.STALL_AFTER_NAMES), 13, "N's twelve and may-app #1318's view-chat-row")
+
+    def test_the_chat_bodys_changes_are_kept_privately_near_each_chat_stall_and_never_counted(self):
+        """may-app #1318 (coordinator, 25 Oct): ChatView's changed properties, private, capped around each stall."""
+        def line(second, text, process=b"MayPlayground[1:2a]", where=b"io.github.mayassistant.may.playground:watchdog"):
+            return b"2026-10-25 07:00:%02d.000 Df %s [%s] %s\n" % (second, process, where, text)
+
+        body = b"com.apple.SwiftUI:Changed Body Properties"
+        shown = b"".join([
+            line(1, b"ChatView: _early1 changed.", where=body), line(2, b"ChatView: _early2 changed.", where=body),
+            line(3, b"ChatView: _a changed.", where=body), line(4, b"ChatView: _b changed.", where=body),
+            line(5, b"ChatView: _position changed." + b" and then some more" * 20, where=body),
+            line(6, b"main-thread stall 330 ms"), line(6, b"main-thread stall-after view-chat"),
+            line(7, b"ChatView: _lonely changed.", where=body),
+            line(8, b"main-thread stall 300 ms"), line(8, b"main-thread stall-after sync-end"),
+            line(9, b"ChatView: _row changed.", where=body),
+            line(10, b"main-thread stall 280 ms"), line(10, b"main-thread stall-after view-chat-row"),
+            line(11, b"main-thread span chat-body 290 ms"),
+            line(12, b"OtherView: _x changed.", process=b"Other[3:4]", where=body)])
+        diagnostics = self.diagnostics(shown=shown)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        whole = (folder / ("chat" + device_tests.DIAG)).read_bytes().split(b"== watchdog ==\n")[1].splitlines()
+        kept = [entry.split(b"] ", 2)[-1] for entry in whole]
+        self.assertEqual(kept[:2], [b"ChatView: _a changed.", b"ChatView: _b changed."],
+                         "the three nearest before the chat stall")
+        self.assertTrue(kept[2].startswith(b"ChatView: _position changed. and then"), kept[2])
+        self.assertEqual(len(whole[2]), device_ios.MAX_BODY_LINE, "each cut")
+        self.assertNotIn(b"ChatView: _early1 changed.", kept)
+        self.assertNotIn(b"ChatView: _lonely changed.", kept, "none before a stall that is not the chat's")
+        self.assertIn(b"ChatView: _row changed.", kept, "the row breadcrumb counts as the chat's")
+        self.assertFalse(any(b"OtherView" in entry for entry in kept), "never another process's lines")
+        self.assertEqual(diagnostics.after, {"view-chat": 1, "sync-end": 1, "view-chat-row": 1})
+        self.assertEqual(diagnostics.spans, {"chat-body": [1, 290]})
+        self.assertEqual(diagnostics.stalls, 3)
 
     def test_the_onboarding_lines_and_the_recording_notes_land_redacted_in_the_diag(self):
         diagnostics = self.diagnostics()
@@ -766,8 +842,12 @@ class DiagnosticsTests(Workspace):
 
         with patch("device_tests.bounded_output", side_effect=bounded):
             self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"main-thread stall 300 ms\n")
-        self.assertEqual(seen, [(["xcrun", "simctl", "spawn", UDID, "log", "show", "--style", "compact", "--start",
-                                  "2026-10-25 00:10:00", "--predicate", device_ios.WATCHDOG], device_tests.MAX_DIAG)])
+        self.assertEqual(seen, [(["xcrun", "simctl", "spawn", UDID, "log", "show", "--style", "compact", "--info",
+                                  "--start", "2026-10-25 00:10:00", "--predicate",
+                                  '(subsystem == "io.github.mayassistant.may.playground" AND category == "watchdog") OR '
+                                  '(process == "MayPlayground" AND subsystem == "com.apple.SwiftUI" AND category == '
+                                  '"Changed Body Properties")'], device_tests.MAX_DIAG)],
+                         "SwiftUI's lines from the Playground's own process alone (may-app #1318)")
         with patch("device_tests.bounded_output", return_value=None):
             self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"", "no answer in time")
 
@@ -789,7 +869,7 @@ class DiagnosticsTests(Workspace):
 class RecorderTests(Workspace):
     BIG = device_ios.MAX_RECORDING + 1
 
-    def recorder(self, outcomes, raw=b"raw", seconds=None):
+    def recorder(self, outcomes, raw=None, seconds=None):
         """stop() with each preset's (exit code, output size) from outcomes, a tail's under ("tail", preset); a preset
         not listed fails. seconds: how long the recording ran."""
         sent, presets = [], []
@@ -827,7 +907,8 @@ class RecorderTests(Workspace):
                                        clock=lambda: float(seconds or 0))
         recorder.process = Process()
         recorder.raws, recorder.marks = [self.private / "sign-in-recording-1.mov"], [0.0]
-        recorder.raws[0].write_bytes(raw)
+        # Over the cap unless the test says otherwise: a part that fits is never converted.
+        recorder.raws[0].write_bytes(b"\0" * (device_ios.MAX_RECORDING + 1) if raw is None else raw)
         if seconds is not None:
             recorder.started = 0.0
         with patch("device_ios.subprocess.run", side_effect=run):
@@ -851,14 +932,13 @@ class RecorderTests(Workspace):
         self.assertEqual((folder / "sign-in.mp4").stat().st_size, 2000)
         self.assertEqual((leftovers, recorder.dropped, recorder.kept), ([], None, None))
 
-    def test_no_conversion_keeps_the_original_when_it_fits(self):
+    def test_a_part_that_fits_is_published_as_recorded_without_any_conversion(self):
+        """Run 40203481816: avconvert failed parts already under the cap (exit 205) (coordinator, 25 Oct)."""
         names, _, presets, folder, recorder, leftovers = self.recorder({}, raw=b"h264" * 10)
-        self.assertEqual(len(presets), len(device_ios.CONVERSIONS))
-        self.assertEqual(names, ["sign-in.mp4"], "the original was not kept")
+        self.assertEqual(presets, [], "no avconvert ran")
+        self.assertEqual(names, ["sign-in.mp4"])
         self.assertEqual((folder / "sign-in.mp4").read_bytes(), b"h264" * 10)
-        self.assertEqual((leftovers, recorder.dropped), ([], None))
-        self.assertEqual(recorder.kept, "unconverted: no conversion fit the cap (PresetAppleM4V720pHD failed (exit 1), "
-                                        "Preset1280x720 failed (exit 1), Preset960x540 failed (exit 1))")
+        self.assertEqual((leftovers, recorder.dropped, recorder.kept, recorder.notes), ([], None, None, []))
 
     def test_nothing_that_fits_is_dropped_and_says_why(self):
         names, _, _, folder, recorder, leftovers = self.recorder(
@@ -1009,13 +1089,15 @@ class RecorderTests(Workspace):
         recorder = device_ios.Recorder(UDID, {}, "chat", self.private, self.private / "log", clock=lambda: 0.0)
         recorder.raws = [self.private / "chat-recording-1.mov", self.private / "chat-recording-2.mov",
                          self.private / "chat-recording-3.mov"]
-        for raw, data in zip(recorder.raws, (b"a", b"b" * 10, b"\0" * self.BIG)):
+        for raw, data in zip(recorder.raws, (b"\0" * self.BIG, b"b" * 10, b"\0" * self.BIG)):
             raw.write_bytes(data)
         recorder.marks, recorder.stopped = [0.0, 300.0, 600.0], 0.0
-        sizes = iter([(0, 100), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0)])
+        sizes = iter([(0, 100), (1, 0), (1, 0), (1, 0)])
+        converted = []
 
         def run(argv, stdout, stderr, stdin, env, timeout):
-            code, size = next(sizes)
+            converted.append(Path(argv[argv.index("--source") + 1]).name)
+            code, size = next(sizes, (1, 0))
             if size:
                 Path(argv[argv.index("--output") + 1]).write_bytes(b"\0" * size)
             stdout.write(b"Error Domain=AVFoundationErrorDomain Code=-11800 \"The operation could not be completed\" "
@@ -1026,14 +1108,15 @@ class RecorderTests(Workspace):
         with patch("device_ios.subprocess.run", side_effect=run):
             names = recorder.stop(folder)
         self.assertEqual(names, ["chat-part1.mp4", "chat-part2.mp4"])
-        self.assertEqual(recorder.kept, "part 2: unconverted: no conversion fit the cap (PresetAppleM4V720pHD failed "
-                                        "(exit 1), Preset1280x720 failed (exit 1), Preset960x540 failed (exit 1))")
+        self.assertEqual((folder / "chat-part2.mp4").read_bytes(), b"b" * 10, "part 2 fit, so it is the recording")
+        self.assertNotIn("chat-recording-2.mov", converted, "a part that fits is never converted")
+        self.assertIsNone(recorder.kept)
         self.assertEqual(recorder.dropped, "part 3: no conversion fit the cap (PresetAppleM4V720pHD failed (exit 1), "
                                            "Preset1280x720 failed (exit 1), Preset960x540 failed (exit 1)) and the "
                                            "original is 38 MB, over it")
-        self.assertEqual(recorder.notes[0], "part 2 PresetAppleM4V720pHD: exit 1; avconvert said: "
+        self.assertEqual(recorder.notes[0], "part 3 PresetAppleM4V720pHD: exit 1; avconvert said: "
                                             "AVFoundationErrorDomain -11800, NSOSStatusErrorDomain -12780")
-        self.assertEqual(len(recorder.notes), 6, "each failed conversion, privately")
+        self.assertEqual(len(recorder.notes), 3, "each failed conversion, privately")
 
     def test_the_scenarios_conversions_share_one_budget(self):
         now = [0.0]
@@ -1074,6 +1157,9 @@ class RecorderTests(Workspace):
         recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
         with patch("device_ios.subprocess.Popen") as popen:
             recorder.start()
+            # Halted here, so its part thread never wakes after the test's folder is gone.
+            self.assertTrue(recorder.halt())
+        self.assertFalse(recorder.thread.is_alive())
         self.assertEqual(popen.call_args.args[0][:6], ["xcrun", "simctl", "io", UDID, "recordVideo", "--codec=h264"])
 
 

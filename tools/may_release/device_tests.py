@@ -168,6 +168,7 @@ SERIAL = "emulator-5554"
 RATE_LIMITED = "Claude is rate limited (skipped, never a pass)"
 UNFINISHED = "the agent did not finish"
 BLOCKED = "the agent reported it was blocked"
+WEDGED = f"the device refused {device_mcp.FAIL_FAST} acts in a row, so the agent was stopped (iOS)"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
 DELIVERY_FAILED = "May's server did not record a succeeded reply"
@@ -1438,6 +1439,8 @@ def combined(entry, record, judged, sends=False):
         return {"verdict": "fail", "reason": SMOKE_MAESTRO}
     if record.get("state") == "rate_limited" or judged[0] == "rate_limited":
         return {"verdict": "skipped", "reason": RATE_LIMITED}
+    if record.get("wedged") is True:
+        return {"verdict": "fail", "reason": WEDGED}
     if record.get("outcome") == "blocked":
         return {"verdict": "fail", "reason": BLOCKED}
     if record.get("outcome") != "completed":

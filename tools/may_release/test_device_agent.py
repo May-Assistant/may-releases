@@ -899,6 +899,15 @@ class AgentRunnerTests(unittest.TestCase):
                                           {"outcome": "completed", "summary": "ok", "actions": 1,
                                            "hierarchy_failure": stored})
                 self.assertEqual(found["hierarchy_failure"], kept, "fixed words alone")
+        for stored, kept in ((True, True), ("yes", None), (1, None)):
+            with self.subTest(wedged=stored):
+                found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
+                                          {"outcome": "blocked", "summary": "x", "actions": 3, "wedged": stored})
+                self.assertEqual(found.get("wedged"), kept, "the fail-fast's mark, true alone")
+        found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
+                                  {"outcome": "unfinished", "summary": "", "hierarchy": "h", "actions": 9})
+        self.assertEqual((found["outcome"], found["actions"], found["hierarchy"]), (None, 9, "h"),
+                         "a run that never called done keeps its steps and screen, with no outcome of its own")
         command = seen["command"]
         self.assertEqual(command[:3], ["/cli/claude", "-p", "Do qa-12345678 now"])
         for flag, value in (("--tools", ""), ("--strict-mcp-config", None), ("--permission-mode", "dontAsk"),
@@ -1306,6 +1315,27 @@ class DeviceServerTests(unittest.TestCase):
                                                        "emulator-5554", "MAY_DEVICE_AGENT_RESULT": "/r",
                                                        "MAY_DEVICE_STEPS": steps}))
 
+    def test_each_call_leaves_the_steps_so_far_until_done(self):
+        """Run 40209923275: iOS notes timed out with nothing recorded; now each call rewrites the result (coordinator,
+        25 Oct)."""
+        self.call("hierarchy")
+        self.call("back")
+        assert self.result.is_file(), "no result after two calls"
+        stored = json.loads(self.result.read_text())
+        self.assertEqual((stored["outcome"], stored["actions"], stored["summary"]), ("unfinished", 2, ""))
+        self.assertIn("Chats", stored["hierarchy"], "the last screen the agent read, for the judge")
+        self.assertFalse(self.call("done", outcome="completed", summary="ok")[0])
+        self.call("back")
+        stored = json.loads(self.result.read_text())
+        self.assertEqual((stored["outcome"], stored["summary"]), ("completed", "ok"), "done is never overwritten")
+
+    def test_android_never_stops_on_refused_acts(self):
+        """The fail-fast is iOS's alone (coordinator, 25 Oct)."""
+        with patch("device_mcp.adb", return_value=(1, b"")):
+            answers = [self.call("back") for _ in range(5)]
+        self.assertEqual({content[0]["text"] for _, content in answers}, {"The device did not take it"})
+        self.assertFalse(self.config["wedged"])
+
     def test_settings_need_an_emulator_serial(self):
         self.assertIsNone(device_mcp.settings({"MAY_DEVICE_ADB": "/sdk/adb", "MAY_DEVICE_SERIAL": "192.168.0.2:5555",
                                                "MAY_DEVICE_AGENT_RESULT": "/r"}))
@@ -1369,6 +1399,32 @@ class IosDeviceServerTests(unittest.TestCase):
 
         with patch("device_mcp.subprocess.run", side_effect=run):
             return device_mcp.call(name, args, self.config)
+
+    def test_three_refused_acts_in_a_row_stop_the_agent_blocked(self):
+        """Run 40203481816: every iOS act after the first refusal was refused too, 90 s each (coordinator, 25 Oct)."""
+        with patch("device_mcp.flow", side_effect=[1, 1, 0, 1, 1, 1]) as flow:
+            answers = [self.call("tap", x=180, y=120) for _ in range(5)]
+            self.assertEqual([failed for failed, _ in answers], [True, True, False, True, True],
+                             "a taken act starts the count again")
+            self.assertFalse(self.config["wedged"])
+            failed, content = self.call("tap", x=180, y=120)
+        self.assertTrue(failed)
+        self.assertEqual(content[0]["text"], device_mcp.WEDGED_TEXT)
+        self.assertEqual(flow.call_count, 6)
+        self.assertTrue(Path(self.config["result"]).is_file(), "the stop was not recorded at once")
+        stored = json.loads(Path(self.config["result"]).read_text())
+        self.assertEqual((stored["outcome"], stored.get("wedged")), ("blocked", True),
+                         "recorded at once, so an agent that never calls done still leaves its reason")
+        for name, args in (("screenshot", {}), ("hierarchy", {}), ("tap", {"x": 1, "y": 1}), ("wait", {"seconds": 1})):
+            with self.subTest(name=name):
+                self.assertEqual(self.call(name, **args), (True, [{"type": "text", "text": device_mcp.WEDGED_TEXT}]))
+        self.assertFalse(self.call("done", outcome="completed", summary="it worked")[0])
+        stored = json.loads(Path(self.config["result"]).read_text())
+        self.assertEqual((stored["outcome"], stored.get("wedged")), ("completed", True), "done never clears it")
+        verdict = device_tests.combined({"server": []}, {"state": "ok", **stored}, ("pass", ""))
+        self.assertEqual(verdict, {"verdict": "fail", "reason": device_tests.WEDGED},
+                         "a stopped agent is never a pass, and the report says why")
+        self.assertIn(device_tests.WEDGED, publish.REASONS)
 
     def test_each_act_is_one_fixed_maestro_command_in_points(self):
         self.call("tap", x=180, y=120)
