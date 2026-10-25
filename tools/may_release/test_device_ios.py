@@ -1157,6 +1157,9 @@ class RecorderTests(Workspace):
         recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
         with patch("device_ios.subprocess.Popen") as popen:
             recorder.start()
+            # Halted here, so its part thread never wakes after the test's folder is gone.
+            self.assertTrue(recorder.halt())
+        self.assertFalse(recorder.thread.is_alive())
         self.assertEqual(popen.call_args.args[0][:6], ["xcrun", "simctl", "io", UDID, "recordVideo", "--codec=h264"])
 
 
