@@ -16,6 +16,7 @@ import device_agent
 import device_ios
 import device_tests
 from device_tests import DeviceTestsError
+import publish
 import renders
 from test_device_tests import network_tripwire, FLOW, MP4, SHA, TOKEN
 from test_renders import png
@@ -122,7 +123,7 @@ class FakeRecorder:
 
 class RunTests(Workspace):
     def run_it(self, selection="sign-in,connections", env=None, maestro_fails=False, agent=None, budgeted=None,
-               calls_left=None, fail_mint=()):
+               calls_left=None, fail_mint=(), diagnosed=None):
         calls, minted, self.maestro_timeouts, self.delivered = [], [], [], []
         self.built()
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
@@ -166,7 +167,10 @@ class RunTests(Workspace):
                                      deleted_by=lambda base, token: self.deleted.append(token) or True,
                                      calls_left=calls_left or (lambda base, token: 100),
                                      delivered=lambda base, token, tag: self.delivered.append(token) or
-                                     ["succeeded"])
+                                     ["succeeded"],
+                                     diagnosed=diagnosed or (lambda udid, env: device_ios.Diagnostics(
+                                         udid, env, reports=self.root / "no-reports",
+                                         shown=lambda *a: b"")))
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             if "CLAUDE_CODE_OAUTH_TOKEN" in environ:
                 os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = environ["CLAUDE_CODE_OAUTH_TOKEN"]
@@ -174,6 +178,35 @@ class RunTests(Workspace):
         runs = list((self.root / device_tests.OUT).iterdir())
         report = json.loads((runs[0] / "ios" / "report.json").read_text())
         return calls, minted, report, out.getvalue(), runs[0]
+
+    def test_each_scenarios_diagnostics_are_kept_while_its_session_lasts_and_the_log_gives_counts(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        events = []
+        test = self
+
+        class Keeping(device_ios.Diagnostics):
+            def __init__(self, udid, env):
+                super().__init__(udid, env, reports=test.root / "no-reports",
+                                 shown=lambda *a: b"main-thread stall 300 ms\nmain-thread stall 820 ms\n")
+
+            def begin(self):
+                events.append("begin")
+                super().begin()
+
+            def keep(self, folder, scenario, token):
+                events.append(("keep", scenario, token, list(test.signed_out)))
+                super().keep(folder, scenario, token)
+
+        calls, minted, report, out, run = self.run_it(diagnosed=Keeping)
+        self.assertEqual(events, ["begin", ("keep", "sign-in", TOKEN + "1", []),
+                                  "begin", ("keep", "connections", TOKEN + "2", [TOKEN + "1"])],
+                         "kept before its own sign-out, with its own session for the redaction")
+        self.assertEqual(sorted(path.name for path in (run / "ios").glob("*" + device_tests.DIAG)),
+                         ["connections.diag.txt", "sign-in.diag.txt"])
+        self.assertIn("May device tests (ios): diagnostics kept for 2 scenarios (4 main-thread stalls, the longest "
+                      "820 ms; 0 with a crash)", out.splitlines())
+        self.assertIn("May device tests (ios): sign-in diagnostics: 0 lines dropped", out.splitlines())
+        self.assertNotIn("main-thread stall 300", out, "the public log gives counts alone")
 
     def test_reduce_motion_is_turned_on_before_the_app_starts_only_when_dispatched(self):
         """The coordinator's A/B switch (25 Oct): ios_reduce_motion, off unless dispatched true."""
@@ -373,6 +406,101 @@ class RunTests(Workspace):
                 with self.assertRaises(Exception) as refused:
                     self.run_it(env=env)
                 self.assertIn(message, refused.exception.args[0])
+
+
+class DiagnosticsTests(Workspace):
+    """Android's twin: the watchdog's stalls (may-app #1272) and the Playground's own new crash reports, redacted."""
+
+    STALLS = (b"2026-10-25 00:10:01.100 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+              b"main-thread stall 412 ms\n"
+              b"2026-10-25 00:10:05.300 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+              b"main-thread stall 1250 ms\n")
+
+    def diagnostics(self, shown=None, reports=None):
+        self.shown = []
+        reports = reports or self.root / "reports"
+        reports.mkdir(exist_ok=True)
+
+        def show(udid, env, start):
+            self.shown.append((udid, start))
+            return self.STALLS if shown is None else shown
+
+        return device_ios.Diagnostics(UDID, {}, reports=reports, shown=show)
+
+    def test_each_scenario_keeps_its_stalls_and_the_playgrounds_new_crash_reports_redacted(self):
+        reports = self.root / "reports"
+        reports.mkdir()
+        (reports / "MayPlayground-2026-10-24-230000.ips").write_bytes(b"old crash\n")
+        diagnostics = self.diagnostics(reports=reports, shown=self.STALLS + b"Authorization: Bearer " +
+                                       TOKEN.encode() + b"\nmain-thread stall 9 ms from sam.avery@example.com\n")
+        (reports / "MayPlayground-2026-10-25-001002.ips").write_bytes(
+            b'{"procName":"MayPlayground"}\nThread 0 Crashed:\n0 MayPlayground ChatView.body\n'
+            b"cookie: sid=" + TOKEN.encode() + b"\n")
+        (reports / "SpringBoard-2026-10-25-001002.ips").write_bytes(b"another process\n")
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"== crash ==\n", text)
+        self.assertIn(b"Thread 0 Crashed:", text)
+        self.assertIn(b"== watchdog ==\n", text)
+        self.assertIn(b"main-thread stall 1250 ms", text)
+        self.assertIn(b"main-thread stall 9 ms from ***@example.com", text)
+        for absent in (b"old crash", b"another process", TOKEN.encode(), b"sam.avery", b"Bearer"):
+            self.assertNotIn(absent, text)
+        self.assertEqual(device_tests.kept_lines(text, ""), (text, 0), "publish's line-by-line check keeps it whole")
+        self.assertTrue(publish.diagnostics_ok(text))
+        self.assertEqual((diagnostics.kept, diagnostics.stalls, diagnostics.longest, diagnostics.crashes,
+                          diagnostics.dropped), (1, 3, 1250, 1, {"chat": 1}),
+                         "the crash report's cookie line; a log line that is no stall is never read")
+        self.assertEqual(self.shown[0][0], UDID)
+        diagnostics.begin()
+        diagnostics.keep(folder, "notes", TOKEN)
+        self.assertEqual(diagnostics.crashes, 1, "a crash report is kept once, by the scenario it came in")
+
+    def test_nothing_new_writes_nothing(self):
+        diagnostics = self.diagnostics(shown=b"Timestamp               Ty Process[PID:TID]\n")
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "sign-in", TOKEN)
+        self.assertEqual(list(folder.iterdir()), [])
+        self.assertEqual((diagnostics.kept, diagnostics.stalls, diagnostics.crashes), (0, 0, 0))
+
+    def test_the_log_read_names_the_playgrounds_watchdog_alone_and_never_fails(self):
+        """Coordinator, 25 Oct: bounded to the Playground's subsystem, so nothing from another process is read."""
+        self.assertEqual(device_ios.WATCHDOG,
+                         'subsystem == "io.github.mayassistant.may.playground" AND category == "watchdog"')
+        seen = []
+
+        def run(argv, capture_output, stdin, env, timeout):
+            seen.append((argv, timeout))
+            return Done()
+
+        with patch("device_ios.subprocess.run", side_effect=run):
+            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"")
+        self.assertEqual(seen, [(["xcrun", "simctl", "spawn", UDID, "log", "show", "--style", "compact", "--start",
+                                  "2026-10-25 00:10:00", "--predicate", device_ios.WATCHDOG],
+                                 device_tests.DIAG_SECONDS)])
+        with patch("device_ios.subprocess.run", side_effect=subprocess.TimeoutExpired("log", 1)):
+            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"")
+        with patch("device_ios.subprocess.run", side_effect=FileNotFoundError()):
+            self.assertEqual(device_ios.show_log(UDID, {}, "2026-10-25 00:10:00"), b"")
+
+    def test_a_link_or_another_name_in_the_reports_folder_is_never_read(self):
+        reports = self.root / "reports"
+        reports.mkdir()
+        secret = self.root / "secret.txt"
+        secret.write_bytes(b"outside\n")
+        diagnostics = self.diagnostics(reports=reports, shown=b"")
+        (reports / "MayPlayground-link.ips").symlink_to(secret)
+        (reports / "MayPlayground.ips.bak").write_bytes(b"not a report\n")
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        self.assertEqual(list(folder.iterdir()), [])
 
 
 class RecorderTests(Workspace):
