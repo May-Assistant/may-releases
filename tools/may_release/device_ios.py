@@ -218,6 +218,12 @@ def outcome(failed, converted):
 # category. The predicate names the Playground's own subsystem, so the log of no other process is ever read.
 WATCHDOG = 'subsystem == "io.github.mayassistant.may.playground" AND category == "watchdog"'
 STALL = re.compile(rb"main-thread stall ([0-9]{1,7}) ms")
+# may-app #1281: beside the stalls, one line per named span of main-thread work of 250 ms or more, in the same category
+# ("main-thread span event-store 1180 ms"). Every span line is kept, in the log's own order among the stalls; the public
+# log counts the five names agreed with N alone, each with its longest.
+SPAN = re.compile(rb"main-thread span ([a-z-]{1,40}) ([0-9]{1,7}) ms[ \t]*\r?\n?$")
+SPAN_NAMES = ("event-store", "recognizer", "dictation-capability", "calendar-access", "agenda-state")
+MAX_SPAN_SECTION = device_tests.MAX_DIAG // 8
 # The simulator's crash reports land in the host's own folder; only the Playground's process is kept.
 CRASH_REPORTS = Path.home() / "Library" / "Logs" / "DiagnosticReports"
 CRASH_REPORT = re.compile(r"MayPlayground[-_][A-Za-z0-9._-]{1,120}\.(?:ips|crash)")
@@ -245,6 +251,7 @@ class Diagnostics:
         self.seen = set(self.crash_reports())
         self.start = None
         self.kept = self.stalls = self.longest = self.crashes = self.drivers = 0
+        self.spans = {}  # name: [count, longest ms], for SPAN_NAMES alone
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
 
     def crash_reports(self):
@@ -274,8 +281,8 @@ class Diagnostics:
                     found.append(b"== crash ==\n" + data + b"\n")
         self.crashes += bool(found)
         lines = [line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
-                 .splitlines(keepends=True) if STALL.search(line)]
-        stalls = [int(STALL.search(line).group(1)) for line in lines]
+                 .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line)]
+        stalls = [int(STALL.search(line).group(1)) for line in lines if STALL.search(line)]
         self.stalls += len(stalls)
         self.longest = max([self.longest, *stalls])
         refused = b""
@@ -291,12 +298,24 @@ class Diagnostics:
                                                                                                          token)
         refused, from_driver = kept_lines(refused, token)
         self.drivers += bool(refused)
+        # Counted from what kept_lines kept, so a span line it dropped is neither published nor counted.
+        spans = [line for line in watchdog.splitlines(keepends=True) if SPAN.search(line)]
+        for line in spans:
+            name, ms = SPAN.search(line).group(1).decode(), int(SPAN.search(line).group(2))
+            if name in SPAN_NAMES:
+                count, longest = self.spans.get(name, [0, 0])
+                self.spans[name] = [count + 1, max(longest, ms)]
         crashes = crashes[:device_tests.MAX_DIAG // 2]
-        room = device_tests.MAX_DIAG - len(crashes) - len(refused) - 128  # the section headers' room
+        room = device_tests.MAX_DIAG - len(crashes) - len(refused) - 192  # the section headers' room
+        # The watchdog's newest lines fill the rest; when that trims any, every span line goes ahead of it too.
+        trimmed = len(watchdog) > room
+        section = b"".join(spans)[:MAX_SPAN_SECTION] if trimmed else b""
+        room -= len(section)
         watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
         if not (crashes or refused or watchdog):
             return
         text = (crashes + (b"== driver ==\n" + refused if refused else b"") +
+                (b"== spans ==\n" + section if section else b"") +
                 (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
         text = text[:device_tests.MAX_DIAG].decode("utf-8", "ignore").encode()
         try:
@@ -492,6 +511,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     if kept:
         print(f"May device tests (ios): diagnostics kept for {kept} scenarios ({stalls} main-thread stalls, the longest "
               f"{longest} ms; {crashes} with a crash; {drivers} with refused device acts)")
+    for name in SPAN_NAMES:
+        if name in diagnostics.spans:
+            count, longest = diagnostics.spans[name]
+            print(f"May device tests (ios): main-thread span {name}: {count}, the longest {longest} ms")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:

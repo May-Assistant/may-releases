@@ -187,7 +187,8 @@ class RunTests(Workspace):
         class Keeping(device_ios.Diagnostics):
             def __init__(self, udid, env):
                 super().__init__(udid, env, reports=test.root / "no-reports",
-                                 shown=lambda *a: b"main-thread stall 300 ms\nmain-thread stall 820 ms\n")
+                                 shown=lambda *a: b"main-thread stall 300 ms\nmain-thread span recognizer 410 ms\n"
+                                                  b"main-thread stall 820 ms\nmain-thread span event-store 1180 ms\n")
 
             def begin(self):
                 events.append("begin")
@@ -210,6 +211,10 @@ class RunTests(Workspace):
                       "820 ms; 0 with a crash; 0 with refused device acts)", out.splitlines())
         self.assertIn("May device tests (ios): sign-in diagnostics: 0 lines dropped", out.splitlines())
         self.assertNotIn("main-thread stall 300", out, "the public log gives counts alone")
+        spans = [line for line in out.splitlines() if "main-thread span" in line]
+        self.assertEqual(spans, ["May device tests (ios): main-thread span event-store: 2, the longest 1180 ms",
+                                 "May device tests (ios): main-thread span recognizer: 2, the longest 410 ms"],
+                         "per name across the scenarios, in the agreed order, only the names seen")
 
     def test_reduce_motion_is_turned_on_before_the_app_starts_only_when_dispatched(self):
         """The coordinator's A/B switch (25 Oct): ios_reduce_motion, off unless dispatched true."""
@@ -429,6 +434,55 @@ class DiagnosticsTests(Workspace):
             return self.STALLS if shown is None else shown
 
         return device_ios.Diagnostics(UDID, {}, reports=reports, shown=show)
+
+    SPANS = (b"2026-10-25 03:11:31.900 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+             b"main-thread span event-store 1180 ms\n"
+             b"2026-10-25 03:11:32.380 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+             b"main-thread stall 1177 ms\n"
+             b"2026-10-25 03:11:33.000 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+             b"main-thread span recognizer 410 ms\n"
+             b"2026-10-25 03:11:33.100 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+             b"main-thread span not-agreed 300 ms\n"
+             b"2026-10-25 03:11:34.000 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+             b"main-thread span event-store 600 ms\n"
+             b"2026-10-25 03:11:35.000 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:watchdog] "
+             b"main-thread span event-store 700 ms during sam.avery@example.com\n")
+
+    def test_the_watchdogs_spans_are_kept_among_the_stalls_and_counted_by_agreed_name(self):
+        """may-app #1281: N's named spans of main-thread work, beside the stalls."""
+        diagnostics = self.diagnostics(shown=self.SPANS)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "notes", TOKEN)
+        text = (folder / ("notes" + device_tests.DIAG)).read_bytes()
+        watchdog = text.split(b"== watchdog ==\n")[1].splitlines()
+        self.assertEqual([line.split(b"] ")[-1] for line in watchdog],
+                         [b"main-thread span event-store 1180 ms", b"main-thread stall 1177 ms",
+                          b"main-thread span recognizer 410 ms", b"main-thread span not-agreed 300 ms",
+                          b"main-thread span event-store 600 ms"], "in the log's own order, stalls and spans together")
+        self.assertNotIn(b"== spans ==", text, "a separate section only when the log is trimmed")
+        self.assertEqual(diagnostics.spans, {"event-store": [2, 1180], "recognizer": [1, 410]},
+                         "an unknown name is kept privately but not counted, and a line not ending at ms is no span")
+        self.assertEqual((diagnostics.stalls, diagnostics.longest), (1, 1177), "spans are never stalls")
+        self.assertTrue(publish.diagnostics_ok(text))
+
+    def test_a_trimmed_watchdog_log_never_loses_its_spans(self):
+        flood = b"".join(b"2026-10-25 03:12:%02d.000 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:"
+                         b"watchdog] main-thread stall %d ms\n" % (i % 60, 300 + i) for i in range(6000))
+        diagnostics = self.diagnostics(shown=self.SPANS + flood)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "notes", TOKEN)
+        text = (folder / ("notes" + device_tests.DIAG)).read_bytes()
+        self.assertLessEqual(len(text), device_tests.MAX_DIAG)
+        self.assertIn(b"== spans ==\n", text)
+        spans, watchdog = text.split(b"== spans ==\n")[1].split(b"== watchdog ==\n")
+        self.assertIn(b"main-thread span event-store 1180 ms", spans)
+        self.assertNotIn(b"span event-store 1180", watchdog, "the trimmed log kept only its newest lines")
+        self.assertIn(b"main-thread stall 6299 ms", watchdog)
+        self.assertEqual(diagnostics.spans["event-store"], [2, 1180])
 
     def test_each_scenario_keeps_its_stalls_and_the_playgrounds_new_crash_reports_redacted(self):
         reports = self.root / "reports"
