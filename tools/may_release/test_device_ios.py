@@ -272,7 +272,7 @@ class RunTests(Workspace):
                           "MAY_DEVICE_BUNDLE": device_ios.BUNDLE})
         self.assertNotIn(TOKEN, json.dumps(device), "the staging session never reaches the agent")
         self.assertEqual((token[:13], model, seconds, tag), ("sk-ant-oat01-", "claude-sonnet-5-5",
-                                                             device_agent.IOS_AGENT_SECONDS, "qa-39557415738"))
+                                                             device_agent.IOS_AGENT_SECONDS, "qa-39557415738-chat"))
         self.assertEqual(len(minted), 3, "one session per scenario and one for the cleanup")
         self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("chat", "ui-pass"),
                                                                                          ("poll", "pass")])

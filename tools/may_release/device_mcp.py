@@ -242,12 +242,44 @@ def compact(xml):
     return "\n".join(lines)[:MAX_HIERARCHY]
 
 
+# Run 40138900610: the done-time dump came back empty for Android's notes and poll-skip, so the judge had nothing to
+# read. A failed dump is tried once more, DUMP_RETRY_SECONDS later and --compressed, and its failure is named in the
+# agent's private record, in fixed words: DUMP_FAILURES.
+DUMP_RETRY_SECONDS = 2
+DUMP_FAILURES = ("adb failed", "no idle state", "unreadable", "iOS hierarchy failed")
+
+
+def android_dump(config):
+    """(uiautomator's XML, None), or (None, why) once both tries failed."""
+    why = None
+    for argv in (("dump", "/dev/tty"), ("dump", "--compressed", "/dev/tty")):
+        if why:
+            time.sleep(DUMP_RETRY_SECONDS)
+        status, data = adb(config, "exec-out", "uiautomator", *argv)
+        xml = data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0]
+        if status:
+            why = "adb failed"
+        elif b"idle state" in data:
+            why = "no idle state"
+        else:
+            try:
+                ElementTree.fromstring(xml)
+            except ElementTree.ParseError:
+                why = "unreadable"
+            else:
+                return xml, None
+    return None, why
+
+
 def current_hierarchy(config):
-    """The screen's hierarchy now, compacted (one element per line), or "" when it could not be read."""
+    """The screen's hierarchy now, compacted (one element per line), or "" when it could not be read (and why, in
+    config["dump_failure"])."""
     if config["platform"] == "ios":
-        return ios_hierarchy(config)
-    status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
-    return "" if status else compact(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
+        text = ios_hierarchy(config)
+        config["dump_failure"] = None if text else "iOS hierarchy failed"
+        return text
+    xml, config["dump_failure"] = android_dump(config)
+    return "" if xml is None else compact(xml)
 
 
 def record(config, outcome, summary):
@@ -256,7 +288,8 @@ def record(config, outcome, summary):
     kept, _ = kept_lines(config["hierarchy"].encode(), "")
     with open(config["result"], "w", encoding="utf-8") as output:
         json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
-                   "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY]}, output)
+                   "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
+                   "hierarchy_failure": config.get("hierarchy_failure")}, output)
 
 
 def call(name, args, config):
@@ -270,8 +303,11 @@ def call(name, args, config):
         # The judge's evidence is the screen as the agent leaves it, taken here (proof run 40123018291: the judge
         # read the agent's last look, from before it sent the message, and failed a delivered chat).
         fresh = current_hierarchy(config)
-        config["hierarchy"] = fresh or ("(no fresh hierarchy at done; the agent's last look follows)\n" +
-                                        config["hierarchy"] if config["hierarchy"] else "")
+        config["hierarchy_failure"] = None if fresh else config.get("dump_failure")
+        why = config["hierarchy_failure"] or "an empty screen"
+        config["hierarchy"] = fresh or (f"(no fresh hierarchy at done: {why}; the agent's last look follows)\n" +
+                                        config["hierarchy"] if config["hierarchy"] else
+                                        f"(no hierarchy at done: {why}; the agent never read one)")
         record(config, outcome, summary)
         return False, [{"type": "text", "text": "Recorded. Stop now."}]
     if name not in {tool["name"] for tool in TOOLS}:
@@ -322,8 +358,8 @@ def call(name, args, config):
     if name != "type":
         return False, [{"type": "text", "text": "Done"}]
     # What landed, so the agent never types it again piece by piece (run 40119835677: three minutes on one sentence).
-    status, data = adb(config, "exec-out", "uiautomator", "dump", "/dev/tty")
-    landed = None if status else focused_text(data.split(b"UI hierchary dumped")[0].split(b"UI hierarchy dumped")[0])
+    xml, _ = android_dump(config)
+    landed = None if xml is None else focused_text(xml)
     if landed is None:
         return False, [{"type": "text", "text": "Done; the focused field could not be read, so take a hierarchy"}]
     return False, [{"type": "text", "text": f"Done. The focused field now reads: {landed!r}"}]

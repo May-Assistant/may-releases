@@ -261,6 +261,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 accounts.finish(row, base, token)
                 token = ""
                 continue
+            own = device_tests.scenario_tag(tag, row)  # the scenario's own tag
             at(f"{row['id']}: launching the app")
             launch(udid, env, token, log)
             recorder = Recorder(udid, env, row["id"], private, log)
@@ -285,7 +286,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {})}
-                records[row["id"]] = agent(cli, row["goal"], tag, device, private / "agent" / row["id"], claude[0],
+                records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"], claude[0],
                                            claude[1], seconds=device_agent.IOS_AGENT_SECONDS)
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
@@ -303,12 +304,12 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
             for check in row.get("truth", []):
                 if "question" in check:
-                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], tag)
+                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], own)
                 else:
-                    path, (status, found) = check["get"], truth(base, token, check["get"], tag)
+                    path, (status, found) = check["get"], truth(base, token, check["get"], own)
                 entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
             if device_tests.sends_messages(row):
-                codes = delivered(base, token, tag)
+                codes = delivered(base, token, own)
                 if codes is not None:
                     entry["delivery"] = codes
             accounts.finish(row, base, token)
