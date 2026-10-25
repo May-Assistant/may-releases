@@ -220,9 +220,11 @@ WATCHDOG = 'subsystem == "io.github.mayassistant.may.playground" AND category ==
 STALL = re.compile(rb"main-thread stall ([0-9]{1,7}) ms")
 # may-app #1281: beside the stalls, one line per named span of main-thread work of 250 ms or more, in the same category
 # ("main-thread span event-store 1180 ms"). Every span line is kept, in the log's own order among the stalls; the public
-# log counts the five names agreed with N alone, each with its longest.
+# log counts the names agreed with N alone, each with its longest: five from #1281, and three on chat's path (the
+# chat's publish, its inbox rows and each transcript page's merge), after run 40164384433's chat stalled every 3 s.
 SPAN = re.compile(rb"main-thread span ([a-z-]{1,40}) ([0-9]{1,7}) ms[ \t]*\r?\n?$")
-SPAN_NAMES = ("event-store", "recognizer", "dictation-capability", "calendar-access", "agenda-state")
+SPAN_NAMES = ("event-store", "recognizer", "dictation-capability", "calendar-access", "agenda-state", "chat-publish",
+              "chat-inbox", "chat-merge")
 MAX_SPAN_SECTION = device_tests.MAX_DIAG // 8
 # The simulator's crash reports land in the host's own folder; only the Playground's process is kept.
 CRASH_REPORTS = Path.home() / "Library" / "Logs" / "DiagnosticReports"
@@ -357,7 +359,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
                   install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
-                  revoked_by=device_tests.revoke, diagnosed=None):
+                  revoked_by=device_tests.revoke, diagnosed=None, noted=device_tests.commitment_note):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -469,19 +471,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             elif recorder.kept:
                 scenario, why = row["id"], recorder.kept
                 print(f"May device tests (ios): {scenario}: its recording was kept {why}")
-            for check in row["server"]:
-                status = checked(base, token, check["get"])
-                entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
-            for check in row.get("truth", []):
-                if "question" in check:
-                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], own)
-                else:
-                    path, (status, found) = check["get"], truth(base, token, check["get"], own)
-                entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
-            if device_tests.sends_messages(row):
-                codes = delivered(base, token, own)
-                if codes is not None:
-                    entry["delivery"] = codes
+            device_tests.server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
             # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
             diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE)
             accounts.finish(row, base, token)

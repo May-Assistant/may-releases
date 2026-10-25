@@ -162,6 +162,31 @@ class ScenarioTests(unittest.TestCase):
         with self.assertRaises(DeviceTestsError):
             device_tests.scenarios("sign-in,unknown")
 
+    def test_chat_notes_and_sign_out_carry_server_truth(self):
+        """Coordinator, 25 Oct: chat's delivery, notes' tagged task with its note, sign-out's session refused."""
+        rows = {row["id"]: row for row in device_tests.scenarios()}
+        self.assertEqual(rows["chat"]["truth"], [{"delivery": "succeeded"}])
+        self.assertEqual(rows["notes"]["truth"], [{"get": "/v1/commitments", "note": "{tag} note from the device test"}])
+        self.assertIn("type: {tag} note from the device test", rows["notes"]["goal"], "the words the agent types")
+        self.assertEqual(rows["sign-out"]["server"], [{"get": "/v1/me", "expect": 401}])
+        chat = dict(rows["chat"], truth=[{"delivery": "succeeded"}, {"question": "answered"}])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "s.json"
+            path.write_text(json.dumps([chat]))
+            with patch("device_tests.SCENARIOS", path):
+                self.assertEqual(device_tests.scenarios()[0]["truth"], chat["truth"])
+
+    def test_sign_out_passes_only_when_its_session_is_refused(self):
+        row = {"driver": "maestro", "server": [{"get": "/v1/me", "expect": 401}]}
+        for status, verdict in ((401, "pass"), (200, "fail"), (0, "fail")):
+            with self.subTest(status=status):
+                entry = {"server": [{"get": "/v1/me", "status": status, "pass": status == 401}]}
+                device_tests.settle(entry, row, True)
+                self.assertEqual(entry["verdict"], verdict)
+        entry = {"server": [{"get": "/v1/me", "status": 401, "pass": True}]}
+        device_tests.settle(entry, row, False)
+        self.assertEqual(entry["verdict"], "fail", "a flow that failed is a fail whatever the server says")
+
     def test_the_notes_scenario_writes_into_its_own_tagged_task(self):
         """Run 40063426822: "the first item you see" was the shared account's, so the note joined the previous run's."""
         goal = device_tests.scenarios("notes")[0]["goal"]
@@ -231,7 +256,8 @@ class ScenarioTests(unittest.TestCase):
         good = device_tests.scenarios()[0]
         for change in ({"id": "Sign In"}, {"flow": "../x.yaml"}, {"driver": "shell"}, {"platforms": ["web"]},
                        {"outward": "no"}, {"fresh": "yes"}, {"server": [{"get": "https://elsewhere/v1/x", "expect": 200}]},
-                       {"server": [{"get": "/v1/me", "expect": 500}]}):
+                       {"server": [{"get": "/v1/me", "expect": 500}]}, {"server": [{"get": "/v1/me", "expect": 302}]},
+                       {"server": [{"get": "/v1/me", "expect": 401.0}]}, {"server": [{"get": "/v1/me", "expect": True}]}):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "s.json"
                 path.write_text(json.dumps([dict(good, **change)]))
@@ -242,7 +268,16 @@ class ScenarioTests(unittest.TestCase):
                        {"truth": [{"get": "/v1/account/devices"}]}, {"truth": [{"get": "/v1/routines", "x": 1}]},
                        {"truth": [{"get": "/v1/event-notes"}]}, {"truth": [{"question": "pending"}]},
                        {"truth": [{"question": "answered", "get": "/v1/routines"}]},
-                       {"truth": "/v1/routines"}):
+                       {"truth": "/v1/routines"},
+                       # The note truth: on the agenda alone, the scenario's tag first, words the goal asks for.
+                       {"truth": [{"get": "/v1/routines", "note": "{tag} note from the device test"}]},
+                       {"truth": [{"get": "/v1/commitments", "note": "note from the device test"}]},
+                       {"truth": [{"get": "/v1/commitments", "note": "{tag} a different note"}]},
+                       {"truth": [{"get": "/v1/commitments", "note": "{tag} " + "x" * 200}]},
+                       {"truth": [{"get": "/v1/commitments", "note": 7}]},
+                       {"truth": [{"get": "/v1/commitments", "note": "{tag} note from the device test", "x": 1}]},
+                       # Delivery truth: only for a goal that sends May a message, and only "succeeded".
+                       {"truth": [{"delivery": "succeeded"}]}, {"truth": [{"delivery": "failed"}]}):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "s.json"
                 path.write_text(json.dumps([dict(agent, **change)]))
@@ -1323,6 +1358,22 @@ class ReasonTests(unittest.TestCase):
             except publish.PublishError as error:
                 self.fail(f"device-open refused a budget-skipped row: {error}")
         self.assertEqual(rows[0]["reason"], device_tests.BUDGET)
+
+
+    def test_an_unverified_row_passes_the_publish_check_with_its_reason(self):
+        report = {"device": "android", "scenarios": [{
+            "id": "notes", "title": "x", "verdict": device_tests.UNVERIFIED, "reason": device_tests.NOT_REACHED,
+            "videos": [], "screenshots": [],
+            "server": [{"get": "/v1/commitments", "status": 200, "pass": False, "unverified": True}]}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps(report))
+            try:
+                _, rows = publish.device_report(path, set(), {"notes": "Add a note"})
+            except publish.PublishError as error:
+                self.fail(f"device-open refused an unverified row: {error}")
+        self.assertEqual((rows[0]["verdict"], rows[0]["reason"], rows[0]["server"]),
+                         (device_tests.UNVERIFIED, device_tests.NOT_REACHED, [("/v1/commitments", 200)]))
 
 
 class SealVerdictTests(unittest.TestCase):
