@@ -83,6 +83,11 @@ SERVER_PATH = re.compile(r"/v1/[a-z0-9/_-]{1,120}")
 # chat that holds it (question_truth).
 TRUTH_PATHS = ("/v1/approvals", "/v1/inbox", "/v1/commitments", "/v1/routines")
 QUESTION_STATES = ("answered", "closed")
+# Server truth a row can ask for besides those reads (coordinator, 25 Oct): {"delivery": "succeeded"}, every tagged
+# message's reply run succeeded (chat); {"get": NOTE_PATH, "note": "{tag} ..."}, the Agenda task whose title holds the
+# scenario's tag has those words in its notes, which the server keeps as the commitment's description (notes). A
+# row's plain "server" reads expect one of EXPECTS: 401 is a session the app signed out (sign-out).
+DELIVERY_TRUTH, NOTE_PATH, EXPECTS, MAX_NOTE = {"delivery": "succeeded"}, "/v1/commitments", (200, 401), 200
 AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 MAX_CHATS = 10
 MAX_GOAL = 1500
@@ -167,6 +172,8 @@ NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
 DELIVERY_FAILED = "May's server did not record a succeeded reply"
 UNCONFIGURED = "server checks not configured"
+UNVERIFIED = "unverified"
+NOT_REACHED = "the agenda's first page on the server did not reach the tagged task (unverified, never a pass)"
 SMOKE_MAESTRO = "Maestro did not drive the app"
 SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
 # The smoke scenario's flow: this repository's own, written to the private folder at run time.
@@ -268,7 +275,11 @@ def scenarios(selection="all", platform="android"):
                     driver == "agent" and "flow" not in row and isinstance(row.get("goal"), str) and
                     "{tag}" in row["goal"] and len(row["goal"]) <= MAX_GOAL and isinstance(row.get("truth"), list) and
                     all(isinstance(c, dict) and (set(c) == {"get"} and c["get"] in TRUTH_PATHS or
-                                                 set(c) == {"question"} and c["question"] in QUESTION_STATES)
+                                                 set(c) == {"question"} and c["question"] in QUESTION_STATES or
+                                                 c == DELIVERY_TRUTH and "Send this message" in row["goal"] or
+                                                 set(c) == {"get", "note"} and c["get"] == NOTE_PATH and
+                                                 isinstance(c["note"], str) and c["note"].startswith("{tag} ") and
+                                                 len(c["note"]) <= MAX_NOTE and c["note"][6:] in row["goal"])
                         for c in row["truth"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
                     isinstance(row.get("goal"), str) and len(row["goal"]) <= MAX_GOAL and row.get("server") == [])
@@ -279,7 +290,7 @@ def scenarios(selection="all", platform="android"):
                  row.get("fresh") is True) and
                 isinstance(row.get("server"), list) and
                 all(isinstance(c, dict) and isinstance(c.get("get"), str) and SERVER_PATH.fullmatch(c["get"]) and
-                    c.get("expect") == 200 for c in row["server"])):
+                    c.get("expect") in EXPECTS and type(c.get("expect")) is int for c in row["server"])):
             raise DeviceTestsError("The scenario list has a malformed row")
         ids.add(row["id"])
         checked.append(row)
@@ -458,6 +469,48 @@ def question_truth(base, token, state, tag, get=urllib.request.urlopen):
 CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 NONE_STORED = "none stored"
 MAX_DELIVERY = 10
+
+
+def commitment_note(base, token, tag, note, get=urllib.request.urlopen):
+    """The Agenda's first page (GET NOTE_PATH, without a cursor: up to the server's 200 items) read for the task whose
+    title holds tag: (HTTP status, "found" when its notes, the commitment's description, hold note; "absent" when the
+    tagged task is not there, or its notes do not hold it; "beyond" when it is not there and the page has more after
+    it, so the run cannot tell). Only the tag and the note are looked for; nothing read is kept or printed."""
+    status, data = read_json(base, token, NOTE_PATH, get)
+    if status != 200:
+        return status, "absent"
+    tasks = [task for task in listed(data, "commitments") if holds(task.get("title"), tag)]
+    if not tasks:
+        more = isinstance(data, dict) and isinstance(data.get("next_cursor"), str) and data["next_cursor"] != ""
+        return status, "beyond" if more else "absent"
+    noted = any(isinstance(task.get("description"), str) and note in task["description"] for task in tasks)
+    return status, "found" if noted else "absent"
+
+
+def server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted):
+    """A scenario's server reads with its own session, while it lasts, into entry: its plain reads (each expecting a
+    status), its delivery codes when it sends May a message, and its truth, every read with the scenario's own tag."""
+    for check in row["server"]:
+        status = checked(base, token, check["get"])
+        entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
+    codes = delivered(base, token, own) if sends_messages(row) else None
+    if codes is not None:
+        entry["delivery"] = codes
+    for check in row.get("truth", []):
+        if "question" in check:
+            path, (status, found) = "/v1/agents", asked(base, token, check["question"], own)
+        elif check == DELIVERY_TRUTH:
+            path, status = "/v1/agents", 0 if codes is None else 200
+            found = bool(codes) and all(code == "succeeded" for code in codes)
+        elif "note" in check:
+            status, state = noted(base, token, own, check["note"].replace("{tag}", own))
+            if state == "beyond":
+                entry["server"].append({"get": NOTE_PATH, "status": status, "pass": False, "unverified": True})
+                continue
+            path, found = NOTE_PATH, state == "found"
+        else:
+            path, (status, found) = check["get"], truth(base, token, check["get"], own)
+        entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
 
 
 def sends_messages(row):
@@ -1202,7 +1255,8 @@ def settle(entry, row, passed):
 
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
-                  deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None, revoked_by=revoke):
+                  deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None, revoked_by=revoke,
+                  noted=commitment_note):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -1305,19 +1359,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
             entry["screenshots"] = [shot] if shot else []
             entry["videos"] = recorder.stop(folder)
-            for check in row["server"]:
-                status = checked(base, token, check["get"])
-                entry["server"].append({"get": check["get"], "status": status, "pass": status == check["expect"]})
-            for check in row.get("truth", []):
-                if "question" in check:
-                    path, (status, found) = "/v1/agents", asked(base, token, check["question"], own)
-                else:
-                    path, (status, found) = check["get"], truth(base, token, check["get"], own)
-                entry["server"].append({"get": path, "status": status, "pass": status == 200 and found})
-            if sends_messages(row):
-                codes = delivered(base, token, own)
-                if codes is not None:
-                    entry["delivery"] = codes
+            server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
             # After the server reads, which need the session while it lasts: a slow dumpsys costs them nothing.
             diagnostics.keep(folder, row["id"], token)
             accounts.finish(row, base, token)
@@ -1386,9 +1428,13 @@ def combined(entry, record, judged, sends=False):
         return {"verdict": SMOKE_PASS, "reason": None}
     if not entry["server"]:
         return {"verdict": "ui-pass", "reason": UNCONFIGURED}
-    if all(check["pass"] for check in entry["server"]):
-        return {"verdict": "pass", "reason": None}
-    return {"verdict": "fail", "reason": NO_TRUTH}
+    # A pass needs the screen and every server read; a read that failed is a fail, one that could not tell is
+    # unverified, never a pass (coordinator, 25 Oct).
+    if any(not check["pass"] and not check.get("unverified") for check in entry["server"]):
+        return {"verdict": "fail", "reason": NO_TRUTH}
+    if any(check.get("unverified") for check in entry["server"]):
+        return {"verdict": UNVERIFIED, "reason": NOT_REACHED}
+    return {"verdict": "pass", "reason": None}
 
 
 # The agent's own account of its run, sealed into the private report.json alone (never a log or the job summary): its
@@ -1472,10 +1518,14 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         scenario, word = entry["id"], entry["verdict"]
         print(f"May device tests ({platform}): {scenario}: {word}")
     counts = {word: sum(1 for entry in report["scenarios"] if entry["verdict"] == word)
-              for word in ("pass", "ui-pass", "fail", "skipped", SMOKE_PASS)}
+              for word in ("pass", "ui-pass", "fail", "skipped", SMOKE_PASS, UNVERIFIED)}
     passed, ui_passed, failed, skipped = counts["pass"], counts["ui-pass"], counts["fail"], counts["skipped"]
     print(f"May device tests ({platform}): {passed} passed, {ui_passed} passed on screen alone (server checks not "
           f"configured), {failed} failed, {skipped} skipped")
+    unverified = counts[UNVERIFIED]
+    if unverified:
+        print(f"May device tests ({platform}): {unverified} could not be checked on the server (unverified, never a "
+              "pass)")
     smoke_passed = counts[SMOKE_PASS]
     if smoke_passed:
         print(f"May device tests ({platform}): {smoke_passed} passed the harness smoke check (not a test of May)")

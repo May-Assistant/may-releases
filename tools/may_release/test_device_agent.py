@@ -63,7 +63,7 @@ class AgentRunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
-                      asked=None, exhausted=False, delivered=None, calls_left=None, fail_mint=()):
+                      asked=None, exhausted=False, delivered=None, calls_left=None, fail_mint=(), noted=None):
         calls, minted, seen = [], [], {}
         self.last_seen = seen
 
@@ -139,6 +139,8 @@ class AgentRunTests(unittest.TestCase):
             device_tests.run_scenarios(selection, minted=mint, checked=lambda *a: 200,
                                        revoked_by=lambda base, token: self.signed_out.append(token) or True,
                                        truth=lambda base, token, path, tag: truth,
+                                       noted=noted or (lambda base, token, tag, note: (
+                                           truth[0], "found" if truth[1] else "absent")),
                                        asked=asked or (lambda base, token, state, tag: truth),
                                        cleaned=clean, agent=agent, deleted_by=delete,
                                        delivered=delivered or deliver,
@@ -176,8 +178,12 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(seen["cleanup"][0], TOKEN + "4")
         self.assertEqual(seen["cleanup"][2], "qa-39557415738")
         self.assertRegex(seen["cleanup"][1], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertEqual([row["verdict"] for row in report["scenarios"]], ["ui-pass", "ui-pass", "pass"])
-        self.assertEqual(report["scenarios"][0]["reason"], "server checks not configured")
+        self.assertEqual([row["verdict"] for row in report["scenarios"]], ["pass", "pass", "pass"])
+        self.assertNotIn("reason", report["scenarios"][0])
+        self.assertEqual(report["scenarios"][0]["server"], [{"get": "/v1/agents", "status": 200, "pass": True}],
+                         "chat's succeeded delivery is its server truth")
+        self.assertEqual(report["scenarios"][1]["server"], [{"get": "/v1/commitments", "status": 200, "pass": True}],
+                         "notes' tagged task holds the note on the server")
         self.assertEqual(report["scenarios"][2]["server"], [{"get": "/v1/routines", "status": 200, "pass": True},
                                                             {"get": "/v1/agents", "status": 200, "pass": True}])
         self.assertEqual(report["scenarios"][0]["notes"], "fine <b>")
@@ -201,13 +207,13 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(self.signed_out, [TOKEN + "1", TOKEN + "2", TOKEN + "3", TOKEN + "4"],
                          "each scenario's shared session at its end, then the cleanup's: none outlives the run")
         self.assertEqual(judge_out.splitlines(), [
-            "May device tests (android): chat: ui-pass", "May device tests (android): notes: ui-pass",
+            "May device tests (android): chat: pass", "May device tests (android): notes: pass",
             "May device tests (android): routines: pass",
-            "May device tests (android): 1 passed, 2 passed on screen alone (server checks not configured), 0 failed, "
+            "May device tests (android): 3 passed, 0 passed on screen alone (server checks not configured), 0 failed, "
             "0 skipped"])
         for secret in (TOKEN, OAUTH, "s" * 32, "saw it", "fine"):
             self.assertNotIn(secret, run_out + judge_out)
-        self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["ui-pass", "ui-pass", "pass"])
+        self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text()), ["pass", "pass", "pass"])
 
     def test_rate_limits_skip_and_never_pass(self):
         _, _, seen, report, _, _ = self.run_and_judge(
@@ -225,7 +231,43 @@ class AgentRunTests(unittest.TestCase):
         _, _, _, report, _, _ = self.reset_and(lambda: self.run_and_judge(
             [record(), record(), record()], [("pass", ""), ("error", ""), ("pass", "")], truth=(200, False)))
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("ui-pass", device_tests.UNCONFIGURED), ("fail", device_tests.NOT_JUDGED), ("fail", device_tests.NO_TRUTH)])
+            ("pass", None), ("fail", device_tests.NOT_JUDGED), ("fail", device_tests.NO_TRUTH)])
+
+    def test_server_truth_counts_chats_delivery_and_never_passes_a_task_it_could_not_reach(self):
+        """Coordinator, 25 Oct: chat's succeeded delivery is its server truth; notes' tagged task beyond the agenda's
+        first page is unverified, never a pass; a fail on the screen or any read is a fail."""
+        seen_notes = []
+
+        def beyond(base, token, tag, note):
+            seen_notes.append((token, tag, note))
+            return 200, "beyond"
+
+        _, _, _, report, run_out, judge_out = self.run_and_judge(
+            [record(), record(), record()], [("pass", "")] * 3, noted=beyond)
+        self.assertEqual(seen_notes, [(TOKEN + "2", "qa-39557415738-notes",
+                                       "qa-39557415738-notes note from the device test")],
+                         "the notes read, with notes' own session, tag and the goal's words")
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", "pass", None), ("notes", device_tests.UNVERIFIED, device_tests.NOT_REACHED),
+            ("routines", "pass", None)])
+        self.assertEqual(report["scenarios"][1]["server"],
+                         [{"get": "/v1/commitments", "status": 200, "pass": False, "unverified": True}])
+        self.assertIn("May device tests (android): notes: unverified", judge_out)
+        self.assertIn("May device tests (android): 1 could not be checked on the server (unverified, never a pass)",
+                      judge_out)
+        self.assertNotIn("note from the device test", run_out + judge_out, "the note's words are never printed")
+        _, _, _, report, _, _ = self.reset_and(lambda: self.run_and_judge(
+            [record(), record(), record()], [("pass", ""), ("fail", "no note on screen"), ("pass", "")], noted=beyond))
+        self.assertEqual(report["scenarios"][1]["verdict"], "fail", "a fail on the screen outranks an unverified read")
+        _, _, _, report, _, _ = self.reset_and(lambda: self.run_and_judge(
+            [record(), record(), record()], [("pass", "")] * 3, noted=lambda *a: (200, "absent")))
+        self.assertEqual((report["scenarios"][1]["verdict"], report["scenarios"][1]["reason"]),
+                         ("fail", device_tests.NO_TRUTH), "a task the server does not hold is a fail")
+        _, _, _, report, _, _ = self.reset_and(lambda: self.run_and_judge(
+            [record(), record(), record()], [("pass", "")] * 3, delivered=lambda *a: None))
+        self.assertEqual(report["scenarios"][0]["server"], [{"get": "/v1/agents", "status": 0, "pass": False}],
+                         "chats that could not be read are no delivery truth")
+        self.assertEqual(json.loads((self.private / device_tests.VERDICTS).read_text())[0], "fail")
 
     def test_the_judge_sees_delivery_codes_alone_and_a_failed_reply_is_never_a_pass(self):
         """Coordinator, 24 Oct: the server's record outranks the screen; a failed code can't be judged into a pass."""
@@ -234,7 +276,7 @@ class AgentRunTests(unittest.TestCase):
             [record(), record(), record()], [("pass", "it replied"), ("pass", ""), ("pass", "")],
             delivered=lambda base, token, tag: next(codes))
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("fail", device_tests.DELIVERY_FAILED), ("ui-pass", device_tests.UNCONFIGURED), ("pass", None)])
+            ("fail", device_tests.DELIVERY_FAILED), ("pass", None), ("pass", None)])
         self.assertEqual([(evidence.get("sends"), evidence.get("delivery")) for evidence in seen["evidence"]],
                          [(True, ["failed (model_rejected_request)"]), (False, None), (True, ["succeeded"])],
                          "each scenario's own codes, and nothing for one that sends no message")
@@ -303,7 +345,7 @@ class AgentRunTests(unittest.TestCase):
         except IndexError:
             self.fail("a switched-off scenario ran")
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("chat", "skipped", device_tests.SWITCHED_OFF), ("notes", "ui-pass", device_tests.UNCONFIGURED),
+            ("chat", "skipped", device_tests.SWITCHED_OFF), ("notes", "pass", None),
             ("routines", "skipped", device_tests.SWITCHED_OFF)])
         self.assertEqual(len(seen["goals"]), 1, "only notes ran")
 
@@ -337,7 +379,7 @@ class AgentRunTests(unittest.TestCase):
         except IndexError:
             self.fail("a scenario whose fresh account was refused ran anyway")
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("chat", "skipped", device_tests.FRESH_EXHAUSTED), ("notes", "ui-pass", device_tests.UNCONFIGURED),
+            ("chat", "skipped", device_tests.FRESH_EXHAUSTED), ("notes", "pass", None),
             ("routines", "skipped", device_tests.FRESH_EXHAUSTED)])
         self.assertEqual(len(seen.get("refused", [])), 1, "once used up, staging is not asked again")
         self.assertEqual(minted, ["s" * 32, "s" * 32], "notes and the cleanup alone, on the shared account")
@@ -357,7 +399,7 @@ class AgentRunTests(unittest.TestCase):
         except device_tests.FreshRefused:
             self.fail("a reply that is not fresh stopped the run instead of skipping its scenario")
         self.assertEqual([(row["id"], row.get("reason")) for row in report["scenarios"]], [
-            ("chat", device_tests.NOT_FRESH), ("notes", device_tests.UNCONFIGURED), ("routines", device_tests.NOT_FRESH)])
+            ("chat", device_tests.NOT_FRESH), ("notes", None), ("routines", device_tests.NOT_FRESH)])
         self.assertEqual(len(seen.get("refused", [])), 1)
         self.assertNotIn("deleted", seen, "a session that is not on a fresh account never reaches delete_fresh")
 
@@ -380,7 +422,7 @@ class AgentRunTests(unittest.TestCase):
             self.fail("a scenario near the model-call cap ran")
         self.assertEqual(read, [TOKEN + "1", TOKEN + "2", TOKEN + "3"], "read with each scenario's own session")
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("chat", "skipped", device_tests.MODEL_CAP), ("notes", "ui-pass", device_tests.UNCONFIGURED),
+            ("chat", "skipped", device_tests.MODEL_CAP), ("notes", "pass", None),
             ("routines", "pass", None)])
         self.assertEqual([goal[1] for goal in seen["goals"]], ["qa-39557415738-notes", "qa-39557415738-routines"],
                          "chat's agent never ran")
@@ -393,7 +435,7 @@ class AgentRunTests(unittest.TestCase):
         except IndexError:
             self.fail("a scenario near the model-call cap ran")
         self.assertEqual([row.get("reason") for row in report["scenarios"]],
-                         [device_tests.MODEL_CAP, device_tests.UNCONFIGURED])
+                         [device_tests.MODEL_CAP, None])
         self.assertEqual(seen.get("deleted"), [TOKEN + "1", TOKEN + "2"],
                          "chat's fresh account is deleted when it is skipped, before notes' is minted")
 
@@ -406,7 +448,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(seen["mint_failed"], [502])
         self.assertEqual(seen.get("slept"), [device_tests.MINT_RETRY_SECONDS], "one pause, then the one retry")
         self.assertEqual([row.get("reason") for row in report["scenarios"]],
-                         [device_tests.UNCONFIGURED, device_tests.UNCONFIGURED, None])
+                         [None, None, None])
 
     def test_a_mint_that_fails_twice_skips_its_scenario_alone_and_the_report_is_kept(self):
         """Run 40077167994: one failed mint 50 minutes into the iOS run stopped it, and the report was lost."""
@@ -416,7 +458,7 @@ class AgentRunTests(unittest.TestCase):
         except device_tests.DeviceTestsError as error:
             self.fail("a failed mint stopped the run: " + error.args[0])
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("chat", "ui-pass", device_tests.UNCONFIGURED), ("notes", "skipped", device_tests.MINT_FAILED),
+            ("chat", "pass", None), ("notes", "skipped", device_tests.MINT_FAILED),
             ("routines", "pass", None)])
         self.assertIn("May device tests (android): notes: staging did not mint a session (HTTP status 429, 0 for no "
                       "reply), twice; the scenario is skipped", run_out)
@@ -502,6 +544,49 @@ def chat_server(chats, messages, agents_status=200):
 
 
 class ServerTruthTests(unittest.TestCase):
+    def test_the_note_is_read_from_the_tagged_tasks_description_on_the_agendas_first_page(self):
+        """may-app: GET /v1/commitments gives {commitments, next_cursor}, 200 to a page; a task's notes are its
+        description. The task is found by the scenario's tag alone."""
+        tag, note = "qa-39557415738-notes", "qa-39557415738-notes note from the device test"
+        asked = []
+
+        def get(body, status=200):
+            def reply(request, timeout):
+                asked.append(request.full_url)
+                if status != 200:
+                    raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+                return FakeReply(json.dumps(body).encode())
+            return reply
+
+        mine = {"title": "qa-39557415738-notes task", "description": note}
+        other = {"title": "qa-39557415738-notes-old task", "description": note}
+        cases = (({"commitments": [{"title": "file taxes", "description": None}, mine], "next_cursor": None},
+                  200, (200, "found")),
+                 ({"commitments": [dict(mine, description="qa-39557415738-notes note from the d")], "next_cursor": None},
+                  200, (200, "absent")),
+                 ({"commitments": [dict(mine, description=None)], "next_cursor": "c2"}, 200, (200, "absent")),
+                 ({"commitments": [other], "next_cursor": "c2"}, 200, (200, "beyond")),
+                 ({"commitments": [other], "next_cursor": None}, 200, (200, "absent")),
+                 ({"commitments": [], "next_cursor": ""}, 200, (200, "absent")),
+                 ({"commitments": [mine]}, 401, (401, "absent")),
+                 ([mine], 200, (200, "found")))
+        for body, status, expected in cases:
+            with self.subTest(body=body, status=status):
+                self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(body, status)),
+                                 expected)
+        self.assertEqual(set(asked), {"https://s/v1/commitments"}, "the first page alone, no cursor")
+
+    def test_a_delivery_truth_records_whether_every_tagged_message_succeeded(self):
+        row = {"driver": "agent", "goal": "Send this message: hi {tag}", "server": [], "truth": [{"delivery": "succeeded"}]}
+        for codes, expected in ((["succeeded", "succeeded"], (200, True)), (["succeeded", "failed (x)"], (200, False)),
+                                ([device_tests.NONE_STORED], (200, False)), ([], (200, False)), (None, (0, False))):
+            with self.subTest(codes=codes):
+                entry = {"server": []}
+                device_tests.server_reads(row, entry, "https://s", TOKEN, "qa-1-chat", None, None, None,
+                                          lambda base, token, tag: codes, None)
+                self.assertEqual(entry["server"], [{"get": "/v1/agents", "status": expected[0], "pass": expected[1]}])
+                self.assertEqual(entry.get("delivery"), codes)
+
     def test_tagged_finds_the_tag_anywhere_in_the_reply_case_insensitively(self):
         def get(body):
             return lambda request, timeout: FakeReply(json.dumps(body).encode())

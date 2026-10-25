@@ -160,6 +160,7 @@ class RunTests(Workspace):
             device_ios.run_scenarios(selection, minted=mint, checked=lambda base, token, path: 200,
                                      revoked_by=lambda base, token: self.signed_out.append(token) or True,
                                      truth=lambda base, token, path, tag: (200, True),
+                                     noted=lambda base, token, tag, note: (200, "found"),
                                      asked=lambda base, token, state, tag: (200, True),
                                      cleaned=lambda base, token, since, tag: 2,
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
@@ -333,7 +334,7 @@ class RunTests(Workspace):
         self.assertEqual((token[:13], model, seconds, tag), ("sk-ant-oat01-", "claude-sonnet-5-5",
                                                              device_agent.IOS_AGENT_SECONDS, "qa-39557415738-chat"))
         self.assertEqual(len(minted), 3, "one session per scenario and one for the cleanup")
-        self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("chat", "ui-pass"),
+        self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]], [("chat", "pass"),
                                                                                          ("poll", "pass")])
         self.assertEqual(self.delivered, [TOKEN + "1", TOKEN + "2"], "each scenario's messages, with its own session")
         self.assertEqual([row.get("delivery") for row in report["scenarios"]], [["succeeded"]] * 2)
@@ -466,6 +467,22 @@ class DiagnosticsTests(Workspace):
                          "an unknown name is kept privately but not counted, and a line not ending at ms is no span")
         self.assertEqual((diagnostics.stalls, diagnostics.longest), (1, 1177), "spans are never stalls")
         self.assertTrue(publish.diagnostics_ok(text))
+
+    def test_chats_three_spans_are_counted_by_name(self):
+        """N, 25 Oct: run 40164384433's chat stalled every 3 s in its idle sync; three spans name that path."""
+        lines = b"".join(b"2026-10-25 05:23:%02d.000 Df MayPlayground[1:2] [io.github.mayassistant.may.playground:"
+                         b"watchdog] main-thread span %s %d ms\n" % (second, name, ms)
+                         for second, (name, ms) in enumerate([(b"chat-publish", 410), (b"chat-inbox", 300),
+                                                              (b"chat-merge", 260), (b"chat-publish", 520),
+                                                              (b"chat-other", 900)]))
+        diagnostics = self.diagnostics(shown=lines)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        self.assertEqual(diagnostics.spans, {"chat-publish": [2, 520], "chat-inbox": [1, 300], "chat-merge": [1, 260]})
+        self.assertIn(b"main-thread span chat-other 900 ms", (folder / ("chat" + device_tests.DIAG)).read_bytes(),
+                      "a name not agreed is kept privately, never counted")
 
     def test_a_trimmed_watchdog_log_never_loses_its_spans(self):
         flood = b"".join(b"2026-10-25 03:12:%02d.000 Df MayPlayground[812:9a1] [io.github.mayassistant.may.playground:"

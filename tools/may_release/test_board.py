@@ -84,6 +84,13 @@ class HistoryTests(unittest.TestCase):
                                 "preview": False},
             "ios/sign-in": {"verdict": "fail", "reason": "r", "shot": "sign-in-end.png", "videos": [], "preview": False}})
 
+    def test_an_unverified_result_is_never_shown_as_a_pass(self):
+        """Coordinator, 25 Oct: a task the server's first page did not reach is unverified, never a pass."""
+        new = board.entry(folder(1), "9", {"android": [row("notes", "unverified", reason=device_tests.NOT_REACHED)]},
+                          NOW)
+        self.assertEqual((new["results"]["android/notes"]["verdict"], new["results"]["android/notes"]["reason"]),
+                         ("skipped", device_tests.NOT_REACHED))
+
     def test_a_chat_scenarios_message_codes_join_its_reason(self):
         coded = dict(row("chat", "fail", reason=device_tests.NO_TRUTH), delivery=["failed (model_cap_reached)"])
         stored = dict(row("chat", "ui-pass"), delivery=[device_tests.NONE_STORED])

@@ -21,7 +21,12 @@
       "ios"
     ],
     "outward": false,
-    "server": []
+    "server": [
+      {
+        "get": "/v1/me",
+        "expect": 401
+      }
+    ]
   },
   {
     "id": "connections",
@@ -73,7 +78,11 @@
     ],
     "outward": false,
     "server": [],
-    "truth": []
+    "truth": [
+      {
+        "delivery": "succeeded"
+      }
+    ]
   },
   {
     "id": "notes",
@@ -86,7 +95,12 @@
     ],
     "outward": false,
     "server": [],
-    "truth": []
+    "truth": [
+      {
+        "get": "/v1/commitments",
+        "note": "{tag} note from the device test"
+      }
+    ]
   },
   {
     "id": "poll",
