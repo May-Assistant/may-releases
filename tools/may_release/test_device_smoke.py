@@ -97,6 +97,7 @@ class Workspace(unittest.TestCase):
             return path.name
 
         with self.environ(env), patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
                 patch("device_tests.adb_shell", side_effect=lambda adb, env, log, line: self.calls.append(

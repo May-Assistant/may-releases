@@ -489,14 +489,15 @@ class DiagnosticsTests(Workspace):
         """Coordinator, 25 Oct: N reads them; through kept_lines with the session, private, counted in the log."""
         diagnostics = self.diagnostics(shown=b"")
         driver = self.root / "driver.txt"
-        driver.write_bytes(b"== refused: - tapOn: (action 7) ==\nTap on point (60,40)... FAILED\n"
+        header = b"== refused: - tapOn: (action 7, 2026-10-25 03:02:57.120 to 2026-10-25 03:04:27.125 UTC) ==\n"
+        driver.write_bytes(header + b"Tap on point (60,40)... FAILED\n"
                            b"launch env MAY_TEST_SESSION=" + TOKEN.encode() + b"\nraw " + TOKEN.encode() + b"\n")
         folder = self.root / "out"
         folder.mkdir()
         diagnostics.begin()
         diagnostics.keep(folder, "notes", TOKEN, driver)
         text = (folder / ("notes" + device_tests.DIAG)).read_bytes()
-        self.assertIn(b"== driver ==\n== refused: - tapOn: (action 7) ==\nTap on point (60,40)... FAILED\n", text)
+        self.assertIn(b"== driver ==\n" + header + b"Tap on point (60,40)... FAILED\n", text)
         self.assertNotIn(TOKEN.encode(), text, "the session itself is dropped too, not only secret-shaped lines")
         self.assertEqual((diagnostics.drivers, diagnostics.dropped), (1, {"notes": 2}))
         self.assertTrue(publish.diagnostics_ok(text))

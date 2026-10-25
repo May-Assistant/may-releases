@@ -2,10 +2,12 @@
 device_mcp.py. Claude Code, the emulator and staging are all faked; nothing here reaches the network."""
 
 import base64
+import datetime
 import hashlib
 import io
 import json
 import os
+import plistlib
 from pathlib import Path
 import subprocess
 import tarfile
@@ -123,6 +125,7 @@ class AgentRunTests(unittest.TestCase):
         environ = dict(self.env, **(env or {}))
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
                 patch("device_tests.flows.sleep", side_effect=lambda s: seen.setdefault("slept", []).append(s)), \
@@ -188,6 +191,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
                          [["succeeded"], None, ["succeeded"]])
         self.assertEqual(run_out.splitlines(), [
+            "May device tests (android): network ready after 4 s",
             # This may-app fixture has no onboarding subflow, so each agent starts from launch and the log says so.
             *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"
               for scenario in ("chat", "notes", "routines")],
@@ -246,7 +250,7 @@ class AgentRunTests(unittest.TestCase):
 
         class Fake:
             def __init__(self, adb, env):
-                self.kept = self.anrs = self.crashes = 0
+                self.kept = self.anrs = self.crashes = self.network = 0
                 self.dropped = {}
 
             def keep(self, folder, scenario, token):
@@ -1103,6 +1107,28 @@ IOS_TREE = {"attributes": {"bounds": "[0,0][393,852]"}, "children": [
     {"attributes": {"accessibilityText": "New chat", "bounds": "[300,780][380,840]"}}]}
 
 
+def device_type(folder, scale):
+    """A simulator device type bundle whose profile gives scale (None: no mainScreenScale)."""
+    bundle = Path(folder) / "iPhone 16 Pro.simdevicetype"
+    (bundle / "Contents" / "Resources").mkdir(parents=True, exist_ok=True)
+    profile = {"mainScreenWidth": 1206} if scale is None else {"mainScreenScale": scale, "mainScreenWidth": 1206}
+    (bundle / device_mcp.PROFILE).write_bytes(plistlib.dumps(profile))
+    return str(bundle)
+
+
+def simctl_list(argv, bundle, udid=IOS_UDID):
+    """`xcrun simctl list devices|devicetypes -j` for one booted simulator of the device type at bundle."""
+    kind = "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro"
+    if argv[:4] == ["xcrun", "simctl", "list", "devices"]:
+        return json.dumps({"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-2": [
+            {"udid": "11111111-0000-4000-8000-000000000000", "deviceTypeIdentifier": "other"},
+            {"udid": udid, "deviceTypeIdentifier": kind, "state": "Booted"}]}}).encode()
+    if argv[:4] == ["xcrun", "simctl", "list", "devicetypes"]:
+        return json.dumps({"devicetypes": [{"identifier": "other", "bundlePath": "/x/Other.simdevicetype"},
+                                           {"identifier": kind, "bundlePath": bundle}]}).encode()
+    return None
+
+
 class IosDeviceServerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -1113,6 +1139,7 @@ class IosDeviceServerTests(unittest.TestCase):
                                            "MAY_DEVICE_AGENT_RESULT": str(self.work / "result.json"),
                                            "PATH": "/usr/bin", "JAVA_HOME": "/java", "SECRET_THING": "x"})
         self.calls, self.flows = [], []
+        self.bundle = device_type(self.work / "types", 3.0)
 
     def tearDown(self):
         self.directory.cleanup()
@@ -1120,6 +1147,9 @@ class IosDeviceServerTests(unittest.TestCase):
     def call(self, name, **args):
         def run(argv, capture_output, stdin, timeout, env):
             self.calls.append((argv, env))
+            listed = simctl_list(argv, self.bundle)
+            if listed is not None:
+                return subprocess.CompletedProcess(argv, 0, listed, b"")
             if "screenshot" in argv:
                 Path(argv[-1]).write_bytes(png(1179, 2556))
             if argv[-1].endswith("act.yaml"):
@@ -1133,14 +1163,16 @@ class IosDeviceServerTests(unittest.TestCase):
     def test_each_act_is_one_fixed_maestro_command_in_points(self):
         self.call("tap", x=180, y=120)
         self.assertEqual(self.flows[-1], 'appId: io.github.mayassistant.may.playground\n---\n- tapOn:\n'
-                                         '    point: "60,40"\n', "screenshot pixels become points (3x)")
+                                         '    point: "60,40"\n    waitToSettleTimeoutMs: 3000\n',
+                         "screenshot pixels become points (3x), and the settle wait after the tap is capped")
         self.call("type", text="Hello May, tag qa-123")
         self.assertEqual(self.flows[-1].splitlines()[-1], '- inputText: "Hello May, tag qa-123"')
         self.call("swipe", x1=600, y1=1800, x2=600, y2=600, ms=500)
         self.assertEqual(self.flows[-1].splitlines()[2:], ['- swipe:', '    start: "200,600"', '    end: "200,200"',
-                                                           '    duration: 500'])
+                                                           '    duration: 500', '    waitToSettleTimeoutMs: 3000'])
         self.call("back")
         self.assertIn('start: "1%,50%"', self.flows[-1])
+        self.assertTrue(self.flows[-1].endswith("    waitToSettleTimeoutMs: 3000\n"))
         acts = [argv for argv, _ in self.calls if argv[0] == "/m/maestro" and argv[-2] == "test"]
         self.assertEqual(acts[0][:4], ["/m/maestro", "--device", IOS_UDID, "test"])
         self.assertTrue(all(env.get("JAVA_HOME") == "/java" and "SECRET_THING" not in env for _, env in self.calls))
@@ -1151,14 +1183,20 @@ class IosDeviceServerTests(unittest.TestCase):
                 b"Authorization: Bearer abc\nsam@example.com was signed in\nTap on point (60,40)... FAILED\n")
 
         def run(argv, capture_output, stdin, timeout, env):
+            listed = simctl_list(argv, self.bundle)
+            if listed is not None:
+                return subprocess.CompletedProcess(argv, 0, listed, b"")
             return subprocess.CompletedProcess(argv, 1, said, b"Error: could not find the element\n")
 
-        with patch("device_mcp.subprocess.run", side_effect=run):
+        start = datetime.datetime(2026, 10, 25, 3, 2, 57, 120456, tzinfo=datetime.timezone.utc)
+        moments = iter([start, start + datetime.timedelta(seconds=90, milliseconds=5)])
+        with patch("device_mcp.subprocess.run", side_effect=run), patch("device_mcp.utc_now", side_effect=moments):
             failed, content = device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
         self.assertEqual((failed, content[0]["text"]), (True, "The device did not take it"))
         self.assertTrue((self.work / device_mcp.DRIVER_FILE).is_file(), "a refused act is kept")
         kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
-        self.assertTrue(kept.startswith(b"== refused: - tapOn: (action 1) ==\n"), kept[:60])
+        self.assertTrue(kept.startswith(b"== refused: - tapOn: (action 1, 2026-10-25 03:02:57.120 to "
+                                        b"2026-10-25 03:04:27.125 UTC) ==\n"), kept[:100])
         self.assertIn(b"Tap on point (60,40)... FAILED\nError: could not find the element\n", kept)
         self.assertIn(b"***@example.com was signed in", kept)
         for absent in (b"Bearer", b"sam@", b"step 0\n", b"step 20\n"):
@@ -1170,9 +1208,50 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertLessEqual((self.work / device_mcp.DRIVER_FILE).stat().st_size, device_mcp.MAX_DRIVER)
         self.assertTrue((self.work / device_mcp.DRIVER_FILE).read_bytes().startswith(kept), "the first refusals stay")
 
+    def test_refused_acts_are_stamped_on_the_utc_clock_the_watchdog_lines_use(self):
+        self.assertEqual(device_mcp.utc_now().utcoffset(), datetime.timedelta(0))
+
     def test_a_taken_act_keeps_nothing(self):
         self.call("tap", x=180, y=120)
         self.assertFalse((self.work / device_mcp.DRIVER_FILE).exists())
+
+    def tap_on(self, profile_scale, tree, x=579, y=2295):
+        """One tap with the simulator's device type giving profile_scale: (the agent's reply, the flows run)."""
+        bundle, flows = device_type(self.work / f"types-{profile_scale}", profile_scale), []
+        self.config["scale"] = None
+
+        def run(argv, capture_output, stdin, timeout, env):
+            listed = simctl_list(argv, bundle)
+            if listed is not None:
+                return subprocess.CompletedProcess(argv, 0, listed, b"")
+            if argv[-1].endswith("act.yaml"):
+                flows.append(Path(argv[-1]).read_text())
+            out = json.dumps(tree).encode() if argv[-1] == "hierarchy" else b""
+            return subprocess.CompletedProcess(argv, 0, out, b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            return device_mcp.call("tap", {"x": x, "y": y}, self.config), flows
+
+    def test_the_scale_is_the_simulators_own_never_the_hierarchys_widest_box(self):
+        """Run 40155638626: an iPhone 16 Pro hierarchy whose widest box was 322 points gave 3.75, and the Agenda tab's
+        tap at screenshot pixel (579, 2295) went to (153, 613) instead of (193, 765)."""
+        narrow = {"attributes": {"bounds": "[0,0][322,700]"}, "children": [
+            {"attributes": {"text": "Agenda", "clickable": "true", "bounds": "[160,740][226,790]"}}]}
+        for scale, point in ((3.0, "193,765"), (2, "290,1148")):
+            _, flows = self.tap_on(scale, narrow)
+            self.assertEqual(len(flows), 1, "the tap was placed")
+            self.assertIn(f'point: "{point}"', flows[0])
+
+    def test_an_unknown_scale_places_no_tap_and_says_so_in_the_private_log(self):
+        for scale in (None, 3.5, 1, True):
+            with self.subTest(scale=scale):
+                (self.work / device_mcp.DRIVER_FILE).unlink(missing_ok=True)
+                (failed, content), flows = self.tap_on(scale, IOS_TREE)
+                self.assertTrue(failed)
+                self.assertIn("screen scale is unknown", content[0]["text"])
+                self.assertEqual(flows, [], "no tap is guessed")
+                self.assertTrue((self.work / device_mcp.DRIVER_FILE).is_file(), "the private log says the scale is unknown")
+                self.assertIn(b"== refused: scale unknown:", (self.work / device_mcp.DRIVER_FILE).read_bytes())
 
     def test_the_hierarchy_is_in_screenshot_pixels(self):
         failed, content = self.call("hierarchy")

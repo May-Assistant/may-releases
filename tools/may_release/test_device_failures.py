@@ -76,6 +76,7 @@ class FailureLineTests(Workspace):
 
         try:
             with self.environ(NO_STAGING), patch("device_tests.boot", return_value=("/sdk/adb", Emulator(), {})), \
+                patch("device_tests.network_ready", return_value=4), \
                     patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                     patch("device_tests.flows.run_private", return_value=0), \
                     patch("device_tests.adb_shell", return_value=0), \
