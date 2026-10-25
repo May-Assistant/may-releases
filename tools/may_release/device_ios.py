@@ -40,6 +40,10 @@ STOP_SECONDS = 30
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
+# The coordinator's A/B switch (25 Oct): with ios_reduce_motion dispatched true, the simulator's Reduce Motion is on
+# before the app first starts, which stops the chat header's mark redrawing every frame (N's audit).
+REDUCE_MOTION = "MAY_IOS_REDUCE_MOTION"
+REDUCE_MOTION_ON = ("defaults", "write", "com.apple.Accessibility", "ReduceMotionEnabled", "-bool", "true")
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
 # (errSecMissingEntitlement) and the app signed out with "Something went wrong on this device" (run 40035089599).
@@ -224,6 +228,11 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                        **device_tests.maestro_isolation(device_tests.maestro_home(root)))
     at("booting the simulator")
     udid = boot(log, env)
+    if os.environ.get(REDUCE_MOTION, "").strip() == "true":
+        if renders.quiet(["xcrun", "simctl", "spawn", udid, *REDUCE_MOTION_ON], log, env=env).returncode:
+            print("May device tests (ios): Reduce Motion could not be turned on; the run goes on without it")
+        else:
+            print("May device tests (ios): Reduce Motion is on for this run")
     results, records, cleaned_count = [], {}, None
     try:
         at("installing the app")

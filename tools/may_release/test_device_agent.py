@@ -943,14 +943,26 @@ class DeviceServerTests(unittest.TestCase):
         self.assertNotIn("sam@", stored["hierarchy"])
         self.assertEqual(stored["actions"], 1, "the look at done is not one of the agent's steps")
 
+    @staticmethod
+    def device(answers, settings=None, dumps=None, scales=None):
+        """A fake adb: settings get answers from scales ({setting: bytes}, b"1" by default), settings put is recorded
+        in settings, and each uiautomator dump takes the next of answers."""
+        def run(argv, capture_output, stdin, timeout):
+            if "settings" in argv:
+                if argv[argv.index("settings") + 1] == "put":
+                    (settings if settings is not None else []).append(tuple(argv[-2:]))
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+                return subprocess.CompletedProcess(argv, 0, (scales or {}).get(argv[-1], b"1\n"), b"")
+            if dumps is not None:
+                dumps.append(argv[argv.index("uiautomator") + 1:])
+            return answers.pop(0)
+        return run
+
     def test_with_no_fresh_screen_at_done_the_last_look_is_kept_and_said_so(self):
         answers = [subprocess.CompletedProcess([], 0, HIERARCHY, b""), subprocess.CompletedProcess([], 1, b"", b""),
                    subprocess.CompletedProcess([], 1, b"", b"")]
         dumps = []
-
-        def run(argv, capture_output, stdin, timeout):
-            dumps.append(argv[argv.index("uiautomator") + 1:])
-            return answers.pop(0)
+        run = self.device(answers, dumps=dumps)
 
         with patch("device_mcp.subprocess.run", side_effect=run), patch("device_mcp.time.sleep") as slept:
             device_mcp.call("hierarchy", {}, self.config)
@@ -962,17 +974,44 @@ class DeviceServerTests(unittest.TestCase):
         self.assertEqual(stored["hierarchy_failure"], "adb failed")
         self.assertEqual(dumps, [["dump", "/dev/tty"], ["dump", "/dev/tty"], ["dump", "--compressed", "/dev/tty"]],
                          "a failed dump is tried once more, compressed")
-        slept.assert_called_once_with(device_mcp.DUMP_RETRY_SECONDS)
+        self.assertEqual([call.args for call in slept.call_args_list],
+                         [(device_mcp.STILL_SECONDS,), (device_mcp.DUMP_RETRY_SECONDS,)])
+
+    def test_the_done_dump_stills_the_animations_and_puts_them_back_after_a_failed_dump(self):
+        """M, 25 Oct: the chat header's mark loops forever, so the dump never sees idle with the animations on."""
+        settings, failed = [], subprocess.CompletedProcess([], 0, b"ERROR: could not get idle state.", b"")
+        scales = {"window_animation_scale": b"1\n", "transition_animation_scale": b"0.5\n",
+                  "animator_duration_scale": b"not a number\n"}
+        with patch("device_mcp.subprocess.run", side_effect=self.device([failed, failed], settings, scales=scales)), \
+                patch("device_mcp.time.sleep"):
+            device_mcp.call("done", {"outcome": "completed", "summary": "x"}, self.config)
+        stilled = [(setting, "0") for setting in device_mcp.ANIMATION_SETTINGS]
+        self.assertEqual(settings, stilled + [("window_animation_scale", "1"), ("transition_animation_scale", "0.5"),
+                                              ("animator_duration_scale", "1")],
+                         "each scale back to what it was (1 when it could not be read), after a failed dump too")
+        self.assertEqual(device_mcp.ANIMATION_SETTINGS, device_tests.ANIMATION_SETTINGS)
+
+    def test_the_scales_are_put_back_even_when_the_dump_raises(self):
+        settings = []
+        with patch("device_mcp.subprocess.run", side_effect=self.device([], settings)), \
+                patch("device_mcp.time.sleep"), patch("device_mcp.android_dump", side_effect=RuntimeError("boom")), \
+                self.assertRaises(RuntimeError):
+            device_mcp.stilled_dump(self.config)
+        self.assertEqual(settings[-3:], [(setting, "1") for setting in device_mcp.ANIMATION_SETTINGS])
+
+    def test_the_agents_own_looks_never_touch_the_animations(self):
+        settings = []
+        with patch("device_mcp.subprocess.run",
+                   side_effect=self.device([subprocess.CompletedProcess([], 0, HIERARCHY, b"")], settings)):
+            device_mcp.call("hierarchy", {}, self.config)
+        self.assertEqual(settings, [], "the recording keeps its motion while the agent works")
 
     def test_a_dump_that_fails_once_is_retried_and_its_screen_kept(self):
         """Run 40138900610: the done-time dump came back empty for Android's notes and poll-skip."""
         answers = [subprocess.CompletedProcess([], 0, b"ERROR: could not get idle state.", b""),
                    subprocess.CompletedProcess([], 0, HIERARCHY, b"")]
 
-        def run(argv, capture_output, stdin, timeout):
-            return answers.pop(0)
-
-        with patch("device_mcp.subprocess.run", side_effect=run), patch("device_mcp.time.sleep"):
+        with patch("device_mcp.subprocess.run", side_effect=self.device(answers)), patch("device_mcp.time.sleep"):
             device_mcp.call("done", {"outcome": "completed", "summary": "x"}, self.config)
         stored = json.loads(self.result.read_text())
         self.assertIn("text='Chats'", stored["hierarchy"])
@@ -983,7 +1022,7 @@ class DeviceServerTests(unittest.TestCase):
                              "no idle state"),
                             (subprocess.CompletedProcess([], 0, b"<hierarchy><node", b""), "unreadable"),
                             (subprocess.CompletedProcess([], 1, b"", b""), "adb failed")):
-            with self.subTest(why=why), patch("device_mcp.subprocess.run", return_value=answer), \
+            with self.subTest(why=why), patch("device_mcp.subprocess.run", side_effect=self.device([answer, answer])), \
                     patch("device_mcp.time.sleep"):
                 config = dict(self.config, hierarchy="")
                 device_mcp.call("done", {"outcome": "completed", "summary": "x"}, config)

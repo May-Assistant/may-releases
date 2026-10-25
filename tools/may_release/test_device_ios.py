@@ -175,6 +175,24 @@ class RunTests(Workspace):
         report = json.loads((runs[0] / "ios" / "report.json").read_text())
         return calls, minted, report, out.getvalue(), runs[0]
 
+    def test_reduce_motion_is_turned_on_before_the_app_starts_only_when_dispatched(self):
+        """The coordinator's A/B switch (25 Oct): ios_reduce_motion, off unless dispatched true."""
+        reduce = ["xcrun", "simctl", "spawn", UDID, "defaults", "write", "com.apple.Accessibility",
+                  "ReduceMotionEnabled", "-bool", "true"]
+        calls, minted, report, out, run = self.run_it(env={device_ios.REDUCE_MOTION: "true"})
+        argvs = [argv for argv, _ in calls]
+        self.assertIn(reduce, argvs)
+        self.assertLess(argvs.index(reduce), argvs.index(["xcrun", "simctl", "install", UDID,
+                                                         str(self.root / device_ios.APP)]),
+                        "on before the app is installed and first started")
+        self.assertIn("May device tests (ios): Reduce Motion is on for this run", out.splitlines())
+        for value in (None, "false", "", "TRUE "):
+            with self.subTest(value=value):
+                (self.private / device_tests.AGENTS).unlink(missing_ok=True)
+                calls, minted, report, out, run = self.run_it(env={device_ios.REDUCE_MOTION: value})
+                self.assertNotIn(reduce, [argv for argv, _ in calls])
+                self.assertNotIn("Reduce Motion", out)
+
     def test_the_session_goes_in_the_launch_environment_alone_and_fresh_per_scenario(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         calls, minted, report, out, run = self.run_it()
