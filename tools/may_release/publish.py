@@ -63,8 +63,8 @@ SHA = re.compile(r"[0-9a-f]{40}")
 FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,140}\.png")
 KINDS = ("ios", "android", "sheet")
 # A renders run folder (a may-app short SHA) or a device-tests one (<UTC date>-<short SHA>).
-RUN_FOLDER = re.compile(r"(?:[0-9]{8}-)?[0-9a-f]{12}")
-DEVICE_RUN = re.compile(r"[0-9]{8}-[0-9a-f]{12}")
+RUN_FOLDER = re.compile(r"[0-9a-f]{12}|" + board.FOLDER.pattern)
+DEVICE_RUN = board.FOLDER
 DEVICES = ("android", "ios")
 # may-app's flows and board notes, sealed by each device job and set aside by device-open for the flow board
 # (board.py), never committed.
@@ -91,7 +91,7 @@ VIDEO_DAYS = 7
 RELEASE_TOKEN, RENDERS_REPO = "MAY_RENDERS_RELEASE_TOKEN", "May-Assistant/may-renders"
 UPLOADS = "https://uploads.github.com"
 VIDEOS = "may-device-videos"
-RELEASE_TAG = re.compile(r"device-tests-[0-9]{8}-[0-9a-f]{12}")
+RELEASE_TAG = re.compile(r"device-tests-(?:" + board.FOLDER.pattern + ")")
 _RELEASES = r"/repos/" + re.escape(RENDERS_REPO) + r"/releases"
 RELEASE_CALLS = (("POST", API, _RELEASES), ("GET", API, _RELEASES + r"/tags/" + RELEASE_TAG.pattern),
                  ("GET", API, _RELEASES + r"\?per_page=100"),

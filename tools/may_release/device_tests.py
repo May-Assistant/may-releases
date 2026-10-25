@@ -293,11 +293,15 @@ def scenarios(selection="all", platform="android"):
 
 
 def run_folder(source):
-    """<UTC date>-<may-app short sha>: the run's folder in may-renders' device-tests/."""
+    """<UTC date>-<may-app short sha>-<GitHub run id>: the run's folder in may-renders' device-tests/, the same for both
+    device jobs of one workflow run, and its own for each run (run 40148200485 overwrote 40148178587's: one commit, one
+    day). Without a run id (a local run) the folder has none."""
     sha = head_revision(source)
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise DeviceTestsError("The prepared checkout has no exact commit")
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d") + "-" + sha[:12]
+    run = os.environ.get("GITHUB_RUN_ID", "")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d") + "-" + sha[:12] + \
+        ("-" + run if re.fullmatch(r"[1-9][0-9]{4,19}", run) else "")
 
 
 def build():

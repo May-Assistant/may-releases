@@ -2073,6 +2073,43 @@ class ReleaseDeviceTests(unittest.TestCase):
                 publish.renders_api(method, host, path, self.TOKEN)
 
 
+class RunFolderTests(unittest.TestCase):
+    """Run 40148200485 overwrote 40148178587's folder in may-renders: one may-app commit, one day."""
+
+    SHA = "67f67b32057900000000000000000000000000ab"
+
+    def folder(self, run):
+        environ = {"GITHUB_RUN_ID": run} if run is not None else {}
+        with patch("device_tests.head_revision", return_value=self.SHA), patch.dict(os.environ, environ, clear=True):
+            return device_tests.run_folder(Path("/may-source"))
+
+    def test_two_runs_of_one_commit_on_one_day_publish_to_two_folders(self):
+        first, second = self.folder("40148178587"), self.folder("40148200485")
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"^[0-9]{8}-67f67b320579-40148178587$")
+        self.assertRegex(self.folder(None), r"^[0-9]{8}-67f67b320579$", "a local run has no run id")
+        self.assertRegex(self.folder("12; rm"), r"^[0-9]{8}-67f67b320579$", "never a run id that is not digits")
+        runs, removed = publish.runs_after([{"folder": first}], {"folder": second})
+        self.assertEqual(([run["folder"] for run in runs], removed), ([second, first], []), "both kept in runs.json")
+
+    def test_every_reader_takes_the_new_folder_and_still_the_old(self):
+        new, old = "20261025-67f67b320579-40148200485", "20261024-8c4723335d19"
+        for folder in (new, old):
+            with self.subTest(folder=folder):
+                self.assertTrue(device_tests.board.valid_folder(folder), "the board reads its date")
+                self.assertTrue(publish.DEVICE_RUN.fullmatch(folder), "device-open and device-push")
+                self.assertTrue(publish.RUN_FOLDER.fullmatch(folder), "runs.json")
+                self.assertTrue(publish.RELEASE_TAG.fullmatch("device-tests-" + folder), "its release")
+                paths = device_tests.board.previews_list([{"folder": folder, "results": {
+                    "ios/chat": {"verdict": "fail", "preview": True, "videos": ["chat.mp4"]}}}], 10)
+                self.assertEqual(paths, {f"media/{folder}/ios-chat.preview.mp4": {"tag": "device-tests-" + folder,
+                                                                                  "asset": "ios-chat.preview.mp4"}},
+                                 "the board's preview resolves to the run's own release")
+        self.assertTrue(publish.RUN_FOLDER.fullmatch("67f67b320579"), "a renders folder is still a short sha")
+        for bad in ("20261025-67f67b320579-0123", "20261025-67f67b320579-", "20261025-67f67b320579-401x"):
+            self.assertFalse(device_tests.board.FOLDER.fullmatch(bad))
+
+
 class BoundedOutputTests(unittest.TestCase):
     """The security read of #115: subprocess.run's kill-then-communicate waits for every holder of the output pipe."""
 
