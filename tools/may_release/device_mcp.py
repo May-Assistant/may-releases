@@ -394,11 +394,22 @@ def record(config, outcome, summary):
     """The agent's result for the judge: its hierarchy through kept_lines and within MAX_HIERARCHY, as the summary is
     redacted where it is sealed."""
     kept, _ = kept_lines(config["hierarchy"].encode(), "")
-    with open(config["result"], "w", encoding="utf-8") as output:
-        json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
-                   "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
-                   "hierarchy_failure": config.get("hierarchy_failure"),
-                   **({"wedged": True} if config.get("wedged") else {})}, output)
+    # Written beside the result and then moved over it, so run_agent, reading it after a timeout while this server
+    # finishes an act, never finds it empty or half written; a write that fails keeps the last result and never ends
+    # the server (the review of #124).
+    partial = config["result"] + ".partial"
+    try:
+        with open(partial, "w", encoding="utf-8") as output:
+            json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
+                       "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
+                       "hierarchy_failure": config.get("hierarchy_failure"),
+                       **({"wedged": True} if config.get("wedged") else {})}, output)
+        os.replace(partial, config["result"])
+    except OSError:
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
 
 
 def call(name, args, config):

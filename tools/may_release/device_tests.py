@@ -1584,7 +1584,9 @@ def truth_lines(row, entry):
             what = "the tagged task holds the goal's note"
         else:
             what = f"an item holding the tag is listed by GET {check['get']}"
-        lines.append(what + ": " + ("could not be checked" if read.get("unverified") else
+        # A read the server did not answer with 200 (status 0 for chats that could not be read, a 401 or a 5xx)
+        # checked nothing: never "not confirmed" (the review of #123).
+        lines.append(what + ": " + ("could not be checked" if read.get("unverified") or read.get("status") != 200 else
                                     "confirmed" if read.get("pass") else "not confirmed"))
     return lines
 
