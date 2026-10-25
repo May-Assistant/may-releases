@@ -278,12 +278,18 @@ class AgentRunTests(unittest.TestCase):
             delivered=lambda base, token, tag: next(codes))
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("fail", device_tests.DELIVERY_FAILED), ("pass", None), ("pass", None)])
+        self.assertEqual([evidence.get("truth") for evidence in seen["evidence"]],
+                         [["every tagged message this run sent has a succeeded reply: not confirmed"],
+                          ["the tagged task holds the goal's note: confirmed"],
+                          ["an item holding the tag is listed by GET /v1/routines: confirmed",
+                           "May's question card in this run's tagged chat is answered: confirmed"]],
+                         "the judge sees what each server read checked and how it came out")
         self.assertEqual([(evidence.get("sends"), evidence.get("delivery")) for evidence in seen["evidence"]],
                          [(True, ["failed (model_rejected_request)"]), (False, None), (True, ["succeeded"])],
                          "each scenario's own codes, and nothing for one that sends no message")
         self.assertIn("May device tests (android): chat: fail", judge_out)
         prompt = device_agent.JUDGE_PROMPT.format(goal="g", outcome="completed", actions=1, summary="s",
-                                                  hierarchy="h", delivery="succeeded")
+                                                  hierarchy="h", delivery="succeeded", truth="t")
         self.assertIn("delivery codes only", prompt)
         self.assertIn("read when it finished", prompt)
 
@@ -946,6 +952,57 @@ class AgentRunnerTests(unittest.TestCase):
                 device_agent.judge(Path("/cli/claude"), "Do {tag}", "qa-12345678", evidence, self.root / "judge",
                                    OAUTH, MODEL)
                 self.assertIn("(delivery codes only): " + line + "\n", seen["prompt"])
+
+    # Modelled on run 40203481816's Android poll (synthetic words, none from the run): the card answered on the server,
+    # the choice shown as a quoted reply, and May's chat reply denying it ever asked.
+    POLL_HIERARCHY = ("mayPoll.question Which fruit would you like as a snack? (qa-1-a-poll)\n"
+                      "mayPoll.picked You answered: Banana\n"
+                      "message.user Banana (quoting: Which fruit would you like as a snack?)\n"
+                      "message.may I never posted a tap-to-answer question; your typed reply is the only answer.")
+
+    def test_a_confirmed_server_read_reaches_the_judge_and_outranks_mays_own_words(self):
+        """Coordinator, 25 Oct: run 40203481816's poll was judged a fail on May's words and a guess about the app,
+        against a card the server confirmed answered."""
+        seen = {}
+
+        def run(command, cwd, env, stdout, stderr, stdin, timeout):
+            seen["prompt"] = command[command.index("-p") + 1]
+            stdout.write(json.dumps({"is_error": False, "structured_output": {"verdict": "pass", "note": ""}}).encode())
+
+        row = device_tests.scenarios("poll")[0]
+        entry = {"server": [{"get": "/v1/agents", "status": 200, "pass": True}], "delivery": ["succeeded"] * 2}
+        evidence = dict(record(), hierarchy=self.POLL_HIERARCHY, sends=True, delivery=entry["delivery"],
+                        truth=device_tests.truth_lines(row, entry))
+        with patch("device_agent.subprocess.run", side_effect=run):
+            device_agent.judge(Path("/cli/claude"), row["goal"], "qa-1-a-poll", evidence, self.root / "judge", OAUTH,
+                               MODEL)
+        prompt = seen.get("prompt", "")
+        self.assertIn("each with this scenario's tag: May's question card in this run's tagged chat is answered: "
+                      "confirmed\n", prompt)
+        self.assertIn("it outranks May's own words in the chat", prompt)
+        self.assertIn("A choice tapped on May's question card shows in the chat as a reply quoting the card.", prompt)
+        self.assertIn("an error on screen, or the goal's own state missing from it, is a fail", prompt,
+                      "the screen must still not contradict the truth")
+        self.assertIn("mayPoll.picked You answered: Banana", prompt)
+
+    def test_each_kind_of_server_read_is_named_for_the_judge(self):
+        rows = {row["id"]: row for row in device_tests.scenarios("all")}
+        cases = (
+            ("poll-skip", [{"get": "/v1/agents", "status": 200, "pass": False}],
+             ["May's question card in this run's tagged chat is closed: not confirmed"]),
+            ("notes", [{"get": "/v1/commitments", "status": 200, "pass": False, "unverified": True}],
+             ["the tagged task holds the goal's note: could not be checked"]),
+            ("chat", [{"get": "/v1/agents", "status": 200, "pass": True}],
+             ["every tagged message this run sent has a succeeded reply: confirmed"]))
+        for scenario, reads, lines in cases:
+            with self.subTest(scenario=scenario):
+                self.assertEqual(device_tests.truth_lines(rows[scenario], {"server": reads}), lines)
+        routines = rows["routines"]
+        found = device_tests.truth_lines(routines, {"server": [{"get": "/v1/routines", "status": 200, "pass": True},
+                                                               {"get": "/v1/agents", "status": 200, "pass": False}]})
+        self.assertEqual(found[0], "an item holding the tag is listed by GET /v1/routines: confirmed")
+        self.assertIsNone(device_tests.truth_lines(None, {}) or None)
+        self.assertEqual(device_agent.truth_text({}), "none: this scenario has no server read")
 
     def test_the_judges_prompt_holds_the_summary_redacted(self):
         """The security read of #110: the agent's summary reached the judge's prompt, an argument, as it was."""
