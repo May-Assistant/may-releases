@@ -16,6 +16,12 @@ was recorded on 2026-10-13:
   https://nodejs.org/dist/v22.22.0/SHASUMS256.txt, and a download of the archive hashed to it.
   The detached signature (SHASUMS256.txt.asc) was not checked: no working gpg on the machine
   that recorded it.
+- Swift 6.2.4 (Ubuntu 24.04, x86_64), recorded on 2026-10-25 for ios-core-pr.yml (may-app's
+  MayCore package on Linux): swift.org publishes no checksum, so the archive was downloaded from
+  download.swift.org and its detached signature (.sig) checked with gpg against
+  https://www.swift.org/keys/all-keys.asc: a good signature from the Swift 6.x Release Signing Key,
+  primary key fingerprint 52BB 7E3D E28A 71BE 22EC 05FF EF80 A866 B47A 981F. The pin is that
+  archive's SHA-256.
 
 Tools land under $RUNNER_TEMP/may-tools. Scripts call them by absolute path.
 """
@@ -52,6 +58,11 @@ TOOLS = {
     ("node", "Linux", "x86_64"): (
         "https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.gz",
         "c33c39ed9c80deddde77c960d00119918b9e352426fd604ba41638d6526a4744", "node-v22.22.0-linux-x64"),
+    # ios_core.py builds and tests may-app's ios/MayCore (Foundation only) with this exact Swift. About 1 GB.
+    ("swift", "Linux", "x86_64"): (
+        "https://download.swift.org/swift-6.2.4-release/ubuntu2404/swift-6.2.4-RELEASE/"
+        "swift-6.2.4-RELEASE-ubuntu24.04.tar.gz",
+        "15608c4fa0364ef906014343d81639cf58169e8a40de2b2d3503c3f35a8bb66d", "swift-6.2.4-RELEASE-ubuntu24.04"),
 }
 
 
@@ -108,7 +119,7 @@ def install(name, system=None, machine=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("tool", choices=("jdk", "age", "node"))
+    parser.add_argument("tool", choices=("jdk", "age", "node", "swift"))
     parser.add_argument("--export", action="store_true",
                         help="add to GITHUB_PATH (and JAVA_HOME to GITHUB_ENV); for no-secret jobs only")
     args = parser.parse_args()

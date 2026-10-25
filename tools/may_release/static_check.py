@@ -251,6 +251,7 @@ WORKFLOW_MINTS = {
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
     "backend-unit-pr.yml": {"backend": ("ci-read", "ci-comment")},
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
+    "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
     "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
     "may-app-review.yml": {"review": ("ci-review",)},
@@ -1682,6 +1683,105 @@ def backend_unit_print_problems(root):
     return found
 
 
+
+# may-app's MayCore Swift package suite at an open may-app pull request head (ios-core-pr.yml, ios_core.py): the same
+# gate, fetch and environment as native-compile-pr.yml's swift-checks (gate.py --action compile-pr, may-native-compile-pr;
+# prepare.py's iOS pull-request fetch), so it holds nothing that lane does not: the PR read token in the check alone, the
+# two source-read keys in the fetch alone, the comment token in the post alone, and nothing on the run (it builds and
+# runs the pull request's own Swift) or the cleanup. Pinned whole: dispatch with exactly pr_number and source_sha,
+# read-only, Linux runners, the pinned Swift installed without carrying a value to later steps (ios_core.py finds it by
+# path), nothing run but its seven commands, a 35-minute job timeout, and no service, cache, artifact, step summary or
+# carried value. ios_core.py prints only fixed lines, a stage's name and verdict, integer counts and the pull request
+# number.
+IOS_CORE = "ios-core-pr.yml"
+IOS_CORE_TOOL = "ios_core.py"
+IOS_CORE_SWIFT = "python3 -I -S -B tools/may_release/toolchain.py swift"
+IOS_CORE_RUN = 'python3 -I -S -B tools/may_release/ios_core.py run --source-sha "$MAY_SOURCE_SHA"'
+IOS_CORE_POST = ('python3 -I -S -B tools/may_release/ios_core.py post --source-sha "$MAY_SOURCE_SHA" '
+                 '--pr-number "$MAY_PR_NUMBER"')
+IOS_CORE_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+                    '"$RUNNER_TEMP/may-swift" "$RUNNER_TEMP/may-tools"')
+IOS_CORE_STEP_NAMES = ["Install the pinned, checksum-verified Swift",
+                       "Check the pull request head and environment before fetching",
+                       "Fetch the pull request head and pinned design system quietly",
+                       "Build and test MayCore without any credential, printing only pass or fail and counts",
+                       "Post the MayCore failures on the may-app pull request, never in this log",
+                       "Remove private source, logs, build outputs and the pinned Swift"]
+IOS_CORE_RUN_NAME = "\nrun-name: 'May iOS core suite for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
+IOS_CORE_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(skipped)", "int(failures)", "int(total)", "number"}
+IOS_CORE_EXIT_CLASSES = {"GateDenial", "IosCoreError", "CompilePrError", "DsCompileError", "StoreError"}
+
+
+@with_app_tokens("ios-core-pr.yml")
+def ios_core_workflow_problems(text):
+    name = IOS_CORE + ": "
+    found = []
+    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or \
+            "GITHUB_PATH" in text or "--export" in text or "--platform android" in text or \
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "core")] != [1, 1] or \
+            text.count("runs-on:") != 2:
+        found.append(name + "is not the Linux MayCore run with no artifact, step summary or carried value")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
+    if IOS_CORE_RUN_NAME not in text or text.count("run-name:") != 1:
+        found.append(name + "run-name is not exactly the pull request number and head SHA")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly pr_number and source_sha")
+    if "\nconcurrency:\n  group: may-ios-core-pr\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "core")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "core"]:
+        found.append(name + "jobs are not exactly admission and core")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != [GATE_COMPILE_PR, IOS_CORE_SWIFT, GATE_CHECK_PULL, PREPARE_IOS_PR, IOS_CORE_RUN, IOS_CORE_POST,
+                IOS_CORE_CLEANUP] or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the Swift install, the check, the fetch, the suite, "
+                     "the post and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "core")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["core"]]
+    cleanup = steps["core"][-1][1] if steps["core"] else ""
+    if leading != {"admission": ["uses", "id"], "core": ["uses"] + ["name"] * len(IOS_CORE_STEP_NAMES)} or \
+            names != [""] + IOS_CORE_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + "core's steps are not exactly the Swift install, check, fetch, suite, post and an "
+                     "always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error|container|services):",
+                 text.replace("        if: always()\n", "", 1)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 35\n" not in job_text(text, "core"):
+        found.append(name + "sets a shell, defaults, a container, a service, a condition or a timeout other than "
+                     "core's 35 minutes")
+    job = job_text(text, "core")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
+            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "core's environment is not the one admission chose, after admission")
+    by_name = dict(steps["core"])
+    swift, check, fetch, suite, post, clean = (by_name.get(n, "") for n in IOS_CORE_STEP_NAMES)
+    allowed = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+        {(n, "${{ secrets." + n + " }}") for n in UNIT_SECRETS}
+    if secrets_in(text) != set(UNIT_SECRETS) or any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
+            secrets_in(post) != {PR_COMMENT_SECRET} or secrets_in(swift + suite + clean) or \
+            "GH_TOKEN" in fetch + suite + post or "env:" in swift + clean or \
+            env_entries(suite) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")] or \
+            sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
+            any(e not in allowed for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
+                     "the post's comment token and the dispatch's inputs")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    return found
+
+
+def ios_core_print_problems(root):
+    return quiet_tool_problems(root, IOS_CORE_TOOL, IOS_CORE_PRINT_VALUES, IOS_CORE_EXIT_CLASSES)
+
 # The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py) each
 # dispatch their lane's workflow (android-unit-pr.yml, backend-unit-pr.yml) for at most one may-app head a run. Each is
 # pinned whole by the same rules (SCHEDULES): the schedule and a bare dispatch as its only triggers, one run at a time,
@@ -2237,6 +2337,8 @@ def control_problems(root):
     found += android_ci_schedule_tool_problems(root)
     found += backend_unit_workflow_problems((flows / BACKEND).read_text())
     found += backend_unit_print_problems(root)
+    found += ios_core_workflow_problems((flows / IOS_CORE).read_text())
+    found += ios_core_print_problems(root)
     found += backend_ci_schedule_workflow_problems((flows / BACKEND_SCHEDULE).read_text())
     found += backend_ci_schedule_tool_problems(root)
     found += renders_workflow_problems((flows / RENDERS).read_text())

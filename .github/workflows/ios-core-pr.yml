@@ -1,0 +1,108 @@
+name: May iOS core suite at a may-app pull request head (MayCore swift test on Linux; pass or fail and counts only)
+# The pull request number and head SHA only (both public in this log already), as the other pull-request lanes.
+run-name: 'May iOS core suite for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open May-Assistant/may-app pull request against main (not from a fork)
+        required: true
+        type: string
+      source_sha:
+        description: That pull request's current 40-character head commit
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: may-ios-core-pr
+  cancel-in-progress: false
+jobs:
+  admission:
+    # may-app's ios/MayCore package (Foundation only) built and tested on a free Linux runner with the pinned Swift
+    # 6.2.4, at the head of an open may-app pull request: `swift build --build-tests` and `swift test --skip-build`
+    # (ios_core.py), in the whole checkout its tests read. Nothing else ran these tests before a merge (may-app #1329
+    # broke BrowserContractTests on main). The same gate, fetch and environment as native-compile-pr.yml's swift-checks
+    # (gate.py --action compile-pr: may-native-compile-pr, no required reviewer, main only): two read-only deploy keys
+    # and a pull-request read token, each in its own step, and the pull-request comment token in the post alone.
+    # Nothing is signed, cached or uploaded. The build and test output stays in a private log, only fixed lines with
+    # counts are printed, and the failures go only to the may-app pull request.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+  core:
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    # The build and tests stop at 25 minutes together (ios_core.RUN_SECONDS); the 1 GB toolchain and the fetch take the
+    # rest.
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code
+        id: ci-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: read
+      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code
+        id: ci-comment
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: write
+      - name: Install the pinned, checksum-verified Swift
+        run: python3 -I -S -B tools/may_release/toolchain.py swift
+      - name: Check the pull request head and environment before fetching
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
+      - name: Fetch the pull request head and pinned design system quietly
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+      - name: Build and test MayCore without any credential, printing only pass or fail and counts
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/ios_core.py run --source-sha "$MAY_SOURCE_SHA"
+      - name: Post the MayCore failures on the may-app pull request, never in this log
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
+        run: python3 -I -S -B tools/may_release/ios_core.py post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+      - name: Remove private source, logs, build outputs and the pinned Swift
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-swift" "$RUNNER_TEMP/may-tools"
