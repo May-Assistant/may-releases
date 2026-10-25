@@ -1242,7 +1242,8 @@ def records_onboarding(row):
 def finish_onboarding(row, source, platform, drive):
     """may-app's ONBOARDING subflow before an agent scenario, so the agent starts from Chats; drive(flow) is the
     platform's Maestro call, true when the flow passed. Without the subflow (an older may-app) or when it does not
-    pass, the agent starts where the app is, and the public log says so. A row that records onboarding gets none."""
+    pass, the agent starts where the app is, and the public log says so. A row that records onboarding gets none.
+    Whether the subflow passed, or None when none ran."""
     if row["driver"] != "agent" or records_onboarding(row):
         return
     flow, scenario = source / FLOWS_DIR / ONBOARDING, row["id"]
@@ -1258,6 +1259,7 @@ def finish_onboarding(row, source, platform, drive):
     if not passed:
         print(f"May device tests ({platform}): {scenario}: the onboarding subflow did not pass; the agent starts "
               "where it stopped")
+    return passed
 
 
 def settle(entry, row, passed):

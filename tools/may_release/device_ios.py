@@ -22,6 +22,8 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import tempfile
+import threading
 import time
 
 import device_agent
@@ -44,6 +46,10 @@ STOP_SECONDS = 30
 TAIL_MARGIN, MIN_TAIL_SECONDS = 0.8, 60
 # One avconvert, however long the recording, never holds the job (the security read of #116).
 CONVERT_SECONDS = 600
+# Run 40181517145 (coordinator, 25 Oct): each scenario is recorded in parts of PART_SECONDS, up to MAX_PARTS, and all
+# its conversions share CONVERSION_BUDGET_SECONDS. The run's budget (device_tests.Budget) counts a scenario's agent
+# and onboarding alone: the job's 30 minutes past RUN_BUDGET_SECONDS cover the last scenario's conversions.
+PART_SECONDS, MAX_PARTS, CONVERSION_BUDGET_SECONDS = 5 * 60, 12, 10 * 60
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
@@ -105,50 +111,110 @@ def xcode():
 
 
 class Recorder:
-    """The simulator's screen for one scenario (simctl recordVideo until SIGINT), then converted (CONVERSIONS) for
-    publishing under MAX_RECORDING, or kept as recorded when no conversion works and it fits."""
+    """The simulator's screen for one scenario (simctl recordVideo until SIGINT) in parts of PART_SECONDS, each then
+    converted (CONVERSIONS) for publishing under MAX_RECORDING, or kept as recorded when no conversion works and it
+    fits. One part is <scenario>.mp4; more are <scenario>-part<n>.mp4, as Android's are."""
 
-    def __init__(self, udid, env, scenario, private, log):
+    def __init__(self, udid, env, scenario, private, log, part_seconds=None, clock=None):
         self.udid, self.env, self.scenario, self.log = udid, env, scenario, log
-        self.raw = private / (scenario + "-recording.mov")
+        self.private, self.clocked = private, clock
+        self.part_seconds = PART_SECONDS if part_seconds is None else part_seconds
+        self.raws, self.marks = [], []  # each part's raw recording, and when it started
         self.process = None
         # Why stop() kept no recording, in fixed words and a size in MB, for the public log (None when one was kept),
         # and how a recording was kept when it is not the usual conversion.
         self.dropped = self.kept = None
-        self.private = private
         self.started = self.stopped = None
+        self.halting, self.stuck = threading.Event(), False
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        # Each conversion's outcome and avconvert's error class (error_class), for the private diag alone.
+        self.notes = []
 
-    def length(self):
-        """How long the recording ran, for the public log ("" when it was never started here)."""
-        return f" after {round(self.stopped - self.started)} s of recording" if self.started is not None else ""
+    def clock(self):
+        return (self.clocked or time.monotonic)()
 
-    def start(self):
+    def length(self, part=0):
+        """How long a part ran, for the public log ("" when it was never started here)."""
+        if self.started is None or not self.marks or self.stopped is None:
+            return ""
+        end = self.marks[part + 1] if part + 1 < len(self.marks) else self.stopped
+        return f" after {round(end - self.marks[part])} s of recording"
+
+    def begin_part(self):
+        raw = self.private / f"{self.scenario}-recording-{len(self.raws) + 1}.mov"
         with self.log.open("ab") as output:
             self.process = subprocess.Popen(["xcrun", "simctl", "io", self.udid, "recordVideo", "--codec=h264",
-                                             "--force", str(self.raw)], stdout=output, stderr=output,
+                                             "--force", str(raw)], stdout=output, stderr=output,
                                             stdin=subprocess.DEVNULL, env=self.env)
-        self.started = time.monotonic()
+        self.raws.append(raw)
+        self.marks.append(self.clock())
 
-    def halt(self):
-        """Ends the recording (SIGINT, so simctl finishes its file) ahead of the server reads; stop() converts it.
-        False when the recorder did not stop and was killed."""
-        if self.process is None or self.stopped is not None or self.dropped:
-            return self.process is not None and not self.dropped
+    def end_part(self):
+        """SIGINT, so simctl finishes the part's file: False when it did not stop and was killed."""
         self.process.send_signal(signal.SIGINT)
         try:
             self.process.wait(timeout=STOP_SECONDS)
         except subprocess.TimeoutExpired:
             self.process.kill()
+            return False
+        return True
+
+    def start(self):
+        self.begin_part()
+        self.started = self.marks[0]
+        self.thread.start()
+
+    def loop(self):
+        """Run 40181517145's 30-minute recordings (330 and 394 MB) failed every preset: a new part every
+        PART_SECONDS keeps each one short, up to MAX_PARTS (the last then runs until halt)."""
+        while not self.halting.wait(self.part_seconds) and len(self.raws) < MAX_PARTS:
+            if not self.end_part():
+                self.stuck = True
+                return
+            if self.halting.is_set():  # halt came while the part ended: no new one
+                return
+            self.begin_part()
+
+    def halt(self):
+        """Ends the recording ahead of the server reads; stop() converts it. False when the recorder did not stop."""
+        if self.process is None or self.dropped:
+            return False
+        if self.stopped is not None:
+            return True
+        self.halting.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2 * STOP_SECONDS + 5)
+        if self.thread.is_alive() or self.stuck or not self.end_part():
             self.dropped = "the recorder did not stop"
             return False
-        self.stopped = time.monotonic()
+        self.stopped = self.clock()
         return True
 
     def stop(self, folder):
         if not self.halt():
             return []
-        seconds = int(self.stopped - self.started) if self.started is not None else 0
-        out = folder / (self.scenario + ".mp4")
+        names, kept, dropped = [], [], []
+        # A budget for all of the scenario's conversions together, so no scenario's recording holds the job.
+        deadline = self.clock() + CONVERSION_BUDGET_SECONDS
+        for part, raw in enumerate(self.raws):
+            many = len(self.raws) > 1
+            out = folder / (f"{self.scenario}-part{part + 1}.mp4" if many else f"{self.scenario}.mp4")
+            name, how, why = self.publish(part, raw, out, deadline)
+            prefix = f"part {part + 1}: " if many else ""
+            if name:
+                names.append(name)
+            if how:
+                kept.append(prefix + how)
+            if why:
+                dropped.append(prefix + why)
+        self.kept = "; ".join(kept) or None
+        self.dropped = "; ".join(dropped) or None
+        return names
+
+    def publish(self, part, raw, out, deadline):
+        """One part converted to out: (its name or None, how it was kept when not the usual conversion, why it was
+        dropped), the last two for the public log in fixed words and MB."""
+        seconds = int((self.marks[part + 1] if part + 1 < len(self.marks) else self.stopped) - self.marks[part])
         # Smoke run 39683880243: the M4V preset's conversion to .mp4 failed. Each preset writes the file type it
         # supports, in the private folder; the first one that works and fits the cap is published as .mp4 (an M4V is
         # an MPEG-4 file). When none does, the original H.264 recording is published if it fits.
@@ -156,53 +222,66 @@ class Recorder:
         # failed or wrote a file still over the cap; each preset's outcome is now named, in fixed words and MB.
         outcomes, smallest = [], None  # smallest: (bytes, preset, suffix) of a conversion that was over the cap
         for preset, suffix in CONVERSIONS:
-            converted = self.private / (self.scenario + "-converted" + suffix)
-            failed = self.convert(["--preset", preset], converted)
+            converted = self.private / (f"{self.scenario}-converted-{part + 1}" + suffix)
+            failed = self.convert(raw, ["--preset", preset], converted, deadline, f"part {part + 1} {preset}")
             if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
                 converted.replace(out)
-                self.raw.unlink(missing_ok=True)
-                return [out.name]
+                raw.unlink(missing_ok=True)
+                return out.name, None, None
             outcomes.append(f"{preset} " + outcome(failed, converted))
             if not failed and converted.is_file() and (smallest is None or converted.stat().st_size < smallest[0]):
                 smallest = (converted.stat().st_size, preset, suffix)
             converted.unlink(missing_ok=True)
         tried = ", ".join(outcomes)
-        if self.raw.is_file() and self.raw.stat().st_size <= MAX_RECORDING:
-            self.raw.replace(out)
-            self.kept = f"unconverted: no conversion fit the cap ({tried}){self.length()}"
-            return [out.name]
-        tail, tried_tail = self.tail(out, seconds, smallest)
+        if raw.is_file() and raw.stat().st_size <= MAX_RECORDING:
+            raw.replace(out)
+            return out.name, f"unconverted: no conversion fit the cap ({tried}){self.length(part)}", None
+        tail, tried_tail = self.tail(part, raw, out, seconds, smallest, deadline)
         if tail:
-            self.raw.unlink(missing_ok=True)
-            self.kept = f"as its last {tail} s alone: the whole did not fit the cap ({tried}){self.length()}"
-            return [out.name]
-        size = megabytes(self.raw) if self.raw.is_file() else 0
-        self.raw.unlink(missing_ok=True)
-        self.dropped = (f"no conversion fit the cap ({tried}) and the original is {size} MB, over it" +
-                        (f"; {tried_tail}" if tried_tail else "") + self.length())
-        return []
+            raw.unlink(missing_ok=True)
+            return (out.name, f"as its last {tail} s alone: the whole did not fit the cap ({tried}){self.length(part)}",
+                    None)
+        size = megabytes(raw) if raw.is_file() else 0
+        raw.unlink(missing_ok=True)
+        return None, None, (f"no conversion fit the cap ({tried}) and the original is {size} MB, over it" +
+                            (f"; {tried_tail}" if tried_tail else "") + self.length(part))
 
-    def convert(self, options, converted):
-        """One avconvert of the raw recording to converted: its exit status, or "timed out" past CONVERT_SECONDS."""
-        with self.log.open("ab") as output:
+    def convert(self, raw, options, converted, deadline, what):
+        """One avconvert of a raw part to converted, within the scenario's conversion budget: its exit status,
+        "timed out" past CONVERT_SECONDS or the budget's end, or "budget spent" when none was left to start it. Its
+        output goes to the private log, and its error class (error_class) to the private diag's notes."""
+        left = int(deadline - self.clock())
+        if left <= 0:
+            self.notes.append(f"{what}: not tried, the scenario's conversion budget was spent")
+            return "budget spent"
+        with tempfile.TemporaryFile() as output:
             try:
-                return subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted), *options,
-                                       "--replace"], stdout=output, stderr=output, stdin=subprocess.DEVNULL,
-                                      env=self.env, timeout=CONVERT_SECONDS).returncode
+                status = subprocess.run(["avconvert", "--source", str(raw), "--output", str(converted), *options,
+                                         "--replace"], stdout=output, stderr=output, stdin=subprocess.DEVNULL,
+                                        env=self.env, timeout=min(CONVERT_SECONDS, left)).returncode
             except subprocess.TimeoutExpired:
-                return "timed out"
+                status = "timed out"
+            output.seek(0)
+            said = output.read(MAX_CONVERT_OUTPUT)
+        with self.log.open("ab") as log:
+            log.write(said)
+        if status:
+            self.notes.append(f"{what}: " + (f"exit {status}" if type(status) is int else status) +
+                              f"; avconvert said: {error_class(said)}")
+        return status
 
-    def tail(self, out, seconds, smallest):
-        """The recording's last part converted to out with smallest's preset, sized to fit the cap: (its length in
+    def tail(self, part, raw, out, seconds, smallest, deadline):
+        """A part's last stretch converted to out with smallest's preset, sized to fit the cap: (its length in
         seconds, or 0 when none was kept; how a tail that was tried and refused came out, for the log, or None)."""
-        if smallest is None or not self.raw.is_file():
+        if smallest is None or not raw.is_file():
             return 0, None
         size, preset, suffix = smallest
         tail = max(MIN_TAIL_SECONDS, int(seconds * MAX_RECORDING * TAIL_MARGIN / size))
         if tail >= seconds:
             return 0, None
-        converted = self.private / (self.scenario + "-tail" + suffix)
-        failed = self.convert(["--preset", preset, "--start", str(seconds - tail), "--duration", str(tail)], converted)
+        converted = self.private / (f"{self.scenario}-tail-{part + 1}" + suffix)
+        failed = self.convert(raw, ["--preset", preset, "--start", str(seconds - tail), "--duration", str(tail)],
+                              converted, deadline, f"part {part + 1} {preset} last {tail} s")
         if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
             converted.replace(out)
             return tail, None
@@ -211,13 +290,33 @@ class Recorder:
         return 0, tried
 
 
+# avconvert's own words for a failure (run 40181517145: exit 205 on every preset, with nothing in the public log to
+# say why): each NSError's domain and code it printed, else its last line, for the private diag alone.
+ERROR_CLASS = re.compile(rb"Domain=([A-Za-z][A-Za-z0-9_.]{0,80}) Code=(-?[0-9]{1,9})")
+MAX_CONVERT_OUTPUT = 64 * 1024
+
+
+def error_class(said):
+    found = []
+    for domain, code in ERROR_CLASS.findall(said):
+        named = f"{domain.decode()} {code.decode()}"
+        if named not in found:
+            found.append(named)
+    if found:
+        return ", ".join(found[:4])
+    lines = [line.strip() for line in said.splitlines() if line.strip()]
+    return lines[-1][:200].decode("utf-8", "replace") if lines else "nothing"
+
+
 def megabytes(path):
     return path.stat().st_size // (1024 * 1024)
 
 
 def outcome(failed, converted):
     """One conversion's outcome for the public log, in fixed words and MB."""
-    return (f"failed (exit {failed})" if type(failed) is int and failed else "failed (timed out)" if failed else
+    return (f"failed (exit {failed})" if type(failed) is int and failed else
+            "not tried (the scenario's conversion budget was spent)" if failed == "budget spent" else
+            "failed (timed out)" if failed else
             f"{megabytes(converted)} MB" if converted.is_file() else "wrote no file")
 
 
@@ -233,6 +332,15 @@ SPAN = re.compile(rb"main-thread span ([a-z-]{1,40}) ([0-9]{1,7}) ms[ \t]*\r?\n?
 SPAN_NAMES = ("event-store", "recognizer", "dictation-capability", "calendar-access", "agenda-state", "chat-publish",
               "chat-inbox", "chat-merge")
 MAX_SPAN_SECTION = device_tests.MAX_DIAG // 8
+# may-app #1309 (N, 25 Oct): after each stall line, "main-thread stall-after <name>", the last main-actor step that ran
+# before it, from a fixed set agreed with N. The public log counts each name, and any other as "other".
+STALL_AFTER = re.compile(rb"main-thread stall-after ([a-z-]{1,40})[ \t]*\r?\n?$")
+STALL_AFTER_NAMES = ("launch", "sync-start", "sync-transcript", "sync-publish", "sync-inbox", "sync-end", "agenda-load",
+                     "connections-load", "pill-read", "view-root", "view-shell", "view-chat")
+# Run 40181517145: chat's and notes' onboarding subflow did not pass, with nothing to say where it stopped. Its last
+# ONBOARDING_LINES of Maestro output go to the scenario's private diag when it does not pass. The private diag keeps
+# DIAG_RESERVE for them and for the recording's notes, written after the conversion.
+ONBOARDING_LINES, DIAG_RESERVE = 40, 16 * 1024
 # The simulator's crash reports land in the host's own folder; only the Playground's process is kept.
 CRASH_REPORTS = Path.home() / "Library" / "Logs" / "DiagnosticReports"
 CRASH_REPORT = re.compile(r"MayPlayground[-_][A-Za-z0-9._-]{1,120}\.(?:ips|crash)")
@@ -261,6 +369,7 @@ class Diagnostics:
         self.start = None
         self.kept = self.stalls = self.longest = self.crashes = self.drivers = 0
         self.spans = {}  # name: [count, longest ms], for SPAN_NAMES alone
+        self.after = {}  # name: count, for STALL_AFTER_NAMES and "other"
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
 
     def crash_reports(self):
@@ -274,9 +383,10 @@ class Diagnostics:
         """The scenario's start, in the log's own local time."""
         self.start = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    def keep(self, folder, scenario, token, driver=None):
+    def keep(self, folder, scenario, token, driver=None, onboarding=b""):
         """Writes <scenario>.diag.txt when there is anything to keep; never an error. driver: the agent's DRIVER_FILE,
-        each refused act's Maestro lines (device_mcp.refused)."""
+        each refused act's Maestro lines (device_mcp.refused); onboarding: the subflow's last lines when it did not
+        pass."""
         found = []
         for path in self.crash_reports():
             if path not in self.seen:
@@ -290,7 +400,7 @@ class Diagnostics:
                     found.append(b"== crash ==\n" + data + b"\n")
         self.crashes += bool(found)
         lines = [line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
-                 .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line)]
+                 .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line) or STALL_AFTER.search(line)]
         stalls = [int(STALL.search(line).group(1)) for line in lines if STALL.search(line)]
         self.stalls += len(stalls)
         self.longest = max([self.longest, *stalls])
@@ -306,6 +416,8 @@ class Diagnostics:
         (crashes, from_crashes), (watchdog, from_log) = kept_lines(b"".join(found), token), kept_lines(b"".join(lines),
                                                                                                          token)
         refused, from_driver = kept_lines(refused, token)
+        onboarding, from_onboarding = kept_lines(onboarding, token)
+        onboarding = whole_lines(onboarding, DIAG_RESERVE // 2 - 64, newest=True)
         self.drivers += bool(refused)
         # Counted from what kept_lines kept, so a span line it dropped is neither published nor counted.
         spans = [line for line in watchdog.splitlines(keepends=True) if SPAN.search(line)]
@@ -314,16 +426,23 @@ class Diagnostics:
             if name in SPAN_NAMES:
                 count, longest = self.spans.get(name, [0, 0])
                 self.spans[name] = [count + 1, max(longest, ms)]
+        for line in watchdog.splitlines(keepends=True):
+            after = STALL_AFTER.search(line)
+            if after:
+                name = after.group(1).decode() if after.group(1).decode() in STALL_AFTER_NAMES else "other"
+                self.after[name] = self.after.get(name, 0) + 1
         crashes = crashes[:device_tests.MAX_DIAG // 2]
-        room = device_tests.MAX_DIAG - len(crashes) - len(refused) - 192  # the section headers' room
+        # The section headers' room, the onboarding lines and the recording's notes (DIAG_RESERVE).
+        room = device_tests.MAX_DIAG - len(crashes) - len(refused) - 192 - DIAG_RESERVE
         # The watchdog's newest lines fill the rest; when that trims any, every span line goes ahead of it too.
         trimmed = len(watchdog) > room
         section = b"".join(spans)[:MAX_SPAN_SECTION] if trimmed else b""
         room -= len(section)
         watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
-        if not (crashes or refused or watchdog):
+        if not (crashes or refused or watchdog or onboarding):
             return
-        text = (crashes + (b"== driver ==\n" + refused if refused else b"") +
+        text = (crashes + (b"== onboarding ==\n" + onboarding if onboarding else b"") +
+                (b"== driver ==\n" + refused if refused else b"") +
                 (b"== spans ==\n" + section if section else b"") +
                 (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
         text = text[:device_tests.MAX_DIAG].decode("utf-8", "ignore").encode()
@@ -332,7 +451,54 @@ class Diagnostics:
         except OSError:
             return
         self.kept += 1
-        self.dropped[scenario] = from_crashes + from_driver + from_log
+        self.dropped[scenario] = from_crashes + from_driver + from_log + from_onboarding
+
+    def recording(self, folder, scenario, token, notes):
+        """The recording's notes (Recorder.notes: each failed conversion and avconvert's error class), added to the
+        scenario's private diag after the conversion, within DIAG_RESERVE; never an error."""
+        section, dropped = kept_lines("".join(note + "\n" for note in notes).encode(), token)
+        if not section:
+            return
+        section = b"== recording ==\n" + whole_lines(section, DIAG_RESERVE // 2 - 64)
+        path = folder / f"{scenario}{device_tests.DIAG}"
+        try:
+            had = path.is_file() and not path.is_symlink()
+            if not had and path.exists():
+                return
+            text = (path.read_bytes() if had else b"") + section
+            path.write_bytes(text[:device_tests.MAX_DIAG].decode("utf-8", "ignore").encode())
+        except OSError:
+            return
+        self.kept += not had
+        self.dropped[scenario] = self.dropped.get(scenario, 0) + dropped
+
+
+def whole_lines(data, limit, newest=False):
+    """At most limit bytes of data in whole lines: its first, or with newest its last."""
+    lines, kept, size = data.splitlines(keepends=True), [], 0
+    for line in reversed(lines) if newest else lines:
+        if size + len(line) > limit:
+            break
+        kept.append(line)
+        size += len(line)
+    return b"".join(reversed(kept) if newest else kept)
+
+
+def last_lines(path, log):
+    """The last ONBOARDING_LINES of a private Maestro log, which is then added to the run's private log and removed:
+    b"" when there is none."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return b""
+        with path.open("rb") as stream:
+            stream.seek(max(0, path.stat().st_size - 64 * 1024))
+            data = stream.read()
+        with log.open("ab") as output:
+            output.write(data)
+        path.unlink()
+    except OSError:
+        return b""
+    return b"".join(data.splitlines(keepends=True)[-ONBOARDING_LINES:])
 
 
 def screenshot(udid, env, path, log):
@@ -456,10 +622,12 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                                                timeout=device_tests.FLOW_SECONDS).returncode
                 except subprocess.SubprocessError:
                     passed = False
-            device_tests.finish_onboarding(row, source, "ios", lambda path: not renders.quiet(
-                [str(launcher), "--device", udid, "test", str(path)], log,
+            onboarding_log = private / f"{row['id']}-onboarding.log"
+            onboarded = device_tests.finish_onboarding(row, source, "ios", lambda path: not renders.quiet(
+                [str(launcher), "--device", udid, "test", str(path)], onboarding_log,
                 env=maestro_env,
                 timeout=device_tests.ONBOARDING_SECONDS).returncode)
+            onboarding = last_lines(onboarding_log, log) if onboarded is False else b""
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
@@ -477,14 +645,16 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             # and got 401. The server reads and the diagnostics come first; the conversion, however long, after.
             device_tests.server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
             # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
-            diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE)
+            diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE,
+                             onboarding=onboarding)
             accounts.finish(row, base, token)
             token = ""
             entry["videos"] = recorder.stop(folder)
+            diagnostics.recording(folder, row["id"], "", recorder.notes)
             if recorder.dropped:
                 scenario, why = row["id"], recorder.dropped
                 print(f"May device tests (ios): {scenario}: its recording was dropped ({why})")
-            elif recorder.kept:
+            if recorder.kept:
                 scenario, why = row["id"], recorder.kept
                 print(f"May device tests (ios): {scenario}: its recording was kept {why}")
             device_tests.settle(entry, row, passed if flow is not None else None)
@@ -516,6 +686,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         if name in diagnostics.spans:
             count, longest = diagnostics.spans[name]
             print(f"May device tests (ios): main-thread span {name}: {count}, the longest {longest} ms")
+    for name in (*STALL_AFTER_NAMES, "other"):
+        if name in diagnostics.after:
+            count = diagnostics.after[name]
+            print(f"May device tests (ios): main-thread stall-after {name}: {count}")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:
