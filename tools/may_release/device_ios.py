@@ -58,6 +58,7 @@ SHOW_TOUCHES = ("-MayShowTouches", "YES")
 # before the app first starts, which stops the chat header's mark redrawing every frame (N's audit).
 REDUCE_MOTION = "MAY_IOS_REDUCE_MOTION"
 REDUCE_MOTION_ON = ("defaults", "write", "com.apple.Accessibility", "ReduceMotionEnabled", "-bool", "true")
+SWIFTUI_PERSIST = ("log", "config", "--subsystem", "com.apple.SwiftUI", "--mode", "level:info,persist:info")
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
 # (errSecMissingEntitlement) and the app signed out with "Something went wrong on this device" (run 40035089599).
@@ -601,6 +602,11 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             print("May device tests (ios): Reduce Motion could not be turned on; the run goes on without it")
         else:
             print("May device tests (ios): Reduce Motion is on for this run")
+    # Run 40232904242: SwiftUI's info lines stayed in the simulator's memory alone, so a scenario's later read kept
+    # only its last minutes of body changes. They are persisted for that subsystem alone, before the app starts; the
+    # read and its rules are unchanged (private diag alone).
+    if renders.quiet(["xcrun", "simctl", "spawn", udid, *SWIFTUI_PERSIST], log, env=env).returncode:
+        print("May device tests (ios): SwiftUI's body changes are kept for the last minutes alone in this run")
     diagnostics = (diagnosed or Diagnostics)(udid, env)
     results, records, cleaned_count = [], {}, None
     try:

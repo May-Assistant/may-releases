@@ -376,8 +376,8 @@ class AgentRunTests(unittest.TestCase):
         except (KeyError, TypeError) as error:
             self.fail("a question truth row was not read as a question: " + type(error).__name__)
         self.assertEqual(asked, [("answered", "qa-39557415738-a-poll"), ("closed", "qa-39557415738-a-poll-skip")])
-        self.assertEqual([device.get("MAY_DEVICE_STEPS") for device in self.last_seen["devices"]], [None, "120"],
-                         "poll keeps the default, poll-skip has 120 to type its free reply (coordinator, 25 Oct)")
+        self.assertEqual([device.get("MAY_DEVICE_STEPS") for device in self.last_seen["devices"]], ["120", "120"],
+                         "both have 120 to type slowly (run 40232904242: poll ran out at 80)")
         self.assertEqual([(row["verdict"], row.get("reason"), row["server"]) for row in report["scenarios"]], [
             ("pass", None, [{"get": "/v1/agents", "status": 200, "pass": True}]),
             ("fail", device_tests.NO_TRUTH, [{"get": "/v1/agents", "status": 200, "pass": False}])])

@@ -303,7 +303,19 @@ class ScenarioTests(unittest.TestCase):
                         continue
                 self.fail(f"a row with {change} was accepted")
         self.assertEqual(device_tests.steps(skip), {"MAY_DEVICE_STEPS": "120"})
-        self.assertEqual(device_tests.steps(device_tests.scenarios("poll")[0]), {})
+        self.assertEqual(device_tests.steps(device_tests.scenarios("poll")[0]), {"MAY_DEVICE_STEPS": "120"},
+                         "run 40232904242: poll ran out at 80 steps typing its message")
+        self.assertEqual(device_tests.steps(device_tests.scenarios("chat")[0]), {})
+
+    def test_the_poll_goals_act_only_on_their_own_tagged_card(self):
+        """Run 40232904242: poll-skip met poll's unanswered card in the shared May chat and stopped."""
+        for scenario in ("poll", "poll-skip"):
+            with self.subTest(scenario=scenario):
+                goal = device_tests.scenarios(scenario)[0]["goal"]
+                self.assertIn("Earlier question cards from other tests, with other tags, may already be in the chat; "
+                              "ignore them and act only on the card that holds {tag}.", goal)
+        self.assertEqual(device_tests.scenarios("poll-skip")[0]["goal"].count("I will answer myself: apples, {tag}."), 1,
+                         "its messages as they were")
 
     def test_only_a_fresh_agent_row_records_onboarding(self):
         onboarding = device_tests.scenarios("onboarding")[0]
