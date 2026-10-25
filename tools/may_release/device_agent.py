@@ -54,9 +54,14 @@ JUDGE_PROMPT = (
     "The screen as the agent left it, read when it finished (accessibility hierarchy, one element per line):\n"
     "{hierarchy}\n\n"
     "May's server, for each message this run sent with its tag (delivery codes only): {delivery}\n\n"
+    "The harness's own reads of May's server after the agent finished, each with this scenario's tag: {truth}\n\n"
     "verdict is pass only if the hierarchy and the report together show the goal achieved; otherwise fail. A "
-    "delivery code of succeeded is the server's record that May answered this run's message. note says why in at "
-    "most three sentences.")
+    "delivery code of succeeded is the server's record that May answered this run's message. A server read marked "
+    "confirmed is the server's record of what happened: it outranks May's own words in the chat, which are model "
+    "text and can be wrong about what the app did, and any guess about how the app works. A choice tapped on May's "
+    "question card shows in the chat as a reply quoting the card. The screen must still not contradict a confirmed "
+    "read: an error on screen, or the goal's own state missing from it, is a fail. note says why in at most three "
+    "sentences.")
 JUDGE_SCHEMA = json.dumps({"type": "object", "additionalProperties": False, "required": ["verdict", "note"],
                            "properties": {"verdict": {"type": "string", "enum": ["pass", "fail"]},
                                           "note": {"type": "string", "maxLength": 600}}})
@@ -182,13 +187,21 @@ def delivery_text(agent):
     return ", ".join(code for code in codes if isinstance(code, str)) or "none found"
 
 
+def truth_text(agent):
+    """The judge's line on the harness's server reads (device_tests.truth_lines), or that there were none."""
+    lines = agent.get("truth")
+    if not isinstance(lines, list) or not lines:
+        return "none: this scenario has no server read"
+    return "; ".join(line for line in lines if isinstance(line, str))
+
+
 def judge(cli, goal, tag, agent, work, token, model):
     """The judge's verdict on one agent run: ("pass" | "fail" | "rate_limited" | "error", note)."""
     work = fresh(work)
     prompt = JUDGE_PROMPT.format(goal=goal.replace("{tag}", tag), outcome=agent.get("outcome") or "none",
                                  actions=agent.get("actions", 0), summary=redacted(agent.get("summary")) or "(none)",
                                  hierarchy=agent.get("hierarchy") or "(none)",
-                                 delivery=delivery_text(agent))
+                                 delivery=delivery_text(agent), truth=truth_text(agent))
     command = base_command(cli, prompt, model) + ["--json-schema", JUDGE_SCHEMA]
     try:
         with (work / "judge.json").open("wb") as out, (work / "judge.err").open("wb") as err:
