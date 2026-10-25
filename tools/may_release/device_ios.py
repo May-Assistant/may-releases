@@ -244,7 +244,7 @@ class Diagnostics:
         self.udid, self.env, self.reports, self.shown = udid, env, reports, shown
         self.seen = set(self.crash_reports())
         self.start = None
-        self.kept = self.stalls = self.longest = self.crashes = 0
+        self.kept = self.stalls = self.longest = self.crashes = self.drivers = 0
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
 
     def crash_reports(self):
@@ -258,8 +258,9 @@ class Diagnostics:
         """The scenario's start, in the log's own local time."""
         self.start = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    def keep(self, folder, scenario, token):
-        """Writes <scenario>.diag.txt when there is anything to keep; never an error."""
+    def keep(self, folder, scenario, token, driver=None):
+        """Writes <scenario>.diag.txt when there is anything to keep; never an error. driver: the agent's DRIVER_FILE,
+        each refused act's Maestro lines (device_mcp.refused)."""
         found = []
         for path in self.crash_reports():
             if path not in self.seen:
@@ -277,22 +278,33 @@ class Diagnostics:
         stalls = [int(STALL.search(line).group(1)) for line in lines]
         self.stalls += len(stalls)
         self.longest = max([self.longest, *stalls])
-        # The crash reports first, at most half; the watchdog's newest lines fill the rest.
+        refused = b""
+        try:
+            if driver is not None and driver.is_file() and not driver.is_symlink():
+                with driver.open("rb") as stream:
+                    refused = stream.read(device_tests.device_mcp.MAX_DRIVER)
+        except OSError:
+            refused = b""
+        # The crash reports first, at most half; the refused acts' driver lines, capped where device_mcp wrote them;
+        # the watchdog's newest lines fill the rest. All through kept_lines with the session.
         (crashes, from_crashes), (watchdog, from_log) = kept_lines(b"".join(found), token), kept_lines(b"".join(lines),
                                                                                                          token)
+        refused, from_driver = kept_lines(refused, token)
+        self.drivers += bool(refused)
         crashes = crashes[:device_tests.MAX_DIAG // 2]
-        room = device_tests.MAX_DIAG - len(crashes) - 64  # the section header's room
+        room = device_tests.MAX_DIAG - len(crashes) - len(refused) - 128  # the section headers' room
         watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
-        if not (crashes or watchdog):
+        if not (crashes or refused or watchdog):
             return
-        text = (crashes + (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
+        text = (crashes + (b"== driver ==\n" + refused if refused else b"") +
+                (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
         text = text[:device_tests.MAX_DIAG].decode("utf-8", "ignore").encode()
         try:
             (folder / f"{scenario}{device_tests.DIAG}").write_bytes(text)
         except OSError:
             return
         self.kept += 1
-        self.dropped[scenario] = from_crashes + from_log
+        self.dropped[scenario] = from_crashes + from_driver + from_log
 
 
 def screenshot(udid, env, path, log):
@@ -452,7 +464,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 if codes is not None:
                     entry["delivery"] = codes
             # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
-            diagnostics.keep(folder, row["id"], token)
+            diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE)
             accounts.finish(row, base, token)
             token = ""
             device_tests.settle(entry, row, passed if flow is not None else None)
@@ -476,9 +488,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     ran = sum(1 for entry in results if entry["verdict"] != "skipped")
     print(f"May device tests (ios): {ran} scenarios ran; verdicts follow the judge step")
     kept, stalls, longest, crashes = diagnostics.kept, diagnostics.stalls, diagnostics.longest, diagnostics.crashes
+    drivers = diagnostics.drivers
     if kept:
         print(f"May device tests (ios): diagnostics kept for {kept} scenarios ({stalls} main-thread stalls, the longest "
-              f"{longest} ms; {crashes} with a crash)")
+              f"{longest} ms; {crashes} with a crash; {drivers} with refused device acts)")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:

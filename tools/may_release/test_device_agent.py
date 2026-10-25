@@ -1145,6 +1145,35 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertEqual(acts[0][:4], ["/m/maestro", "--device", IOS_UDID, "test"])
         self.assertTrue(all(env.get("JAVA_HOME") == "/java" and "SECRET_THING" not in env for _, env in self.calls))
 
+    def test_a_refused_acts_driver_lines_are_kept_redacted_and_capped(self):
+        """Coordinator, 25 Oct: iOS notes lost every tap after the Agenda tab, and the driver's words were never kept."""
+        said = (b"".join(b"Running on simulator, step %d\n" % n for n in range(60)) +
+                b"Authorization: Bearer abc\nsam@example.com was signed in\nTap on point (60,40)... FAILED\n")
+
+        def run(argv, capture_output, stdin, timeout, env):
+            return subprocess.CompletedProcess(argv, 1, said, b"Error: could not find the element\n")
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            failed, content = device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
+        self.assertEqual((failed, content[0]["text"]), (True, "The device did not take it"))
+        self.assertTrue((self.work / device_mcp.DRIVER_FILE).is_file(), "a refused act is kept")
+        kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
+        self.assertTrue(kept.startswith(b"== refused: - tapOn: (action 1) ==\n"), kept[:60])
+        self.assertIn(b"Tap on point (60,40)... FAILED\nError: could not find the element\n", kept)
+        self.assertIn(b"***@example.com was signed in", kept)
+        for absent in (b"Bearer", b"sam@", b"step 0\n", b"step 20\n"):
+            self.assertNotIn(absent, kept)
+        self.assertEqual(len(kept.splitlines()), 1 + device_mcp.DRIVER_LINES - 1, "the last 40 lines, one dropped")
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            for _ in range(200):
+                device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
+        self.assertLessEqual((self.work / device_mcp.DRIVER_FILE).stat().st_size, device_mcp.MAX_DRIVER)
+        self.assertTrue((self.work / device_mcp.DRIVER_FILE).read_bytes().startswith(kept), "the first refusals stay")
+
+    def test_a_taken_act_keeps_nothing(self):
+        self.call("tap", x=180, y=120)
+        self.assertFalse((self.work / device_mcp.DRIVER_FILE).exists())
+
     def test_the_hierarchy_is_in_screenshot_pixels(self):
         failed, content = self.call("hierarchy")
         self.assertFalse(failed)

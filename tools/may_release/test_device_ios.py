@@ -181,7 +181,7 @@ class RunTests(Workspace):
 
     def test_each_scenarios_diagnostics_are_kept_while_its_session_lasts_and_the_log_gives_counts(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
-        events = []
+        events, drivers = [], []
         test = self
 
         class Keeping(device_ios.Diagnostics):
@@ -193,18 +193,21 @@ class RunTests(Workspace):
                 events.append("begin")
                 super().begin()
 
-            def keep(self, folder, scenario, token):
+            def keep(self, folder, scenario, token, driver=None):
+                drivers.append(driver)
                 events.append(("keep", scenario, token, list(test.signed_out)))
-                super().keep(folder, scenario, token)
+                super().keep(folder, scenario, token, driver)
 
         calls, minted, report, out, run = self.run_it(diagnosed=Keeping)
         self.assertEqual(events, ["begin", ("keep", "sign-in", TOKEN + "1", []),
                                   "begin", ("keep", "connections", TOKEN + "2", [TOKEN + "1"])],
                          "kept before its own sign-out, with its own session for the redaction")
+        self.assertEqual(drivers, [self.private / "agent" / scenario / device_tests.device_mcp.DRIVER_FILE
+                                   for scenario in ("sign-in", "connections")], "each scenario's own agent folder")
         self.assertEqual(sorted(path.name for path in (run / "ios").glob("*" + device_tests.DIAG)),
                          ["connections.diag.txt", "sign-in.diag.txt"])
         self.assertIn("May device tests (ios): diagnostics kept for 2 scenarios (4 main-thread stalls, the longest "
-                      "820 ms; 0 with a crash)", out.splitlines())
+                      "820 ms; 0 with a crash; 0 with refused device acts)", out.splitlines())
         self.assertIn("May device tests (ios): sign-in diagnostics: 0 lines dropped", out.splitlines())
         self.assertNotIn("main-thread stall 300", out, "the public log gives counts alone")
 
@@ -481,6 +484,26 @@ class DiagnosticsTests(Workspace):
         for absent in (b"someone else", b"lookalike"):
             self.assertNotIn(absent, text)
         self.assertEqual(device_ios.BUNDLE, "io.github.mayassistant.may.playground")
+
+    def test_the_refused_acts_driver_lines_land_redacted_in_the_diagnostics(self):
+        """Coordinator, 25 Oct: N reads them; through kept_lines with the session, private, counted in the log."""
+        diagnostics = self.diagnostics(shown=b"")
+        driver = self.root / "driver.txt"
+        driver.write_bytes(b"== refused: - tapOn: (action 7) ==\nTap on point (60,40)... FAILED\n"
+                           b"launch env MAY_TEST_SESSION=" + TOKEN.encode() + b"\nraw " + TOKEN.encode() + b"\n")
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "notes", TOKEN, driver)
+        text = (folder / ("notes" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"== driver ==\n== refused: - tapOn: (action 7) ==\nTap on point (60,40)... FAILED\n", text)
+        self.assertNotIn(TOKEN.encode(), text, "the session itself is dropped too, not only secret-shaped lines")
+        self.assertEqual((diagnostics.drivers, diagnostics.dropped), (1, {"notes": 2}))
+        self.assertTrue(publish.diagnostics_ok(text))
+        link = self.root / "link.txt"
+        link.symlink_to(driver)
+        diagnostics.keep(folder, "chat", TOKEN, link)
+        self.assertFalse((folder / ("chat" + device_tests.DIAG)).exists(), "a link is never read")
 
     def test_nothing_new_writes_nothing(self):
         diagnostics = self.diagnostics(shown=b"Timestamp               Ty Process[PID:TID]\n")
