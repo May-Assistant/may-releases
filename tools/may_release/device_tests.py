@@ -1509,6 +1509,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         stored = {}
     records = stored.get("agents", {}) if isinstance(stored, dict) else {}
     goals = {row["id"]: row["goal"] for row in scenarios("all", platform) if row["driver"] == "agent"}
+    rows = {row["id"]: row for row in scenarios("all", platform)}
     sending = {row["id"] for row in scenarios("all", platform) if sends_messages(row)}
     goals.update((row["id"], row["goal"]) for row in smoke_rows(platform))
     pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
@@ -1524,7 +1525,8 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         if record.get("state") != "rate_limited" and record.get("outcome") == "completed":
             try:
                 # Its delivery codes alone, never a message's text; None when its chats could not be read.
-                evidence = dict(record, sends=entry["id"] in sending, delivery=entry.get("delivery"))
+                evidence = dict(record, sends=entry["id"] in sending, delivery=entry.get("delivery"),
+                                truth=truth_lines(rows.get(entry["id"]), entry))
                 judged = judged_by(cli, goals[entry["id"]], scenario_tag(stored.get("tag", ""), entry), evidence,
                                    private / "judge" / entry["id"], token, model)
             except (OSError, subprocess.SubprocessError, KeyError):
@@ -1557,6 +1559,31 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
     smoke_passed = counts[SMOKE_PASS]
     if smoke_passed:
         print(f"May device tests ({platform}): {smoke_passed} passed the harness smoke check (not a test of May)")
+
+
+def truth_lines(row, entry):
+    """What each of a scenario's server reads checked and how it came out, in fixed words, for the judge (coordinator,
+    25 Oct: run 40203481816's Android poll was judged a fail on May's own words, against a confirmed answered card).
+    entry["server"] holds the row's plain reads, then one read for each truth row, in order (server_reads)."""
+    if row is None:
+        return []
+    reads = entry.get("server", [])
+    lines = []
+    for check, read in zip(row["server"], reads):
+        lines.append(f"GET {check['get']} answered {read.get('status')}, expected {check['expect']}: " +
+                     ("confirmed" if read.get("pass") else "not confirmed"))
+    for check, read in zip(row.get("truth", []), reads[len(row["server"]):]):
+        if "question" in check:
+            what = f"May's question card in this run's tagged chat is {check['question']}"
+        elif check == DELIVERY_TRUTH:
+            what = "every tagged message this run sent has a succeeded reply"
+        elif "note" in check:
+            what = "the tagged task holds the goal's note"
+        else:
+            what = f"an item holding the tag is listed by GET {check['get']}"
+        lines.append(what + ": " + ("could not be checked" if read.get("unverified") else
+                                    "confirmed" if read.get("pass") else "not confirmed"))
+    return lines
 
 
 def smoke_rows(platform):
