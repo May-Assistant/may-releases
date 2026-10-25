@@ -163,7 +163,7 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
             else None, "summary": str(record.get("summary", ""))[:1000], "hierarchy": str(record.get("hierarchy", "")),
             "actions": record.get("actions") if type(record.get("actions")) is int else 0,
             "hierarchy_failure": record.get("hierarchy_failure") if record.get("hierarchy_failure") in
-            DUMP_FAILURES else None}
+            DUMP_FAILURES else None, **({"wedged": True} if record.get("wedged") is True else {})}
 
 
 def redacted(text):

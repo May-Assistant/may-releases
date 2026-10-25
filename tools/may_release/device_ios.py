@@ -50,6 +50,7 @@ CONVERT_SECONDS = 600
 # its conversions share CONVERSION_BUDGET_SECONDS. The run's budget (device_tests.Budget) counts a scenario's agent
 # and onboarding alone: the job's 30 minutes past RUN_BUDGET_SECONDS cover the last scenario's conversions.
 PART_SECONDS, MAX_PARTS, CONVERSION_BUDGET_SECONDS = 5 * 60, 12, 10 * 60
+IOS_LAST = ("notes", "chat")
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
@@ -220,6 +221,11 @@ class Recorder:
         # an MPEG-4 file). When none does, the original H.264 recording is published if it fits.
         # Run 40035089599 dropped five recordings with "no conversion worked", which did not say whether avconvert
         # failed or wrote a file still over the cap; each preset's outcome is now named, in fixed words and MB.
+        # Run 40203481816: avconvert failed parts that were already under the cap (exit 205, with no cause given), so
+        # a part that fits is published as recorded, and only a part over the cap is converted (coordinator, 25 Oct).
+        if raw.is_file() and raw.stat().st_size <= MAX_RECORDING:
+            raw.replace(out)
+            return out.name, None, None
         outcomes, smallest = [], None  # smallest: (bytes, preset, suffix) of a conversion that was over the cap
         for preset, suffix in CONVERSIONS:
             converted = self.private / (f"{self.scenario}-converted-{part + 1}" + suffix)
@@ -233,9 +239,6 @@ class Recorder:
                 smallest = (converted.stat().st_size, preset, suffix)
             converted.unlink(missing_ok=True)
         tried = ", ".join(outcomes)
-        if raw.is_file() and raw.stat().st_size <= MAX_RECORDING:
-            raw.replace(out)
-            return out.name, f"unconverted: no conversion fit the cap ({tried}){self.length(part)}", None
         tail, tried_tail = self.tail(part, raw, out, seconds, smallest, deadline)
         if tail:
             raw.unlink(missing_ok=True)
@@ -323,6 +326,15 @@ def outcome(failed, converted):
 # may-app #1272: the debug Playground's main-thread watchdog logs one line per stall of 250 ms or more, alone in its
 # category. The predicate names the Playground's own subsystem, so the log of no other process is ever read.
 WATCHDOG = 'subsystem == "io.github.mayassistant.may.playground" AND category == "watchdog"'
+# may-app #1318 (N and the coordinator, 25 Oct): the debug Playground's ChatView logs which of its properties changed
+# for each body update (SwiftUI's _logChanges). Read from the Playground's own process alone, and kept in the private
+# diag alone, never counted or printed: those lines name may-app's properties. Only the BODY_BEFORE nearest before each
+# chat breadcrumb (CHAT_AFTER) are kept, each cut to MAX_BODY_LINE bytes.
+BODY_CHANGES = 'process == "MayPlayground" AND subsystem == "com.apple.SwiftUI" AND category == "Changed Body Properties"'
+PREDICATE = f"({WATCHDOG}) OR ({BODY_CHANGES})"
+BODY_CHANGE = re.compile(rb"MayPlayground\[[0-9]+:[0-9a-f]+\] \[com\.apple\.SwiftUI:Changed Body Properties\] ")
+CHAT_AFTER = (b"view-chat", b"view-chat-row")
+BODY_BEFORE, MAX_BODY_LINE = 3, 300
 STALL = re.compile(rb"main-thread stall ([0-9]{1,7}) ms")
 # may-app #1281: beside the stalls, one line per named span of main-thread work of 250 ms or more, in the same category
 # ("main-thread span event-store 1180 ms"). Every span line is kept, in the log's own order among the stalls; the public
@@ -330,13 +342,13 @@ STALL = re.compile(rb"main-thread stall ([0-9]{1,7}) ms")
 # chat's publish, its inbox rows and each transcript page's merge), after run 40164384433's chat stalled every 3 s.
 SPAN = re.compile(rb"main-thread span ([a-z-]{1,40}) ([0-9]{1,7}) ms[ \t]*\r?\n?$")
 SPAN_NAMES = ("event-store", "recognizer", "dictation-capability", "calendar-access", "agenda-state", "chat-publish",
-              "chat-inbox", "chat-merge")
+              "chat-inbox", "chat-merge", "chat-body")
 MAX_SPAN_SECTION = device_tests.MAX_DIAG // 8
 # may-app #1309 (N, 25 Oct): after each stall line, "main-thread stall-after <name>", the last main-actor step that ran
 # before it, from a fixed set agreed with N. The public log counts each name, and any other as "other".
 STALL_AFTER = re.compile(rb"main-thread stall-after ([a-z-]{1,40})[ \t]*\r?\n?$")
 STALL_AFTER_NAMES = ("launch", "sync-start", "sync-transcript", "sync-publish", "sync-inbox", "sync-end", "agenda-load",
-                     "connections-load", "pill-read", "view-root", "view-shell", "view-chat")
+                     "connections-load", "pill-read", "view-root", "view-shell", "view-chat", "view-chat-row")
 # Run 40181517145: chat's and notes' onboarding subflow did not pass, with nothing to say where it stopped. Its last
 # ONBOARDING_LINES of Maestro output go to the scenario's private diag when it does not pass. The private diag keeps
 # DIAG_RESERVE for them and for the recording's notes, written after the conversion.
@@ -351,10 +363,28 @@ OWN_REPORT = re.compile(rb'"bundleID"[ \t]*:[ \t]*"' + re.escape(BUNDLE.encode()
 REPORT_HEAD = 16 * 1024
 
 
+def body_changes(lines):
+    """The watchdog's lines with only the BODY_BEFORE body-change lines nearest before each chat breadcrumb kept (the
+    rest dropped), each cut to MAX_BODY_LINE bytes; the log's order is kept."""
+    keep, waiting = set(), []
+    for number, line in enumerate(lines):
+        if BODY_CHANGE.search(line):
+            waiting = (waiting + [number])[-BODY_BEFORE:]
+            continue
+        after = STALL_AFTER.search(line)
+        if after:  # each breadcrumb closes its stall: only the chat's keep the changes before them
+            if after.group(1) in CHAT_AFTER:
+                keep.update(waiting)
+            waiting = []
+    return [line if not BODY_CHANGE.search(line) else line.rstrip(b"\r\n")[:MAX_BODY_LINE] + b"\n"
+            for number, line in enumerate(lines) if not BODY_CHANGE.search(line) or number in keep]
+
+
 def show_log(udid, env, start):
     """The simulator's unified log since start, the watchdog's lines alone; b"" when it could not be read."""
     done = device_tests.bounded_output(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
-                                        "--start", start, "--predicate", WATCHDOG], env, limit=device_tests.MAX_DIAG)
+                                        "--info", "--start", start, "--predicate", PREDICATE], env,
+                                       limit=device_tests.MAX_DIAG)
     return b"" if done is None else done[1]
 
 
@@ -399,8 +429,9 @@ class Diagnostics:
                 if OWN_REPORT.search(data[:REPORT_HEAD]):
                     found.append(b"== crash ==\n" + data + b"\n")
         self.crashes += bool(found)
-        lines = [line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
-                 .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line) or STALL_AFTER.search(line)]
+        lines = body_changes([line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
+                              .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line) or
+                              STALL_AFTER.search(line) or BODY_CHANGE.search(line)])
         stalls = [int(STALL.search(line).group(1)) for line in lines if STALL.search(line)]
         self.stalls += len(stalls)
         self.longest = max([self.longest, *stalls])
@@ -536,6 +567,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
+    # Run 40203481816: chat ran second and wedged for 19 minutes, so poll and poll-skip found no budget left. The
+    # scenarios most likely to wedge run last on iOS (coordinator, 25 Oct); the rest keep the list's order.
+    chosen.sort(key=lambda row: IOS_LAST.index(row["id"]) + 1 if row["id"] in IOS_LAST else 0)
     agents, staged = device_tests.uses(chosen)
     require_step_secrets((device_tests.SIGNIN_SECRET, device_agent.OAUTH))
     secret = os.environ.pop(device_tests.SIGNIN_SECRET, "")
@@ -690,6 +724,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         if name in diagnostics.after:
             count = diagnostics.after[name]
             print(f"May device tests (ios): main-thread stall-after {name}: {count}")
+    wedged = sum(1 for record in records.values() if isinstance(record, dict) and record.get("wedged") is True)
+    if wedged:
+        print(f"May device tests (ios): {wedged} scenarios stopped after refused device acts in a row (fail-fast)")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:

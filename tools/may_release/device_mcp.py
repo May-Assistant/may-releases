@@ -15,6 +15,7 @@ read or write a file, or reach the network itself.
 
 - type takes plain text only (letters, digits, spaces and . , ! : - _ @; never ? or *, a glob in the device shell), so nothing reaches adb's shell as a
   command.
+- On iOS, after FAIL_FAST refused acts in a row, every call but done answers that the agent must stop, blocked.
 - At most MAX_ACTIONS look or act calls, or a scenario's own steps (MAY_DEVICE_STEPS, up to MOST_ACTIONS); after
   that every call but done answers that the limit is reached.
 - done records the agent's own outcome (completed or blocked) and a short summary to MAY_DEVICE_AGENT_RESULT, which
@@ -40,6 +41,11 @@ MAX_ACTIONS = 80
 # Run 40181517145: Android's poll-skip reached 80 steps typing its free reply (about 17 characters a type call), so a
 # scenario row may carry its own "steps" (coordinator, 25 Oct: poll-skip 120), never above MOST_ACTIONS.
 MOST_ACTIONS = 200
+# Run 40203481816: on iOS, every act after the first refusal was refused too, each holding the agent 90 s, so a wedged
+# scenario spent its whole 20 minutes. After FAIL_FAST refused acts in a row the server stops every call but done, and
+# the agent's result says so (coordinator, 25 Oct). iOS alone.
+FAIL_FAST = 3
+WEDGED_TEXT = f"The device refused {FAIL_FAST} acts in a row: call done now with outcome blocked"
 MAX_HIERARCHY = 40_000
 MAX_SUMMARY = 1000
 MAX_FIELD = 300
@@ -116,7 +122,7 @@ def settings(environ):
     steps = environ.get("MAY_DEVICE_STEPS", str(MAX_ACTIONS))
     if not (re.fullmatch(r"[1-9][0-9]{0,2}", steps) and int(steps) <= MOST_ACTIONS):
         return None
-    base = {"result": result, "actions": 0, "hierarchy": "", "steps": int(steps)}
+    base = {"result": result, "actions": 0, "hierarchy": "", "steps": int(steps), "refusals": 0, "wedged": False}
     if environ.get("MAY_DEVICE_PLATFORM", "android") == "android":
         adb, serial = environ.get("MAY_DEVICE_ADB", ""), environ.get("MAY_DEVICE_SERIAL", "")
         if not (adb and re.fullmatch(r"emulator-[0-9]{4}", serial)):
@@ -389,7 +395,8 @@ def record(config, outcome, summary):
     with open(config["result"], "w", encoding="utf-8") as output:
         json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
                    "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
-                   "hierarchy_failure": config.get("hierarchy_failure")}, output)
+                   "hierarchy_failure": config.get("hierarchy_failure"),
+                   **({"wedged": True} if config.get("wedged") else {})}, output)
 
 
 def call(name, args, config):
@@ -412,6 +419,8 @@ def call(name, args, config):
         return False, [{"type": "text", "text": "Recorded. Stop now."}]
     if name not in {tool["name"] for tool in TOOLS}:
         return True, [{"type": "text", "text": "Unknown tool"}]
+    if config.get("wedged"):
+        return True, [{"type": "text", "text": WEDGED_TEXT}]
     if config["actions"] >= config["steps"]:
         return True, [{"type": "text", "text": f"The {config['steps']}-step limit is reached: call done now"}]
     config["actions"] += 1
@@ -504,6 +513,12 @@ def ios_act(name, args, ints, config):
     else:
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
     status = flow(config, command)
+    config["refusals"] = config["refusals"] + 1 if status else 0
+    if config["refusals"] >= FAIL_FAST:
+        config["wedged"] = True
+        # Recorded now, so a stopped agent that never calls done still leaves its reason; a later done replaces it.
+        record(config, "blocked", WEDGED_TEXT)
+        return True, [{"type": "text", "text": WEDGED_TEXT}]
     return bool(status), [{"type": "text", "text": "Done" if not status else "The device did not take it"}]
 
 
