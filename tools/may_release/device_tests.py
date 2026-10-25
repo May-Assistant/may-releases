@@ -1358,7 +1358,10 @@ def sealed_agent(record):
     actions = record.get("actions")
     return {"outcome": record.get("outcome") if record.get("outcome") in ("completed", "blocked") else None,
             "actions": actions if type(actions) is int and 0 <= actions <= device_mcp.MAX_ACTIONS else 0,
-            "summary": summary.decode("utf-8", "replace").strip()[:MAX_AGENT_SUMMARY]}
+            "summary": summary.decode("utf-8", "replace").strip()[:MAX_AGENT_SUMMARY],
+            # Why no screen could be read at done (device_mcp.DUMP_FAILURES' fixed words), or None.
+            "hierarchy_failure": record.get("hierarchy_failure") if record.get("hierarchy_failure") in
+            device_mcp.DUMP_FAILURES else None}
 
 
 def judge_scenarios(judged_by=device_agent.judge, platform="android"):

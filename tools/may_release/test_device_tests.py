@@ -293,7 +293,12 @@ class SealedAgentTests(unittest.TestCase):
             self.assertNotIn(secret, sealed["summary"])
         self.assertTrue(publish.agent_ok(sealed))
         odd = device_tests.sealed_agent({"outcome": "finished", "summary": 7, "actions": "80"})
-        self.assertEqual(odd, {"outcome": None, "actions": 0, "summary": "7"})
+        self.assertEqual(odd, {"outcome": None, "actions": 0, "summary": "7", "hierarchy_failure": None})
+        failing = device_tests.sealed_agent({"outcome": "completed", "summary": "ok", "hierarchy_failure": "no idle state"})
+        self.assertEqual(failing["hierarchy_failure"], "no idle state", "why the judge had no screen, sealed")
+        self.assertTrue(publish.agent_ok(failing))
+        for odd_failure in ("<b>", "No Idle State", 3):
+            self.assertIsNone(device_tests.sealed_agent({"hierarchy_failure": odd_failure})["hierarchy_failure"])
 
     def test_joining_redacted_lines_never_makes_a_secret_shaped_summary(self):
         """The security read of #110: "may_token:" and an opaque value, harmless line by line, joined into one."""
@@ -328,11 +333,12 @@ class SealedAgentTests(unittest.TestCase):
                          "a scenario that sends nothing has no codes to wait for")
 
     def test_publish_refuses_a_sealed_account_out_of_shape(self):
-        good = {"outcome": "completed", "actions": 3, "summary": "ok"}
+        good = {"outcome": "completed", "actions": 3, "summary": "ok", "hierarchy_failure": None}
         self.assertTrue(publish.agent_ok(good))
         for bad in (dict(good, summary="x" * (device_tests.MAX_AGENT_SUMMARY + 1)),
                     dict(good, summary="Cookie: sid=1"), dict(good, summary="sam@example.com"),
-                    dict(good, outcome="finished"), dict(good, actions=999), dict(good, extra=1), "ok"):
+                    dict(good, outcome="finished"), dict(good, actions=999), dict(good, extra=1), "ok",
+                    dict(good, hierarchy_failure="<script>"), {k: v for k, v in good.items() if k != "hierarchy_failure"}):
             with self.subTest(bad=bad):
                 self.assertFalse(publish.agent_ok(bad))
 

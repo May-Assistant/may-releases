@@ -38,6 +38,10 @@ MAX_RECORDING = 38 * 1024 * 1024
 # presets as MPEG-4 at 720p and 540p.
 CONVERSIONS = (("PresetAppleM4V720pHD", ".m4v"), ("Preset1280x720", ".mp4"), ("Preset960x540", ".mp4"))
 STOP_SECONDS = 30
+# Run 40138900610: iOS chat recorded for 1809 s, and even its smallest conversion (49 MB) was over the cap, so the
+# stuck scenario, the one most worth watching, kept no recording. Then its last part alone is converted, as long as the
+# smallest whole conversion suggests will fit (with TAIL_MARGIN to spare), and never less than MIN_TAIL_SECONDS.
+TAIL_MARGIN, MIN_TAIL_SECONDS = 0.8, 60
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
@@ -110,11 +114,11 @@ class Recorder:
         # and how a recording was kept when it is not the usual conversion.
         self.dropped = self.kept = None
         self.private = private
-        self.started = None
+        self.started = self.stopped = None
 
     def length(self):
         """How long the recording ran, for the public log ("" when it was never started here)."""
-        return f" after {round(time.monotonic() - self.started)} s of recording" if self.started is not None else ""
+        return f" after {round(self.stopped - self.started)} s of recording" if self.started is not None else ""
 
     def start(self):
         with self.log.open("ab") as output:
@@ -133,13 +137,15 @@ class Recorder:
             self.process.kill()
             self.dropped = "the recorder did not stop"
             return []
+        self.stopped = time.monotonic()
+        seconds = int(self.stopped - self.started) if self.started is not None else 0
         out = folder / (self.scenario + ".mp4")
         # Smoke run 39683880243: the M4V preset's conversion to .mp4 failed. Each preset writes the file type it
         # supports, in the private folder; the first one that works and fits the cap is published as .mp4 (an M4V is
         # an MPEG-4 file). When none does, the original H.264 recording is published if it fits.
         # Run 40035089599 dropped five recordings with "no conversion worked", which did not say whether avconvert
         # failed or wrote a file still over the cap; each preset's outcome is now named, in fixed words and MB.
-        outcomes = []
+        outcomes, smallest = [], None  # smallest: (bytes, preset, suffix) of a conversion that was over the cap
         for preset, suffix in CONVERSIONS:
             converted = self.private / (self.scenario + "-converted" + suffix)
             with self.log.open("ab") as output:
@@ -152,16 +158,43 @@ class Recorder:
                 return [out.name]
             outcomes.append(f"{preset} " + (f"failed (exit {failed})" if failed else
                                             f"{megabytes(converted)} MB" if converted.is_file() else "wrote no file"))
+            if not failed and converted.is_file() and (smallest is None or converted.stat().st_size < smallest[0]):
+                smallest = (converted.stat().st_size, preset, suffix)
             converted.unlink(missing_ok=True)
         tried = ", ".join(outcomes)
         if self.raw.is_file() and self.raw.stat().st_size <= MAX_RECORDING:
             self.raw.replace(out)
             self.kept = f"unconverted: no conversion fit the cap ({tried}){self.length()}"
             return [out.name]
+        tail = self.tail(out, seconds, smallest)
+        if tail:
+            self.raw.unlink(missing_ok=True)
+            self.kept = f"as its last {tail} s alone: the whole did not fit the cap ({tried}){self.length()}"
+            return [out.name]
         size = megabytes(self.raw) if self.raw.is_file() else 0
         self.raw.unlink(missing_ok=True)
         self.dropped = f"no conversion fit the cap ({tried}) and the original is {size} MB, over it{self.length()}"
         return []
+
+    def tail(self, out, seconds, smallest):
+        """The recording's last part converted to out with smallest's preset, sized to fit the cap: its length in
+        seconds, or 0 when there is none to try or it did not fit either."""
+        if smallest is None or not self.raw.is_file():
+            return 0
+        size, preset, suffix = smallest
+        tail = max(MIN_TAIL_SECONDS, int(seconds * MAX_RECORDING * TAIL_MARGIN / size))
+        if tail >= seconds:
+            return 0
+        converted = self.private / (self.scenario + "-tail" + suffix)
+        with self.log.open("ab") as output:
+            failed = subprocess.run(["avconvert", "--source", str(self.raw), "--output", str(converted), "--preset",
+                                     preset, "--start", str(seconds - tail), "--duration", str(tail), "--replace"],
+                                    stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=self.env).returncode
+        if not failed and converted.is_file() and converted.stat().st_size <= MAX_RECORDING:
+            converted.replace(out)
+            return tail
+        converted.unlink(missing_ok=True)
+        return 0
 
 
 def megabytes(path):

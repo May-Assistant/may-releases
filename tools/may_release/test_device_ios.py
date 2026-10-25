@@ -506,9 +506,11 @@ class DiagnosticsTests(Workspace):
 class RecorderTests(Workspace):
     BIG = device_ios.MAX_RECORDING + 1
 
-    def recorder(self, outcomes, raw=b"raw"):
-        """stop() with each preset's (exit code, output size) from outcomes; a preset not listed fails."""
+    def recorder(self, outcomes, raw=b"raw", seconds=None):
+        """stop() with each preset's (exit code, output size) from outcomes, a tail's under ("tail", preset); a preset
+        not listed fails. seconds: how long the recording ran."""
         sent, presets = [], []
+        self.tails = []
 
         class Process:
             def send_signal(self, number):
@@ -519,7 +521,12 @@ class RecorderTests(Workspace):
 
         def run(argv, stdout, stderr, stdin, env):
             preset = argv[argv.index("--preset") + 1]
-            presets.append((preset, Path(argv[argv.index("--output") + 1]).suffix))
+            if "--start" in argv:
+                self.tails.append((preset, Path(argv[argv.index("--output") + 1]).suffix,
+                                   argv[argv.index("--start") + 1], argv[argv.index("--duration") + 1]))
+                preset = ("tail", preset)
+            else:
+                presets.append((preset, Path(argv[argv.index("--output") + 1]).suffix))
             code, size = outcomes.get(preset, (1, 0))
             if size:
                 Path(argv[argv.index("--output") + 1]).write_bytes(b"\0" * size)
@@ -531,7 +538,10 @@ class RecorderTests(Workspace):
         recorder = device_ios.Recorder(UDID, {}, "sign-in", self.private, self.private / "log")
         recorder.process = Process()
         recorder.raw.write_bytes(raw)
-        with patch("device_ios.subprocess.run", side_effect=run):
+        if seconds is not None:
+            recorder.started = 0.0
+        with patch("device_ios.subprocess.run", side_effect=run), \
+                patch("device_ios.time.monotonic", return_value=float(seconds or 0)):
             names = recorder.stop(folder)
         leftovers = [path.name for path in self.private.iterdir() if path.name.startswith("sign-in-")]
         return names, sent, presets, folder, recorder, leftovers
@@ -569,6 +579,40 @@ class RecorderTests(Workspace):
         self.assertEqual(recorder.dropped, "no conversion fit the cap (PresetAppleM4V720pHD wrote no file, "
                                            "Preset1280x720 failed (exit 1), Preset960x540 38 MB) and the original is "
                                            "38 MB, over it")
+
+    # Run 40138900610's iOS chat, scaled to a 1,000-byte cap: 1809 s recorded, every conversion over the cap.
+    RUN = {"PresetAppleM4V720pHD": (0, 1290), "Preset1280x720": (0, 2974), "Preset960x540": (0, 2579)}
+
+    def test_a_recording_too_long_for_the_cap_keeps_its_last_part(self):
+        """The stuck scenario is the one most worth watching (coordinator, 25 Oct)."""
+        with patch("device_ios.MAX_RECORDING", 1000):
+            names, _, _, folder, recorder, leftovers = self.recorder(
+                {**self.RUN, ("tail", "PresetAppleM4V720pHD"): (0, 900)}, raw=b"\0" * 5474, seconds=1809)
+        # The smallest whole conversion's preset, for the share of the recording that size suggests fits, less a margin.
+        tail = int(1809 * 1000 * device_ios.TAIL_MARGIN / 1290)
+        self.assertEqual(self.tails, [("PresetAppleM4V720pHD", ".m4v", str(1809 - tail), str(tail))])
+        self.assertEqual((names, (folder / "sign-in.mp4").stat().st_size, leftovers), (["sign-in.mp4"], 900, []))
+        self.assertEqual(recorder.kept, f"as its last {tail} s alone: the whole did not fit the cap "
+                                        "(PresetAppleM4V720pHD 0 MB, Preset1280x720 0 MB, Preset960x540 0 MB) after "
+                                        "1809 s of recording")
+        self.assertIsNone(recorder.dropped)
+
+    def test_a_last_part_still_over_the_cap_is_dropped_as_before(self):
+        with patch("device_ios.MAX_RECORDING", 1000):
+            names, _, _, folder, recorder, leftovers = self.recorder(
+                {**self.RUN, ("tail", "PresetAppleM4V720pHD"): (0, 1200)}, raw=b"\0" * 5474, seconds=1809)
+        self.assertEqual((names, list(folder.iterdir()), leftovers, recorder.kept), ([], [], [], None))
+        self.assertTrue(recorder.dropped.startswith("no conversion fit the cap"), recorder.dropped)
+
+    def test_the_last_part_is_never_shorter_than_a_minute_nor_tried_on_a_shorter_recording(self):
+        with patch("device_ios.MAX_RECORDING", 1000):
+            self.recorder({"PresetAppleM4V720pHD": (0, 10 ** 6)}, raw=b"\0" * 5474, seconds=1809)
+            self.assertEqual(self.tails, [("PresetAppleM4V720pHD", ".m4v", str(1809 - device_ios.MIN_TAIL_SECONDS),
+                                           str(device_ios.MIN_TAIL_SECONDS))])
+            self.recorder({"PresetAppleM4V720pHD": (0, 10 ** 6)}, raw=b"\0" * 5474, seconds=device_ios.MIN_TAIL_SECONDS)
+            self.assertEqual(self.tails, [], "a recording no longer than the tail has nothing to cut")
+            self.recorder({}, raw=b"\0" * 5474, seconds=1809)
+            self.assertEqual(self.tails, [], "no conversion worked, so none to cut with")
 
     def test_a_dropped_recording_says_how_long_it_ran(self):
         """The length sets each recording's bitrate against the cap, so the public log carries it in seconds."""

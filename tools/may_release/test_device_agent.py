@@ -179,7 +179,7 @@ class AgentRunTests(unittest.TestCase):
                                                             {"get": "/v1/agents", "status": 200, "pass": True}])
         self.assertEqual(report["scenarios"][0]["notes"], "fine <b>")
         self.assertEqual([row.get("agent") for row in report["scenarios"]],
-                         [{"outcome": "completed", "actions": 7, "summary": "saw it"}] * 3,
+                         [{"outcome": "completed", "actions": 7, "summary": "saw it", "hierarchy_failure": None}] * 3,
                          "the agent's own account, sealed into the private report")
         self.assertNotIn("saw it", run_out + judge_out, "never in the public log")
         self.assertEqual(seen.get("delivered"), [(TOKEN + "1", "qa-39557415738-chat"),
