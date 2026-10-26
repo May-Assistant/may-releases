@@ -43,6 +43,10 @@ from sealed import SealedError
 from store import StoreError, require_step_secrets
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
+# The backend job's own result (needs.backend.result), for the post job when no record reached it (coordinator, 26 Oct:
+# with the key pair unset a post would be silent and the may-app merge gate would have no result to read). Only
+# success and failure are posted, as the result line alone: no detail, still head-marked.
+JOB_RESULT, RESULTS = "MAY_BACKEND_RESULT", {"success": True, "failure": False}
 SOURCE, PRIVATE = "may-source", "may-private"
 MARKER = "may-backend-unit-pr"
 LABELS = {"toolchain": "Toolchain (Node 22.22.0, Postgres 16.15)", "install": "Install (`npm ci`)",
@@ -184,6 +188,19 @@ def comment_body(sha, url, outcome, failed, shown=None):
     return body
 
 
+def result_body(sha, url, passed):
+    """The comment when no record reached the post job: the backend job's pass or fail, and why there is no detail."""
+    if not SHA.fullmatch(sha or ""):
+        raise BackendPostError("The tested commit is not an exact SHA")
+    lines = [f"### May backend checks: {'passed' if passed else 'failed'}", "",
+             f"`{sha}`: the backend job {'passed' if passed else 'failed'}. Its details are not posted: no sealed record "
+             "reached the post job (`MAY_RENDERS_RECIPIENT` or `MAY_RENDERS_DECRYPT_KEY` may be unset in "
+             "may-native-compile-pr, or the job stopped before its seal)."]
+    if url:
+        lines += ["", f"Run: {url}"]
+    return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
+
+
 def runner_root():
     raw = os.environ.get("RUNNER_TEMP")
     if not raw or not Path(raw).is_dir():
@@ -237,19 +254,23 @@ def post(sha, pr, call_api=github):
         raise BackendPostError("Source SHA is not an exact lowercase commit SHA")
     number = pull_number(pr)
     private = runner_root() / PRIVATE
-    if not (private / OUTCOME).is_file():
-        print("May backend checks: no record to post (MAY_RENDERS_RECIPIENT or MAY_RENDERS_DECRYPT_KEY may be unset in "
-              "may-native-compile-pr); the backend job's verdict stands")
-        return 0
-    outcome, failed = read_record(private)
-    passed = outcome["result"] == "passed"
-    total, errors = failed["total"], failed["typecheck_total"]
+    sealed = (private / OUTCOME).is_file()
+    if sealed:
+        outcome, failed = read_record(private)
+        passed = outcome["result"] == "passed"
+        total, errors = failed["total"], failed["typecheck_total"]
+    else:
+        passed = RESULTS.get(os.environ.get(JOB_RESULT, ""))
+        if passed is None:
+            print("May backend checks: no record and no backend result to post; nothing posted")
+            return 0
     if not token:
         print("May backend checks: MAY_APP_PR_COMMENT_TOKEN is not set in may-native-compile-pr; no comment posted")
         return 0 if passed else 1
     if len(token) < 20:
         raise BackendPostError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")
-    body = comment_body(sha, run_url(os.environ), outcome, failed)
+    url = run_url(os.environ)
+    body = comment_body(sha, url, outcome, failed) if sealed else result_body(sha, url, passed)
     if holds(body, token):
         raise BackendPostError("The comment holds a credential; nothing was posted")
     status, pull = call_api("GET", f"/repos/{APP_REPO}/pulls/{number}", None, token)
@@ -262,6 +283,12 @@ def post(sha, pr, call_api=github):
     if not post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
         print(f"May backend checks' result already posted for this head on may-app #{number}; nothing posted again")
         return 0 if passed else 1
+    if not sealed and passed:
+        print(f"May backend checks passed; the result alone posted to may-app #{number} (no sealed record: no details)")
+        return 0
+    if not sealed:
+        print(f"May backend checks failed; the result alone posted to may-app #{number} (no sealed record: no details)")
+        return 1
     if passed:
         print(f"May backend checks passed; result posted to may-app #{number}")
         return 0

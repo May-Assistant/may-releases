@@ -1556,6 +1556,10 @@ def sealed_download(artifact, job):
             f"          name: {artifact}-${{{{ github.run_attempt }}}}\n"
             "          path: ${{ runner.temp }}/may-sealed-download\n")
 UNIT_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}")}
+# The PR-code job's result, on the post alone: what it posts when no sealed record reached it (the review of #133's
+# follow-up, coordinator 26 Oct).
+UNIT_RESULT = ("MAY_UNIT_RESULT", "${{ needs.unit.result }}")
+BACKEND_RESULT = ("MAY_BACKEND_RESULT", "${{ needs.backend.result }}")
 UNIT_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}"), UNIT_BREAKDOWN_ENV} | \
     {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)}
 UNIT_SECRETS = COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)
@@ -1642,8 +1646,10 @@ def android_unit_workflow_problems(text):
             "GH_TOKEN" in fetch + suites + post or "env:" in jdk + age + verdict + clean + post_clean or \
             env_entries(suites) != [sha, UNIT_BREAKDOWN_ENV] or set(env_entries(seal)) != {sha, recipient} or \
             set(env_entries(opener)) != {sha, recipient, decrypt} or text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or \
-            sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
-            any(e not in UNIT_ENV | {recipient, decrypt} for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+            sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}"),
+                                                     UNIT_RESULT}) or text.count("needs.unit.result") != 1 or \
+            any(e not in UNIT_ENV | {recipient, decrypt, UNIT_RESULT} for e in env_entries(text)) or \
+            re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
                      "the seal's public key, the open's decrypt key, the post's comment token and the dispatch's inputs")
     if "${{ inputs." in "\n".join(runs):
@@ -1833,8 +1839,10 @@ def backend_unit_workflow_problems(text):
             env_entries(guard) != [("MAY_PG_CONTAINER", "${{ job.services.postgres.id }}")] or \
             env_entries(checks) != [sha] or set(env_entries(seal)) != {sha, recipient} or \
             set(env_entries(opener)) != {sha, recipient, decrypt} or text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or \
-            sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
-            any(e not in BACKEND_ENV | {recipient, decrypt} for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+            sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}"),
+                                                     BACKEND_RESULT}) or text.count("needs.backend.result") != 1 or \
+            any(e not in BACKEND_ENV | {recipient, decrypt, BACKEND_RESULT} for e in env_entries(text)) or \
+            re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
                      "the seal's public key, the open's decrypt key, the post's comment token and the dispatch's inputs")
     if "${{ inputs." in "\n".join(runs):

@@ -44,6 +44,10 @@ from sealed import SealedError
 from store import StoreError, require_step_secrets
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
+# The unit job's own result (needs.unit.result), for the post job when no record reached it (coordinator, 26 Oct:
+# with the key pair unset a post would be silent and the may-app merge gate would have no result to read). Only
+# success and failure are posted, as the result line alone: no detail, still head-marked.
+JOB_RESULT, RESULTS = "MAY_UNIT_RESULT", {"success": True, "failure": False}
 SOURCE, PRIVATE = "may-source", "may-private"
 MARKER = "may-android-unit-pr"
 LABELS = {"core": "core (`:core:test`)", "playground": "May Playground (`:app:testPlaygroundDebugUnitTest`)",
@@ -156,6 +160,19 @@ def comment_body(sha, url, outcome, failed, shown=None):
     return body
 
 
+def result_body(sha, url, passed):
+    """The comment when no record reached the post job: the unit job's pass or fail, and why there is no detail."""
+    if not SHA.fullmatch(sha or ""):
+        raise UnitPostError("The tested commit is not an exact SHA")
+    lines = [f"### May Android unit suites: {'passed' if passed else 'failed'}", "",
+             f"`{sha}`: the unit job {'passed' if passed else 'failed'}. Its details are not posted: no sealed record "
+             "reached the post job (`MAY_RENDERS_RECIPIENT` or `MAY_RENDERS_DECRYPT_KEY` may be unset in "
+             "may-native-compile-pr, or the job stopped before its seal)."]
+    if url:
+        lines += ["", f"Run: {url}"]
+    return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
+
+
 def runner_root():
     raw = os.environ.get("RUNNER_TEMP")
     if not raw or not Path(raw).is_dir():
@@ -209,19 +226,23 @@ def post(sha, pr, call_api=github):
         raise UnitPostError("Source SHA is not an exact lowercase commit SHA")
     number = pull_number(pr)
     private = runner_root() / PRIVATE
-    if not (private / OUTCOME).is_file():
-        print("May Android unit suites: no record to post (MAY_RENDERS_RECIPIENT or MAY_RENDERS_DECRYPT_KEY may be "
-              "unset in may-native-compile-pr); the unit job's verdict stands")
-        return 0
-    outcome, failed = read_record(private)
-    passed = outcome["result"] == "passed"
-    total = failed["total"]
+    sealed = (private / OUTCOME).is_file()
+    if sealed:
+        outcome, failed = read_record(private)
+        passed = outcome["result"] == "passed"
+        total = failed["total"]
+    else:
+        passed = RESULTS.get(os.environ.get(JOB_RESULT, ""))
+        if passed is None:
+            print("May Android unit suites: no record and no unit result to post; nothing posted")
+            return 0
     if not token:
         print("May Android unit suites: MAY_APP_PR_COMMENT_TOKEN is not set in may-native-compile-pr; no comment posted")
         return 0 if passed else 1
     if len(token) < 20:
         raise UnitPostError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")
-    body = comment_body(sha, run_url(os.environ), outcome, failed)
+    url = run_url(os.environ)
+    body = comment_body(sha, url, outcome, failed) if sealed else result_body(sha, url, passed)
     if holds(body, token):
         raise UnitPostError("The comment holds a credential; nothing was posted")
     status, pull = call_api("GET", f"/repos/{APP_REPO}/pulls/{number}", None, token)
@@ -234,6 +255,12 @@ def post(sha, pr, call_api=github):
     if not post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
         print(f"May Android unit suites' result already posted for this head on may-app #{number}; nothing posted again")
         return 0 if passed else 1
+    if not sealed and passed:
+        print(f"May Android unit suites passed; the result alone posted to may-app #{number} (no sealed record: no details)")
+        return 0
+    if not sealed:
+        print(f"May Android unit suites failed; the result alone posted to may-app #{number} (no sealed record: no details)")
+        return 1
     if passed:
         print(f"May Android unit suites passed; result posted to may-app #{number}")
         return 0

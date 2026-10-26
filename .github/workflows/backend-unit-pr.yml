@@ -154,7 +154,7 @@ jobs:
   post:
     # A fresh runner that runs no may-app code: the comment token is minted here alone, the decrypt key and the comment
     # token each live in one step. It runs once backend has finished, passed or failed; with nothing sealed (no key
-    # pair set yet) it posts nothing and backend's verdict stands.
+    # pair set yet) it posts backend's result line alone, with no detail, still head-marked.
     needs: [admission, backend]
     if: ${{ !cancelled() && needs.admission.result == 'success' }}
     runs-on: ubuntu-24.04
@@ -196,6 +196,7 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
           MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
+          MAY_BACKEND_RESULT: ${{ needs.backend.result }}
         run: python3 -I -S -B tools/may_release/backend_unit_post.py post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
       - name: Remove the decrypted record
         if: always()

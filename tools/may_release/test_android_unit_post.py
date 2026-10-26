@@ -390,13 +390,36 @@ class PostTests(PostCase):
         with self.assertRaises(StoreError):
             self.verdict({"MAY_APP_READ_KEY": "x"})
 
-    def test_without_a_record_the_post_posts_nothing_and_leaves_the_verdict_to_unit(self):
+    def test_without_a_record_or_a_unit_result_nothing_is_posted(self):
         (self.root / "may-private" / android_unit.OUTCOME).unlink()
-        code, out = self.post(self.api())
-        self.assertEqual((code, out), (0, "May Android unit suites: no record to post (MAY_RENDERS_RECIPIENT or "
-                                          "MAY_RENDERS_DECRYPT_KEY may be unset in may-native-compile-pr); the unit job's "
-                                          "verdict stands\n"))
-        self.assertEqual(self.calls, [])
+        for result in (None, "cancelled", "skipped", "success; x"):
+            with self.subTest(result=result):
+                self.calls = []
+                code, out = self.post(self.api(), extra={tool.JOB_RESULT: result} if result else None)
+                self.assertEqual((code, out), (0, "May Android unit suites: no record and no unit result to post; nothing posted\n"))
+                self.assertEqual(self.calls, [])
+
+    def test_without_a_record_the_unit_jobs_result_alone_is_posted_head_marked(self):
+        """Coordinator, 26 Oct: with the key pair unset a post was silent and the may-app merge gate had no result to
+        read. The unit job's own pass or fail is posted alone, with no detail, still head-marked."""
+        (self.root / "may-private" / android_unit.OUTCOME).unlink()
+        for result, passed in (("success", True), ("failure", False)):
+            with self.subTest(result=result):
+                self.calls = []
+                word = "passed" if passed else "failed"
+                code, out = self.post(self.api(), extra={tool.JOB_RESULT: result})
+                self.assertEqual((code, out), (0 if passed else 1, f"May Android unit suites {word}; the result alone posted to may-app "
+                                                                   "#42 (no sealed record: no details)\n"))
+                self.assertEqual([(m, path) for m, path, _ in self.calls][0], ("GET", PULLS), "the pull request read again")
+                body = self.posted()[0]
+                self.assertTrue(body.startswith(f"### May Android unit suites: {word}\n\n`{SHA}`: the unit job {word}."))
+                self.assertIn(f"<!-- may-android-unit-pr head={SHA} -->", body)
+                self.assertNotIn(SECRET_TEXT, body)
+        self.calls = []
+        code, out = self.post(self.api(comments=[{"body": f"x <!-- may-android-unit-pr head={SHA} -->"}]),
+                              extra={tool.JOB_RESULT: "failure"})
+        self.assertEqual((code, self.posted()), (1, []))
+        self.assertIn("already posted", out)
 
     def test_the_step_summary_carries_counts_only(self):
         summary = self.root / "summary.md"
@@ -607,6 +630,16 @@ class WorkflowTests(unittest.TestCase):
         for case, (old, new, message) in cases.items():
             with self.subTest(case=case):
                 self.flagged(WORKFLOW, old, new, message, case)
+
+    def test_the_unit_jobs_result_reaches_the_post_alone(self):
+        secret = "android-unit-pr.yml: a secret or env entry other than"
+        result = "          MAY_UNIT_RESULT: ${{ needs.unit.result }}\n"
+        sealer = "          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n        run: python3 -I -S -B " \
+            "tools/may_release/android_unit_post.py seal"
+        for old, new in ((result, ""), (result, "          MAY_UNIT_RESULT: ${{ needs.admission.result }}\n"),
+                         (sealer, result + sealer)):
+            with self.subTest(new=new[:60]):
+                self.flagged(WORKFLOW, old, new, secret, new[:60])
 
     def test_the_job_that_runs_the_pull_requests_code_holds_no_app_key_token_or_decrypt_key(self):
         """The independent review of #133: the runner user has sudo and can read every secret its job references."""
