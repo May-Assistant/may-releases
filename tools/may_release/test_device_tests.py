@@ -305,11 +305,13 @@ class ScenarioTests(unittest.TestCase):
                 with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
                     device_tests.scenarios()
         chat = device_tests.scenarios("chat")[0]
+        shared = {key: value for key, value in chat.items() if key != "chat"}
+        # Independent review of #132: a row that sends May a message needs a chat of its own, never the shared one.
         for change in ({"goal": chat["goal"].replace("open the chat named {tag} chat", "open the chat named May")},
-                       {"chat": False}):
+                       {"chat": False}, {"_without_chat": True}):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "s.json"
-                path.write_text(json.dumps([dict(chat, **change)]))
+                path.write_text(json.dumps([shared if "_without_chat" in change else dict(chat, **change)]))
                 with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
                     device_tests.scenarios()
 

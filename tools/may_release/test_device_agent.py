@@ -485,6 +485,18 @@ class AgentRunTests(unittest.TestCase):
             self.run_and_judge([OSError("agent died")], [], env={device_tests.FRESH: "chat"}, selection="chat")
         self.assertEqual(self.last_seen.get("deleted"), [TOKEN + "1"], "the run's finally deleted chat's account")
 
+    def test_a_run_that_stops_part_way_still_cleans_up_its_tag(self):
+        """Independent review of #132: the tag cleanup ran only on completion, so a run that stopped part-way left its
+        "<tag> chat" agents and items on the shared account. It runs in the finally, before the sessions are signed
+        out."""
+        with self.assertRaises(RuntimeError):
+            self.run_and_judge([record(), RuntimeError("the emulator went away"), record()], [])
+        seen = self.last_seen
+        self.assertEqual(seen.get("cleanup", (None,))[0:3:2], (TOKEN + "3", "qa-39557415738-a"),
+                         "the run's tag, with a session minted for the cleanup")
+        self.assertIn(TOKEN + "3", self.signed_out, "and that session signed out by abandon after it")
+        self.assertEqual([tag for _, tag, *_ in seen["goals"]], ["qa-39557415738-a-chat", "qa-39557415738-a-notes"])
+
     def test_an_agent_scenario_near_the_model_call_cap_is_skipped_and_never_run(self):
         read = []
 
@@ -700,7 +712,9 @@ class ServerTruthTests(unittest.TestCase):
                          ("\n".join(["Gather W-2s", "call the accountant about " + note, "qa-1 notes", ""]), 3, 1))
         agenda = {"/v1/commitments": {"commitments": [
                       {"id": "11111111-1111-1111-1111-111111111111", "title": "File taxes ", "revision": 4,
-                       "description": "Gather W-2s\n" + note, "status": "accepted"},
+                       "description": "  Gather W-2s  \n" + note, "status": "accepted"},
+                      {"id": "44444444-4444-4444-4444-444444444444", "title": "file taxes", "revision": 7,
+                       "description": note + "\n  ", "status": "accepted"},
                       {"id": "22222222-2222-2222-2222-222222222222", "title": "qa-1 task", "revision": 1,
                        "description": note}], "next_cursor": "p2"},
                   "/v1/commitments?cursor=p2": {"commitments": [
@@ -723,11 +737,14 @@ class ServerTruthTests(unittest.TestCase):
         counts = device_tests.tidy_notes("https://s", TOKEN, get=get, post=patch_(200))
         self.assertEqual(asked, ["/v1/commitments", "/v1/commitments?cursor=p2"], "every page of the Agenda")
         self.assertEqual(saved, [("https://s/v1/commitments/11111111-1111-1111-1111-111111111111", "PATCH",
-                                  {"expected_revision": 4, "description": "Gather W-2s"})],
-                         "the file taxes task alone, at its revision, with its own lines kept")
-        self.assertEqual(counts, {"tasks": 2, "lines": 1, "mixed": 0, "saved": 1, "failed": 0})
+                                  {"expected_revision": 4, "description": "  Gather W-2s  "}),
+                                 ("https://s/v1/commitments/44444444-4444-4444-4444-444444444444", "PATCH",
+                                  {"expected_revision": 7, "description": None})],
+                         "the file taxes tasks alone, at their revisions, with their own lines kept as they were "
+                         "(independent review of #132: no trimming), and none when only whitespace is left")
+        self.assertEqual(counts, {"tasks": 3, "lines": 2, "mixed": 0, "saved": 2, "failed": 0})
         saved.clear()
-        self.assertEqual(device_tests.tidy_notes("https://s", TOKEN, get=get, post=patch_(409))["failed"], 1)
+        self.assertEqual(device_tests.tidy_notes("https://s", TOKEN, get=get, post=patch_(409))["failed"], 2)
         self.assertIsNone(device_tests.tidy_notes("https://s", TOKEN, get=lambda r, timeout: (_ for _ in ()).throw(
             urllib.error.HTTPError(r.full_url, 401, "no", {}, None)), post=patch_(200)))
 
@@ -773,7 +790,7 @@ class ServerTruthTests(unittest.TestCase):
         self.assertEqual(device_tests.tagged("https://s", TOKEN, "/v1/routines", tag,
                                              get=get({"routines": [{"name": "stretch"}]})), (200, False))
 
-    def test_question_truth_finds_the_card_in_the_tagged_chat_or_mays_own(self):
+    def test_question_truth_finds_the_card_in_the_runs_own_chat_alone(self):
         tag = "qa-39557415738"
         question = {"id": "m2", "kind": "question", "question": {"state": "answered", "answer": {"choice_id": "c1"}}}
 
@@ -783,11 +800,11 @@ class ServerTruthTests(unittest.TestCase):
                            {"/v1/conversations/a7/messages": [{"kind": "text", "text": "Ask me, tag " + tag}, question]})
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, True))
         self.assertEqual(seen, ["/v1/agents", "/v1/conversations/a7/messages"])
-        get, _ = server([{"id": "may", "name": "May"}],
-                        {"/v1/conversations/may/messages": [{"kind": "text", "text": tag}, question]})
-        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, True),
-                         "May's own chat, first in the list, is read too")
-        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "closed", tag, get=get), (200, False))
+        get, seen = server([{"id": "may", "name": "May"}],
+                           {"/v1/conversations/may/messages": [{"kind": "text", "text": tag}, question]})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
+                         "independent review of #132: with no chat of its own listed, May's shared chat is never read")
+        self.assertEqual(seen, ["/v1/agents"])
         get, _ = server([{"id": "may", "name": "May"}], {"/v1/conversations/may/messages": [question]})
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
                          "a question in a chat without the tag is someone else's")
@@ -833,10 +850,13 @@ class ServerTruthTests(unittest.TestCase):
         run = "qa-40138900610"
         poll, skip = device_tests.scenario_tag(run, {"id": "poll"}), device_tests.scenario_tag(run, {"id": "poll-skip"})
         self.assertEqual((poll, skip), ("qa-40138900610-poll", "qa-40138900610-poll-skip"))
-        get, _ = chat_server([{"id": "may", "name": "May"}], {"/v1/conversations/may/messages": [
+        mixed = [
             {"author": "user", "text": "Ask me one question, tag " + poll, "latest_run": {"status": "failed"}},
             {"author": "user", "text": "Ask me one question, tag " + skip, "latest_run": {"status": "succeeded"}},
-            {"author": "user", "text": "I will answer myself: apples, " + skip + ".", "latest_run": {"status": "succeeded"}}]})
+            {"author": "user", "text": "I will answer myself: apples, " + skip + ".", "latest_run": {"status": "succeeded"}}]
+        # Each reads its own chat alone; "<poll> chat" is not named with poll-skip's tag, nor the other way round.
+        get, _ = chat_server([{"id": "p", "name": poll + " chat"}, {"id": "k", "name": skip + " chat"}],
+                             {"/v1/conversations/p/messages": mixed, "/v1/conversations/k/messages": mixed})
         self.assertEqual(device_tests.message_codes("https://s", TOKEN, skip, get=get), ["succeeded", "succeeded"])
         self.assertEqual(device_tests.message_codes("https://s", TOKEN, poll, get=get), ["failed"],
                          "poll's tag is a prefix of poll-skip's, yet never matches it")
@@ -870,8 +890,8 @@ class ServerTruthTests(unittest.TestCase):
         self.assertEqual(set(seen), {"/v1/agents", "/v1/conversations/a7/messages"})
         get, seen = server(may[:1], {"/v1/conversations/may/messages": [
             {"author": "user", "text": "Hello " + tag, "latest_run": {"status": "failed", "error_code": "model_cap_reached"}}]})
-        self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), ["failed (model_cap_reached)"],
-                         "with no chat of its own, May's is read")
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), [device_tests.NONE_STORED],
+                         "independent review of #132: with no chat of its own, May's shared chat is never read")
         for text in ("Hello", "Plan", "Sent!", "<b>", "other"):
             self.assertNotIn(text, json.dumps(codes), "codes alone leave the reader")
         get, _ = server(may, {"/v1/conversations/may/messages": [{"author": "user", "text": "untagged"}]})
@@ -880,7 +900,7 @@ class ServerTruthTests(unittest.TestCase):
         get, _ = server(may, {}, agents_status=401)
         self.assertIsNone(device_tests.message_codes("https://s", TOKEN, tag, get=get))
         many = [{"author": "user", "text": tag, "latest_run": {"status": "queued"}}] * 30
-        get, _ = server(may[:1], {"/v1/conversations/may/messages": many})
+        get, _ = server(may, {"/v1/conversations/a7/messages": many})
         self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get),
                          ["queued"] * device_tests.MAX_DELIVERY)
         get, seen = server([{"id": "../../v1/account", "name": tag}], {})
@@ -926,14 +946,15 @@ class ServerTruthTests(unittest.TestCase):
         ours = [{"author": "user", "kind": "chat", "body": "This is device test " + tag,
                  "latest_run": {"status": "succeeded", "error_code": None}},
                 {"author": "may", "kind": "chat", "body": "Done."}]
-        get, seen = chat_server([{"id": "may", "name": "May"}],
-                                {"/v1/conversations/may/messages": history[:200] + [old_card] + history[200:] + ours})
+        chat = [{"id": "c1", "name": tag + " chat"}]
+        get, seen = chat_server(chat,
+                                {"/v1/conversations/c1/messages": history[:200] + [old_card] + history[200:] + ours})
         self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), ["succeeded"])
-        self.assertEqual(seen.count("/v1/conversations/may/messages"), 3, "453 messages: two pages of 200 and one of 53")
+        self.assertEqual(seen.count("/v1/conversations/c1/messages"), 3, "453 messages: two pages of 200 and one of 53")
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
                          "an older run's answered card, before this run's first tagged message, never passes")
         card = {"author": "may", "kind": "question", "body": "Which?", "question": {"state": "answered"}}
-        get, _ = chat_server([{"id": "may", "name": "May"}], {"/v1/conversations/may/messages": history + ours + [card]})
+        get, _ = chat_server(chat, {"/v1/conversations/c1/messages": history + ours + [card]})
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, True))
 
     def test_paging_stops_at_a_cursor_that_does_not_move_and_at_the_page_cap(self):

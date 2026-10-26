@@ -592,6 +592,19 @@ class RunTests(Workspace):
                              "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", device_tests.FRESH: "all"})
         self.assertEqual(self.deleted, [TOKEN + "1"], "the run's finally deleted chat's account")
 
+    def test_a_run_that_stops_part_way_still_cleans_up_its_tag_on_ios(self):
+        """Independent review of #132: the tag cleanup runs in the finally, so a run that stops part-way still removes
+        its "<tag> chat" agents and items from the shared account."""
+        def agent(*args, **kwargs):
+            raise OSError("agent died")
+
+        with self.assertRaises(OSError):
+            self.run_it(selection="chat", agent=agent,
+                        env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
+                             "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", "GITHUB_RUN_ID": "39557415738"})
+        self.assertEqual(self.cleaned_tags, ["qa-39557415738-i"], "the run's own tag, cleaned before the finally ends")
+        self.assertEqual(self.chats, ["qa-39557415738-i-chat"])
+
     def test_an_agent_scenario_near_the_model_call_cap_is_skipped_on_ios_too(self):
         def agent(*args, **kwargs):
             self.fail("an agent ran near the model-call cap")

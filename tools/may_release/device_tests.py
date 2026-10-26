@@ -294,8 +294,8 @@ def scenarios(selection="all", platform="android"):
                                                  isinstance(c["note"], str) and c["note"].startswith("{tag} ") and
                                                  len(c["note"]) <= MAX_NOTE and c["note"][6:] in row["goal"])
                         for c in row["truth"]) and
-                    ("chat" not in row or row["chat"] is True and "Send this message" in row["goal"] and
-                     CHAT_GOAL in row["goal"]) or
+                    ("Send this message" in row["goal"]) == (row.get("chat") is True) and
+                    ("chat" not in row or CHAT_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
                     isinstance(row.get("goal"), str) and len(row["goal"]) <= MAX_GOAL and row.get("server") == [])
                 and isinstance(row.get("title"), str) and
@@ -464,10 +464,11 @@ def run_messages(messages, tag):
 
 
 def run_chats(data, tag):
-    """The chats a scenario's messages are read in (GET /v1/agents' reply): those named with its tag (its own, made by
-    make_chat), or, when there is none, May's own (the first), at most MAX_CHATS."""
+    """The chats a scenario's messages are read in (GET /v1/agents' reply): those named with its tag alone (its own,
+    made by make_chat), at most MAX_CHATS. Never May's shared chat: with no chat of its own listed, nothing is read and
+    its truth fails (independent review of may-releases #132)."""
     agents = [row for row in listed(data, "agents") if isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
-    chosen = [row for row in agents if holds(row.get("name"), tag)] or agents[:1]
+    chosen = [row for row in agents if holds(row.get("name"), tag)]
     return list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]
 
 
@@ -563,7 +564,8 @@ def tidy_notes(base, token, get=urllib.request.urlopen, post=urllib.request.urlo
         counts["lines"] += removed
         request = urllib.request.Request(base + f"{NOTE_PATH}/{task['id']}", method="PATCH",
                                          data=json.dumps({"expected_revision": task["revision"],
-                                                          "description": notes.strip() or None}).encode(),
+                                                          "description": notes if notes.strip() else None})
+                                         .encode(),
                                          headers={"Authorization": "Bearer " + token,
                                                   "Content-Type": "application/json"})
         try:
@@ -686,6 +688,20 @@ def make_chat(base, token, tag, post=urllib.request.urlopen):
     found = data.get("agent", data) if isinstance(data, dict) else None
     return status in (200, 201) and isinstance(found, dict) and isinstance(found.get("id"), str) and \
         AGENT_ID.fullmatch(found["id"]) is not None
+
+
+def tag_cleanup(accounts, base, secret, since, tag, minted, cleaned):
+    """K's cleanup of what the run made on the shared account (its tagged items and chats), with a session of its own
+    (signed out by abandon). Called from the run's finally, so a run that stops part-way cleans up too (independent
+    review of may-releases #132). The count removed, or None when there was nothing shared or it did not answer."""
+    if not accounts.shared:
+        return None
+    at("cleanup")
+    try:
+        token = accounts.track(minted(base, secret))
+    except DeviceTestsError:
+        return None  # read as a cleanup that did not answer: the report is kept
+    return cleaned(base, token, since, tag)
 
 
 def own_chat(row, entry, base, token, own, made):
@@ -1534,14 +1550,8 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             entry["videos"] = recorder.stop(folder)
             settle(entry, row, passed if flow is not None else None)
             token = ""
-        if accounts.shared:
-            at("cleanup")
-            try:
-                token = accounts.track(minted(base, secret))  # signed out by abandon, below
-            except MintFailed:
-                token = ""  # read as a cleanup that did not answer: the report is kept
-            cleaned_count = cleaned(base, token, since, tag) if token else None
     finally:
+        cleaned_count = tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)
         accounts.abandon(base)
         token = secret = ""
         forget_maestro_home(root)

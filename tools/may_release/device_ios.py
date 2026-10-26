@@ -717,14 +717,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 scenario, why = row["id"], recorder.kept
                 print(f"May device tests (ios): {scenario}: its recording was kept {why}")
             device_tests.settle(entry, row, passed if flow is not None else None)
-        if accounts.shared:
-            at("cleanup")
-            try:
-                token = accounts.track(minted(base, secret))  # signed out by abandon, below
-            except device_tests.MintFailed:
-                token = ""  # read as a cleanup that did not answer: the report is kept
-            cleaned_count = cleaned(base, token, since, tag) if token else None
     finally:
+        cleaned_count = device_tests.tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)
         accounts.abandon(base)
         token = secret = ""
         device_tests.forget_maestro_home(root)
