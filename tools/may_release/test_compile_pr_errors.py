@@ -544,6 +544,9 @@ class SealedRoundTripTests(PostCase):
 
     def setUp(self):
         super().setUp()
+        # Found now, on the job's own PATH: each step below runs with a cleared environment whose PATH is
+        # /usr/bin:/bin, which CI's pinned age (toolchain.py age --export) is not on.
+        self.found = {name: shutil.which(name) for name in ("age", "age-keygen")}
         self.secret = next(line for line in subprocess.run(["age-keygen"], capture_output=True, text=True,
                                                             check=True).stdout.splitlines()
                            if line.startswith("AGE-SECRET-KEY-1"))
@@ -551,7 +554,7 @@ class SealedRoundTripTests(PostCase):
                                      check=True).stdout.strip()
 
     def tools(self, name, relative):
-        return shutil.which(relative)
+        return self.found[relative]
 
     def run_step(self, call, env):
         out = io.StringIO()
