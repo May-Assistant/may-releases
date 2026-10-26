@@ -185,15 +185,23 @@ def pinned_swift_bin():
 
 
 def run_tool(argv, log, cwd, env, deadline):
-    """The tool's exit status, or None when it ran past the deadline; its output goes to the private log alone."""
+    """The tool's exit status, or None when it ran past the deadline; its output goes to the private log alone. Its
+    direct child is root's sudo, which this runner user may not signal (re-review of #128): past the deadline, every
+    SANDBOX_USER process is killed instead (stop_all), and sudo then exits on its own."""
     left = deadline - time.monotonic()
     if left <= 0:
         return None
+    with log.open("ab") as output:
+        process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
+                                   stdin=subprocess.DEVNULL)
     try:
-        with log.open("ab") as output:
-            return subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
-                                  stdin=subprocess.DEVNULL, timeout=left).returncode
+        return process.wait(timeout=left)
     except subprocess.TimeoutExpired:
+        stop_all(log)
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         return None
 
 

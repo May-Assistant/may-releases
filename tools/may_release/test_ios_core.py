@@ -274,12 +274,60 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(self.calls, [])
 
     def test_run_tool_stops_at_the_shared_deadline(self):
-        log = self.private / "x.log"
-        self.assertIsNone(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"}, time.monotonic() - 1))
-        self.assertEqual(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"}, time.monotonic() + 30), 0)
-        self.assertIsNone(tool.run_tool(["sleep", "5"], log, self.root, {"PATH": "/usr/bin:/bin"},
-                                        time.monotonic() + 0.2))
+        log, stopped = self.private / "x.log", []
+        with patch.object(tool, "stop_all", lambda log: stopped.append(True)):
+            self.assertIsNone(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"}, time.monotonic() - 1))
+            self.assertEqual(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"},
+                                           time.monotonic() + 30), 0)
+            self.assertEqual(stopped, [])
+            self.assertIsNone(tool.run_tool(["sleep", "5"], log, self.root, {"PATH": "/usr/bin:/bin"},
+                                            time.monotonic() + 0.2))
+        self.assertEqual(stopped, [True], "past the deadline every sandbox process is stopped")
         self.assertEqual(tool.RUN_SECONDS, 25 * 60)
+
+    def test_a_timed_out_sudo_child_is_never_signalled_and_the_timeout_is_recorded(self):
+        """Re-review of #128: run_tool's child is root's sudo, which the runner may not signal; killing it raised
+        PermissionError, so the step crashed and no timeout was recorded."""
+        test = self
+
+        class RootSudo:
+            stopped = False
+
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+
+            def wait(self, timeout=None):
+                if not RootSudo.stopped:
+                    raise subprocess.TimeoutExpired(self.argv, timeout)
+                return -9
+
+            def kill(self):
+                raise PermissionError(1, "Operation not permitted")
+
+            terminate = send_signal = kill
+
+        def stop(log):
+            RootSudo.stopped = True
+        with patch.object(tool.subprocess, "Popen", RootSudo), patch.object(tool, "stop_all", stop):
+            try:
+                status = tool.run_tool(tool.sandboxed(["swift", "build"]), self.private / "x.log", self.root, {},
+                                       time.monotonic() + 0.1)
+            except Exception as error:  # the bug: signalling root's sudo raised
+                self.fail(f"run_tool raised {type(error).__name__} instead of recording a timeout")
+            self.assertIsNone(status)
+        self.assertTrue(RootSudo.stopped)
+        # And through the whole run: the build's timeout is recorded, never a crash.
+        RootSudo.stopped = False
+        sha, real, popen = self.commit(), tool.run_tool, subprocess.Popen
+        only_sudo = lambda argv, **kwargs: RootSudo(argv) if argv[0] == "sudo" else popen(argv, **kwargs)
+        with patch.object(tool.subprocess, "Popen", only_sudo):
+            try:
+                out, outcome, _ = self.run_it(sha, run_tool=lambda argv, log, cwd, env, deadline: real(
+                    argv, log, cwd, env, time.monotonic() + 0.1))
+            except Exception as error:
+                self.fail(f"the run raised {type(error).__name__} instead of recording a timeout")
+        self.assertEqual((outcome["result"], outcome["stages"]), ("timeout", {"build": "timeout", "tests": "not run"}))
+        self.assertIn("May iOS core build: did not finish in time", out)
 
 
 class ParseTests(unittest.TestCase):
