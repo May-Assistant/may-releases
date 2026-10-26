@@ -155,7 +155,7 @@ class RunTests(Workspace):
             minted.append("fresh" if fresh else secret)
             return TOKEN + str(len(minted))
 
-        self.deleted, self.cleaned_tags = [], []
+        self.deleted, self.cleaned_tags, self.chats = [], [], []
 
         environ = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin", **(env or {})}
@@ -170,6 +170,7 @@ class RunTests(Workspace):
                                      revoked_by=lambda base, token: self.signed_out.append(token) or True,
                                      truth=lambda base, token, path, tag: (200, True),
                                      noted=lambda base, token, tag, note: (200, "found"),
+                                     made=lambda base, token, tag: self.chats.append(tag) or True,
                                      asked=lambda base, token, state, tag: (200, True),
                                      cleaned=lambda base, token, since, tag: self.cleaned_tags.append(tag) or 2,
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
@@ -590,6 +591,19 @@ class RunTests(Workspace):
                         env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
                              "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", device_tests.FRESH: "all"})
         self.assertEqual(self.deleted, [TOKEN + "1"], "the run's finally deleted chat's account")
+
+    def test_a_run_that_stops_part_way_still_cleans_up_its_tag_on_ios(self):
+        """Independent review of #132: the tag cleanup runs in the finally, so a run that stops part-way still removes
+        its "<tag> chat" agents and items from the shared account."""
+        def agent(*args, **kwargs):
+            raise OSError("agent died")
+
+        with self.assertRaises(OSError):
+            self.run_it(selection="chat", agent=agent,
+                        env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
+                             "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", "GITHUB_RUN_ID": "39557415738"})
+        self.assertEqual(self.cleaned_tags, ["qa-39557415738-i"], "the run's own tag, cleaned before the finally ends")
+        self.assertEqual(self.chats, ["qa-39557415738-i-chat"])
 
     def test_an_agent_scenario_near_the_model_call_cap_is_skipped_on_ios_too(self):
         def agent(*args, **kwargs):

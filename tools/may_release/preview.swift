@@ -1,24 +1,40 @@
-// A small silent preview: `preview <recording.mp4> <preview.mp4> <width> <seconds> <fps> <bitrate>` writes the
-// recording's video alone, scaled to <width> points wide (its height even, the aspect kept), as a timelapse of at most
-// <seconds> at <fps> frames a second, H.264 at about <bitrate> bits a second (device_tests.PREVIEW_*). device_ios.py
-// compiles this with the pinned Xcode's swiftc on the device runner, as renders.py compiles stitch.swift; it reads and
-// writes only the paths it is given.
+// A small silent preview: `preview <preview.mp4> <width> <seconds> <fps> <bitrate> <recording.mp4>...` writes the
+// recordings' video alone, joined in the order given (a scenario's parts), scaled to <width> points wide (its height
+// even, the aspect kept), as a timelapse of at most <seconds> at <fps> frames a second, H.264 at about <bitrate> bits a
+// second (device_tests.PREVIEW_*). device_ios.py compiles this with the pinned Xcode's swiftc on the device runner, as
+// renders.py compiles stitch.swift; it reads and writes only the paths it is given.
 import AVFoundation
 import Foundation
 
 let arguments = CommandLine.arguments
-guard arguments.count == 7, let width = Double(arguments[3]), width >= 16, width <= 2000,
-      let maxSeconds = Double(arguments[4]), maxSeconds >= 1, let fps = Double(arguments[5]), fps >= 1, fps <= 60,
-      let bitrate = Int(arguments[6]), bitrate >= 10_000 else { exit(2) }
-let asset = AVURLAsset(url: URL(fileURLWithPath: arguments[1]))
-guard let track = asset.tracks(withMediaType: .video).first else { exit(3) }
-let shown = track.naturalSize.applying(track.preferredTransform)
+guard arguments.count >= 7, let width = Double(arguments[2]), width >= 16, width <= 2000,
+      let maxSeconds = Double(arguments[3]), maxSeconds >= 1, let fps = Double(arguments[4]), fps >= 1, fps <= 60,
+      let bitrate = Int(arguments[5]), bitrate >= 10_000 else { exit(2) }
+// The parts end to end in one composition track, shown as the first part is (its size and transform).
+let asset = AVMutableComposition()
+guard let track = asset.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
+else { exit(3) }
+var natural = CGSize.zero
+for (index, path) in arguments[6...].enumerated() {
+    let part = AVURLAsset(url: URL(fileURLWithPath: path))
+    guard let source = part.tracks(withMediaType: .video).first else { exit(3) }
+    if index == 0 {
+        natural = source.naturalSize
+        track.preferredTransform = source.preferredTransform
+    }
+    do {
+        try track.insertTimeRange(source.timeRange, of: source, at: asset.duration)
+    } catch {
+        exit(3)
+    }
+}
+let shown = natural.applying(track.preferredTransform)
 guard abs(shown.width) > 0, abs(shown.height) > 0 else { exit(3) }
 let height = max(2, (width * abs(shown.height) / abs(shown.width) / 2).rounded() * 2)
 // The writer scales: its size is the preview's as shown, so the source's transform is applied before scaling.
 let rotated = abs(track.preferredTransform.b) == 1
 guard let reader = try? AVAssetReader(asset: asset),
-      let writer = try? AVAssetWriter(outputURL: URL(fileURLWithPath: arguments[2]), fileType: .mp4) else { exit(4) }
+      let writer = try? AVAssetWriter(outputURL: URL(fileURLWithPath: arguments[1]), fileType: .mp4) else { exit(4) }
 let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
 let input = AVAssetWriterInput(mediaType: .video, outputSettings: [

@@ -1213,7 +1213,8 @@ def renders_print_problems(root):
 # decrypt key and the may-renders write key each in one step. Pinned whole: dispatch with exactly source_sha and
 # scenarios plus one nightly schedule, read-only, its own concurrency group, nothing run but its commands, the one
 # encrypted upload, and only the conditions named here. device_tests.py prints only scenario ids, verdict words and
-# counts.
+# counts. The one-off tidy job (tidy_file_taxes, coordinator, 26 Oct) runs instead of the device jobs and the publish:
+# device_tests.py tidy alone, with the sign-in secret and the staging URL in its one step.
 DEVICE_TESTS = "device-tests.yml"
 DEVICE_TOOL = "python3 -I -S -B tools/may_release/device_tests.py "
 KVM_RUN = ("echo 'KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"' | sudo tee "
@@ -1222,6 +1223,8 @@ KVM_RUN = ("echo 'KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"stat
 IOS_TOOL = DEVICE_TOOL + "{} --platform ios"
 DEVICE_RUNS = [
     'python3 -I -S -B tools/may_release/gate.py --action device-tests --source-sha "$MAY_SOURCE_SHA"',
+    # tidy
+    DEVICE_TOOL + "tidy",
     # android
     "python3 -I -S -B tools/may_release/toolchain.py age",
     'python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA"',
@@ -1254,8 +1257,13 @@ DEVICE_UPLOAD = (
     "          retention-days: 7\n")
 DEVICE_DOWNLOAD = ("name: may-device-{}-${{{{ github.run_attempt }}}}\n"
                    "          path: ${{{{ runner.temp }}}}/may-device-download\n")
-DEVICE_CONDITIONS = ["if: always()", "if: always()", "if: ${{ !cancelled() && needs.admission.result == 'success' }}",
+DEVICE_TIDY, DEVICE_UNTIDY = "if: ${{ inputs.tidy_file_taxes }}", "if: ${{ !inputs.tidy_file_taxes }}"
+DEVICE_CONDITIONS = [DEVICE_TIDY, DEVICE_UNTIDY, "if: always()", DEVICE_UNTIDY, "if: always()",
+                     "if: ${{ !cancelled() && needs.admission.result == 'success' && !inputs.tidy_file_taxes }}",
                      "if: always()"]
+DEVICE_TIDY_INPUT = ("      tidy_file_taxes:\n        description: [^\n]+\n        required: false\n"
+                     "        type: boolean\n        default: false\n")
+DEVICE_TIDY_STEP = "Remove the leftover note lines from the test account's file taxes task"
 # The previews step (the flow board's): optional and bounded in each device job, so the seal always runs after it.
 PREVIEW_STEP = ("      - name: Make a 270px preview of each recording, with no secret\n"
                 "        # Optional and bounded: the seal and the handover always run after it.\n"
@@ -1274,9 +1282,9 @@ DEVICE_RELEASE = "MAY_RENDERS_RELEASE_TOKEN"
 DEVICE_CLAUDE = "CLAUDE_CODE_OAUTH_TOKEN"
 DEVICE_SECRETS = set(COMPILE_SECRETS) | {DEVICE_SIGNIN, "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_RENDERS_WRITE_KEY", DEVICE_RELEASE,
                                          DEVICE_CLAUDE}
-# How often each secret is named: the read keys in each fetch, the sign-in secret in each scenarios step, the Claude
-# token in each job's scenarios and judge steps.
-DEVICE_SECRET_COUNTS = dict({name: 2 for name in (*COMPILE_SECRETS, DEVICE_SIGNIN)}, **{DEVICE_CLAUDE: 4})
+# How often each secret is named: the read keys in each fetch, the sign-in secret in each scenarios step and the tidy
+# step, the Claude token in each job's scenarios and judge steps.
+DEVICE_SECRET_COUNTS = dict({name: 2 for name in COMPILE_SECRETS}, **{DEVICE_SIGNIN: 3, DEVICE_CLAUDE: 4})
 DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
                ("MAY_DEVICE_TESTS_OUTWARD", "${{ vars.MAY_DEVICE_TESTS_OUTWARD }}"),
                ("MAY_DEVICE_TESTS_SKIP", "${{ vars.MAY_DEVICE_TESTS_SKIP }}"),
@@ -1306,31 +1314,34 @@ def device_tests_workflow_problems(text):
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion",
-                                                             "ios_diagnostics"] or \
-            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean"] or \
+                                                             "ios_diagnostics", "tidy_file_taxes"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean"] or \
             not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or not re.search(DEVICE_DIAGNOSTICS_INPUT, trigger) or \
+            not re.search(DEVICE_TIDY_INPUT, trigger) or \
             re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
-        found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion and "
-                     "ios_diagnostics booleans, plus one nightly schedule")
+        found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion, "
+                     "ios_diagnostics and tidy_file_taxes booleans, plus one nightly schedule")
     if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     jobs = ("admission", "android", "ios", "publish")
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
             [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1, 1] or \
-            text.count("permissions:") != 5:
+            "    permissions:\n      contents: read\n    steps:\n" not in job_text(text, "tidy") or \
+            text.count("permissions:") != 6:
         found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
-    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs) or \
-            [re.findall(r"(?m)^    runs-on: (.+)$", job_text(text, job)) for job in jobs] != \
-            [["ubuntu-24.04"], ["ubuntu-24.04"], ["macos-15"], ["ubuntu-24.04"]]:
-        found.append(name + "jobs are not exactly admission, android and publish on Linux and ios on macOS")
-    for job in ("android", "ios", "publish"):
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "tidy", *jobs[1:]] or \
+            [re.findall(r"(?m)^    runs-on: (.+)$", job_text(text, job)) for job in ("tidy", *jobs)] != \
+            [["ubuntu-24.04"], ["ubuntu-24.04"], ["ubuntu-24.04"], ["macos-15"], ["ubuntu-24.04"]]:
+        found.append(name + "jobs are not exactly admission, tidy, android and publish on Linux and ios on macOS")
+    for job in ("tidy", "android", "ios", "publish"):
         if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job_text(text, job):
             found.append(name + job + "'s environment is not the one admission chose")
     if re.search(r"(?m)^    environment:", job_text(text, "admission")) or \
+            "    needs: admission\n" not in job_text(text, "tidy") or \
             "    needs: admission\n" not in job_text(text, "android") or \
             "    needs: admission\n" not in job_text(text, "ios") or \
             "    needs: [admission, android, ios]\n" not in job_text(text, "publish"):
-        found.append(name + "android and ios do not run after admission (and publish after both)")
+        found.append(name + "tidy, android and ios do not run after admission (and publish after both devices)")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
     kvm = re.sub(r"\s+", " ", text.partition("      - name: Let the emulator use KVM\n        run: |\n")[2]
                  .partition("      - name:")[0]).strip()
@@ -1340,8 +1351,8 @@ def device_tests_workflow_problems(text):
                      "seal, the verdict, the publish steps and the cleanups")
     if "${{ inputs." in "\n".join(runs):
         found.append(name + "interpolates inputs into shell")
-    if uses_in(text) != [CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT,
-                         DOWNLOAD_ARTIFACT] or text.count("upload-artifact") != 2 or \
+    if uses_in(text) != [CHECKOUT, CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT,
+                         DOWNLOAD_ARTIFACT, DOWNLOAD_ARTIFACT] or text.count("upload-artifact") != 2 or \
             DEVICE_UPLOAD.format("android") not in job_text(text, "android") or \
             DEVICE_UPLOAD.format("ios") not in job_text(text, "ios") or \
             any(DEVICE_DOWNLOAD.format(device) not in job_text(text, "publish") for device in ("android", "ios")):
@@ -1351,9 +1362,10 @@ def device_tests_workflow_problems(text):
             any(PREVIEW_STEP.format(platform) not in job_text(text, job)
                 for job, platform in (("android", ""), ("ios", " --platform ios"))) or \
             PROTOTYPE_STEP not in job_text(text, "android") or "device_tests.py prototypes" in job_text(text, "ios") or \
-            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["120", "120", "30"]:
+            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["10", "120", "120", "30"]:
         found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
-    steps = {job: dict(job_steps(text, job)[1]) for job in jobs}
+    steps = {job: dict(job_steps(text, job)[1]) for job in ("tidy", *jobs)}
+    tidy = steps["tidy"].get(DEVICE_TIDY_STEP, "")
     fetch_step, scenarios_step = "Fetch the may-app commit and its design system quietly", \
         "Run the scenarios against staging and record them"
     seal_step = "Encrypt the report to the renders public key"
@@ -1364,8 +1376,9 @@ def device_tests_workflow_problems(text):
     push = steps["publish"].get("Push the run folder to may-renders", "")
     release = steps["publish"].get("Upload the recordings as may-renders release assets", "")
     judge, ios_judge = (steps[job].get("Judge the agent scenarios", "") for job in ("android", "ios"))
-    named = (*fetches, scenarios, ios_scenarios, judge, ios_judge, *seals, decrypt, push, release)
-    others = [chunk for job in ("android", "ios", "publish") for chunk in steps[job].values() if chunk not in named]
+    named = (*fetches, scenarios, ios_scenarios, judge, ios_judge, *seals, decrypt, push, release, tidy)
+    others = [chunk for job in ("tidy", "android", "ios", "publish") for chunk in steps[job].values()
+              if chunk not in named]
     model = ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}")
     recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
     staging = ("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}")
@@ -1373,6 +1386,9 @@ def device_tests_workflow_problems(text):
             any(text.count("secrets." + n) != DEVICE_SECRET_COUNTS.get(n, 1) for n in DEVICE_SECRETS) or \
             any(secrets_in(fetch) != set(COMPILE_SECRETS) for fetch in fetches) or \
             any(secrets_in(chunk) != {DEVICE_SIGNIN, DEVICE_CLAUDE} for chunk in (scenarios, ios_scenarios)) or \
+            secrets_in(tidy) != {DEVICE_SIGNIN} or set(env_entries(tidy)) != {
+                staging, (DEVICE_SIGNIN, "${{ secrets." + DEVICE_SIGNIN + " }}")} or \
+            len(steps["tidy"]) != 2 or text.count("inputs.tidy_file_taxes") != 4 or \
             any(model not in env_entries(chunk) for chunk in (scenarios, judge, ios_scenarios, ios_judge)) or \
             staging not in env_entries(ios_scenarios) or DEVICE_REDUCE_MOTION not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_reduce_motion") != 1 or DEVICE_DIAGNOSTICS not in env_entries(ios_scenarios) or \
@@ -1380,10 +1396,10 @@ def device_tests_workflow_problems(text):
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
-            text.count("vars.") != 15 or text.count("GH_TOKEN") != 1 or \
+            text.count("vars.") != 16 or text.count("GH_TOKEN") != 1 or \
             any(e not in DEVICE_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret, variable or env entry other than each fetch's two source-read keys, the sign-in "
-                     "secret in each scenarios step, the Claude token in each job's scenarios and judge steps alone, the "
+                     "secret in each scenarios step and the tidy step, the Claude token in each job's scenarios and judge steps alone, the "
                      "decrypt and write keys and the release token (each in its one step) and the inputs")
     if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
         found.append(name + "writes a step summary or carries a value between steps")
@@ -1393,7 +1409,7 @@ def device_tests_workflow_problems(text):
 DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count", "platform",
                        "made", "deleted", "kept", "status",
                        "smoke_passed", "stage", "detail", "missing", "anrs", "crashes", "dropped", "revoked",
-                       "unrevoked", "waited", "network", "unverified"}
+                       "unrevoked", "waited", "network", "unverified", "tasks", "lines", "mixed", "saved"}
 
 
 def device_tests_print_problems(root):

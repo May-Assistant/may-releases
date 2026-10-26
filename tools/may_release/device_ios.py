@@ -101,10 +101,10 @@ def preview_encoder(log, tool=renders.quiet):
              str(Path(__file__).resolve().parent / "preview.swift")], log, env=env, timeout=COMPILE_SECONDS).returncode:
         raise DeviceTestsError("preview.swift did not compile")
 
-    def encode(video, target):
-        return not renders.quiet([str(binary), str(video), str(target), str(device_tests.PREVIEW_WIDTH),
+    def encode(videos, target):
+        return not renders.quiet([str(binary), str(target), str(device_tests.PREVIEW_WIDTH),
                                   str(device_tests.PREVIEW_MAX_SECONDS), str(device_tests.PREVIEW_FPS),
-                                  str(device_tests.PREVIEW_BITRATE)], log,
+                                  str(device_tests.PREVIEW_BITRATE), *(str(video) for video in videos)], log,
                                  env=xcode(), timeout=device_tests.PREVIEW_SECONDS).returncode
     return encode
 
@@ -576,7 +576,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
                   install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
-                  revoked_by=device_tests.revoke, diagnosed=None, noted=device_tests.commitment_note):
+                  revoked_by=device_tests.revoke, diagnosed=None, noted=device_tests.commitment_note,
+                  made=device_tests.make_chat):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -660,6 +661,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 token = ""
                 continue
             own = device_tests.scenario_tag(tag, row)  # the scenario's own tag
+            if not device_tests.own_chat(row, entry, base, token, own, made):
+                accounts.finish(row, base, token)
+                token = ""
+                continue
             at(f"{row['id']}: launching the app")
             diagnostics.begin()
             launch(udid, env, token, log)
@@ -712,14 +717,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 scenario, why = row["id"], recorder.kept
                 print(f"May device tests (ios): {scenario}: its recording was kept {why}")
             device_tests.settle(entry, row, passed if flow is not None else None)
-        if accounts.shared:
-            at("cleanup")
-            try:
-                token = accounts.track(minted(base, secret))  # signed out by abandon, below
-            except device_tests.MintFailed:
-                token = ""  # read as a cleanup that did not answer: the report is kept
-            cleaned_count = cleaned(base, token, since, tag) if token else None
     finally:
+        cleaned_count = device_tests.tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)
         accounts.abandon(base)
         token = secret = ""
         device_tests.forget_maestro_home(root)
