@@ -347,10 +347,10 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(case=case):
                 self.flagged(WORKFLOW, old, new, message)
         workflow = (static_check.ROOT / WORKFLOW).read_text()
-        swift = workflow[workflow.index("  swift-checks:\n"):]
+        swift = workflow[workflow.index("  swift-checks:\n"):workflow.index("  post:\n")]
         self.flagged(WORKFLOW, swift, swift.replace("    runs-on: ubuntu-24.04\n", "    runs-on: macos-15\n", 1),
-                     name + "is not the iOS-only May Playground compile with no artifact")
-        self.flagged(WORKFLOW, swift, "", name + "jobs are not exactly admission, native and swift-checks")
+                     name + "is not the iOS-only May Playground compile")
+        self.flagged(WORKFLOW, swift, "", name + "jobs are not exactly admission, native, swift-checks and post")
 
     def test_printing_anything_from_may_app_is_flagged(self):
         anchor = '        print("May Swift checks passed")\n'

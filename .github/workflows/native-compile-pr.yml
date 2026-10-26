@@ -43,7 +43,10 @@ jobs:
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
         run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
   native:
-    # The Mac compile starts only after may-app's Linux Swift checks pass (swift-checks, below).
+    # The Mac compile starts only after may-app's Linux Swift checks pass (swift-checks, below). It runs the pull request's
+    # own build code as the runner user, so it never holds the comment token (independent review of may-releases #130):
+    # it seals its errors to the environment's own age key, hands over only that file, and fails when the compile
+    # failed; the post job, on a fresh runner, posts them.
     needs: [admission, swift-checks]
     runs-on: macos-15
     environment: ${{ needs.admission.outputs.environment }}
@@ -65,16 +68,8 @@ jobs:
           owner: May-Assistant
           repositories: may-app
           permission-pull-requests: read
-      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code
-        id: ci-comment
-        if: vars.MAY_CI_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.MAY_CI_APP_ID }}
-          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
-          owner: May-Assistant
-          repositories: may-app
-          permission-pull-requests: write
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
       - name: Check the pull request head and environment before fetching
         env:
           GH_TOKEN: ${{ github.token }}
@@ -91,15 +86,23 @@ jobs:
         run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
       - name: Compile without signing, store access or any credential
         run: python3 -I -S -B tools/may_release/compile.py --platform ios --target playground --record-outcome
-      - name: Post the errors on the may-app pull request, never in this log
+      - name: Seal the errors for the post job, with no secret
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
-          MAY_PR_NUMBER: ${{ inputs.pr_number }}
-          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
-        run: python3 -I -S -B tools/may_release/compile_pr_errors.py --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/compile_pr_errors.py seal --source-sha "$MAY_SOURCE_SHA"
+      - name: Hand over only the sealed record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-compile-record-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-compile-sealed/compile.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the compile failed
+        run: python3 -I -S -B tools/may_release/compile_pr_errors.py verdict
       - name: Remove private source, logs and products
         if: always()
-        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle"
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-derived" "$RUNNER_TEMP/may-packages" "$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-compile-sealed"
   swift-checks:
     # may-app's tools/ios/test_swift_*.py (may-app #1050) on Linux, before the macOS compile: an init's labels out of order
     # or a missing import fails here in a minute, and native never starts. The same check and fetch as native, with the
@@ -164,3 +167,52 @@ jobs:
       - name: Remove private source and logs
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private"
+  post:
+    # A fresh Linux runner that runs no may-app code: the comment token is minted here alone, the decrypt key and the
+    # comment token each live in one step, and the record is checked whole before it is posted. It runs once native has
+    # finished, passed or failed; with nothing sealed (no key pair set yet) it posts nothing and native's verdict stands.
+    needs: [admission, native]
+    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code
+        id: ci-comment
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: write
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Nothing to download (no key pair yet, or native stopped before its seal) is reported by the next step.
+        continue-on-error: true
+        with:
+          name: may-compile-record-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-compile-download
+      - name: Decrypt and check the compile record
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
+        run: python3 -I -S -B tools/may_release/compile_pr_errors.py open --source-sha "$MAY_SOURCE_SHA"
+      - name: Post the errors on the may-app pull request, never in this log
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
+        run: python3 -I -S -B tools/may_release/compile_pr_errors.py post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+      - name: Remove the decrypted record
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-compile-download"

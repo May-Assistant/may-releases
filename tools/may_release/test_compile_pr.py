@@ -312,8 +312,10 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
 
     def test_each_widening_is_flagged(self):
         name = "native-compile-pr.yml: "
-        secret = name + "a secret or env entry other than the pull request check's PR token, the fetch step's two source-read keys and the post's comment token"
-        runs = name + "runs something other than the gate, the fetch, the compile, the post and the cleanup"
+        secret = name + ("a secret or env entry other than the pull request check's PR token, the fetch step's two "
+                         "source-read keys, the seal's public key, the open's decrypt key and the post's comment token")
+        runs = name + ("runs something other than the gate, age, the fetch, the compile, the seal, the verdict, the open, "
+                       "the post and the cleanups")
         compile_step = "      - name: Compile without signing, store access or any credential\n"
         fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
         cases = {
@@ -333,7 +335,7 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
             "a store environment": ("    environment: ${{ needs.admission.outputs.environment }}\n",
                 "    environment: may-ios-playground-internal\n", name + "native's environment is not the one admission chose"),
             "an artifact": (compile_step, "      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n" + compile_step,
-                name + "is not the iOS-only May Playground compile with no artifact"),
+                name + "is not the iOS-only May Playground compile with its one sealed record as the only artifact"),
             "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n  workflow_dispatch:\n",
                 name + "is not dispatched with exactly pr_number and source_sha"),
             "the PR token in admission": ('          GH_TOKEN: ${{ github.token }}\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n          MAY_PR_NUMBER',
