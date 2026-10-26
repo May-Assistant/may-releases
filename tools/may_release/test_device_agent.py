@@ -710,6 +710,39 @@ class ServerTruthTests(unittest.TestCase):
         kept, removed, mixed = device_tests.tidy_lines(text)
         self.assertEqual((kept, removed, mixed),
                          ("\n".join(["Gather W-2s", "call the accountant about " + note, "qa-1 notes", ""]), 3, 1))
+
+    def test_tidy_removes_notes_glued_into_one_line_with_a_stray_character_or_two(self):
+        """Run 40290565440: the leftover was two notes glued into one line, with a stray character between them; it was
+        kept as mixed (coordinator, 26 Oct). A line goes when its notes leave at most MAX_STRAY other characters."""
+        glued = ".qa-40063426822 note from the device testkqa-40057045702 note from the device test"
+        three = " ".join(f"qa-{n} note from the device test." for n in (1, 2, 3))
+        for line, gone in ((glued, True), (glued + " ", True), (three, True), ("xy" + glued, False),
+                           (glued + " ok", False), ("Pay: qa-1 note from the device test", False),
+                           ("ab", False), ("qa-1 note", False)):
+            with self.subTest(line=line):
+                kept, removed, mixed = device_tests.tidy_lines("Gather W-2s\n" + line)
+                self.assertEqual((kept, removed, mixed),
+                                 ("Gather W-2s", 1, 0) if gone else
+                                 ("Gather W-2s\n" + line, 0, int("note from the device test" in line)))
+
+    def test_tidy_saves_the_glued_line_away(self):
+        glued = ".qa-40063426822 note from the device testkqa-40057045702 note from the device test"
+        agenda = {"/v1/commitments": {"commitments": [
+            {"id": "11111111-1111-1111-1111-111111111111", "title": "file taxes", "revision": 9,
+             "description": "Gather W-2s\n" + glued, "status": "accepted"}], "next_cursor": None}}
+        saved = []
+
+        def patch_(request, timeout):
+            saved.append(json.loads(request.data))
+            return FakeReply(b"{}")
+
+        counts = device_tests.tidy_notes("https://s", TOKEN, get=lambda request, timeout: FakeReply(
+            json.dumps(agenda["/v1/commitments"]).encode()), post=patch_)
+        self.assertEqual((saved, counts), ([{"expected_revision": 9, "description": "Gather W-2s"}],
+                                           {"tasks": 1, "lines": 1, "mixed": 0, "saved": 1, "failed": 0}))
+
+    def test_tidy_reads_every_page_and_saves_at_each_revision(self):
+        note = "qa-40243708096-i-notes note from the device test"
         agenda = {"/v1/commitments": {"commitments": [
                       {"id": "11111111-1111-1111-1111-111111111111", "title": "File taxes ", "revision": 4,
                        "description": "  Gather W-2s  \n" + note, "status": "accepted"},
