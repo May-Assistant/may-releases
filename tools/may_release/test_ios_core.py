@@ -255,12 +255,14 @@ class RunTests(unittest.TestCase):
             ["chmod", "0700", "--", "/home/runner"], *setup,
             ["tee", "-a", "--", "/etc/cron.deny", b"may-core\n"], ["tee", "-a", "--", "/etc/at.deny", b"may-core\n"],
             ["run_tool"], *kill, ["run_tool"], *kill,
-            *kill, tool.LEFTOVERS, ["rm", "-rf", "--", str(tool.SANDBOX)], ["userdel", "may-core"]])
+            *kill, tool.leftovers(), ["rm", "-rf", "--", str(tool.SANDBOX)], ["userdel", "may-core"]])
         self.assertEqual(self.as_sandbox_calls, [["/usr/bin/test", "!", "-x", "/home/runner"],
                                                  ["/usr/bin/test", "!", "-x", str(self.root)]],
                          "as the build user, neither the runner's home nor runner temp can be entered")
-        self.assertEqual(tool.LEFTOVERS, ["find", "/", "/tmp", "/var/tmp", "/dev/shm", "-xdev", "-user", "may-core",
-                                          "-delete"])
+        with patch.object(tool.os.path, "isdir", lambda path: path != "/var/lib/php/sessions"):
+            self.assertEqual(tool.leftovers(), [
+                "find", "/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mqueue", "/var/crash", "/mnt", "/opt/may-core",
+                "-xdev", "-user", "may-core", "-delete"], "the world-writable places and the sandbox, never the root")
         useradd = [argv for argv in setup if argv[0] == "useradd"]
         self.assertEqual(len(useradd), 1)
         for flag in ("-G", "--groups", "-aG", "sudo"):
@@ -277,8 +279,13 @@ class RunTests(unittest.TestCase):
                 with self.assertRaises(tool.IosCoreError):
                     self.run_it(self.commit(), admin_fails=step)
                 self.assertEqual(self.calls, [])
-                self.assertEqual(self.admin_calls[-3:], [tool.LEFTOVERS, ["rm", "-rf", "--", str(tool.SANDBOX)],
+                self.assertEqual(self.admin_calls[-3:], [tool.leftovers(), ["rm", "-rf", "--", str(tool.SANDBOX)],
                                                          ["userdel", "may-core"]])
+
+    def test_a_cleanup_that_cannot_remove_the_build_users_files_says_so_in_a_fixed_line(self):
+        out, outcome, _ = self.run_it(self.commit(), admin_fails="find")
+        self.assertEqual(outcome["result"], "passed")
+        self.assertEqual(out.splitlines()[-1], "May iOS core suite: some files of the build user could not be removed")
 
     def test_a_build_user_that_can_reach_the_runners_files_runs_nothing(self):
         """Second re-review of #128: the token mints' outputs and the job's command files sit under the runner's

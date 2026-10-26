@@ -67,7 +67,10 @@ ADMIN_SECONDS = 10 * 60
 # until none of its processes is left (STOP_ROUNDS), and its files anywhere on the runner go with it (LEFTOVERS).
 DENY_FILES = ("/etc/cron.deny", "/etc/at.deny")
 STOP_ROUNDS = 20
-LEFTOVERS = ["find", "/", "/tmp", "/var/tmp", "/dev/shm", "-xdev", "-user", SANDBOX_USER, "-delete"]
+# Third re-review of #128: the world-writable places, each its own mount or not (-xdev keeps each scan in its own), and the
+# sandbox; never the whole root, which cost minutes of the job.
+LEFTOVER_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mqueue", "/var/crash", "/var/lib/php/sessions",
+                 "/mnt", str(SANDBOX))
 LOG, OUTCOME, FAILURES = "ios-core.log", "ios-core-result.json", "ios-core-failures.json"
 RESULTS = ("passed", "failed", "timeout")
 STAGES = ("build", "tests")
@@ -202,10 +205,16 @@ def stop_all(log, strict=True):
         raise IosCoreError("A process of the unprivileged build user could not be stopped")
 
 
+def leftovers():
+    """The root command that deletes SANDBOX_USER's files in each of LEFTOVER_DIRS that exists here."""
+    return ["find", *(d for d in LEFTOVER_DIRS if os.path.isdir(d)), "-xdev", "-user", SANDBOX_USER, "-delete"]
+
+
 def teardown(log):
     """The sandbox gone: its user's processes, its files anywhere on the runner, its copies and the user itself."""
     stop_all(log, strict=False)
-    admin(LEFTOVERS, log)
+    if admin(leftovers(), log) != 0:
+        print("May iOS core suite: some files of the build user could not be removed")
     admin(["rm", "-rf", "--", str(SANDBOX)], log)
     admin(["userdel", SANDBOX_USER], log)
 
