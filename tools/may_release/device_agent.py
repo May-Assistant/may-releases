@@ -26,7 +26,7 @@ import subprocess
 import sys
 import urllib.request
 
-from device_mcp import DUMP_FAILURES, kept_lines
+from device_mcp import DRIVER_CAUSES, DUMP_FAILURES, kept_lines
 from review import CLI_MAX_BYTES, CLI_SHA512, CLI_URL, checked_cli, header_safe, outcome
 
 # review.py's pinned release for macOS on Apple silicon (macos-15): npm's darwin-arm64 platform package, a single
@@ -168,7 +168,10 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
             else None, "summary": str(record.get("summary", ""))[:1000], "hierarchy": str(record.get("hierarchy", "")),
             "actions": record.get("actions") if type(record.get("actions")) is int else 0,
             "hierarchy_failure": record.get("hierarchy_failure") if record.get("hierarchy_failure") in
-            DUMP_FAILURES else None, **({"wedged": True} if record.get("wedged") is True else {})}
+            DUMP_FAILURES else None,
+            **{key: record.get(key) if record.get(key) in DRIVER_CAUSES else None
+               for key in ("hierarchy_cause", "refusal_cause")},
+            **({"wedged": True} if record.get("wedged") is True else {})}
 
 
 def redacted(text):

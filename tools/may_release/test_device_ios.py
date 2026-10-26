@@ -381,6 +381,19 @@ class RunTests(Workspace):
                          ("sign-in", "skipped", device_tests.SWITCHED_OFF))
         self.assertEqual(len(minted), 0, "connections has no flow, sign-in is switched off: no session minted")
 
+    def test_each_agent_drives_for_its_rows_own_seconds_or_the_ios_default(self):
+        """Run 40290647340: iOS onboarding took its whole 20 minutes; its row now gives it 600 s."""
+        seen = []
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            seen.append(seconds)
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        self.run_it(selection="chat,onboarding", agent=agent,
+                    env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40,
+                         "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5", "GITHUB_RUN_ID": "39557415738"})
+        self.assertEqual(seen, [device_agent.IOS_AGENT_SECONDS, 600])
+
     def test_agent_scenarios_drive_the_simulator_through_maestro(self):
         seen = []
 
@@ -411,9 +424,10 @@ class RunTests(Workspace):
         self.assertEqual(self.signed_out, [TOKEN + "1", TOKEN + "2", TOKEN + "3"],
                          "each scenario's shared session, then the cleanup's, signed out")
 
-    def test_notes_and_chat_run_last_on_ios(self):
+    def test_notes_chat_and_then_onboarding_run_last_on_ios(self):
         """Run 40203481816: chat ran second and wedged, so poll and poll-skip found no budget left (coordinator,
-        25 Oct: sign-out, poll, poll-skip, notes, then chat)."""
+        25 Oct: sign-out, poll, poll-skip, notes, then chat). Run 40290647340: onboarding's 20 minutes left chat and
+        notes none, so it runs after them (coordinator, 26 Oct)."""
         seen = []
 
         def agent(cli, goal, tag, device, work, token, model, seconds):
@@ -421,11 +435,12 @@ class RunTests(Workspace):
             return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
 
         _, _, report, _, _ = self.run_it(
-            selection="chat,notes,poll,poll-skip,sign-out", agent=agent,
+            selection="onboarding,chat,notes,poll,poll-skip,sign-out", agent=agent,
             env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5",
                  "GITHUB_RUN_ID": "39557415738"})
-        self.assertEqual([row["id"] for row in report["scenarios"]], ["sign-out", "poll", "poll-skip", "notes", "chat"])
-        self.assertEqual(seen, ["poll", "poll-skip", "notes", "chat"])
+        self.assertEqual([row["id"] for row in report["scenarios"]],
+                         ["sign-out", "poll", "poll-skip", "notes", "chat", "onboarding"])
+        self.assertEqual(seen, ["poll", "poll-skip", "notes", "chat", "onboarding"])
 
     def test_scenarios_stopped_by_the_fail_fast_are_counted(self):
         def agent(cli, goal, tag, device, work, token, model, seconds):

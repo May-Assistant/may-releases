@@ -50,7 +50,8 @@ CONVERT_SECONDS = 600
 # its conversions share CONVERSION_BUDGET_SECONDS. The run's budget (device_tests.Budget) counts a scenario's agent
 # and onboarding alone: the job's 30 minutes past RUN_BUDGET_SECONDS cover the last scenario's conversions.
 PART_SECONDS, MAX_PARTS, CONVERSION_BUDGET_SECONDS = 5 * 60, 12, 10 * 60
-IOS_LAST = ("notes", "chat")
+# Onboarding after them (coordinator, 26 Oct, run 40290647340): its new account's 20 minutes left chat and notes none.
+IOS_LAST = ("notes", "chat", "onboarding")
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
@@ -577,7 +578,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                   install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
                   revoked_by=device_tests.revoke, diagnosed=None, noted=device_tests.commitment_note,
-                  made=device_tests.make_chat):
+                  made=device_tests.open_chat):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -694,7 +695,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {}),
                           **device_tests.steps(row)}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"], claude[0],
-                                           claude[1], seconds=device_agent.IOS_AGENT_SECONDS)
+                                           claude[1], seconds=device_tests.agent_seconds(row, device_agent.IOS_AGENT_SECONDS))
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)

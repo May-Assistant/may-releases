@@ -97,9 +97,15 @@ NOTE_GOAL = "Do not open any existing task; create a new one."
 # /v1/agents, named CHAT_NAME with its tag, removed by the test session's cleanup with the tag), never in the shared
 # May chat that every earlier run wrote to (coordinator, 26 Oct). Its goal opens that chat by name.
 CHAT_NAME, CHAT_GOAL = "{tag} chat", "open the chat named {tag} chat"
+# Run 40290647340: on the new chat's empty state the iOS driver refused every act, so the chat gets its first message
+# over the API (first_message) and the device never lands on it empty (coordinator, 26 Oct). The message holds no tag,
+# so no truth, delivery code or question card ever counts it or May's reply to it (run_messages starts at the tag).
+FIRST_MESSAGE = "This chat is for an automated device test. Reply with the word ready."
 AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 MAX_CHATS = 10
 MAX_GOAL = 1500
+# The least a row may give its agent (its own "seconds"): enough to launch, look and act a few times.
+MIN_AGENT_SECONDS = 5 * 60
 PLATFORMS = ("android", "ios")
 APP_ID = "io.github.mayassistant.may.playground"
 # May Playground's launcher activity (may-app's namespace, not its application ID) and the pause before a second start.
@@ -211,6 +217,9 @@ MINT_FAILED = "skipped: staging did not mint a test session for it"
 MINT_RETRY_SECONDS = 30
 MINT_FATAL = (401, 403, 404)
 NO_CHAT = "skipped: staging did not make the scenario's own chat"
+NO_FIRST = "skipped: staging did not take the first message of the scenario's own chat"
+NOT_STARTED = "May Playground did not start on the emulator after one retry (its diagnostics are sealed)"
+HALTED = "skipped: the run stopped after May Playground did not start"
 
 
 def fresh_switch():
@@ -231,6 +240,14 @@ def switched_off():
 
 class DeviceTestsError(ValueError):
     pass
+
+
+class LaunchFailed(DeviceTestsError):
+    """The app did not start twice: said is the last attempt's `am start` output, for the private diagnostics."""
+
+    def __init__(self, said):
+        super().__init__("May Playground did not start on the emulator after one retry")
+        self.said = said
 
 
 class MintFailed(DeviceTestsError):
@@ -303,6 +320,8 @@ def scenarios(selection="all", platform="android"):
                 isinstance(row.get("outward"), bool) and isinstance(row.get("fresh", False), bool) and
                 ("steps" not in row or driver == "agent" and type(row["steps"]) is int and
                  device_mcp.MAX_ACTIONS < row["steps"] <= device_mcp.MOST_ACTIONS) and
+                ("seconds" not in row or driver == "agent" and type(row["seconds"]) is int and
+                 MIN_AGENT_SECONDS <= row["seconds"] <= device_agent.AGENT_SECONDS) and
                 ("onboarding" not in row or row["onboarding"] == RECORD and driver == "agent" and
                  row.get("fresh") is True) and ("chat" not in row or driver == "agent") and
                 isinstance(row.get("server"), list) and
@@ -679,8 +698,8 @@ def cleanup(base, token, since, tag, post=urllib.request.urlopen):
 
 def make_chat(base, token, tag, post=urllib.request.urlopen):
     """A scenario's own chat (CHAT_NAME with its tag), made with its session before its agent starts: POST /v1/agents
-    {client_key, name}, keyed by the tag so a repeat makes no second one. True when staging answered 200 or 201 with
-    the chat's id. Nothing from the reply is kept or printed."""
+    {client_key, name}, keyed by the tag so a repeat makes no second one. The chat's id when staging answered 200 or
+    201 with one, else None. Nothing else from the reply is kept, and nothing is printed."""
     request = urllib.request.Request(base + "/v1/agents", method="POST",
                                      data=json.dumps({"client_key": tag, "name": CHAT_NAME.replace("{tag}", tag)})
                                      .encode(),
@@ -689,10 +708,34 @@ def make_chat(base, token, tag, post=urllib.request.urlopen):
         with post(request, timeout=60) as reply:
             status, data = reply.status, json.loads(reply.read(1024 * 1024))
     except (urllib.error.URLError, TimeoutError, ValueError):
-        return False
+        return None
     found = data.get("agent", data) if isinstance(data, dict) else None
-    return status in (200, 201) and isinstance(found, dict) and isinstance(found.get("id"), str) and \
+    ok = status in (200, 201) and isinstance(found, dict) and isinstance(found.get("id"), str) and \
         AGENT_ID.fullmatch(found["id"]) is not None
+    return found["id"] if ok else None
+
+
+def first_message(base, token, chat, tag, post=urllib.request.urlopen):
+    """FIRST_MESSAGE in the chat (a chat's id is its conversation's): POST /v1/conversations/<chat>/messages, keyed by
+    the tag so a repeat sends no second one. True when staging answered 200 or 202; nothing of the reply is kept."""
+    request = urllib.request.Request(base + f"/v1/conversations/{chat}/messages", method="POST",
+                                     data=json.dumps({"client_message_id": tag + "-first", "body": FIRST_MESSAGE})
+                                     .encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            return reply.status in (200, 202)
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+
+
+def open_chat(base, token, tag, post=urllib.request.urlopen):
+    """The scenario's own chat, made (make_chat) and given its first message (first_message): True, or the reason it
+    could not start (NO_CHAT or NO_FIRST)."""
+    chat = make_chat(base, token, tag, post)
+    if chat is None:
+        return NO_CHAT
+    return True if first_message(base, token, chat, tag, post) else NO_FIRST
 
 
 def tag_cleanup(accounts, base, secret, since, tag, minted, cleaned):
@@ -710,14 +753,18 @@ def tag_cleanup(accounts, base, secret, since, tag, minted, cleaned):
 
 
 def own_chat(row, entry, base, token, own, made):
-    """Whether a scenario may start: True, or, for a row with "chat" whose chat staging did not make, False with
-    entry's reason NO_CHAT."""
+    """Whether a scenario may start: True, or, for a row with "chat" whose chat staging did not make or give its first
+    message (made: open_chat), False with entry's reason NO_CHAT or NO_FIRST."""
     if not row.get("chat"):
         return True
     at(f"{row['id']}: making its own chat")
-    if made(base, token, own):
+    opened = made(base, token, own)
+    if opened is True:
         return True
-    entry["reason"] = NO_CHAT
+    if opened == NO_FIRST:
+        entry["reason"] = NO_FIRST
+    else:
+        entry["reason"] = NO_CHAT
     return False
 
 
@@ -905,17 +952,24 @@ def launch(adb, env, token, log):
     """The app, stopped and started again with a fresh test session (signed out, with no token: the smoke scenario).
     It names MainActivity, as may-app's hook documents (TestSession.kt), rather than resolving the launcher: smoke run
     39677407348 failed at this start. One retry after LAUNCH_RETRY_SECONDS, for an activity manager still settling
-    just after boot; a second failure stops the run."""
+    just after boot; a second failure raises LaunchFailed, with that attempt's output from the private log."""
     flows.run_private([adb, "shell", "am", "force-stop", APP_ID], log, env=env, check=False)
     # The session goes to the emulator's shell on adb's stdin, never in an argument the runner's process list shows.
     start = " ".join(["am", "start", "-W", "-n", APP_ID + "/" + ACTIVITY] +
                      (["--es", "may_test_session", shlex.quote(token)] if token else [])) + "\n"
     for attempt in range(2):
+        mark = log.stat().st_size if log.is_file() else 0
         if not adb_shell(adb, env, log, start):
             return
         if not attempt:
             flows.sleep(LAUNCH_RETRY_SECONDS)
-    raise DeviceTestsError("May Playground did not start on the emulator after one retry")
+    try:
+        with log.open("rb") as output:
+            output.seek(mark)
+            said = output.read(MAX_DIAG // 8)
+    except OSError:
+        said = b""
+    raise LaunchFailed(said)
 
 
 ADB_SHELL_SECONDS = 120
@@ -1070,6 +1124,34 @@ class Diagnostics:
         self.kept += 1
         self.network += len(failures)
         self.dropped[scenario] = from_stacks + from_log
+
+
+# Run 40290647340 (coordinator and M, 26 Oct): the app did not start, and the run removed everything, so the cause
+# could not be named. On a launch failure the scenario keeps, as its .diag.txt, the failed `am start`'s output, the
+# emulator's crash and main logs (their last LAUNCH_LOG_LINES) and the top activity's dump, each redacted and capped.
+LAUNCH_LOG_LINES = 1000
+
+
+def launch_diagnostics(adb, env, folder, scenario, token, said):
+    """Writes <scenario>.diag.txt for a launch that failed; the lines it dropped, or None when nothing was written.
+    Never an error."""
+    sections = ((b"am start", said or b""),
+                (b"logcat crash,main", adb_output(adb, env, ["logcat", "-d", "-t", str(LAUNCH_LOG_LINES), "-b",
+                                                             "crash,main"]) or b""),
+                (b"dumpsys activity top", adb_output(adb, env, ["shell", "dumpsys", "activity", "top"]) or b""))
+    text, dropped = b"", 0
+    for name, data in sections:
+        kept, lost = kept_lines(data, token)
+        dropped += lost
+        # The logs' newest lines, the dump's first: each section at most a third.
+        kept = kept[-(MAX_DIAG // 3):] if name.startswith(b"logcat") else kept[:MAX_DIAG // 3]
+        text += b"== " + name + b" ==\n" + kept + (b"" if kept.endswith(b"\n") or not kept else b"\n")
+    text = text.decode("utf-8", "replace").encode()[:MAX_DIAG].decode("utf-8", "ignore").encode()
+    try:
+        (folder / f"{scenario}{DIAG}").write_bytes(text)
+    except OSError:
+        return None
+    return dropped
 
 
 def screenshot(adb, env, path, log):
@@ -1380,11 +1462,18 @@ class Budget:
         return True
 
 
-def cap(row, agent_seconds=device_agent.AGENT_SECONDS):
-    """The longest a scenario may take: its Maestro flow's timeout, or the agent's."""
+def agent_seconds(row, default=device_agent.AGENT_SECONDS):
+    """How long the agent may drive a row: the platform's default, or less when the row sets its own seconds (the
+    onboarding row, 600: run 40290647340's onboarding took its whole 20 minutes and left chat and notes no budget)."""
+    return min(row.get("seconds", default), default)
+
+
+def cap(row, default=device_agent.AGENT_SECONDS):
+    """The longest a scenario may take: its Maestro flow's timeout, or the agent's (agent_seconds)."""
     if row["driver"] == "maestro":
         return FLOW_SECONDS
-    return agent_seconds + (ONBOARDING_SECONDS if row["driver"] == "agent" and not records_onboarding(row) else 0)
+    onboarding = ONBOARDING_SECONDS if row["driver"] == "agent" and not records_onboarding(row) else 0
+    return agent_seconds(row, default) + onboarding
 
 
 def steps(row):
@@ -1437,7 +1526,7 @@ def settle(entry, row, passed):
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None, revoked_by=revoke,
-                  noted=commitment_note, made=make_chat):
+                  noted=commitment_note, made=open_chat):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -1480,10 +1569,14 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()), **maestro_isolation(maestro_home(root)))
         budget = (budgeted or Budget)()
+        halted = False
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
                      "server": []}
             results.append(entry)
+            if halted:
+                entry["reason"] = HALTED
+                continue
             if row["outward"] and not outward:
                 entry["reason"] = "outward actions are off (MAY_DEVICE_TESTS_OUTWARD)"
                 continue
@@ -1518,7 +1611,21 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 token = ""
                 continue
             at(f"{row['id']}: launching the app")
-            launch(adb, env, token, log)
+            try:
+                launch(adb, env, token, log)
+            except LaunchFailed as failed:
+                # The report and the diagnostics are kept and sealed; the scenarios after it are not started.
+                dropped = launch_diagnostics(adb, env, folder, row["id"], token, failed.said)
+                if dropped is not None:
+                    diagnostics.kept += 1
+                    diagnostics.dropped[row["id"]] = dropped
+                entry.update(verdict="fail", reason=NOT_STARTED)
+                accounts.finish(row, base, token)
+                token = ""
+                halted = True
+                print("May device tests (android): May Playground did not start on the emulator after one retry; the "
+                      "run stopped there, and its diagnostics are sealed")
+                continue
             recorder = Recorder(adb, env, row["id"], log)
             recorder.start()
             started = time.monotonic()
@@ -1539,7 +1646,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL,
                           **steps(row)}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"],
-                                           claude[0], claude[1])
+                                           claude[0], claude[1], seconds=agent_seconds(row))
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
@@ -1647,7 +1754,11 @@ def sealed_agent(record):
             "summary": summary.decode("utf-8", "replace").strip()[:MAX_AGENT_SUMMARY],
             # Why no screen could be read at done (device_mcp.DUMP_FAILURES' fixed words), or None.
             "hierarchy_failure": record.get("hierarchy_failure") if record.get("hierarchy_failure") in
-            device_mcp.DUMP_FAILURES else None}
+            device_mcp.DUMP_FAILURES else None,
+            # What the iOS driver said when that read, or the last refused act, failed (device_mcp.DRIVER_CAUSES), or
+            # None (coordinator, 26 Oct).
+            **{key: record.get(key) if record.get(key) in device_mcp.DRIVER_CAUSES else None
+               for key in ("hierarchy_cause", "refusal_cause")}}
 
 
 def judge_scenarios(judged_by=device_agent.judge, platform="android"):
