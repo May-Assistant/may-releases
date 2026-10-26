@@ -749,7 +749,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             print(f"May device tests (ios): main-thread stall-after {name}: {count}")
     wedged = sum(1 for record in records.values() if isinstance(record, dict) and record.get("wedged") is True)
     if wedged:
-        print(f"May device tests (ios): {wedged} scenarios stopped after refused device acts in a row (fail-fast)")
+        print(f"May device tests (ios): {wedged} scenarios stopped after the device stopped taking acts (fail-fast)")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:
