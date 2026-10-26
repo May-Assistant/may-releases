@@ -44,15 +44,20 @@ class ToolchainTests(unittest.TestCase):
 
     def test_pins_are_exact_https_sha256(self):
         for (name, system, machine), (url, checksum, top) in toolchain.TOOLS.items():
-            # GitHub releases, or Node.js's own dist host for Node alone.
+            # GitHub releases, or Node.js's or Swift's own download host for that tool alone.
             self.assertTrue(url.startswith("https://github.com/") or
-                            (name == "node" and url.startswith("https://nodejs.org/dist/v")), url)
+                            (name == "node" and url.startswith("https://nodejs.org/dist/v")) or
+                            (name == "swift" and url.startswith("https://download.swift.org/swift-")), url)
             self.assertRegex(checksum, r"^[0-9a-f]{64}$")
         self.assertIn("21.0.12.1", toolchain.TOOLS[("jdk", "Linux", "x86_64")][0])
         # may-app backend-ci.yml's Node, exactly.
         url, _, top = toolchain.TOOLS[("node", "Linux", "x86_64")]
         self.assertEqual((url, top), ("https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.gz",
                                       "node-v22.22.0-linux-x64"))
+        # MayCore's Swift, exactly (ios-core-pr.yml).
+        url, _, top = toolchain.TOOLS[("swift", "Linux", "x86_64")]
+        self.assertEqual((url, top), ("https://download.swift.org/swift-6.2.4-release/ubuntu2404/swift-6.2.4-RELEASE/"
+                                      "swift-6.2.4-RELEASE-ubuntu24.04.tar.gz", "swift-6.2.4-RELEASE-ubuntu24.04"))
 
     def test_verified_archive_installs(self):
         with self.pin(archive_bytes([("age/age", b"#!/bin/sh\n", "file")])):
