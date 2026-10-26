@@ -62,6 +62,12 @@ RUN_SECONDS = 25 * 60
 SANDBOX_USER = "may-core"
 SANDBOX = Path("/opt/may-core")
 ADMIN_SECONDS = 10 * 60
+# Second re-review of #128: that user may not schedule work to outlive the run (DENY_FILES), may not enter the runner's
+# home or runner temp (where the job's command files and the token mints' outputs live: checked as that user), is killed
+# until none of its processes is left (STOP_ROUNDS), and its files anywhere on the runner go with it (LEFTOVERS).
+DENY_FILES = ("/etc/cron.deny", "/etc/at.deny")
+STOP_ROUNDS = 20
+LEFTOVERS = ["find", "/", "/tmp", "/var/tmp", "/dev/shm", "-xdev", "-user", SANDBOX_USER, "-delete"]
 LOG, OUTCOME, FAILURES = "ios-core.log", "ios-core-result.json", "ios-core-failures.json"
 RESULTS = ("passed", "failed", "timeout")
 STAGES = ("build", "tests")
@@ -141,12 +147,24 @@ def failing_tests(text, roots):
     return found[:MAX_FAILURES], len(found)
 
 
-def admin(argv, log):
-    """One root command of the sandbox's own setup or teardown (never the pull request's code); its status, or None."""
+def admin(argv, log, data=None):
+    """One root command of the sandbox's own setup or teardown (never the pull request's code), with data on its
+    stdin when given; its status, or None."""
     try:
         with log.open("ab") as output:
-            return subprocess.run(["sudo", "-n", *argv], stdout=output, stderr=subprocess.STDOUT,
-                                  stdin=subprocess.DEVNULL, timeout=ADMIN_SECONDS).returncode
+            return subprocess.run(["sudo", "-n", *argv], stdout=output, stderr=subprocess.STDOUT, input=data,
+                                  stdin=None if data is not None else subprocess.DEVNULL,
+                                  timeout=ADMIN_SECONDS).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def as_sandbox(argv, log):
+    """A check run as SANDBOX_USER (never the pull request's code); its status, or None."""
+    try:
+        with log.open("ab") as output:
+            return subprocess.run(sandboxed(argv), stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                  cwd=SANDBOX, timeout=60).returncode
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -172,9 +190,24 @@ def sandbox_setup(source, swift_top):
              str(SANDBOX / "build")]]
 
 
-def stop_all(log):
-    """Every process of SANDBOX_USER, killed (none left is fine)."""
-    admin(["pkill", "-KILL", "-u", SANDBOX_USER], log)
+def stop_all(log, strict=True):
+    """Every process of SANDBOX_USER killed, as that user (kill -1: all it may signal, forks during a scan included),
+    round after round until pgrep finds none; strict, refuses if any is left."""
+    for _ in range(STOP_ROUNDS):
+        admin(["-u", SANDBOX_USER, "/usr/bin/kill", "-KILL", "-1"], log)
+        if admin(["pgrep", "-u", SANDBOX_USER], log) == 1:
+            return
+        time.sleep(0.25)
+    if strict:
+        raise IosCoreError("A process of the unprivileged build user could not be stopped")
+
+
+def teardown(log):
+    """The sandbox gone: its user's processes, its files anywhere on the runner, its copies and the user itself."""
+    stop_all(log, strict=False)
+    admin(LEFTOVERS, log)
+    admin(["rm", "-rf", "--", str(SANDBOX)], log)
+    admin(["userdel", SANDBOX_USER], log)
 
 
 def pinned_swift_bin():
@@ -197,7 +230,7 @@ def run_tool(argv, log, cwd, env, deadline):
     try:
         return process.wait(timeout=left)
     except subprocess.TimeoutExpired:
-        stop_all(log)
+        stop_all(log, strict=False)  # a process that survives fails the run at the step's own stop_all
         try:
             process.wait(timeout=60)
         except subprocess.TimeoutExpired:
@@ -245,14 +278,22 @@ def run_suite(source_sha):
     try:
         run_sandboxed(source, swift_top, private, log)
     finally:
-        stop_all(log)
-        admin(["rm", "-rf", "--", str(SANDBOX)], log)
+        teardown(log)
 
 
 def run_sandboxed(source, swift_top, private, log):
+    home = Path(os.environ.get("HOME") or Path.home())
+    if admin(["chmod", "0700", "--", str(home)], log) != 0:
+        raise IosCoreError("The unprivileged build user could not be set up; nothing ran")
     for argv in sandbox_setup(source, swift_top):
         if admin(argv, log) != 0:
             raise IosCoreError("The unprivileged build user could not be set up; nothing ran")
+    for path in DENY_FILES:
+        if admin(["tee", "-a", "--", path], log, data=(SANDBOX_USER + "\n").encode()) != 0:
+            raise IosCoreError("The unprivileged build user could not be set up; nothing ran")
+    for path in (home, runner_root()):
+        if as_sandbox(["/usr/bin/test", "!", "-x", str(path)], log) != 0:
+            raise IosCoreError("The unprivileged build user can reach the runner's files; nothing ran")
     env = child_env()
     if swift_version(env) != SWIFT_VERSION:
         raise IosCoreError("Swift is not the pinned 6.2.4; nothing ran")

@@ -105,17 +105,28 @@ class RunTests(unittest.TestCase):
             raise AssertionError("unexpected tool " + argv[0])
         return run_tool
 
-    def run_it(self, sha, run_tool=None, version="6.2.4", extra=None, admin_fails=None):
+    def run_it(self, sha, run_tool=None, version="6.2.4", extra=None, admin_fails=None, reachable=(),
+               survivors=0):
         environ = {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin:/bin", "HOME": "/home/runner",
                    "SOMETHING_ELSE": "x", **(extra or {})}
         out = io.StringIO()
         self.admin_calls = []
 
-        def admin(argv, log):
-            self.admin_calls.append(list(argv))
+        self.as_sandbox_calls, left = [], [survivors]
+
+        def admin(argv, log, data=None):
+            self.admin_calls.append(list(argv) + ([data] if data is not None else []))
+            if argv[0] == "pgrep":  # 1: none left; a surviving process answers 0 for that many rounds
+                left[0] -= 1
+                return 0 if left[0] >= 0 else 1
             return 1 if admin_fails and argv[0] == admin_fails else 0
+
+        def as_sandbox(argv, log):
+            self.as_sandbox_calls.append(list(argv))
+            return 1 if argv[-1] in reachable else 0
         with patch.dict(os.environ, environ, clear=True), patch("sys.stdout", out), \
-                patch.object(tool, "admin", admin), \
+                patch.object(tool, "admin", admin), patch.object(tool, "as_sandbox", as_sandbox), \
+                patch.object(tool.time, "sleep", lambda seconds: None), \
                 patch.object(tool, "run_tool", run_tool or self.fake()), \
                 patch.object(tool, "swift_version", lambda env: version), \
                 patch.object(tool, "pinned_swift_bin", lambda: self.bin):
@@ -239,10 +250,17 @@ class RunTests(unittest.TestCase):
         self.run_it(self.commit())
         swift_top = self.bin.parent.parent
         setup = tool.sandbox_setup(self.source, swift_top)
-        self.assertEqual(self.admin_calls[:len(setup)], setup)
-        self.assertEqual(self.admin_calls[len(setup):], [
-            ["run_tool"], ["pkill", "-KILL", "-u", "may-core"], ["run_tool"], ["pkill", "-KILL", "-u", "may-core"],
-            ["pkill", "-KILL", "-u", "may-core"], ["rm", "-rf", "--", str(tool.SANDBOX)]])
+        kill = [["-u", "may-core", "/usr/bin/kill", "-KILL", "-1"], ["pgrep", "-u", "may-core"]]
+        self.assertEqual(self.admin_calls, [
+            ["chmod", "0700", "--", "/home/runner"], *setup,
+            ["tee", "-a", "--", "/etc/cron.deny", b"may-core\n"], ["tee", "-a", "--", "/etc/at.deny", b"may-core\n"],
+            ["run_tool"], *kill, ["run_tool"], *kill,
+            *kill, tool.LEFTOVERS, ["rm", "-rf", "--", str(tool.SANDBOX)], ["userdel", "may-core"]])
+        self.assertEqual(self.as_sandbox_calls, [["/usr/bin/test", "!", "-x", "/home/runner"],
+                                                 ["/usr/bin/test", "!", "-x", str(self.root)]],
+                         "as the build user, neither the runner's home nor runner temp can be entered")
+        self.assertEqual(tool.LEFTOVERS, ["find", "/", "/tmp", "/var/tmp", "/dev/shm", "-xdev", "-user", "may-core",
+                                          "-delete"])
         useradd = [argv for argv in setup if argv[0] == "useradd"]
         self.assertEqual(len(useradd), 1)
         for flag in ("-G", "--groups", "-aG", "sudo"):
@@ -259,8 +277,29 @@ class RunTests(unittest.TestCase):
                 with self.assertRaises(tool.IosCoreError):
                     self.run_it(self.commit(), admin_fails=step)
                 self.assertEqual(self.calls, [])
-                self.assertEqual(self.admin_calls[-2:], [["pkill", "-KILL", "-u", "may-core"],
-                                                         ["rm", "-rf", "--", str(tool.SANDBOX)]])
+                self.assertEqual(self.admin_calls[-3:], [tool.LEFTOVERS, ["rm", "-rf", "--", str(tool.SANDBOX)],
+                                                         ["userdel", "may-core"]])
+
+    def test_a_build_user_that_can_reach_the_runners_files_runs_nothing(self):
+        """Second re-review of #128: the token mints' outputs and the job's command files sit under the runner's
+        home and runner temp; if the build user can enter either, nothing runs."""
+        for path in ("/home/runner", str(self.root)):
+            with self.subTest(path=path):
+                self.calls = []
+                with self.assertRaises(tool.IosCoreError):
+                    self.run_it(self.commit(), reachable=(path,))
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.admin_calls[-1], ["userdel", "may-core"])
+
+    def test_the_build_user_is_killed_until_none_is_left_and_a_survivor_fails_the_step(self):
+        out, outcome, _ = self.run_it(self.commit(), survivors=3)
+        self.assertEqual(outcome["result"], "passed", "three rounds, then none left")
+        kills = [argv for argv in self.admin_calls if argv[-1:] == ["-1"]]
+        self.assertGreaterEqual(len(kills), 4)
+        self.calls = []
+        with self.assertRaises(tool.IosCoreError):
+            self.run_it(self.commit(), survivors=10 * tool.STOP_ROUNDS)
+        self.assertEqual(len(self.calls), 1, "the tests never start after a build whose processes survive")
 
     def test_failures_in_the_sandboxs_copy_are_repo_relative(self):
         out, outcome, failures = self.run_it(self.commit(), self.fake(test=1, test_output=failing(tool.SANDBOX / "src")))
@@ -275,7 +314,7 @@ class RunTests(unittest.TestCase):
 
     def test_run_tool_stops_at_the_shared_deadline(self):
         log, stopped = self.private / "x.log", []
-        with patch.object(tool, "stop_all", lambda log: stopped.append(True)):
+        with patch.object(tool, "stop_all", lambda log, strict=True: stopped.append(True)):
             self.assertIsNone(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"}, time.monotonic() - 1))
             self.assertEqual(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"},
                                            time.monotonic() + 30), 0)
@@ -306,7 +345,7 @@ class RunTests(unittest.TestCase):
 
             terminate = send_signal = kill
 
-        def stop(log):
+        def stop(log, strict=True):
             RootSudo.stopped = True
         with patch.object(tool.subprocess, "Popen", RootSudo), patch.object(tool, "stop_all", stop):
             try:
