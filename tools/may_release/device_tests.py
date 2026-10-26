@@ -966,9 +966,13 @@ def launch(adb, env, token, log):
     try:
         with log.open("rb") as output:
             output.seek(mark)
-            said = output.read(MAX_DIAG // 8)
+            said = output.read(MAX_DIAG // 8 + 1)
     except OSError:
         said = b""
+    # Cut at a line's end, never inside one: launch_diagnostics redacts line by line, and a token cut short would no
+    # longer match its pattern or the session (review of may-releases #136).
+    if len(said) > MAX_DIAG // 8:
+        said = said[:said.rfind(b"\n", 0, MAX_DIAG // 8) + 1]
     raise LaunchFailed(said)
 
 
