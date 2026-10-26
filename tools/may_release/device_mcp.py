@@ -16,7 +16,7 @@ read or write a file, or reach the network itself.
 - type takes plain text only (letters, digits, spaces and . , ! : - _ @; never ? or *, a glob in the device shell), so nothing reaches adb's shell as a
   command.
 - On iOS, after FAIL_FAST refused acts in a row (or one refused on a snapshot timeout right after a screen read that
-  timed out, or on a settle timeout), every call but done answers that the agent must stop, blocked.
+  timed out), every call but done answers that the agent must stop, blocked.
 - At most MAX_ACTIONS look or act calls, or a scenario's own steps (MAY_DEVICE_STEPS, up to MOST_ACTIONS); after
   that every call but done answers that the limit is reached.
 - Every call but done rewrites MAY_DEVICE_AGENT_RESULT as unfinished, with the steps so far and the last hierarchy.
@@ -48,8 +48,9 @@ MOST_ACTIONS = 200
 # the agent's result says so (coordinator, 25 Oct). iOS alone. Run 40309200520: three refusals, each a 90 s snapshot
 # timeout, still cost poll and poll-skip 9 minutes apiece and chat its budget; the stop now comes at the second refusal
 # in a row, or at once when a refusal's snapshot timeout follows a screen read that timed out too (the screen is not
-# coming back) or an act was taken and its screen never settled (a settle timeout), and each act's Maestro call is held
-# ACT_SECONDS at most (coordinator, 26 Oct).
+# coming back), and each act's Maestro call is held ACT_SECONDS at most (coordinator, 26 Oct). A settle timeout (the
+# act was taken and its screen never settled) counts toward the two in a row like any refusal, so one slow settle while
+# a reply streams does not end the scenario (independent review of #139).
 FAIL_FAST, ACT_SECONDS = 2, 60
 UNFINISHED = "unfinished"  # the result's outcome until done replaces it
 WEDGED_TEXT = "The device stopped taking acts: call done now with outcome blocked"
@@ -344,8 +345,11 @@ DUMP_FAILURES = ("adb failed", "no idle state", "unreadable", "iOS hierarchy fai
 # iOS hierarchy read, and for the last refused act, is sorted into DRIVER_CAUSES' fixed words (first match in
 # CAUSE_PATTERNS' order, else "other"); only the word is kept in the agent's record and the sealed report.
 # Run 40309200520's diagnostics (coordinator, 26 Oct): a tap printed COMPLETED and then the act ran out of time, so
-# Maestro was waiting for the screen to settle after it ("settle timeout", tool's own "(timed out)" after COMPLETED).
-CAUSE_PATTERNS = (("settle timeout", re.compile(rb"COMPLETED.*\n\(timed out\)\n", re.DOTALL)),
+# Maestro was waiting for the screen to settle after it ("settle timeout": Maestro's own status line for the command
+# ending "... COMPLETED", then tool's "(timed out)"). Anchored to that line's end, so typed text holding the word is
+# not one (independent review of #139).
+CAUSE_PATTERNS = (("settle timeout", re.compile(rb"(?m)(?:Tap|Input text|Swip|Press)[^\n]*\.\.\. COMPLETED[ \t\r]*$"
+                                                rb"(?s:.*)\n\(timed out\)\n\Z")),
                   ("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
                   ("snapshot timeout", re.compile(rb"timed? ?out|timeout|snapshot", re.IGNORECASE)),
                   ("lost connection", re.compile(rb"connection (?:refused|reset|lost|closed)|broken pipe|unavailable|"
@@ -558,8 +562,11 @@ def ios_act(name, args, ints, config):
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
     status = flow(config, command)
     config["refusals"] = config["refusals"] + 1 if status else 0
-    cause = config.get("refusal_cause")
-    stuck = bool(status) and (cause == "settle timeout" or cause == "snapshot timeout" == config.get("dump_cause"))
+    stuck = bool(status) and config.get("refusal_cause") == "snapshot timeout" == config.get("dump_cause")
+    if not status:
+        # A taken act changes the screen, so an earlier read's time-out no longer says it is stuck (independent review
+        # of #139).
+        config["dump_cause"] = None
     if config["refusals"] >= FAIL_FAST or stuck:
         config["wedged"] = True
         # Recorded now, so a stopped agent that never calls done still leaves its reason; a later done replaces it.
