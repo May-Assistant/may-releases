@@ -790,10 +790,12 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual(static_check.compile_pr_errors_print_problems(static_check.ROOT), [])
 
     def test_the_post_alone_is_told_the_comment_apps_slug(self):
-        slug = "          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}\n"
+        slug = ("          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}\n"
+                "        run: python3 -I -S -B tools/may_release/compile_pr_errors.py post")
+        line, run = slug.split("\n", 1)
         message = "native-compile-pr.yml: job post's post is not told the May CI app's slug exactly once"
-        self.flagged(WORKFLOW, slug, "", message)
-        self.flagged(WORKFLOW, slug, slug + slug, message)
+        self.flagged(WORKFLOW, slug, run, message)
+        self.flagged(WORKFLOW, slug, line + "\n" + slug, message)
 
     def test_native_s_result_reaches_the_post_alone(self):
         secret = "native-compile-pr.yml: a secret or env entry other than"

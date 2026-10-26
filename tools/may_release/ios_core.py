@@ -38,7 +38,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from android_unit import clean
 from compile_pr_errors import CompilePrError, github
-from ds_compile import DsCompileError, MAX_BODY, SHA, fence_for, post_once, run_url
+from ds_compile import DsCompileError, MAX_BODY, SHA, comment_author, fence_for, post_once, run_url
 from gate import APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
@@ -337,7 +337,7 @@ def post(sha, pr, call_api=github):
         validate_pull_request(pull, number, sha)
     except GateDenial:
         raise IosCoreError("The pull request is no longer open at the checked head; nothing was posted") from None
-    if not post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
+    if not post_once(call_api, APP_REPO, number, sha, body, token, MARKER, comment_author(os.environ)):
         print(f"May iOS core result already posted for this head on may-app #{number}; nothing posted again")
         return 1
     print(f"May iOS core suite failed; {int(total)} failures posted to may-app #{number}")

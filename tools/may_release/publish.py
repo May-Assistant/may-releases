@@ -42,7 +42,7 @@ import urllib.request
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from ds_compile import API, DsCompileError, MAX_BODY, post_once, request, run_url
+from ds_compile import API, DsCompileError, MAX_BODY, comment_author, post_once, request, run_url
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import GITHUB_HOST_KEY
 import board
@@ -852,7 +852,7 @@ def comment(sha, pr, call_api=github):
         validate_pull_request(pull, number, sha)
     except GateDenial:
         raise PublishError("The pull request is no longer open at the rendered head; nothing was posted") from None
-    if post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
+    if post_once(call_api, APP_REPO, number, sha, body, token, MARKER, comment_author(os.environ)):
         print(f"May iOS renders linked on may-app #{number}")
     else:
         print(f"May iOS renders already linked for this head on may-app #{number}; nothing posted again")
