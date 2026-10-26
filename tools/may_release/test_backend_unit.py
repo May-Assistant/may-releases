@@ -77,7 +77,8 @@ class Fixture(unittest.TestCase):
         self.directory.cleanup()
 
     def fake(self, install=0, typecheck=0, migrate=("applied 2 migration(s)", "schema up to date"), migrate_status=0,
-             test_status=0, test_output=None, owner=0, tsc_output="", test_timeout=False):
+             test_status=0, test_output=None, owner=0, tsc_output="", test_timeout=False,
+             silence=0):
         runs = list(migrate)
 
         def quiet(argv, log, *, cwd=None, env=None, timeout=None):
@@ -100,18 +101,24 @@ class Fixture(unittest.TestCase):
             if argv[:2] == ["npm", "test"]:
                 write(test_output if test_output is not None else tap(self.root))
                 return None if test_timeout else test_status
+            if argv[0] == "psql" and argv[-1] in backend_unit.SILENCE_SQL:
+                return silence
             if argv[0] == "psql":
                 return owner
             raise AssertionError("unexpected tool " + argv[0])
         return quiet
 
-    def value(self, node="v22.22.0", server="16.15 (Debian 16.15-1.pgdg120+1)", applied="2"):
+    def value(self, node="v22.22.0", server="16.15 (Debian 16.15-1.pgdg120+1)", applied="2", silent=None):
+        settings = dict(backend_unit.SILENT, **(silent or {}))
+
         def answer(argv, env):
             self.calls.append((list(argv), None, dict(env or {})))
             if argv == ["node", "--version"]:
                 return node
             if "SHOW server_version" in argv:
                 return server
+            if argv[-1].startswith("SHOW ") and argv[-1][5:] in settings:
+                return settings[argv[-1][5:]]
             if "SELECT count(*) FROM schema_migrations" in argv:
                 return applied
             raise AssertionError("unexpected value " + argv[0])
@@ -153,13 +160,14 @@ class RunTests(Fixture):
     def test_the_stages_run_in_backend_ci_order_in_backend(self):
         self.run_checks(self.fake())
         self.assertEqual(self.tools(), [
-            ["node", "--version"], ["npm", "--version"], ["psql", backend_unit.ADMIN_URL, "-Atc"],
+            ["node", "--version"], ["npm", "--version"], ["psql", backend_unit.ADMIN_URL, "-Atc"]]
+            + [["psql", backend_unit.ADMIN_URL, "-v"]] * 4 + [["psql", backend_unit.ADMIN_URL, "-Atc"]] * 3 + [
             ["npm", "ci", "--no-audit"], ["npm", "run", "typecheck"],
             ["psql", backend_unit.ADMIN_URL, "-v"], ["psql", backend_unit.ADMIN_URL, "-v"],
             ["npm", "run", "-s"], ["npm", "run", "-s"], ["psql", backend_unit.MIGRATE_URL, "-Atc"], ["npm", "test"]])
         backend = self.root / "may-source/backend"
         self.assertTrue(all(cwd == backend for argv, cwd, _ in self.calls if argv[0] == "npm" and argv[1] != "--version"))
-        owner = [argv[-1] for argv, _, _ in self.calls if "-qc" in argv]
+        owner = [argv[-1] for argv, _, _ in self.calls if "-qc" in argv and argv[-1] not in backend_unit.SILENCE_SQL]
         self.assertEqual(owner, ["CREATE ROLE may_owner LOGIN NOSUPERUSER NOBYPASSRLS CREATEROLE",
                                  "CREATE DATABASE may_ci_migrate OWNER may_owner"])
 
@@ -206,9 +214,9 @@ class RunTests(Fixture):
 
     def test_npm_test_that_does_not_finish_fails(self):
         out, error = self.run_checks(self.fake(test_timeout=True, test_output=tap(self.root, summary=False)))
-        self.assertEqual(error, "npm test did not finish within 15 minutes")
+        self.assertEqual(error, "npm test did not finish within 25 minutes")
         self.assertIn("May backend tests: did not finish in time", out)
-        self.assertEqual(backend_unit.TEST_SECONDS, 15 * 60)
+        self.assertEqual(backend_unit.TEST_SECONDS, 25 * 60)
 
     def test_a_failed_install_stops_every_later_stage(self):
         out, error = self.run_checks(self.fake(install=1))
@@ -225,6 +233,37 @@ class RunTests(Fixture):
         self.assertIn("May backend migrations: failed", out)
         self.assertIn("May backend tests: passed", out)
         self.assertIn(["npm", "test"], self.tools())
+
+    def test_the_log_is_silenced_and_read_back_before_any_pull_request_code(self):
+        self.run_checks(self.fake())
+        tools = [argv for argv, _, _ in self.calls]
+        silenced = [i for i, argv in enumerate(tools) if argv[-1] in backend_unit.SILENCE_SQL]
+        self.assertEqual([tools[i][-1] for i in silenced], list(backend_unit.SILENCE_SQL))
+        self.assertTrue(all("ON_ERROR_STOP=1" in tools[i] for i in silenced))
+        read_back = [i for i, argv in enumerate(tools) if argv[-1] in {"SHOW " + n for n in backend_unit.SILENT}]
+        self.assertEqual(len(read_back), 3)
+        self.assertLess(max(silenced), min(read_back))
+        for later in (["npm", "ci"], ["npm", "run"], ["npm", "test"]):
+            with self.subTest(later=later):
+                self.assertLess(max(read_back), min(i for i, argv in enumerate(tools) if argv[:2] == later))
+        self.assertEqual(backend_unit.SILENT, {"log_min_messages": "panic", "log_min_error_statement": "panic",
+                                               "log_checkpoints": "off"})
+
+    def test_a_log_that_cannot_be_silenced_runs_nothing(self):
+        cases = {
+            "the ALTER refused": (dict(silence=1), dict()),
+            "the ALTER timed out": (dict(silence=None), dict()),
+            "a setting left at its default": (dict(), dict(silent={"log_min_error_statement": "error"})),
+            "checkpoints still logged": (dict(), dict(silent={"log_checkpoints": "on"})),
+            "a setting unreadable": (dict(), dict(silent={"log_min_messages": None})),
+        }
+        for case, (fake, value) in cases.items():
+            with self.subTest(case=case):
+                self.calls = []
+                out, error = self.run_checks(self.fake(**fake), self.value(**value))
+                self.assertEqual(error, "The Postgres service's log could not be silenced; nothing ran")
+                self.assertEqual(out, "")
+                self.assertFalse([argv for argv, _, _ in self.calls if argv[0] == "npm" and argv[1] != "--version"])
 
     def test_migrations_need_every_file_applied_once_and_a_quiet_second_run(self):
         cases = {
@@ -356,6 +395,59 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(type_errors("error: something\nsrc/x.ts:1:1 - error TS1: y\n", []), ([], 0))
 
 
+class ServiceLogTests(Fixture):
+    CONTAINER = "0123456789abcdef" * 4
+
+    def check(self, log, status=0, container=None):
+        ran = []
+
+        def run(argv, *, stdout, stderr, stdin, timeout):
+            ran.append(list(argv))
+            self.assertIs(stdout, stderr)
+            stdout.write(log)
+            return subprocess.CompletedProcess(argv, status)
+        out = io.StringIO()
+        with patch.dict(os.environ, self.environ, clear=True), patch("sys.stdout", out), \
+                patch.object(backend_unit.subprocess, "run", run):
+            try:
+                backend_unit.check_service_log(self.CONTAINER if container is None else container)
+            except BackendTestsError as error:
+                return out.getvalue(), error.args[0], ran
+        return out.getvalue(), None, ran
+
+    def test_a_silent_log_passes_and_prints_only_a_fixed_line(self):
+        log = (b"PostgreSQL init process complete; ready for start up.\n"
+               b"2026-10-25 10:00:00.000 UTC [1] LOG:  database system is ready to accept connections\n")
+        out, error, ran = self.check(log)
+        self.assertIsNone(error)
+        self.assertEqual(out, "May backend database log: no error, statement, detail, context or hint lines\n")
+        self.assertEqual(ran, [["docker", "logs", "--details", self.CONTAINER]])
+
+    def test_error_statement_detail_context_and_hint_lines_fail_with_their_count_alone(self):
+        log = ("LOG:  ready\n"
+               f"ERROR:  duplicate key value violates unique constraint \"{PRIVATE}\"\n"
+               f"DETAIL:  Key (email)=({MESSAGE}) already exists.\n"
+               f"STATEMENT:  INSERT INTO users (email) VALUES ('{MESSAGE}')\n"
+               f"CONTEXT:  PL/pgSQL function {PRIVATE}() line 3\n"
+               "HINT:  No function matches the given name.\n").encode()
+        out, error, _ = self.check(log)
+        self.assertEqual(error, "The Postgres service's log is not silent")
+        self.assertEqual(out, "May backend database log: 5 lines that could carry may-app's SQL or data\n")
+        for private in (PRIVATE, MESSAGE):
+            self.assertNotIn(private, out + error)
+        self.assertTrue((self.root / "may-private" / backend_unit.SERVICE_LOG).is_file())
+
+    def test_an_unreadable_log_or_unknown_container_fails_without_reading_it(self):
+        out, error, _ = self.check(b"", status=1)
+        self.assertEqual(error, "The Postgres service's log could not be read, so it was not checked")
+        self.assertEqual(out, "")
+        for container in ("", "postgres", "0123; cat /etc/passwd", "ABCDEF0123456789", "-f"):
+            with self.subTest(container=container):
+                out, error, ran = self.check(b"", container=container)
+                self.assertEqual(error, "The Postgres service's container is unknown, so its log was not checked")
+                self.assertEqual((out, ran), ("", []))
+
+
 class CliTests(unittest.TestCase):
     def test_an_unprepared_runner_prints_only_a_fixed_line(self):
         tool = Path(backend_unit.__file__)
@@ -406,7 +498,7 @@ class WorkflowTests(unittest.TestCase):
             "GH_TOKEN on the checks": (checks_step, checks_step + "          GH_TOKEN: ${{ github.token }}\n", secret),
             "a read key on the Node install": (node_step, node_step + "        env:\n          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n", secret),
             "a comment token in the fetch": (fetch_env, fetch_env + "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n", secret),
-            "a job-level env": ("    timeout-minutes: 20\n", "    timeout-minutes: 20\n    env:\n      CI: '1'\n", secret),
+            "a job-level env": ("    timeout-minutes: 30\n", "    timeout-minutes: 30\n    env:\n      CI: '1'\n", secret),
             "a secret in the service": ("          POSTGRES_HOST_AUTH_METHOD: trust\n",
                                         "          POSTGRES_HOST_AUTH_METHOD: trust\n          POSTGRES_PASSWORD: ${{ secrets.MAY_APP_READ_KEY }}\n", service),
             "a Postgres tag without its digest": ("postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d",
@@ -441,15 +533,38 @@ class WorkflowTests(unittest.TestCase):
                                  name + "permissions are not exactly read-only"),
             "the Android lane's concurrency group": ("  group: may-backend-unit-pr\n", "  group: may-android-unit-pr\n",
                                                      name + "does not run one at a time in its own concurrency group"),
-            "a longer timeout": ("    timeout-minutes: 20\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
+            "a longer timeout": ("    timeout-minutes: 30\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
             "a macOS runner": ("  backend:\n    needs: admission\n    runs-on: ubuntu-24.04\n",
                                "  backend:\n    needs: admission\n    runs-on: macos-15\n", shape),
+            "no log guard": ("      - name: Check the database log holds no statement text, never printing it\n        if: always()\n",
+                             "      - name: Check the database log holds no statement text, never printing it\n",
+                             name + "backend's steps are not exactly"),
+            "a guard holding a token": ("          MAY_PG_CONTAINER: ${{ job.services.postgres.id }}\n",
+                                        "          MAY_PG_CONTAINER: ${{ job.services.postgres.id }}\n          GH_TOKEN: ${{ github.token }}\n",
+                                        name + "a secret or env entry"),
+            "a guard printing the log": ('--check-service-log "$MAY_PG_CONTAINER"', '--check-service-log "$MAY_PG_CONTAINER"; docker logs "$MAY_PG_CONTAINER"',
+                                         name + "runs something other than"),
             "another run name": ("run-name: 'May backend checks for may-app #", "run-name: 'May backend for may-app #",
                                  name + "run-name is not exactly the pull request number and head SHA"),
         }
         for case, (old, new, message) in cases.items():
             with self.subTest(case=case):
                 self.flagged(WORKFLOW, old, new, message, case)
+
+    def test_the_log_must_be_silenced_before_any_pull_request_code(self):
+        tool = "tools/may_release/backend_unit.py"
+        message = "backend_unit.py: the Postgres service's log is not silenced"
+        cases = {
+            "no silencing": ("nothing ran\")\n    silence(env, log)\n", "nothing ran\")\n", message),
+            "statements still logged": ("log_min_error_statement = 'panic'", "log_min_error_statement = 'error'", message),
+            "a setting not read back": ('"log_checkpoints": "off"}', '}', message),
+            "the install before the toolchain": ("    check_toolchain(env, logs[\"toolchain\"])\n",
+                                                 "    quiet([\"npm\", \"ci\"], logs[\"install\"], env=env)\n    check_toolchain(env, logs[\"toolchain\"])\n", message),
+        }
+        self.assertEqual(static_check.backend_unit_silence_problems(static_check.ROOT), [])
+        for case, (old, new, message) in cases.items():
+            with self.subTest(case=case):
+                self.flagged(tool, old, new, message, case)
 
     def test_the_tool_prints_only_fixed_lines_and_counts(self):
         tool = "tools/may_release/backend_unit.py"

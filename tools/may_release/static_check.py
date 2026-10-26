@@ -1287,8 +1287,13 @@ DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
 DEVICE_REDUCE_MOTION = ("MAY_IOS_REDUCE_MOTION", "${{ inputs.ios_reduce_motion }}")
 DEVICE_REDUCE_MOTION_INPUT = ("      ios_reduce_motion:\n        description: [^\n]+\n        required: false\n"
                               "        type: boolean\n        default: false\n")
+# Evidence runs alone (coordinator, 26 Oct): the iOS app's watchdog and SwiftUI change log (may-app #1338), asked for at
+# launch, in the iOS scenarios step alone.
+DEVICE_DIAGNOSTICS = ("MAY_IOS_DIAGNOSTICS", "${{ inputs.ios_diagnostics }}")
+DEVICE_DIAGNOSTICS_INPUT = ("      ios_diagnostics:\n        description: [^\n]+\n        required: false\n"
+                            "        type: boolean\n        default: false\n")
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
-              ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION} | DEVICE_VARS | \
+              ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS} | DEVICE_VARS | \
     {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
 
 
@@ -1300,12 +1305,13 @@ def device_tests_workflow_problems(text):
         found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
-            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion"] or \
-            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean"] or \
-            not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion",
+                                                             "ios_diagnostics"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean"] or \
+            not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or not re.search(DEVICE_DIAGNOSTICS_INPUT, trigger) or \
             re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
-        found.append(name + "is not dispatched with exactly source_sha, scenarios and an optional ios_reduce_motion "
-                     "boolean, plus one nightly schedule")
+        found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion and "
+                     "ios_diagnostics booleans, plus one nightly schedule")
     if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     jobs = ("admission", "android", "ios", "publish")
@@ -1369,7 +1375,8 @@ def device_tests_workflow_problems(text):
             any(secrets_in(chunk) != {DEVICE_SIGNIN, DEVICE_CLAUDE} for chunk in (scenarios, ios_scenarios)) or \
             any(model not in env_entries(chunk) for chunk in (scenarios, judge, ios_scenarios, ios_judge)) or \
             staging not in env_entries(ios_scenarios) or DEVICE_REDUCE_MOTION not in env_entries(ios_scenarios) or \
-            text.count("inputs.ios_reduce_motion") != 1 or \
+            text.count("inputs.ios_reduce_motion") != 1 or DEVICE_DIAGNOSTICS not in env_entries(ios_scenarios) or \
+            text.count("inputs.ios_diagnostics") != 1 or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
@@ -1542,8 +1549,9 @@ def android_unit_print_problems(root):
 # install scripts, typecheck, migrations and tests) or the cleanup. It is pinned whole: dispatch with exactly pr_number
 # and source_sha, read-only, Linux runners, backend-ci.yml's Postgres service exactly (BACKEND_SERVICES: 16.15 by digest,
 # trust auth on the runner's loopback, no secret), the pinned Node installed without carrying a value to later steps
-# (backend_unit.py finds it by path), nothing run but its seven commands, backend-ci.yml's 20-minute job timeout, and no
-# artifact (backend-ci.yml's log upload is dropped: this repository's artifacts are public), step summary or carried
+# (backend_unit.py finds it by path), nothing run but its eight commands, a 30-minute job timeout (the suite outgrew
+# backend-ci.yml's 20), the service's log silenced before any pull request code and checked for statement text at the
+# end (GitHub prints it at teardown), and no artifact (backend-ci.yml's log upload is dropped: this repository's artifacts are public), step summary or carried
 # value. backend_unit.py prints only fixed lines, a stage's name and verdict from its own words, and integer test counts;
 # backend_unit_post.py only fixed lines, the pull request number and two counts (backend_unit_print_problems).
 BACKEND = "backend-unit-pr.yml"
@@ -1551,17 +1559,19 @@ BACKEND_NODE = "python3 -I -S -B tools/may_release/toolchain.py node"
 BACKEND_RUN = 'python3 -I -S -B tools/may_release/backend_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome'
 BACKEND_POST = ('python3 -I -S -B tools/may_release/backend_unit_post.py --source-sha "$MAY_SOURCE_SHA" '
                 '--pr-number "$MAY_PR_NUMBER"')
+BACKEND_LOG_GUARD = 'python3 -I -S -B tools/may_release/backend_unit.py --check-service-log "$MAY_PG_CONTAINER"'
 BACKEND_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
                    '"$RUNNER_TEMP/may-npm" "$RUNNER_TEMP/may-tools"')
 BACKEND_RUNS = [GATE_COMPILE_PR, BACKEND_NODE, GATE_CHECK_PULL, PREPARE_ANDROID_PR, BACKEND_RUN, BACKEND_POST,
-                BACKEND_CLEANUP]
+                BACKEND_LOG_GUARD, BACKEND_CLEANUP]
 BACKEND_STEP_NAMES = ["Install the pinned, checksum-verified Node",
                       "Check the pull request head and environment before fetching",
                       "Fetch the pull request head and pinned design system quietly",
                       "Run the backend checks without any credential, printing only pass or fail and counts",
                       "Post the backend failures on the may-app pull request, never in this log",
+                      "Check the database log holds no statement text, never printing it",
                       "Remove private source, logs, dependencies and the pinned Node"]
-BACKEND_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+BACKEND_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}"), ("MAY_PG_CONTAINER", "${{ job.services.postgres.id }}")} | \
     {(name, "${{ secrets." + name + " }}") for name in UNIT_SECRETS}
 BACKEND_RUN_NAME = "\nrun-name: 'May backend checks for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
 # backend-ci.yml's service container, exactly: Postgres 16.15 by digest, superuser may_admin with trust auth (nothing
@@ -1616,32 +1626,34 @@ def backend_unit_workflow_problems(text):
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
     if runs != BACKEND_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
         found.append(name + "runs something other than the gate, the Node install, the check, the fetch, the backend "
-                     "checks, the post and the cleanup")
+                     "checks, the post, the database log guard and the cleanup")
     steps = {job: job_steps(text, job)[1] for job in ("admission", "backend")}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
     names = [step for step, _ in steps["backend"]]
     cleanup = steps["backend"][-1][1] if steps["backend"] else ""
     if leading != {"admission": ["uses", "id"], "backend": ["uses"] + ["name"] * len(BACKEND_STEP_NAMES)} or \
             names != [""] + BACKEND_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            "\n        if: always()\n" not in (steps["backend"][-2][1] if len(steps["backend"]) > 1 else "") or \
             uses_in(text) != [CHECKOUT, CHECKOUT]:
-        found.append(name + "backend's steps are not exactly the Node install, check, fetch, checks, post and an "
-                     "always-run cleanup")
-    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 20\n" not in job_text(text, "backend"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than backend's 20 minutes")
+        found.append(name + "backend's steps are not exactly the Node install, check, fetch, checks, post, an "
+                     "always-run database log guard and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 2)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 30\n" not in job_text(text, "backend"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than backend's 30 minutes")
     job = job_text(text, "backend")
     if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
             "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + "backend's environment is not the one admission chose, after admission")
     by_name = dict(steps["backend"])
-    node, check, fetch, checks, post, clean = (by_name.get(n, "") for n in BACKEND_STEP_NAMES)
+    node, check, fetch, checks, post, guard, clean = (by_name.get(n, "") for n in BACKEND_STEP_NAMES)
     # Each secret bound exactly once: the PR token in the pull request check, the read keys in the fetch, the comment
     # token in the post (after the pull request's own install scripts and tests have run). The checks get the source
     # SHA alone; the post the inputs and its token, no GitHub token; the Node install and the cleanup no env.
     if secrets_in(text) != set(UNIT_SECRETS) or any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS) or \
             secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
             secrets_in(post) != {PR_COMMENT_SECRET} or \
-            secrets_in(node + checks + clean) or "GH_TOKEN" in fetch + checks + post or "env:" in node + clean or \
+            secrets_in(node + checks + guard + clean) or "GH_TOKEN" in fetch + checks + post + guard or \
+            "env:" in node + clean or env_entries(guard) != [("MAY_PG_CONTAINER", "${{ job.services.postgres.id }}")] or \
             env_entries(checks) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")] or \
             sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
             any(e not in BACKEND_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
@@ -1653,7 +1665,7 @@ def backend_unit_workflow_problems(text):
 
 
 BACKEND_TOOL = "backend_unit.py"
-BACKEND_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(passed)", "int(failed)", "int(skipped)"}
+BACKEND_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(passed)", "int(failed)", "int(skipped)", "int(leaked)"}
 BACKEND_EXIT_CLASSES = {"BackendTestsError", "StoreError"}
 BACKEND_POST_TOOL = "backend_unit_post.py"
 BACKEND_POST_PRINT_VALUES = {"number", "int(total)", "int(errors)"}
@@ -1809,6 +1821,33 @@ def ios_core_sandbox_problems(root):
             len(stopped) != len(calls) or not all(stopped):
         return [IOS_CORE_TOOL + ": the pull request's Swift does not run as the unprivileged may-core user alone, "
                 "stopped after each step"]
+    return []
+
+
+# backend_unit.py silences the service's log before any pull request code (GitHub prints that log at teardown, and
+# Postgres's defaults put failing statements, their detail and context in it): SILENCE_SQL exactly, each setting read
+# back (SILENT), as check_toolchain's last call, and check_toolchain before any tool run_checks runs itself.
+BACKEND_SILENCE_SQL = ("ALTER SYSTEM SET log_min_messages = 'panic'", "ALTER SYSTEM SET log_min_error_statement = 'panic'",
+                       "ALTER SYSTEM SET log_checkpoints = off", "SELECT pg_reload_conf()")
+BACKEND_SILENT = {"log_min_messages": "panic", "log_min_error_statement": "panic", "log_checkpoints": "off"}
+
+
+def backend_unit_silence_problems(root):
+    path = root / "tools/may_release" / BACKEND_TOOL
+    tree = ast.parse(path.read_text())
+    toolchain, silence, checks = (function_source(tree, name) for name in ("check_toolchain", "silence", "run_checks"))
+    loops = [ast.unparse(n.iter) for n in ast.walk(silence) if isinstance(n, ast.For)] if silence else []
+    first_tool = next((i for i, statement in enumerate(checks.body) if any(
+        isinstance(n, ast.Call) and ast.unparse(n.func) in ("quiet", "value") for n in ast.walk(statement))),
+        None) if checks else None
+    toolchain_at = [i for i, statement in enumerate(checks.body)
+                    if ast.unparse(statement) == "check_toolchain(env, logs['toolchain'])"] if checks else []
+    if assigned_literal(path, "SILENCE_SQL") != BACKEND_SILENCE_SQL or assigned_literal(path, "SILENT") != BACKEND_SILENT \
+            or toolchain is None or ast.unparse(toolchain.body[-1]) != "silence(env, log)" or \
+            loops != ["SILENCE_SQL", "SILENT.items()"] or len(toolchain_at) != 1 or first_tool is None or \
+            first_tool < toolchain_at[0]:
+        return [BACKEND_TOOL + ": the Postgres service's log is not silenced (SILENCE_SQL, read back) before any pull "
+                "request code"]
     return []
 
 # The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py) each
@@ -2366,6 +2405,7 @@ def control_problems(root):
     found += android_ci_schedule_tool_problems(root)
     found += backend_unit_workflow_problems((flows / BACKEND).read_text())
     found += backend_unit_print_problems(root)
+    found += backend_unit_silence_problems(root)
     found += ios_core_workflow_problems((flows / IOS_CORE).read_text())
     found += ios_core_print_problems(root)
     found += backend_ci_schedule_workflow_problems((flows / BACKEND_SCHEDULE).read_text())

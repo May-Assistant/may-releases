@@ -2305,9 +2305,21 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, line + line.replace("MAY_IOS", "MAY_ALSO")), "a secret, variable")
         self.flagged(self.text.replace("        type: boolean\n        default: false\n", "        type: string\n"
-                                       "        default: \"\"\n"), "an optional ios_reduce_motion boolean")
+                                       "        default: \"\"\n"), "optional ios_reduce_motion and ios_diagnostics booleans")
         self.flagged(self.text.replace("      ios_reduce_motion:\n", "      reduce_motion:\n"),
-                     "an optional ios_reduce_motion boolean")
+                     "optional ios_reduce_motion and ios_diagnostics booleans")
+
+    def test_diagnostics_is_an_optional_boolean_read_by_the_ios_scenarios_step_alone(self):
+        line = "          MAY_IOS_DIAGNOSTICS: ${{ inputs.ios_diagnostics }}\n"
+        self.assertEqual(self.text.count(line), 1)
+        android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
+        self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
+        self.flagged(self.text.replace("      ios_diagnostics:\n", "      diagnostics:\n"),
+                     "optional ios_reduce_motion and ios_diagnostics booleans")
+        block = self.text[self.text.index("      ios_diagnostics:\n"):self.text.index("  schedule:\n")]
+        self.flagged(self.text.replace(block, block.replace("type: boolean", "type: string").replace(
+            "default: false", 'default: ""')), "optional ios_reduce_motion and ios_diagnostics booleans")
 
     def test_the_sign_in_secret_stays_in_the_scenarios_step(self):
         line = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"
