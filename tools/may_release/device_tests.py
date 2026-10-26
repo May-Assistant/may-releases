@@ -518,9 +518,13 @@ def commitment_note(base, token, title, note, get=urllib.request.urlopen):
 
 # A one-off (coordinator, 26 Oct): earlier notes runs typed their note into the shared account's "file taxes" task
 # instead of a task of their own. `tidy` removes only those lines from it: a line made of nothing but such notes
-# (LEFTOVER_NOTE, the notes goal's words after a run's tag); any other line, a mixed one included, is kept.
+# (LEFTOVER_NOTE, the notes goal's words after a run's tag, each with its full stop if it has one), give or take
+# MAX_STRAY other characters that are not spaces: run 40290565440 found two notes glued into one line with a stray
+# character between them (".qa-<run> note from the device testkqa-<run> note from the device test"). Any other line,
+# one holding such a note among more words included, is kept and counted.
 TIDY_TITLE = "file taxes"
-LEFTOVER_NOTE = re.compile(r"(?:\s*qa-[0-9]+(?:-[a-z0-9]+)* note from the device test\.?)+\s*", re.IGNORECASE)
+LEFTOVER_NOTE = re.compile(r"qa-[0-9]+(?:-[a-z0-9]+)* note from the device test\.?", re.IGNORECASE)
+MAX_STRAY = 2
 MAX_AGENDA_PAGES = 20
 
 
@@ -529,10 +533,11 @@ def tidy_lines(text):
     words)."""
     kept, removed, mixed = [], 0, 0
     for line in text.split("\n"):
-        if LEFTOVER_NOTE.fullmatch(line):
-            removed += 1
-            continue
-        mixed += LEFTOVER_NOTE.search(line) is not None
+        if LEFTOVER_NOTE.search(line) is not None:
+            if len("".join(LEFTOVER_NOTE.sub("", line).split())) <= MAX_STRAY:
+                removed += 1
+                continue
+            mixed += 1
         kept.append(line)
     return "\n".join(kept), removed, mixed
 
