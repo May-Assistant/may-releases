@@ -54,6 +54,8 @@ AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
 SOURCE, PRIVATE = "may-source", "may-private"
 # The sealed record: written by seal into SEALED, uploaded, downloaded by the post job into DOWNLOAD, opened into RECORD.
 SEALED, DOWNLOAD, SEALED_NAME, RECORD = "may-compile-sealed", "may-compile-download", "compile.age", "compile-record.json"
+# Every sealed record is padded to MAX_RECORD bytes (JSON then spaces), so the ciphertext's size says nothing about how
+# many errors it holds (independent review of #133); a record that would not fit is refused.
 MAX_RECORD, MAX_ERROR_LINE, MAX_TOTAL = 256 * 1024, 600, 1_000_000
 LOG = "ios-compile.log"
 SCHEME, DESTINATION = "MayPlayground", "generic/platform=iOS Simulator"
@@ -178,8 +180,11 @@ def seal(sha):
         raise CompilePrError("MAY_RENDERS_RECIPIENT is not an age public key")
     plain, sealed = private / RECORD, root / SEALED
     sealed.mkdir(mode=0o700, exist_ok=True)
+    data = json.dumps(record).encode()
+    if len(data) > MAX_RECORD:
+        raise CompilePrError("The compile record is too large to seal")
     try:
-        write_private(plain, json.dumps(record).encode())
+        write_private(plain, data + b" " * (MAX_RECORD - len(data)))
         if subprocess.run([toolchain.tool_path("age", "age"), "-r", recipient, "-o", str(sealed / SEALED_NAME),
                            str(plain)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                           stdin=subprocess.DEVNULL, env=child_env()).returncode:
@@ -228,7 +233,7 @@ def open_record(sha):
         write_private(plain, b"")
         if subprocess.run([toolchain.tool_path("age", "age"), "-d", "-i", str(key), "-o", str(plain), str(sealed)],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                          env=env).returncode or plain.stat().st_size > MAX_RECORD:
+                          env=env).returncode or plain.stat().st_size != MAX_RECORD:
             raise CompilePrError("The compile record failed to decrypt or authenticate")
         try:
             record = checked_record(json.loads(plain.read_text()), sha)

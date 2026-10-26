@@ -585,6 +585,26 @@ class SealedRoundTripTests(PostCase):
         self.assertEqual((code, error, out), (1, None, "May iOS compile failed; 2 errors posted to may-app #42\n"))
         self.assertIn("ios/MayPlayground/App.swift:2:1: error: expected '}'", self.calls[-1][2]["body"])
 
+    def test_every_sealed_record_is_the_same_size(self):
+        """Independent review of #133: the ciphertext's size must not say how many errors a compile had."""
+        sizes = []
+        for result, log in (("passed", ""), ("failed", self.LOG),
+                            ("failed", "\n".join(f"{CK}/ios/A{n}.swift:1:1: error: {'x' * 200}" for n in range(150)))):
+            (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": result}))
+            (self.private / tool.LOG).write_text(log.replace(CK, str(self.checkout)))
+            self.run_step(lambda: tool.seal(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public))
+            sizes.append((self.root / tool.SEALED / tool.SEALED_NAME).stat().st_size)
+        self.assertEqual(len(set(sizes)), 1, sizes)
+        # An unpadded record, sealed by anything but seal, is refused when opened.
+        plain = self.root / "short.json"
+        plain.write_text(json.dumps({"sha": SHA, "passed": True, "errors": [], "total": 0}))
+        (self.root / tool.DOWNLOAD).mkdir()
+        subprocess.run(["age", "-r", self.public, "-o", str(self.root / tool.DOWNLOAD / tool.SEALED_NAME), str(plain)],
+                       check=True)
+        with self.assertRaisesRegex(CompilePrError, "failed to decrypt or authenticate"):
+            self.run_step(lambda: tool.open_record(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public,
+                                                                    MAY_RENDERS_DECRYPT_KEY=self.secret))
+
     def test_another_key_a_tampered_record_or_another_commit_is_refused(self):
         self.sealed_and_handed_over()
         other = next(line for line in subprocess.run(["age-keygen"], capture_output=True, text=True,

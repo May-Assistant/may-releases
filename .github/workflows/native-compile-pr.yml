@@ -42,15 +42,15 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
         run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
-  native:
-    # The Mac compile starts only after may-app's Linux Swift checks pass (swift-checks, below). It runs the pull request's
-    # own build code as the runner user, so it never holds the comment token (independent review of may-releases #130):
-    # it seals its errors to the environment's own age key, hands over only that file, and fails when the compile
-    # failed; the post job, on a fresh runner, posts them.
-    needs: [admission, swift-checks]
-    runs-on: macos-15
+  pull:
+    # The pull request check, on a Linux runner that runs no pull request code: the May CI App's key is referenced only
+    # in jobs like this one, never in the job that compiles (independent review of may-releases #133). It mints the
+    # read token and checks that the pull request is still open, against may-app main, from may-app itself, at
+    # source_sha; native needs it, and its fetch checks again that refs/pull/<number>/head is source_sha.
+    needs: admission
+    runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
-    timeout-minutes: 55
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -68,8 +68,6 @@ jobs:
           owner: May-Assistant
           repositories: may-app
           permission-pull-requests: read
-      - name: Install pinned age, before any pull request code
-        run: python3 -I -S -B tools/may_release/toolchain.py age
       - name: Check the pull request head and environment before fetching
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,6 +75,25 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
         run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
+  native:
+    # The Mac compile starts only after the pull request check (pull) and may-app's Linux Swift checks (swift-checks)
+    # pass. It runs the pull request's own build code as the runner user, so it references no GitHub App key and no
+    # token (independent reviews of may-releases #130 and #133): only the two read-only deploy keys, in its fetch. It
+    # seals its errors to the environment's own age key, hands over only that file, and fails when the compile failed;
+    # the post job, on a fresh runner, posts them.
+    needs: [admission, pull, swift-checks]
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
       - name: Fetch the pull request head and pinned design system quietly
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
