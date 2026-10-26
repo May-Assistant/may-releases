@@ -58,6 +58,12 @@ SHOW_TOUCHES = ("-MayShowTouches", "YES")
 # before the app first starts, which stops the chat header's mark redrawing every frame (N's audit).
 REDUCE_MOTION = "MAY_IOS_REDUCE_MOTION"
 REDUCE_MOTION_ON = ("defaults", "write", "com.apple.Accessibility", "ReduceMotionEnabled", "-bool", "true")
+# may-app #1338 (N, 26 Oct): the debug Playground's main-thread watchdog and SwiftUI's change log run only when the
+# launch environment asks (MAY_DIAG_WATCHDOG=1, MAY_DIAG_LOG_CHANGES=1); the watchdog's 10 Hz ping was the suspected cause
+# of the idle hangs. With ios_diagnostics dispatched true, every launch asks (evidence runs alone); otherwise no stall,
+# span or stall-after line exists to read, and the public log says the stalls were not collected, never 0.
+DIAGNOSTICS = "MAY_IOS_DIAGNOSTICS"
+DIAGNOSTICS_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG": "1", "SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES": "1"}
 SWIFTUI_PERSIST = ("log", "config", "--subsystem", "com.apple.SwiftUI", "--mode", "level:info,persist:info")
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
@@ -549,11 +555,17 @@ def boot(log, env):
     return udid
 
 
+def diagnostics_wanted():
+    return os.environ.get(DIAGNOSTICS, "").strip() == "true"
+
+
 def launch(udid, env, token, log):
     """The app, stopped and started again with a fresh test session in its launch environment (never an argument);
     signed out, with no token (the smoke scenario). SHOW_TOUCHES draws each tap in the app (may-app #1194, May
-    Playground alone), as Android's show_touches does, since the simulator's recording never shows touches."""
+    Playground alone), as Android's show_touches does, since the simulator's recording never shows touches. The
+    watchdog and SwiftUI's change log are asked for only on a diagnostics run (DIAGNOSTICS_LAUNCH)."""
     renders.quiet(["xcrun", "simctl", "terminate", udid, BUNDLE], log, env=env)
+    env = dict(env, **DIAGNOSTICS_LAUNCH) if diagnostics_wanted() else env
     launched = renders.quiet(["xcrun", "simctl", "launch", udid, BUNDLE, *SHOW_TOUCHES], log,
                              env=dict(env, SIMCTL_CHILD_MAY_TEST_SESSION=token) if token else env)
     if launched.returncode:
@@ -602,6 +614,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             print("May device tests (ios): Reduce Motion could not be turned on; the run goes on without it")
         else:
             print("May device tests (ios): Reduce Motion is on for this run")
+    if diagnostics_wanted():
+        print("May device tests (ios): the main-thread watchdog and SwiftUI's change log are on for this run")
     # Run 40232904242: SwiftUI's info lines stayed in the simulator's memory alone, so a scenario's later read kept
     # only its last minutes of body changes. They are persisted for that subsystem alone, before the app starts; the
     # read and its rules are unchanged (private diag alone).
@@ -719,9 +733,12 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     print(f"May device tests (ios): {ran} scenarios ran; verdicts follow the judge step")
     kept, stalls, longest, crashes = diagnostics.kept, diagnostics.stalls, diagnostics.longest, diagnostics.crashes
     drivers = diagnostics.drivers
-    if kept:
+    if kept and diagnostics_wanted():
         print(f"May device tests (ios): diagnostics kept for {kept} scenarios ({stalls} main-thread stalls, the longest "
               f"{longest} ms; {crashes} with a crash; {drivers} with refused device acts)")
+    elif kept:
+        print(f"May device tests (ios): diagnostics kept for {kept} scenarios (main-thread stalls not collected: "
+              f"dispatch with ios_diagnostics for them; {crashes} with a crash; {drivers} with refused device acts)")
     for name in SPAN_NAMES:
         if name in diagnostics.spans:
             count, longest = diagnostics.spans[name]

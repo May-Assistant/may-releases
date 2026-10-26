@@ -17,6 +17,11 @@ on:
         required: false
         type: boolean
         default: false
+      ios_diagnostics:
+        description: Ask the iOS app for its main-thread watchdog and SwiftUI change log (evidence runs only; off, stalls are not collected)
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "17 3 * * *"
 permissions:
@@ -157,6 +162,7 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}
           MAY_IOS_REDUCE_MOTION: ${{ inputs.ios_reduce_motion }}
+          MAY_IOS_DIAGNOSTICS: ${{ inputs.ios_diagnostics }}
         run: python3 -I -S -B tools/may_release/device_tests.py run --platform ios --scenarios "$MAY_SCENARIOS"
       - name: Judge the agent scenarios
         env:
