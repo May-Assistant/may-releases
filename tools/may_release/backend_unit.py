@@ -11,7 +11,8 @@ against the job's Postgres 16.15 service container (pinned by digest in backend-
   CREATEROLE) and the may_ci_migrate database it owns, run `npm run -s migrate` twice as may_owner, then require
   every backend/migrations/NNN_name.sql to be applied exactly once (schema_migrations), the first run to say
   `applied <n> migration(s)` and the second to end with `schema up to date`;
-- tests: `npm test` (node --test, which bounds each file itself) with the job's Postgres as MAY_TEST_ADMIN_URL,
+- tests: `npm test` (node --test, which bounds each file itself) with the job's Postgres as MAY_TEST_ADMIN_URL (as
+  TEST_ADMIN, never the superuser),
   stopped after 25 minutes (the suite outgrew backend-ci.yml's 15 by 25 Oct).
 An install that fails stops the stages after it; a failed typecheck or migration run still runs the stages after it,
 so one red stage does not hide another (as Gradle's --continue in android_unit.py).
@@ -51,12 +52,29 @@ STAGES = {"toolchain": "backend-toolchain.log", "install": "backend-install.log"
 # may-app backend-ci.yml's pins: NODE_EXPECTED_VERSION and PG_EXPECTED_VERSION.
 NODE_VERSION = "v22.22.0"
 POSTGRES_VERSION = "16.15"
-# The service container's superuser, with trust auth on the runner's loopback (backend-ci.yml's MAY_TEST_ADMIN_URL),
-# and the migration owner's URL backend-ci.yml builds from it (user may_owner, no password, database may_ci_migrate).
+# The service container's superuser, with trust auth on the runner's loopback, and the migration owner's URL
+# backend-ci.yml builds (user may_owner, no password, database may_ci_migrate).
 ADMIN_URL = "postgres://may_admin@127.0.0.1:5432/postgres"
 MIGRATE_URL = "postgres://may_owner@127.0.0.1:5432/may_ci_migrate"
-OWNER_SQL = ("CREATE ROLE may_owner LOGIN NOSUPERUSER NOBYPASSRLS CREATEROLE",
-             "CREATE DATABASE may_ci_migrate OWNER may_owner")
+# The tests' admin, MAY_TEST_ADMIN_URL (coordinator, 26 Oct): the pull request's tests and migrations hold this URL, so it
+# is no superuser, and may set no logging parameter or reach the superuser; everything else the suite does (databases,
+# roles, BYPASSRLS roles, terminating its own backends, replica mode) it may. Its name has no may_ prefix: the suite
+# lists may_* roles. Made by the superuser (LOCK_SQL); may_owner is then made by it (TEST_OWNER_SQL), so it holds
+# may_owner's rights (createrole_self_grant), and the superuser can no longer log in (CLOSE_SQL): with trust auth on
+# the loopback, any process here could otherwise connect as may_admin. The superuser URL never leaves this script.
+TEST_ADMIN = "ci_admin"
+TEST_ADMIN_URL = "postgres://ci_admin@127.0.0.1:5432/postgres"
+LOCK_SQL = ("CREATE ROLE ci_admin LOGIN NOSUPERUSER CREATEDB CREATEROLE BYPASSRLS",
+            "GRANT pg_signal_backend, pg_read_all_stats, pg_read_all_data, pg_write_all_data TO ci_admin",
+            "GRANT SET ON PARAMETER session_replication_role TO ci_admin WITH GRANT OPTION",
+            "ALTER ROLE ci_admin SET createrole_self_grant = 'set, inherit'")
+TEST_OWNER_SQL = ("CREATE ROLE may_owner LOGIN NOSUPERUSER NOBYPASSRLS CREATEROLE",
+                  "GRANT SET ON PARAMETER session_replication_role TO may_owner")
+CLOSE_SQL = "ALTER ROLE may_admin NOLOGIN"
+# Read as the tests' admin once the superuser is closed: itself no superuser, and may_admin unable to log in.
+LOCKED_SQL = ("SELECT r.rolsuper::text || ',' || a.rolcanlogin::text FROM pg_roles r, pg_roles a "
+              "WHERE r.rolname = current_user AND a.rolname = 'may_admin'")
+OWNER_SQL = ("CREATE DATABASE may_ci_migrate OWNER may_owner",)
 # The same filename rule as may-app's src/db/migrate.ts (and backend-ci.yml's find).
 MIGRATION_FILE = re.compile(r"[0-9]{3}_[a-z0-9_]+\.sql")
 INSTALL_SECONDS = 10 * 60
@@ -251,7 +269,7 @@ def migration_files(backend):
 def migrate(backend, log, env):
     """(verdict, applied, files) of backend-ci.yml's "Migrations from scratch"."""
     for sql in OWNER_SQL:
-        if quiet(["psql", ADMIN_URL, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:
+        if quiet(["psql", TEST_ADMIN_URL, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:
             return "failed", None, None
     env = dict(env, MAY_DATABASE_URL_MIGRATE=MIGRATE_URL)
     # Each run's own log, read alone below, then appended to the stage's log.
@@ -286,6 +304,7 @@ def check_toolchain(env, log):
     if server != POSTGRES_VERSION and not server.startswith(POSTGRES_VERSION + " "):
         raise BackendTestsError("The Postgres service is not 16.15, or not reachable; nothing ran")
     silence(env, log)
+    lock(env, log)
 
 
 def silence(env, log):
@@ -297,6 +316,19 @@ def silence(env, log):
     for setting, wanted in SILENT.items():
         if value(["psql", ADMIN_URL, "-Atc", "SHOW " + setting], env) != wanted:
             raise BackendTestsError("The Postgres service's log could not be silenced; nothing ran")
+
+
+def lock(env, log):
+    """The tests' admin made (LOCK_SQL, TEST_OWNER_SQL) and the superuser closed (CLOSE_SQL), checked as that admin
+    (LOCKED_SQL) and by the superuser's refused login; refuses otherwise, before any of the pull request's code runs."""
+    steps = [(ADMIN_URL, sql) for sql in LOCK_SQL] + [(TEST_ADMIN_URL, sql) for sql in TEST_OWNER_SQL] + \
+        [(ADMIN_URL, CLOSE_SQL)]
+    for url, sql in steps:
+        if quiet(["psql", url, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:
+            raise BackendTestsError("The Postgres service's superuser could not be closed to the tests; nothing ran")
+    if value(["psql", TEST_ADMIN_URL, "-Atc", LOCKED_SQL], env) != "false,false" or \
+            value(["psql", ADMIN_URL, "-Atc", "SELECT 1"], env) is not None:
+        raise BackendTestsError("The Postgres service's superuser could not be closed to the tests; nothing ran")
 
 
 def run_checks(source_sha, record=False):
@@ -312,8 +344,8 @@ def run_checks(source_sha, record=False):
             (private / name).unlink(missing_ok=True)
     logs = {stage: private / name for stage, name in STAGES.items()}
     node_bin = pinned_node_bin()
-    env = child_env(PATH=str(node_bin) + os.pathsep + os.environ.get("PATH", ""), MAY_TEST_ADMIN_URL=ADMIN_URL,
-                    npm_config_cache=str(root / "may-npm"), npm_config_update_notifier="false",
+    env = child_env(PATH=str(node_bin) + os.pathsep + os.environ.get("PATH", ""),
+                    MAY_TEST_ADMIN_URL=TEST_ADMIN_URL, npm_config_cache=str(root / "may-npm"), npm_config_update_notifier="false",
                     npm_config_fund="false", npm_config_audit="false", GIT_TERMINAL_PROMPT="0")
     check_toolchain(env, logs["toolchain"])
     stages = dict.fromkeys(STAGES, "not run")

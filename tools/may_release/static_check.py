@@ -1707,11 +1707,42 @@ def backend_unit_silence_problems(root):
     toolchain_at = [i for i, statement in enumerate(checks.body)
                     if ast.unparse(statement) == "check_toolchain(env, logs['toolchain'])"] if checks else []
     if assigned_literal(path, "SILENCE_SQL") != BACKEND_SILENCE_SQL or assigned_literal(path, "SILENT") != BACKEND_SILENT \
-            or toolchain is None or ast.unparse(toolchain.body[-1]) != "silence(env, log)" or \
+            or toolchain is None or [ast.unparse(n) for n in toolchain.body[-2:]] != ["silence(env, log)", "lock(env, log)"] or \
             loops != ["SILENCE_SQL", "SILENT.items()"] or len(toolchain_at) != 1 or first_tool is None or \
             first_tool < toolchain_at[0]:
         return [BACKEND_TOOL + ": the Postgres service's log is not silenced (SILENCE_SQL, read back) before any pull "
                 "request code"]
+    return backend_unit_lock_problems(path, tree, checks)
+
+
+# The pull request's tests and migrations hold the tests' admin alone (coordinator, 26 Oct): ci_admin, no superuser,
+# made by LOCK_SQL exactly, may_owner made by it (TEST_OWNER_SQL), the superuser closed (CLOSE_SQL) and checked
+# (LOCKED_SQL and a refused login), in lock(); MAY_TEST_ADMIN_URL is TEST_ADMIN_URL, and the superuser URL appears
+# only in the toolchain stage's own calls.
+BACKEND_TEST_ADMIN_URL = "postgres://ci_admin@127.0.0.1:5432/postgres"
+BACKEND_LOCK_SQL = ("CREATE ROLE ci_admin LOGIN NOSUPERUSER CREATEDB CREATEROLE BYPASSRLS",
+                    "GRANT pg_signal_backend, pg_read_all_stats, pg_read_all_data, pg_write_all_data TO ci_admin",
+                    "GRANT SET ON PARAMETER session_replication_role TO ci_admin WITH GRANT OPTION",
+                    "ALTER ROLE ci_admin SET createrole_self_grant = 'set, inherit'")
+BACKEND_TEST_OWNER_SQL = ("CREATE ROLE may_owner LOGIN NOSUPERUSER NOBYPASSRLS CREATEROLE",
+                          "GRANT SET ON PARAMETER session_replication_role TO may_owner")
+BACKEND_ADMIN_USERS = {"check_toolchain", "silence", "lock"}
+
+
+def backend_unit_lock_problems(path, tree, checks):
+    lock = function_source(tree, "lock")
+    env = [k for n in ast.walk(checks) if isinstance(n, ast.Call) and ast.unparse(n.func) == "child_env"
+           for k in n.keywords if k.arg == "MAY_TEST_ADMIN_URL"] if checks else []
+    users = {node.name for node in tree.body if isinstance(node, ast.FunctionDef) and any(
+        isinstance(n, ast.Name) and n.id == "ADMIN_URL" for n in ast.walk(node))}
+    if assigned_literal(path, "TEST_ADMIN_URL") != BACKEND_TEST_ADMIN_URL or \
+            assigned_literal(path, "LOCK_SQL") != BACKEND_LOCK_SQL or \
+            assigned_literal(path, "TEST_OWNER_SQL") != BACKEND_TEST_OWNER_SQL or \
+            assigned_literal(path, "CLOSE_SQL") != "ALTER ROLE may_admin NOLOGIN" or lock is None or \
+            "LOCKED_SQL" not in ast.unparse(lock) or "'SELECT 1'" not in ast.unparse(lock) or \
+            [ast.unparse(k.value) for k in env] != ["TEST_ADMIN_URL"] or not users <= BACKEND_ADMIN_USERS:
+        return [BACKEND_TOOL + ": the tests hold more than the non-superuser ci_admin, or the superuser is not closed "
+                "to them (LOCK_SQL, CLOSE_SQL)"]
     return []
 
 # The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py) each

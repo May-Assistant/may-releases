@@ -78,7 +78,7 @@ class Fixture(unittest.TestCase):
 
     def fake(self, install=0, typecheck=0, migrate=("applied 2 migration(s)", "schema up to date"), migrate_status=0,
              test_status=0, test_output=None, owner=0, tsc_output="", test_timeout=False,
-             silence=0):
+             silence=0, lock=0):
         runs = list(migrate)
 
         def quiet(argv, log, *, cwd=None, env=None, timeout=None):
@@ -103,12 +103,16 @@ class Fixture(unittest.TestCase):
                 return None if test_timeout else test_status
             if argv[0] == "psql" and argv[-1] in backend_unit.SILENCE_SQL:
                 return silence
+            if argv[0] == "psql" and argv[-1] in (*backend_unit.LOCK_SQL, *backend_unit.TEST_OWNER_SQL,
+                                                  backend_unit.CLOSE_SQL):
+                return lock
             if argv[0] == "psql":
                 return owner
             raise AssertionError("unexpected tool " + argv[0])
         return quiet
 
-    def value(self, node="v22.22.0", server="16.15 (Debian 16.15-1.pgdg120+1)", applied="2", silent=None):
+    def value(self, node="v22.22.0", server="16.15 (Debian 16.15-1.pgdg120+1)", applied="2", silent=None,
+              locked="false,false", superuser_login=None):
         settings = dict(backend_unit.SILENT, **(silent or {}))
 
         def answer(argv, env):
@@ -121,6 +125,10 @@ class Fixture(unittest.TestCase):
                 return settings[argv[-1][5:]]
             if "SELECT count(*) FROM schema_migrations" in argv:
                 return applied
+            if argv[-1] == backend_unit.LOCKED_SQL and argv[1] == backend_unit.TEST_ADMIN_URL:
+                return locked
+            if argv[1:] == [backend_unit.ADMIN_URL, "-Atc", "SELECT 1"]:
+                return superuser_login
             raise AssertionError("unexpected value " + argv[0])
         return answer
 
@@ -161,14 +169,17 @@ class RunTests(Fixture):
         self.run_checks(self.fake())
         self.assertEqual(self.tools(), [
             ["node", "--version"], ["npm", "--version"], ["psql", backend_unit.ADMIN_URL, "-Atc"]]
-            + [["psql", backend_unit.ADMIN_URL, "-v"]] * 4 + [["psql", backend_unit.ADMIN_URL, "-Atc"]] * 3 + [
+            + [["psql", backend_unit.ADMIN_URL, "-v"]] * 4 + [["psql", backend_unit.ADMIN_URL, "-Atc"]] * 3
+            + [["psql", backend_unit.ADMIN_URL, "-v"]] * 4 + [["psql", backend_unit.TEST_ADMIN_URL, "-v"]] * 2
+            + [["psql", backend_unit.ADMIN_URL, "-v"], ["psql", backend_unit.TEST_ADMIN_URL, "-Atc"],
+               ["psql", backend_unit.ADMIN_URL, "-Atc"]] + [
             ["npm", "ci", "--no-audit"], ["npm", "run", "typecheck"],
-            ["psql", backend_unit.ADMIN_URL, "-v"], ["psql", backend_unit.ADMIN_URL, "-v"],
+            ["psql", backend_unit.TEST_ADMIN_URL, "-v"],
             ["npm", "run", "-s"], ["npm", "run", "-s"], ["psql", backend_unit.MIGRATE_URL, "-Atc"], ["npm", "test"]])
         backend = self.root / "may-source/backend"
         self.assertTrue(all(cwd == backend for argv, cwd, _ in self.calls if argv[0] == "npm" and argv[1] != "--version"))
         owner = [argv[-1] for argv, _, _ in self.calls if "-qc" in argv and argv[-1] not in backend_unit.SILENCE_SQL]
-        self.assertEqual(owner, ["CREATE ROLE may_owner LOGIN NOSUPERUSER NOBYPASSRLS CREATEROLE",
+        self.assertEqual(owner, [*backend_unit.LOCK_SQL, *backend_unit.TEST_OWNER_SQL, backend_unit.CLOSE_SQL,
                                  "CREATE DATABASE may_ci_migrate OWNER may_owner"])
 
     def test_the_tools_get_the_pinned_node_the_test_database_and_the_store_allowlist_only(self):
@@ -177,7 +188,7 @@ class RunTests(Fixture):
         for argv, _, env in self.calls:
             with self.subTest(tool=argv[:2]):
                 self.assertTrue(env["PATH"].startswith(str(self.node) + os.pathsep))
-                self.assertEqual(env["MAY_TEST_ADMIN_URL"], "postgres://may_admin@127.0.0.1:5432/postgres")
+                self.assertEqual(env["MAY_TEST_ADMIN_URL"], "postgres://ci_admin@127.0.0.1:5432/postgres")
                 self.assertEqual(env["npm_config_cache"], str(self.root / "may-npm"))
                 for name in ("SOMETHING_ELSE", "GH_TOKEN", "GITHUB_TOKEN"):
                     self.assertNotIn(name, env)
@@ -262,6 +273,42 @@ class RunTests(Fixture):
                 self.calls = []
                 out, error = self.run_checks(self.fake(**fake), self.value(**value))
                 self.assertEqual(error, "The Postgres service's log could not be silenced; nothing ran")
+                self.assertEqual(out, "")
+                self.assertFalse([argv for argv, _, _ in self.calls if argv[0] == "npm" and argv[1] != "--version"])
+
+    def test_the_tests_hold_the_non_superuser_admin_and_the_superuser_is_closed_before_any_pull_request_code(self):
+        self.run_checks(self.fake())
+        tools = [argv for argv, _, _ in self.calls]
+        close = ["psql", backend_unit.ADMIN_URL, "-v", "ON_ERROR_STOP=1", "-qc", backend_unit.CLOSE_SQL]
+        self.assertIn(close, tools, "the superuser is closed")
+        closed = tools.index(close)
+        self.assertEqual(backend_unit.CLOSE_SQL, "ALTER ROLE may_admin NOLOGIN")
+        self.assertLess(closed, min(i for i, argv in enumerate(tools) if argv[:2] == ["npm", "ci"]))
+        self.assertFalse([argv for argv in tools[closed + 1:] if argv[0] == "psql" and argv[1] == backend_unit.ADMIN_URL
+                          and argv[-1] != "SELECT 1"], "nothing runs as the superuser once it is closed")
+        made_by_admin = [argv[-1] for argv in tools if argv[0] == "psql" and argv[1] == backend_unit.TEST_ADMIN_URL
+                         and "-qc" in argv]
+        self.assertEqual(made_by_admin[:2], list(backend_unit.TEST_OWNER_SQL), "may_owner is the tests' admin's own")
+        self.assertIn("NOSUPERUSER", backend_unit.LOCK_SQL[0])
+        self.assertFalse(backend_unit.TEST_ADMIN.startswith("may_"), "the suite lists may_* roles")
+        for argv, _, env in self.calls:
+            with self.subTest(tool=argv[:2]):
+                self.assertNotIn("may_admin", " ".join(f"{k}={v}" for k, v in env.items()))
+
+    def test_a_superuser_that_is_not_closed_runs_nothing(self):
+        cases = {
+            "a lock statement refused": (dict(lock=1), dict()),
+            "a lock statement timed out": (dict(lock=None), dict()),
+            "the tests' admin a superuser": (dict(), dict(locked="true,false")),
+            "the superuser still able to log in by its flag": (dict(), dict(locked="false,true")),
+            "the lock unreadable": (dict(), dict(locked=None)),
+            "the superuser's login still answered": (dict(), dict(superuser_login="1")),
+        }
+        for case, (fake, value) in cases.items():
+            with self.subTest(case=case):
+                self.calls = []
+                out, error = self.run_checks(self.fake(**fake), self.value(**value))
+                self.assertEqual(error, "The Postgres service's superuser could not be closed to the tests; nothing ran")
                 self.assertEqual(out, "")
                 self.assertFalse([argv for argv, _, _ in self.calls if argv[0] == "npm" and argv[1] != "--version"])
 
@@ -560,6 +607,26 @@ class WorkflowTests(unittest.TestCase):
             "a setting not read back": ('"log_checkpoints": "off"}', '}', message),
             "the install before the toolchain": ("    check_toolchain(env, logs[\"toolchain\"])\n",
                                                  "    quiet([\"npm\", \"ci\"], logs[\"install\"], env=env)\n    check_toolchain(env, logs[\"toolchain\"])\n", message),
+        }
+        self.assertEqual(static_check.backend_unit_silence_problems(static_check.ROOT), [])
+        for case, (old, new, message) in cases.items():
+            with self.subTest(case=case):
+                self.flagged(tool, old, new, message, case)
+
+    def test_the_tests_must_hold_the_non_superuser_admin_alone(self):
+        tool = "tools/may_release/backend_unit.py"
+        message = "backend_unit.py: the tests hold more than the non-superuser ci_admin"
+        cases = {
+            "the superuser handed to the tests": ("MAY_TEST_ADMIN_URL=TEST_ADMIN_URL,", "MAY_TEST_ADMIN_URL=ADMIN_URL,", message),
+            "a superuser test admin": ('"CREATE ROLE ci_admin LOGIN NOSUPERUSER CREATEDB', '"CREATE ROLE ci_admin LOGIN SUPERUSER CREATEDB', message),
+            "the superuser left open": ('CLOSE_SQL = "ALTER ROLE may_admin NOLOGIN"', 'CLOSE_SQL = "SELECT 1"', message),
+            "the close unchecked": ('    if value(["psql", TEST_ADMIN_URL, "-Atc", LOCKED_SQL], env) != "false,false" or \\\n'
+                                    '            value(["psql", ADMIN_URL, "-Atc", "SELECT 1"], env) is not None:\n',
+                                    '    if False:\n', message),
+            "the migrations as the superuser": ('        if quiet(["psql", TEST_ADMIN_URL, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:\n            return "failed", None, None',
+                                                '        if quiet(["psql", ADMIN_URL, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:\n            return "failed", None, None', message),
+            "no lock": ("    silence(env, log)\n    lock(env, log)\n", "    silence(env, log)\n",
+                        "backend_unit.py: the Postgres service's log is not silenced"),
         }
         self.assertEqual(static_check.backend_unit_silence_problems(static_check.ROOT), [])
         for case, (old, new, message) in cases.items():
