@@ -1,7 +1,7 @@
 """may-app's MayCore Swift package suite at an open may-app pull request head (ios-core-pr.yml), on Linux.
 
 ios/MayCore is Foundation only, so it builds and tests on Linux, and nothing else ran its tests before a merge: may-app
-#1329 broke BrowserContractTests on main unseen. This runs it at the head prepare.py fetched (the whole checkout: the
+#1329 broke one of them on main unseen. This runs it at the head prepare.py fetched (the whole checkout: the
 tests read contracts/, shared/test-vectors/, ios/App and ios/project.yml, and skip without them) with the pinned Swift
 6.2.4 (toolchain.py swift), in two steps:
 

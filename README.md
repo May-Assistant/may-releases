@@ -637,7 +637,7 @@ gh workflow run backend-unit-pr.yml -f pr_number=<may-app PR number> -f source_s
 
 ### iOS core suite at a pull request head
 
-`ios-core-pr.yml` runs may-app's MayCore Swift package suite, which nothing ran before a merge (may-app #1329 broke `BrowserContractTests` on main unseen). Dispatch it by hand with the pull request's number and current head:
+`ios-core-pr.yml` runs may-app's MayCore Swift package suite, which nothing ran before a merge (may-app #1329 broke one of its tests on main unseen). Dispatch it by hand with the pull request's number and current head:
 
 ```
 gh workflow run ios-core-pr.yml -f pr_number=<may-app PR number> -f source_sha=<that PR's current head SHA> --repo May-Assistant/may-releases --ref main

@@ -39,14 +39,14 @@ def passing(tests=2705, skipped=8):
 
 
 def failing(source):
-    test = source / "ios/MayCore/Tests/MayCoreTests/BrowserContractTests.swift"
-    return (f"{test}:162: error: BrowserContractTests.testTheValuesTheAppComparesAgainstAreTheContracts : "
+    test = source / "ios/MayCore/Tests/MayCoreTests/FixtureTests.swift"
+    return (f"{test}:162: error: FixtureTests.testFixtureValue : "
             f"XCTAssertNotEqual failed: (\"{PRIVATE}\") is equal to (\"{PRIVATE}\")\n"
-            "Test Case 'BrowserContractTests.testTheValuesTheAppComparesAgainstAreTheContracts' failed (0.0 seconds)\n"
+            "Test Case 'FixtureTests.testFixtureValue' failed (0.0 seconds)\n"
             "Test Suite 'All tests' failed at 2026-10-25 23:20:49.827\n"
             "\t Executed 2705 tests, with 8 tests skipped and 1 failure (0 unexpected) in 31.5 (31.5) seconds\n"
             "◇ Test run started.\n"
-            f"✘ Test agendaRows() recorded an issue at AgendaRowTests.swift:12:3: Expectation failed: {PRIVATE}\n"
+            f"✘ Test fixtureRows() recorded an issue at FixtureRowTests.swift:12:3: Expectation failed: {PRIVATE}\n"
             "✘ Test run with 3 tests in 1 suite failed after 0.002 seconds with 1 issue.\n")
 
 
@@ -148,12 +148,12 @@ class RunTests(unittest.TestCase):
         self.assertEqual(outcome["result"], "failed")
         self.assertEqual(failures["total"], 2)
         first, second = failures["failures"]
-        self.assertEqual(first["test"], "BrowserContractTests.testTheValuesTheAppComparesAgainstAreTheContracts")
-        self.assertEqual(first["at"], "ios/MayCore/Tests/MayCoreTests/BrowserContractTests.swift:162")
+        self.assertEqual(first["test"], "FixtureTests.testFixtureValue")
+        self.assertEqual(first["at"], "ios/MayCore/Tests/MayCoreTests/FixtureTests.swift:162")
         self.assertIn(PRIVATE, first["message"])
-        self.assertEqual((second["test"], second["at"]), ("agendaRows()", "AgendaRowTests.swift:12"))
+        self.assertEqual((second["test"], second["at"]), ("fixtureRows()", "FixtureRowTests.swift:12"))
         self.assertNotIn(PRIVATE, out)
-        self.assertNotIn("BrowserContractTests", out)
+        self.assertNotIn("FixtureTests", out)
 
     def test_a_test_run_that_exits_non_zero_fails_even_with_a_clean_summary(self):
         out, outcome, _ = self.run_it(self.commit(), self.fake(test=1))
@@ -246,8 +246,8 @@ class ParseTests(unittest.TestCase):
 
 
 def recorded(result="failed", entries=None, stages=None, tests=(2705, 8, 1)):
-    entries = [{"test": "BrowserContractTests.testValues", "message": f"XCTAssertNotEqual failed: {PRIVATE}",
-                "at": "ios/MayCore/Tests/MayCoreTests/BrowserContractTests.swift:162"}] if entries is None else entries
+    entries = [{"test": "FixtureTests.testValues", "message": f"XCTAssertNotEqual failed: {PRIVATE}",
+                "at": "ios/MayCore/Tests/MayCoreTests/FixtureTests.swift:162"}] if entries is None else entries
     return {"result": result, "stages": stages or {"build": "passed", "tests": "failed"},
             "tests": list(tests) if tests is not None else None, "problems": len(entries)}, \
         {"failures": entries, "total": len(entries)}
@@ -299,7 +299,7 @@ class PostTests(unittest.TestCase):
         self.assertEqual((code, out), (1, "May iOS core suite failed; 1 failures posted to may-app #42\n"))
         [body] = self.posted()
         self.assertIn(PRIVATE, body)
-        self.assertIn("ios/MayCore/Tests/MayCoreTests/BrowserContractTests.swift:162: BrowserContractTests.testValues",
+        self.assertIn("ios/MayCore/Tests/MayCoreTests/FixtureTests.swift:162: FixtureTests.testValues",
                       body)
         self.assertIn("Executed 2705 tests, with 8 skipped and 1 failures.", body)
         self.assertIn(f"<!-- {tool.MARKER} head={SHA} -->", body)

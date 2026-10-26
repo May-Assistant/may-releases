@@ -21,8 +21,8 @@ jobs:
   admission:
     # may-app's ios/MayCore package (Foundation only) built and tested on a free Linux runner with the pinned Swift
     # 6.2.4, at the head of an open may-app pull request: `swift build --build-tests` and `swift test --skip-build`
-    # (ios_core.py), in the whole checkout its tests read. Nothing else ran these tests before a merge (may-app #1329
-    # broke BrowserContractTests on main). The same gate, fetch and environment as native-compile-pr.yml's swift-checks
+    # (ios_core.py), in the whole checkout its tests read. Nothing else ran these tests before a merge, and one broke
+    # on main unseen. The same gate, fetch and environment as native-compile-pr.yml's swift-checks
     # (gate.py --action compile-pr: may-native-compile-pr, no required reviewer, main only): two read-only deploy keys
     # and a pull-request read token, each in its own step, and the pull-request comment token in the post alone.
     # Nothing is signed, cached or uploaded. The build and test output stays in a private log, only fixed lines with
