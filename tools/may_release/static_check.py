@@ -1721,7 +1721,7 @@ IOS_CORE_STEP_NAMES = ["Install the pinned, checksum-verified Swift",
                        "Remove private source, logs, build outputs and the pinned Swift"]
 IOS_CORE_RUN_NAME = "\nrun-name: 'May iOS core suite for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
 IOS_CORE_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(skipped)", "int(failures)", "int(total)", "number"}
-IOS_CORE_EXIT_CLASSES = {"GateDenial", "IosCoreError", "CompilePrError", "DsCompileError", "StoreError"}
+IOS_CORE_EXIT_CLASSES = {"GateDenial", "IosCoreError", "SandboxError", "CompilePrError", "DsCompileError", "StoreError"}
 
 
 @with_app_tokens("ios-core-pr.yml")
@@ -1794,33 +1794,71 @@ def ios_core_workflow_problems(text):
 
 def ios_core_print_problems(root):
     return quiet_tool_problems(root, IOS_CORE_TOOL, IOS_CORE_PRINT_VALUES, IOS_CORE_EXIT_CLASSES) + \
-        ios_core_sandbox_problems(root)
+        sandboxed_tool_problems(root, IOS_CORE_TOOL, SANDBOXED_TOOLS[IOS_CORE_TOOL]) + sandbox_problems(root)
 
 
-# Review of #128: the pull request's Swift runs only as SANDBOX_USER, a fresh system user in no group but its own, so it
-# never holds the runner user's sudo or files: every run_tool call and the version check run sandboxed(...), the user
-# is made with no other group, and every step is followed by stop_all.
-def ios_core_sandbox_problems(root):
-    path = root / "tools/may_release" / IOS_CORE_TOOL
+# sandbox.py (reviews of #128): the pull request's own code runs only as a fresh system user, in no group but its own,
+# denied cron and at, unable to enter the runner's home or runner temp (checked as itself before anything runs), killed
+# as itself round after round until none is left, and removed at the end with its files anywhere on the runner.
+SANDBOX_TOOL = "sandbox.py"
+SANDBOX_LEFTOVER_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mqueue", "/var/crash", "/var/lib/php/sessions",
+                         "/mnt")
+
+
+def sandbox_problems(root):
+    path = root / "tools/may_release" / SANDBOX_TOOL
     tree = ast.parse(path.read_text())
-    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "run_tool"]
-    version, setup, sandboxed = (function_source(tree, name) for name in ("swift_version", "sandbox_setup", "sandboxed"))
-    body = function_source(tree, "run_sandboxed")
-    # Each statement holding a run_tool call is followed, in its own block, by stop_all(log).
-    blocks = [n.body for n in ast.walk(body) if hasattr(n, "body") and isinstance(n.body, list)] if body else []
+    fns = {name: function_source(tree, name) for name in ("sandboxed", "setup_commands", "setup", "stop_all",
+                                                          "teardown", "step", "leftovers")}
+    text = {name: ast.unparse(fn) if fn else "" for name, fn in fns.items()}
+    dirs = [n for n in tree.body if isinstance(n, ast.Assign) and [getattr(t, "id", None) for t in n.targets]
+            == ["LEFTOVER_DIRS"]]
+    if assigned_literal(path, "USER") != "may-sandbox" or None in fns.values() or \
+            assigned_literal(path, "DENY_FILES") != ("/etc/cron.deny", "/etc/at.deny") or \
+            len(dirs) != 1 or [ast.unparse(e).strip("'") for e in dirs[0].value.elts] != [*SANDBOX_LEFTOVER_DIRS,
+                                                                                         "str(ROOT)"] or \
+            "'-xdev', '-user', USER, '-delete'" not in text["leftovers"] or "'/'," in text["leftovers"] or \
+            re.search(r"'(-G|--groups|-aG|sudo|wheel|admin)'", text["setup_commands"]) or \
+            "'-u', USER" not in text["sandboxed"] or "'-i'" not in text["sandboxed"] or \
+            "'/usr/bin/kill', '-KILL', '-1'" not in text["stop_all"] or "'pgrep', '-u', USER" not in text["stop_all"] or \
+            "for _ in range(STOP_ROUNDS)" not in text["stop_all"] or \
+            "for path in DENY_FILES" not in text["setup"] or "'/usr/bin/test', '!', '-x'" not in text["setup"] or \
+            "for path in (home, runner_temp)" not in text["setup"] or "'chmod', '0700'" not in text["setup"] or \
+            [ast.unparse(n) for n in fns["teardown"].body[1:] if not isinstance(n, ast.Expr) or
+             not isinstance(n.value, ast.Constant)] != ["stop_all(log, strict=False)",
+                                                         "swept = admin(leftovers(), log) == 0",
+                                                         "admin(['rm', '-rf', '--', str(ROOT)], log)",
+                                                         "admin(['userdel', USER], log)", "return swept"] or \
+            "stop_all(log, strict=False)" not in text["step"] or ".kill(" in text["step"] or ".terminate(" in text["step"]:
+        return [SANDBOX_TOOL + ": the unprivileged user is not exactly a fresh, groupless, sealed-off user, killed until "
+                "none is left and removed with its files"]
+    return quiet_tool_problems(root, SANDBOX_TOOL, set(), {"SandboxError"})
+
+
+# Each lane that runs a pull request's own code does so only through sandbox.step on a sandboxed command, each step
+# followed by stop_all(log), inside sandbox.setup and a finally that calls sandbox.teardown.
+SANDBOXED_TOOLS = {"ios_core.py": {"swift", "sandbox.sandboxed"}, "swift_checks.py": {"sandbox.sandboxed"}}
+
+
+def sandboxed_tool_problems(root, tool, wrappers):
+    tree = ast.parse((root / "tools/may_release" / tool).read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "sandbox.step"]
+    blocks = [n.body for n in ast.walk(tree) if hasattr(n, "body") and isinstance(n.body, list)]
     stopped = [i + 1 < len(block) and ast.unparse(block[i + 1]) == "stop_all(log)"
                for block in blocks for i, statement in enumerate(block)
-               if not isinstance(statement, (ast.If, ast.For, ast.While, ast.With, ast.Try))
-               and "run_tool(" in ast.unparse(statement)]
-    if assigned_literal(path, "SANDBOX_USER") != "may-core" or not calls or version is None or setup is None or \
-            sandboxed is None or any(not (n.args and isinstance(n.args[0], ast.Call) and
-                                          ast.unparse(n.args[0].func) == "sandboxed") for n in calls) or \
-            "sandboxed(['swift', '--version'])" not in ast.unparse(version) or \
-            re.search(r"'(-G|--groups|-aG|sudo|wheel|admin)'", ast.unparse(setup)) or \
-            "'-u', SANDBOX_USER" not in ast.unparse(sandboxed) or "'-i'" not in ast.unparse(sandboxed) or \
-            len(stopped) != len(calls) or not all(stopped):
-        return [IOS_CORE_TOOL + ": the pull request's Swift does not run as the unprivileged may-core user alone, "
-                "stopped after each step"]
+               if not isinstance(statement, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.FunctionDef,
+                                             ast.ClassDef))
+               and "sandbox.step(" in ast.unparse(statement)]
+    tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try) and
+             any("sandbox.teardown(log)" in ast.unparse(x) for x in n.finalbody)]
+    others = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in
+              ("subprocess.run", "subprocess.Popen") and not (n.args and isinstance(n.args[0], ast.Call) and
+                                                              ast.unparse(n.args[0].func) in wrappers)]
+    if not calls or any(not (n.args and isinstance(n.args[0], ast.Call) and ast.unparse(n.args[0].func) in wrappers)
+                        for n in calls) or len(stopped) != len(calls) or not all(stopped) or len(tries) != 1 or \
+            "sandbox.setup(" not in ast.unparse(tree) or others:
+        return [tool + ": the pull request's code does not run as the sandbox's unprivileged user alone, stopped after "
+                "each step"]
     return []
 
 
@@ -2139,11 +2177,12 @@ def compile_pr_errors_print_problems(root):
 # number of failing checks, like compile_pr_errors.py.
 SWIFT_CHECKS = "swift_checks.py"
 SWIFT_CHECKS_PRINT_VALUES = {"number", "int(total)", "int(problems)"}
-SWIFT_CHECKS_EXIT_CLASSES = {"GateDenial", "SwiftChecksError", "CompilePrError", "DsCompileError", "StoreError"}
+SWIFT_CHECKS_EXIT_CLASSES = {"GateDenial", "SwiftChecksError", "SandboxError", "CompilePrError", "DsCompileError", "StoreError"}
 
 
 def swift_checks_print_problems(root):
-    return quiet_tool_problems(root, SWIFT_CHECKS, SWIFT_CHECKS_PRINT_VALUES, SWIFT_CHECKS_EXIT_CLASSES)
+    return quiet_tool_problems(root, SWIFT_CHECKS, SWIFT_CHECKS_PRINT_VALUES, SWIFT_CHECKS_EXIT_CLASSES) + \
+        sandboxed_tool_problems(root, SWIFT_CHECKS, SANDBOXED_TOOLS[SWIFT_CHECKS])
 
 
 def quiet_tool_problems(root, filename, print_values, exit_classes, files=None):

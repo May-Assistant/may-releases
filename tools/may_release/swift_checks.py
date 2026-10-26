@@ -30,6 +30,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it after the standard library.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -40,7 +41,9 @@ from ds_compile import DsCompileError, MAX_BODY, SHA, fence_for, post_once, run_
 from gate import APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
-from store import StoreError, child_env, prepared, require_step_secrets, runner_root
+import sandbox
+from sandbox import SandboxError, stop_all
+from store import StoreError, prepared, require_step_secrets, runner_root
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
 # The Swift checks, then the parity checks (a screens.json row iOS does not draw fails the pull request, not main:
@@ -100,6 +103,27 @@ def problem_count(text, blocks):
     return blocks
 
 
+def run_patterns(present, log, roots, codes, found):
+    """Each pattern's own discovery, one after the other into the log, as the sandbox's user in its copy of the
+    checkout (reviews of may-releases #128: the post step that holds the comment token runs in this job); each run's
+    part is read on its own, since unittest's summary line counts that run alone."""
+    for pattern in present:
+        start = log.stat().st_size
+        status = sandbox.step(sandbox.sandboxed(["/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s",
+                                                CHECKS_DIR, "-p", pattern]), log, sandbox.ROOT / "src",
+                             time.monotonic() + CHECK_SECONDS)
+        stop_all(log)
+        codes.append(status)
+        if status is None:
+            break
+        if status not in (0, NO_TESTS):
+            with log.open("rb") as written:
+                written.seek(start)
+                text = written.read().decode("utf-8", errors="replace")
+            entries, blocks = failing_checks(text, roots)
+            found.append((entries, problem_count(text, blocks)))
+
+
 def run_checks(source_sha):
     require_step_secrets(())
     if not SHA.fullmatch(source_sha or ""):
@@ -109,29 +133,18 @@ def run_checks(source_sha):
     checks = source / CHECKS_DIR
     present = [pattern for pattern in PATTERNS if checks.is_dir() and not checks.is_symlink() and
                any(p.is_file() for p in checks.glob(pattern))]
-    roots = [str(source), str(source.resolve())]
+    roots = [str(sandbox.ROOT / "src"), str(source), str(source.resolve())]
     codes, entries, problems = [], [], 0
     log.write_bytes(b"")
-    # Each pattern's own discovery, one after the other into the log; each run's part is read on its own, since
-    # unittest's summary line counts that run alone.
-    for pattern in present:
-        start = log.stat().st_size
-        try:
-            with log.open("ab") as output:
-                codes.append(subprocess.run([sys.executable, "-I", "-m", "unittest", "discover", "-s", CHECKS_DIR,
-                                             "-p", pattern], cwd=source, env=child_env(), stdout=output,
-                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                            timeout=CHECK_SECONDS).returncode)
-        except subprocess.TimeoutExpired:
-            codes.append(None)
-            break
-        if codes[-1] not in (0, NO_TESTS):
-            with log.open("rb") as written:
-                written.seek(start)
-                text = written.read().decode("utf-8", errors="replace")
-            found, blocks = failing_checks(text, roots)
-            entries += found
-            problems += problem_count(text, blocks)
+    try:
+        if present:
+            sandbox.setup(log, source, runner_root())
+        run_patterns(present, log, roots, codes, entries)
+    finally:
+        if present and not sandbox.teardown(log):
+            print("May Swift checks: some files of the sandbox user could not be removed")
+    problems = sum(count for _, count in entries)
+    entries = [entry for group, _ in entries for entry in group]
     result = ("timeout" if None in codes else "failed" if any(code not in (0, NO_TESTS) for code in codes)
               else "passed" if 0 in codes else "skipped")
     entries = entries[:MAX_FAILURES] if result == "failed" else []
@@ -260,7 +273,7 @@ if __name__ == "__main__":
         failed = main()
     except GateDenial as denial:
         raise SystemExit("May Swift checks denied: " + denial.args[0]) from None
-    except (SwiftChecksError, CompilePrError, DsCompileError, StoreError) as error:
+    except (SwiftChecksError, SandboxError, CompilePrError, DsCompileError, StoreError) as error:
         raise SystemExit("May Swift checks stopped: " + error.args[0]) from None
     except (PrepareError, OSError, subprocess.SubprocessError):
         raise SystemExit("May Swift checks stopped; no may-app source, path or credential was printed") from None

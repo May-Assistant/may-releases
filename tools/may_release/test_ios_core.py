@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import ios_core as tool
+import sandbox
 import static_check
 import store
 from test_compile_pr import pull
@@ -65,7 +66,7 @@ class RunTests(unittest.TestCase):
         self.bin = self.root / "may-tools/swift/bin"
         self.calls = []
         # No test makes the real user or copies as root: a run that reaches admin without run_it's fake fails here.
-        guard = patch.object(tool, "admin", side_effect=AssertionError("a real sudo command in a test"))
+        guard = patch.object(sandbox, "admin", side_effect=AssertionError("a real sudo command in a test"))
         guard.start()
         self.addCleanup(guard.stop)
 
@@ -90,8 +91,8 @@ class RunTests(unittest.TestCase):
 
     def fake(self, build=0, test=0, build_output="Build complete!\n", test_output=None):
         """run_tool as Swift would answer: (status or None for out of time) and its output, written to the log."""
-        def run_tool(argv, log, cwd, env, deadline):
-            self.calls.append((list(argv), cwd, dict(env)))
+        def run_tool(argv, log, cwd, deadline):
+            self.calls.append((list(argv), cwd, {}))
             self.assertGreater(deadline, time.monotonic())
             self.admin_calls.append(["run_tool"])
             argv = argv[argv.index("swift"):] if "swift" in argv else argv
@@ -125,9 +126,9 @@ class RunTests(unittest.TestCase):
             self.as_sandbox_calls.append(list(argv))
             return 1 if argv[-1] in reachable else 0
         with patch.dict(os.environ, environ, clear=True), patch("sys.stdout", out), \
-                patch.object(tool, "admin", admin), patch.object(tool, "as_sandbox", as_sandbox), \
-                patch.object(tool.time, "sleep", lambda seconds: None), \
-                patch.object(tool, "run_tool", run_tool or self.fake()), \
+                patch.object(sandbox, "admin", admin), patch.object(sandbox, "as_sandbox", as_sandbox), \
+                patch.object(sandbox.time, "sleep", lambda seconds: None), \
+                patch.object(sandbox, "step", run_tool or self.fake()), \
                 patch.object(tool, "swift_version", lambda env: version), \
                 patch.object(tool, "pinned_swift_bin", lambda: self.bin):
             tool.run_suite(sha)
@@ -146,16 +147,16 @@ class RunTests(unittest.TestCase):
 
     def test_build_then_tests_in_the_package_with_no_fetch_no_secret_and_private_folders(self):
         self.run_it(self.commit(), extra={"MAY_APP_PR_TOKEN_UNRELATED": "x"})
-        scratch = ["--scratch-path", str(tool.SANDBOX / "build")]
+        scratch = ["--scratch-path", str(sandbox.ROOT / "build")]
         self.assertEqual([argv for argv, _, _ in self.calls], [
-            tool.sandboxed(["swift", "build", "--build-tests", "--disable-automatic-resolution"] + scratch),
-            tool.sandboxed(["swift", "test", "--skip-build", "--disable-automatic-resolution"] + scratch)])
-        self.assertEqual(tool.sandboxed(["x"]), [
-            "sudo", "-n", "-u", "may-core", "--", "/usr/bin/env", "-i",
-            f"PATH={tool.SANDBOX}/swift/usr/bin:/usr/bin:/bin", f"HOME={tool.SANDBOX}/home", "x"])
+            tool.swift(["swift", "build", "--build-tests", "--disable-automatic-resolution"] + scratch),
+            tool.swift(["swift", "test", "--skip-build", "--disable-automatic-resolution"] + scratch)])
+        self.assertEqual(tool.swift(["x"]), [
+            "sudo", "-n", "-u", "may-sandbox", "--", "/usr/bin/env", "-i",
+            f"PATH={sandbox.ROOT}/swift/usr/bin:/usr/bin:/bin", f"HOME={sandbox.ROOT}/home", "x"])
         for argv, cwd, env in self.calls:
             with self.subTest(tool=argv[:2]):
-                self.assertEqual(cwd, tool.SANDBOX / "src/ios/MayCore")
+                self.assertEqual(cwd, sandbox.ROOT / "src/ios/MayCore")
                 for name in ("SOMETHING_ELSE", "MAY_APP_PR_TOKEN_UNRELATED"):
                     self.assertNotIn(name, env)
         with self.assertRaises(store.StoreError):
@@ -249,26 +250,27 @@ class RunTests(unittest.TestCase):
     def test_the_pull_requests_swift_runs_as_the_unprivileged_user_in_its_own_copies_and_is_stopped_after_each_step(self):
         self.run_it(self.commit())
         swift_top = self.bin.parent.parent
-        setup = tool.sandbox_setup(self.source, swift_top)
-        kill = [["-u", "may-core", "/usr/bin/kill", "-KILL", "-1"], ["pgrep", "-u", "may-core"]]
+        setup = sandbox.setup_commands(self.source, {"swift": swift_top})
+        kill = [["-u", "may-sandbox", "/usr/bin/kill", "-KILL", "-1"], ["pgrep", "-u", "may-sandbox"]]
         self.assertEqual(self.admin_calls, [
             ["chmod", "0700", "--", "/home/runner"], *setup,
-            ["tee", "-a", "--", "/etc/cron.deny", b"may-core\n"], ["tee", "-a", "--", "/etc/at.deny", b"may-core\n"],
+            ["tee", "-a", "--", "/etc/cron.deny", b"may-sandbox\n"], ["tee", "-a", "--", "/etc/at.deny", b"may-sandbox\n"],
             ["run_tool"], *kill, ["run_tool"], *kill,
-            *kill, tool.leftovers(), ["rm", "-rf", "--", str(tool.SANDBOX)], ["userdel", "may-core"]])
+            *kill, sandbox.leftovers(), ["rm", "-rf", "--", str(sandbox.ROOT)], ["userdel", "may-sandbox"]])
         self.assertEqual(self.as_sandbox_calls, [["/usr/bin/test", "!", "-x", "/home/runner"],
                                                  ["/usr/bin/test", "!", "-x", str(self.root)]],
                          "as the build user, neither the runner's home nor runner temp can be entered")
-        with patch.object(tool.os.path, "isdir", lambda path: path != "/var/lib/php/sessions"):
-            self.assertEqual(tool.leftovers(), [
-                "find", "/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mqueue", "/var/crash", "/mnt", "/opt/may-core",
-                "-xdev", "-user", "may-core", "-delete"], "the world-writable places and the sandbox, never the root")
+        with patch.object(sandbox.os.path, "isdir", lambda path: path != "/var/lib/php/sessions"):
+            self.assertEqual(sandbox.leftovers(), [
+                "find", "/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mqueue", "/var/crash", "/mnt",
+                "/opt/may-sandbox", "-xdev", "-user", "may-sandbox", "-delete"],
+                "the world-writable places and the sandbox, never the root")
         useradd = [argv for argv in setup if argv[0] == "useradd"]
         self.assertEqual(len(useradd), 1)
         for flag in ("-G", "--groups", "-aG", "sudo"):
             self.assertNotIn(flag, useradd[0], "the user joins no group but its own")
-        self.assertEqual(useradd[0][-1], "may-core")
-        self.assertIn(["chown", "-R", "may-core:may-core", "--", str(tool.SANDBOX / "src")], setup)
+        self.assertEqual(useradd[0][-1], "may-sandbox")
+        self.assertIn(["chown", "-R", "may-sandbox:may-sandbox", "--", str(sandbox.ROOT / "src")], setup)
         self.assertNotIn(str(swift_top), [a for argv in setup if argv[0] == "chown" for a in argv],
                          "the toolchain's copy is not theirs")
 
@@ -276,11 +278,11 @@ class RunTests(unittest.TestCase):
         for step in ("useradd", "cp", "chown", "install"):
             with self.subTest(step=step):
                 self.calls = []
-                with self.assertRaises(tool.IosCoreError):
+                with self.assertRaises(sandbox.SandboxError):
                     self.run_it(self.commit(), admin_fails=step)
                 self.assertEqual(self.calls, [])
-                self.assertEqual(self.admin_calls[-3:], [tool.leftovers(), ["rm", "-rf", "--", str(tool.SANDBOX)],
-                                                         ["userdel", "may-core"]])
+                self.assertEqual(self.admin_calls[-3:], [sandbox.leftovers(), ["rm", "-rf", "--", str(sandbox.ROOT)],
+                                                         ["userdel", "may-sandbox"]])
 
     def test_a_cleanup_that_cannot_remove_the_build_users_files_says_so_in_a_fixed_line(self):
         out, outcome, _ = self.run_it(self.commit(), admin_fails="find")
@@ -293,10 +295,10 @@ class RunTests(unittest.TestCase):
         for path in ("/home/runner", str(self.root)):
             with self.subTest(path=path):
                 self.calls = []
-                with self.assertRaises(tool.IosCoreError):
+                with self.assertRaises(sandbox.SandboxError):
                     self.run_it(self.commit(), reachable=(path,))
                 self.assertEqual(self.calls, [])
-                self.assertEqual(self.admin_calls[-1], ["userdel", "may-core"])
+                self.assertEqual(self.admin_calls[-1], ["userdel", "may-sandbox"])
 
     def test_the_build_user_is_killed_until_none_is_left_and_a_survivor_fails_the_step(self):
         out, outcome, _ = self.run_it(self.commit(), survivors=3)
@@ -304,12 +306,12 @@ class RunTests(unittest.TestCase):
         kills = [argv for argv in self.admin_calls if argv[-1:] == ["-1"]]
         self.assertGreaterEqual(len(kills), 4)
         self.calls = []
-        with self.assertRaises(tool.IosCoreError):
-            self.run_it(self.commit(), survivors=10 * tool.STOP_ROUNDS)
+        with self.assertRaises(sandbox.SandboxError):
+            self.run_it(self.commit(), survivors=10 * sandbox.STOP_ROUNDS)
         self.assertEqual(len(self.calls), 1, "the tests never start after a build whose processes survive")
 
     def test_failures_in_the_sandboxs_copy_are_repo_relative(self):
-        out, outcome, failures = self.run_it(self.commit(), self.fake(test=1, test_output=failing(tool.SANDBOX / "src")))
+        out, outcome, failures = self.run_it(self.commit(), self.fake(test=1, test_output=failing(sandbox.ROOT / "src")))
         self.assertEqual(failures["failures"][0]["at"], "ios/MayCore/Tests/MayCoreTests/FixtureTests.swift:162")
 
     def test_only_the_pinned_swift_runs(self):
@@ -321,13 +323,11 @@ class RunTests(unittest.TestCase):
 
     def test_run_tool_stops_at_the_shared_deadline(self):
         log, stopped = self.private / "x.log", []
-        with patch.object(tool, "stop_all", lambda log, strict=True: stopped.append(True)):
-            self.assertIsNone(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"}, time.monotonic() - 1))
-            self.assertEqual(tool.run_tool(["true"], log, self.root, {"PATH": "/usr/bin:/bin"},
-                                           time.monotonic() + 30), 0)
+        with patch.object(sandbox, "stop_all", lambda log, strict=True: stopped.append(True)):
+            self.assertIsNone(sandbox.step(["true"], log, self.root, time.monotonic() - 1))
+            self.assertEqual(sandbox.step(["true"], log, self.root, time.monotonic() + 30), 0)
             self.assertEqual(stopped, [])
-            self.assertIsNone(tool.run_tool(["sleep", "5"], log, self.root, {"PATH": "/usr/bin:/bin"},
-                                            time.monotonic() + 0.2))
+            self.assertIsNone(sandbox.step(["sleep", "5"], log, self.root, time.monotonic() + 0.2))
         self.assertEqual(stopped, [True], "past the deadline every sandbox process is stopped")
         self.assertEqual(tool.RUN_SECONDS, 25 * 60)
 
@@ -354,22 +354,22 @@ class RunTests(unittest.TestCase):
 
         def stop(log, strict=True):
             RootSudo.stopped = True
-        with patch.object(tool.subprocess, "Popen", RootSudo), patch.object(tool, "stop_all", stop):
+        with patch.object(sandbox.subprocess, "Popen", RootSudo), patch.object(sandbox, "stop_all", stop):
             try:
-                status = tool.run_tool(tool.sandboxed(["swift", "build"]), self.private / "x.log", self.root, {},
-                                       time.monotonic() + 0.1)
+                status = sandbox.step(tool.swift(["swift", "build"]), self.private / "x.log", self.root,
+                                      time.monotonic() + 0.1)
             except Exception as error:  # the bug: signalling root's sudo raised
                 self.fail(f"run_tool raised {type(error).__name__} instead of recording a timeout")
             self.assertIsNone(status)
         self.assertTrue(RootSudo.stopped)
         # And through the whole run: the build's timeout is recorded, never a crash.
         RootSudo.stopped = False
-        sha, real, popen = self.commit(), tool.run_tool, subprocess.Popen
+        sha, real, popen = self.commit(), sandbox.step, subprocess.Popen
         only_sudo = lambda argv, **kwargs: RootSudo(argv) if argv[0] == "sudo" else popen(argv, **kwargs)
-        with patch.object(tool.subprocess, "Popen", only_sudo):
+        with patch.object(sandbox.subprocess, "Popen", only_sudo):
             try:
-                out, outcome, _ = self.run_it(sha, run_tool=lambda argv, log, cwd, env, deadline: real(
-                    argv, log, cwd, env, time.monotonic() + 0.1))
+                out, outcome, _ = self.run_it(sha, run_tool=lambda argv, log, cwd, deadline: real(
+                    argv, log, cwd, time.monotonic() + 0.1))
             except Exception as error:
                 self.fail(f"the run raised {type(error).__name__} instead of recording a timeout")
         self.assertEqual((outcome["result"], outcome["stages"]), ("timeout", {"build": "timeout", "tests": "not run"}))
@@ -599,19 +599,35 @@ class WorkflowTests(unittest.TestCase):
                 self.flagged(WORKFLOW, old, new, message, case)
 
     def test_the_pull_requests_swift_must_run_sandboxed(self):
-        tool_path = "tools/may_release/ios_core.py"
-        message = "ios_core.py: the pull request's Swift does not run as the unprivileged may-core user alone"
+        message = "ios_core.py: the pull request's code does not run as the sandbox's unprivileged user alone"
+        held = "sandbox.py: the unprivileged user is not exactly a fresh, groupless, sealed-off user"
         cases = {
-            "the build as the runner": ("run_tool(sandboxed(BUILD + scratch)", "run_tool(BUILD + scratch", message),
-            "the tests as the runner": ("run_tool(sandboxed(TEST + scratch)", "run_tool(TEST + scratch", message),
-            "no stop after the build": ("    stop_all(log)\n    stages[\"build\"]", "    stages[\"build\"]", message),
-            "the user in sudo": ('"--shell", "/usr/sbin/nologin", SANDBOX_USER]', '"--shell", "/usr/sbin/nologin", "-G", "sudo", SANDBOX_USER]', message),
-            "the version as the runner": ('sandboxed(["swift", "--version"])', '["swift", "--version"]', message),
-            "the runner's environment kept": ('"/usr/bin/env", "-i",', '"/usr/bin/env",', message),
+            "the build as the runner": ("tools/may_release/ios_core.py", "sandbox.step(swift(BUILD + scratch)",
+                                        "sandbox.step(BUILD + scratch", message),
+            "the tests as the runner": ("tools/may_release/ios_core.py", "sandbox.step(swift(TEST + scratch)",
+                                        "sandbox.step(TEST + scratch", message),
+            "no stop after the build": ("tools/may_release/ios_core.py", "    stop_all(log)\n    stages[\"build\"]",
+                                        "    stages[\"build\"]", message),
+            "the version as the runner": ("tools/may_release/ios_core.py", 'swift(["swift", "--version"])',
+                                          '["swift", "--version"]', message),
+            "the user in sudo": ("tools/may_release/sandbox.py", '"--shell", "/usr/sbin/nologin", USER]',
+                                 '"--shell", "/usr/sbin/nologin", "-G", "sudo", USER]', held),
+            "the runner's environment kept": ("tools/may_release/sandbox.py", '"/usr/bin/env", "-i",',
+                                              '"/usr/bin/env",', held),
+            "no cron deny": ("tools/may_release/sandbox.py", 'DENY_FILES = ("/etc/cron.deny", "/etc/at.deny")',
+                             'DENY_FILES = ("/etc/at.deny",)', held),
+            "one kill round": ("tools/may_release/sandbox.py", "    for _ in range(STOP_ROUNDS):",
+                               "    for _ in range(1):", held),
+            "no leftover sweep": ("tools/may_release/sandbox.py", "    swept = admin(leftovers(), log) == 0\n",
+                                  "    swept = True\n", held),
+            "a whole-root sweep": ("tools/may_release/sandbox.py", 'LEFTOVER_DIRS = ("/tmp",',
+                                   'LEFTOVER_DIRS = ("/", "/tmp",', held),
+            "no reach check": ("tools/may_release/sandbox.py", "    for path in (home, runner_temp):",
+                               "    for path in ():", held),
         }
-        for case, (old, new, msg) in cases.items():
+        for case, (path, old, new, msg) in cases.items():
             with self.subTest(case=case):
-                self.flagged(tool_path, old, new, msg, case)
+                self.flagged(path, old, new, msg, case)
 
     def test_printing_anything_from_may_app_is_flagged(self):
         anchor = '        print("May iOS core suite: this commit has no ios/MayCore package; failed")\n'

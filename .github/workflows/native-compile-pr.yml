@@ -104,7 +104,8 @@ jobs:
     # may-app's tools/ios/test_swift_*.py (may-app #1050) on Linux, before the macOS compile: an init's labels out of order
     # or a missing import fails here in a minute, and native never starts. The same check and fetch as native, with the
     # same secrets bound to the same steps; the checks run with none and print one fixed line, and the post alone holds
-    # MAY_APP_PR_COMMENT_TOKEN and puts the failing checks on the may-app pull request (swift_checks.py).
+    # MAY_APP_PR_COMMENT_TOKEN and puts the failing checks on the may-app pull request (swift_checks.py). The checks are
+    # the pull request's own code, so they run as sandbox.py's unprivileged user, never the runner user with its sudo.
     needs: admission
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}

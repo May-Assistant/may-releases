@@ -9,8 +9,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
+import sandbox
 import static_check
 import store
 import swift_checks as tool
@@ -40,6 +42,33 @@ class RunTests(unittest.TestCase):
         self.source, self.private = self.root / "may-source", self.root / "may-private"
         (self.source / "android/build-deps/may-design-system").mkdir(parents=True)
         self.private.mkdir()
+        # The sandbox faked: its step runs the sandboxed command's own argv here, as this user, in the checkout. No
+        # test makes the real user: a call reaching sandbox.admin fails.
+        self.events, self.steps, self.setup_fails, self.step_status, self.swept = [], [], False, "run", True
+
+        def setup(log, source, runner_temp, copies=None):
+            self.events.append("setup")
+            if self.setup_fails:
+                raise sandbox.SandboxError("The unprivileged user could not be set up; nothing ran")
+
+        def step(argv, log, cwd, deadline):
+            self.events.append("step")
+            self.steps.append((list(argv), cwd))
+            self.assertEqual(argv[:7], ["sudo", "-n", "-u", sandbox.USER, "--", "/usr/bin/env", "-i"],
+                             "only a sandboxed command may run the pull request's checks")
+            if self.step_status != "run":
+                return self.step_status
+            inner = argv[7 + 2:]
+            with log.open("ab") as output:
+                return subprocess.run(inner, cwd=self.source, env={"PATH": os.environ.get("PATH", "")}, stdout=output,
+                                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=120).returncode
+        for target, name, fake in ((sandbox, "setup", setup), (sandbox, "step", step),
+                                   (sandbox, "teardown", lambda log: self.events.append("teardown") or self.swept),
+                                   (tool, "stop_all", lambda log, strict=True: self.events.append("stop")),
+                                   (sandbox, "admin", unittest.mock.Mock(side_effect=AssertionError("real sudo")))):
+            patcher = patch.object(target, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.directory.cleanup()
@@ -105,61 +134,47 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out, "May Swift checks failed: 2 failing checks, which go to the may-app pull request only\n")
 
     def test_both_patterns_run_in_turn_and_their_failures_add_up(self):
-        seen = []
-        real = subprocess.run
-
-        def spy(argv, **kwargs):
-            if "unittest" in argv:
-                seen.append(argv[-1])
-            return real(argv, **kwargs)
-
         sha = self.commit({"test_swift_inits.py": FAILING, "test_parity_snapshots.py": FAILING.replace("Inits", "Rows")})
-        with patch("swift_checks.subprocess.run", side_effect=spy):
-            out, outcome, failures = self.run_it(sha)
-        self.assertEqual(seen, ["test_swift_*.py", "test_parity_*.py"])
+        out, outcome, failures = self.run_it(sha)
+        self.assertEqual([argv[-1] for argv, _ in self.steps], ["test_swift_*.py", "test_parity_*.py"])
         self.assertEqual((outcome, failures["total"]), ({"result": "failed", "problems": 4}, 4))
         self.assertEqual(len(failures["failures"]), 4)
 
-    def test_parity_checks_alone_still_run_and_none_at_all_is_skipped(self):
-        out, outcome, _ = self.run_it(self.commit({"test_parity_snapshots.py": PASSING}))
-        self.assertEqual((out, outcome), ("May Swift checks passed\n", {"result": "passed", "problems": 0}))
-        out, outcome, _ = self.run_it(self.commit({"test_other.py": PASSING}))
-        self.assertEqual(outcome, {"result": "skipped", "problems": 0})
-        self.assertEqual(out, "May Swift checks: this commit has none (tools/ios/test_swift_*.py, test_parity_*.py); "
-                              "skipped\n")
-
-    def test_the_checks_run_from_tools_ios_with_no_secret(self):
-        seen = {}
-        real = subprocess.run
-
-        def spy(argv, **kwargs):
-            if "unittest" in argv:
-                seen.update(argv=argv, cwd=kwargs.get("cwd"), env=kwargs.get("env"))
-            return real(argv, **kwargs)
-
+    def test_the_checks_run_as_the_sandboxs_user_in_its_copy_with_no_secret(self):
+        """Reviews of may-releases #128: the checks are the pull request's own code, in the job whose post step holds
+        the comment token, so they run as sandbox.py's unprivileged user, never the runner user."""
         sha = self.commit({"test_swift_inits.py": PASSING})
-        with patch("swift_checks.subprocess.run", side_effect=spy):
-            self.run_it(sha, extra={"MAY_APP_PR_TOKEN_UNRELATED": "x"})
-        self.assertIn("argv", seen, "the checks did not run")
-        self.assertEqual(seen["argv"][1:], ["-I", "-m", "unittest", "discover", "-s", "tools/ios", "-p", "test_swift_*.py"])
-        self.assertEqual(Path(seen["cwd"]), self.source)
-        self.assertNotIn("MAY_APP_PR_TOKEN_UNRELATED", seen["env"])
+        self.run_it(sha, extra={"MAY_APP_PR_TOKEN_UNRELATED": "x"})
+        self.assertEqual(self.steps, [(sandbox.sandboxed(["/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s",
+                                                          "tools/ios", "-p", "test_swift_*.py"]), sandbox.ROOT / "src")])
+        self.assertEqual(self.events, ["setup", "step", "stop", "teardown"])
+        self.assertNotIn("MAY_APP_PR_TOKEN_UNRELATED", " ".join(self.steps[0][0]))
         with self.assertRaises(store.StoreError):
             self.run_it(sha, extra={"MAY_APP_PR_COMMENT_TOKEN": TOKEN})
 
+    def test_no_check_no_sandbox_and_a_failed_setup_runs_nothing_and_still_tears_down(self):
+        self.run_it(self.commit({"test_other.py": PASSING}))
+        self.assertEqual(self.events, [], "a commit with no check makes no user")
+        self.setup_fails = True
+        with self.assertRaises(sandbox.SandboxError):
+            self.run_it(self.commit({"test_swift_inits.py": PASSING}))
+        self.assertEqual(self.events, ["setup", "teardown"])
+        self.assertEqual(self.steps, [])
+
+    def test_a_cleanup_that_cannot_remove_the_sandbox_users_files_says_so_in_a_fixed_line(self):
+        self.swept = False
+        out, outcome, _ = self.run_it(self.commit({"test_swift_inits.py": PASSING}))
+        self.assertEqual(out, "May Swift checks: some files of the sandbox user could not be removed\n"
+                              "May Swift checks passed\n")
+        self.assertEqual(outcome["result"], "passed")
+
     def test_a_check_that_does_not_finish_is_a_timeout(self):
         sha = self.commit({"test_swift_inits.py": PASSING})
-        real = subprocess.run
-
-        def slow(argv, **kwargs):
-            if "unittest" in argv:
-                raise subprocess.TimeoutExpired("python3", 1)
-            return real(argv, **kwargs)
-
-        with patch("swift_checks.subprocess.run", side_effect=slow):
-            out, outcome, _ = self.run_it(sha)
+        self.step_status = None
+        out, outcome, _ = self.run_it(sha)
         self.assertEqual((out, outcome), ("May Swift checks did not finish within 10 minutes\n",
                                           {"result": "timeout", "problems": 0}))
+        self.assertEqual(self.events, ["setup", "step", "stop", "teardown"], "stopped even on a timeout")
 
 
 def recorded(result="failed", entries=None, total=None):
