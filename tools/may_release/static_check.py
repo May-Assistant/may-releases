@@ -263,6 +263,11 @@ FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          
 # review.py's schedule passes over heads whose STARTED marker is the token's own user's; an installation token has no
 # user (GET /user), so the fetch step, where the schedule picks, is told the app's slug: the marker is the app bot's.
 REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n"
+# A post that edits its head's own comment in place is told the comment app's slug, so it edits only that bot's
+# comments (review of may-releases #137): {(workflow, job): the post step's run line it sits right above}.
+COMMENT_SLUG = "          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}\n"
+COMMENT_SLUG_POSTS = {("native-compile-pr.yml", "post"): "        run: python3 -I -S -B tools/may_release/"
+                                                           "compile_pr_errors.py post "}
 APP_TOKEN_TRACES = ("create-github-app-token", CI_APP_ID, CI_APP_KEY, RENDERS_APP_ID, RENDERS_APP_KEY, "steps.ci-",
                     "steps.renders-", "MAY_REVIEW_APP_SLUG")
 
@@ -320,6 +325,11 @@ def unminted(workflow_name, text):
                         fetch_step not in body:
                     found.append(name + "the fetch step is not told the May CI app's slug exactly once")
                 body = body.replace(REVIEW_SLUG, "")
+            if step_id == "ci-comment" and (workflow_name, job) in COMMENT_SLUG_POSTS:
+                if body.count(COMMENT_SLUG) != 1 or \
+                        COMMENT_SLUG + COMMENT_SLUG_POSTS[(workflow_name, job)] not in body:
+                    found.append(name + f"job {job}'s post is not told the May CI app's slug exactly once")
+                body = body.replace(COMMENT_SLUG, "")
         text = text[:span[0]] + body + text[span[1]:]
     if any(trace in text for trace in APP_TOKEN_TRACES):
         found.append(name + "a GitHub App token is minted or used other than by its pinned, narrowed step right after "

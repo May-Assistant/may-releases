@@ -29,6 +29,7 @@ SHA, OTHER = "a" * 40, "b" * 40
 HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
 TOKEN = "github_pat_" + "D" * 50
 WORKFLOW = ".github/workflows/native-compile-pr.yml"
+BOT = {"type": "Bot", "login": "may-ci[bot]"}
 TOOL = "tools/may_release/compile_pr_errors.py"
 # Text that stands for may-app source: it must never reach stdout, stderr or anything but the comment.
 MARKER = "PRIVATE-APP-SOURCE-7c2e"
@@ -237,7 +238,8 @@ class PostCase(unittest.TestCase):
 
     def environ(self, **extra):
         env = {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin:/bin", "GITHUB_RUN_ID": "987",
-               "GITHUB_STEP_SUMMARY": str(self.root / "summary"), "GITHUB_OUTPUT": str(self.root / "output")}
+               "GITHUB_STEP_SUMMARY": str(self.root / "summary"), "GITHUB_OUTPUT": str(self.root / "output"),
+               tool.APP_SLUG: "may-ci"}
         env.update(extra)
         return env
 
@@ -384,7 +386,7 @@ class PostTests(PostCase):
                 self.assertNotIn("error", body.split("<!--")[0].lower().replace("errors", ""), "no detail")
         posted = body
         self.calls = []
-        self.pages = {1: [{"id": 5, "body": posted}]}
+        self.pages = {1: [{"id": 5, "body": posted, "user": BOT}]}
         code, _, out, _ = self.post(env=self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, **{tool.NATIVE_RESULT: "failure"}))
         self.assertEqual(code, 1)
         self.assertIn("already posted", out, "the same result for the same head is not posted twice")
@@ -406,8 +408,8 @@ class DedupeTests(PostCase):
     """One comment per head, and the newest result in it (review of may-releases #137): a marked comment is edited in
     place, unless it already reads the same."""
 
-    def marked(self, sha, name="may-ios-compile-pr", body="x", id=7):
-        return {"id": id, "body": f"{body}\n\n<!-- {name} head={sha} -->\n---"}
+    def marked(self, sha, name="may-ios-compile-pr", body="x", id=7, user=None):
+        return {"id": id, "body": f"{body}\n\n<!-- {name} head={sha} -->\n---", "user": user or BOT}
 
     def edits(self):
         return [(m, p, b["body"]) for m, p, b, _ in self.calls if m in ("PATCH", "POST")]
@@ -416,7 +418,7 @@ class DedupeTests(PostCase):
         self.write()
         self.post()
         body = self.calls[-1][2]["body"]
-        self.calls, self.pages = [], {1: [{"body": "other"}] * 100, 2: [{"id": 9, "body": body}]}
+        self.calls, self.pages = [], {1: [{"body": "other"}] * 100, 2: [{"id": 9, "body": body, "user": BOT}]}
         code, error, out, _ = self.post()
         self.assertEqual((code, error), (1, None))
         self.assertEqual(out, "May iOS compile result already posted for this head on may-app #42; nothing posted again\n")
@@ -453,6 +455,45 @@ class DedupeTests(PostCase):
         self.assertEqual(self.post()[:2], (1, None))
         self.assertEqual([(m, p) for m, p, _ in self.edits()],
                          [("PATCH", "/repos/May-Assistant/may-app/issues/comments/13"), ("POST", COMMENTS)])
+
+    def test_only_the_comment_apps_own_comments_are_edited_or_counted(self):
+        """Review of may-releases #137: a person's or another app's comment quoting the marker is never the target."""
+        self.write()
+        self.post()
+        body = self.calls[-1][2]["body"]
+        for user in ({"type": "User", "login": "may-ci[bot]"}, {"type": "Bot", "login": "other-app[bot]"},
+                     {"type": "User", "login": "someone"}, None):
+            with self.subTest(user=user):
+                self.calls = []
+                stranger = {"id": 21, "body": body, **({"user": user} if user else {})}
+                self.pages = {1: [stranger]}
+                self.assertEqual(self.post()[:2], (1, None))
+                self.assertEqual([(m, p) for m, p, _ in self.edits()], [("POST", COMMENTS)], "never edited or skipped")
+
+    def test_without_the_apps_slug_nothing_is_read_or_edited_and_the_result_is_posted(self):
+        """The PAT fallback: its user is not known here, so no comment is taken as its own."""
+        self.write()
+        self.pages = {1: [self.marked(SHA, id=8)]}
+        env = self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN)
+        for slug in (None, "", "Bad Slug"):
+            with self.subTest(slug=slug):
+                self.calls = []
+                env.pop(tool.APP_SLUG, None)
+                env.update({tool.APP_SLUG: slug} if slug is not None else {})
+                self.assertEqual(self.post(env=env)[:2], (1, None))
+                self.assertEqual([(m, p) for m, p, _, _ in self.calls], [("GET", PULLS), ("POST", COMMENTS)])
+
+    def test_an_edit_of_a_comment_this_pull_request_did_not_list_is_refused(self):
+        calls = []
+        guarded = tool.listed_only(lambda m, p, b, t: calls.append((m, p)) or (200, [{"id": 31}] if m == "GET" else {}))
+        with self.assertRaises(CompilePrError):
+            guarded("PATCH", "/repos/May-Assistant/may-app/issues/comments/31", {"body": "b"}, TOKEN)
+        guarded("GET", COMMENTS + "?per_page=100&page=1", None, TOKEN)
+        self.assertEqual(guarded("PATCH", "/repos/May-Assistant/may-app/issues/comments/31", {"body": "b"}, TOKEN)[0], 200)
+        with self.assertRaises(CompilePrError):
+            guarded("PATCH", "/repos/May-Assistant/may-app/issues/comments/32", {"body": "b"}, TOKEN)
+        self.assertEqual(calls, [("GET", COMMENTS + "?per_page=100&page=1"),
+                                 ("PATCH", "/repos/May-Assistant/may-app/issues/comments/31")])
 
     def test_another_head_the_design_system_marker_or_an_odd_id_does_not_stop_the_post(self):
         self.write()
@@ -730,6 +771,12 @@ class ShapeTests(unittest.TestCase):
     def test_the_committed_workflow_and_tool_pass(self):
         self.assertEqual(static_check.compile_pr_workflow_problems((static_check.ROOT / WORKFLOW).read_text()), [])
         self.assertEqual(static_check.compile_pr_errors_print_problems(static_check.ROOT), [])
+
+    def test_the_post_alone_is_told_the_comment_apps_slug(self):
+        slug = "          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}\n"
+        message = "native-compile-pr.yml: job post's post is not told the May CI app's slug exactly once"
+        self.flagged(WORKFLOW, slug, "", message)
+        self.flagged(WORKFLOW, slug, slug + slug, message)
 
     def test_native_s_result_reaches_the_post_alone(self):
         secret = "native-compile-pr.yml: a secret or env entry other than"

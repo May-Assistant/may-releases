@@ -66,6 +66,10 @@ MARKER = "may-ios-compile-pr"
 # with the key pair unset, #133's post was silent and the may-app merge gate had no result to read). Only success and
 # failure are posted, as the result line alone: no detail, still head-marked.
 NATIVE_RESULT, RESULTS = "MAY_NATIVE_RESULT", {"success": True, "failure": False}
+# The May CI App's slug (the comment mint's app-slug output): the post edits or counts as posted only its own bot's
+# comments, "<slug>[bot]" (review of may-releases #137). Unset with the PAT fallback: then it posts anew each run.
+APP_SLUG = "MAY_CI_APP_SLUG"
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,38}")
 
 
 class CompilePrError(ValueError):
@@ -118,6 +122,21 @@ ALLOWED_CALLS = (("GET", _PR.format("pulls")),
                  ("POST", _PR.format("issues") + r"/comments"),
                  # The head's own marked comment, edited in place (ds_compile.post_or_update).
                  ("PATCH", r"/repos/" + re.escape(APP_REPO) + r"/issues/comments/[1-9][0-9]{0,19}"))
+
+
+def listed_only(call_api):
+    """call_api, refusing an edit of any comment the pull request's own comment pages did not list (review of
+    may-releases #137): ALLOWED_CALLS takes any may-app comment id, so the id is checked against this pull request's."""
+    listed = set()
+
+    def call(method, path, payload, token):
+        if method == "PATCH" and path.rsplit("/", 1)[-1] not in listed:
+            raise CompilePrError("Only this pull request's own comments can be edited")
+        status, data = call_api(method, path, payload, token)
+        if method == "GET" and "/comments?" in path and isinstance(data, list):
+            listed.update(str(c["id"]) for c in data if isinstance(c, dict) and type(c.get("id")) is int)
+        return status, data
+    return call
 
 
 def github(method, path, payload, token):
@@ -302,7 +321,9 @@ def post(sha, pr, call_api=github):
         validate_pull_request(pull, number, sha)
     except GateDenial:
         raise CompilePrError("The pull request is no longer open at the compiled head; nothing was posted") from None
-    done = post_or_update(call_api, APP_REPO, number, sha, body, token, MARKER)
+    slug = os.environ.get(APP_SLUG, "")
+    author = slug + "[bot]" if SLUG.fullmatch(slug) else None
+    done = post_or_update(listed_only(call_api), APP_REPO, number, sha, body, token, MARKER, author)
     if done == "same":
         print(f"May iOS compile result already posted for this head on may-app #{number}; nothing posted again")
         return 0 if passed else 1
