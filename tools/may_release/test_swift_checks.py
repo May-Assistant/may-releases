@@ -33,6 +33,8 @@ class Inits(unittest.TestCase):
         raise ImportError("no module at /home/runner/work/_temp/may-source/ios/App/X.swift")
 '''
 PASSING = "import unittest\nclass Inits(unittest.TestCase):\n    def test_fine(self):\n        pass\n"
+# A passing parity check, beside a Swift check: may-app main has both patterns, and a commit lacking either fails.
+PARITY = {"test_parity_snapshots.py": PASSING.replace("Inits", "Snapshots")}
 
 
 class RunTests(unittest.TestCase):
@@ -100,7 +102,7 @@ class RunTests(unittest.TestCase):
         return out.getvalue(), outcome, failures
 
     def test_failing_checks_are_recorded_privately_and_counted_publicly(self):
-        out, outcome, failures = self.run_it(self.commit({"test_swift_inits.py": FAILING}))
+        out, outcome, failures = self.run_it(self.commit({"test_swift_inits.py": FAILING, **PARITY}))
         self.assertEqual(out, "May Swift checks failed: 2 failing checks, which go to the may-app pull request only\n")
         self.assertEqual(outcome, {"result": "failed", "problems": 2})
         by_test = {entry["test"]: entry for entry in failures["failures"]}
@@ -113,15 +115,33 @@ class RunTests(unittest.TestCase):
             self.assertFalse(any(line.startswith(("Ran ", "FAILED")) for line in entry["lines"]), "the block ends")
         self.assertNotIn("About.swift", out)
 
-    def test_passing_checks_and_commits_without_any(self):
-        out, outcome, _ = self.run_it(self.commit({"test_swift_inits.py": PASSING}))
+    def test_passing_checks_pass_and_a_commit_that_drops_them_fails(self):
+        """Independent review of may-releases #130: "skipped" was green, so a pull request that deleted tools/ios,
+        symlinked it, or left checks that find no test passed. may-app main has both patterns; lacking either fails."""
+        out, outcome, _ = self.run_it(self.commit({"test_swift_inits.py": PASSING, **PARITY}))
         self.assertEqual((out, outcome), ("May Swift checks passed\n", {"result": "passed", "problems": 0}))
-        for checks in (None, {"test_other.py": PASSING}, {"test_swift_empty.py": "import unittest\n"}):
+        missing = ("May Swift checks failed: this commit has no tools/ios/test_swift_*.py or test_parity_*.py check, "
+                   "or they found no test\n")
+        for checks in (None, {"test_other.py": PASSING}, {"test_swift_inits.py": PASSING}, PARITY,
+                       {"test_swift_empty.py": "import unittest\n", **PARITY}):
             with self.subTest(checks=sorted(checks or {})):
                 out, outcome, failures = self.run_it(self.commit(checks))
-                self.assertEqual(outcome, {"result": "skipped", "problems": 0}, "no check is not a failure")
-                self.assertIn("skipped", out)
+                self.assertEqual(outcome, {"result": "failed", "problems": 0, "missing": True})
+                self.assertEqual(out, missing)
                 self.assertEqual(failures, {"failures": [], "total": 0})
+        for linked in ("tools", "tools/ios"):
+            with self.subTest(linked=linked):
+                sha = self.commit({"test_swift_inits.py": PASSING, **PARITY})
+                elsewhere = self.root / "elsewhere"
+                shutil.rmtree(elsewhere, ignore_errors=True)
+                shutil.move(self.source / linked, elsewhere)
+                (self.source / linked).symlink_to(elsewhere)
+                try:
+                    out, outcome, _ = self.run_it(sha)
+                finally:
+                    (self.source / linked).unlink()
+                self.assertEqual((out, outcome), (missing, {"result": "failed", "problems": 0, "missing": True}),
+                                 "a symlinked check folder is never followed and never passes")
 
     def test_a_parity_check_that_fails_fails_the_job_with_the_swift_checks_passing(self):
         """may-app's test_parity_snapshots was red on main from #1144 to #1153 and nothing ran it."""
@@ -163,7 +183,7 @@ class RunTests(unittest.TestCase):
 
     def test_a_cleanup_that_cannot_remove_the_sandbox_users_files_says_so_in_a_fixed_line(self):
         self.swept = False
-        out, outcome, _ = self.run_it(self.commit({"test_swift_inits.py": PASSING}))
+        out, outcome, _ = self.run_it(self.commit({"test_swift_inits.py": PASSING, **PARITY}))
         self.assertEqual(out, "May Swift checks: some files of the sandbox user could not be removed\n"
                               "May Swift checks passed\n")
         self.assertEqual(outcome["result"], "passed")
@@ -234,13 +254,17 @@ class PostTests(unittest.TestCase):
         self.assertIn(f"<!-- {tool.MARKER} head={SHA} -->", body)
         self.assertNotIn("MaySettingsItem", out)
 
-    def test_a_pass_or_a_skip_posts_nothing_and_lets_the_compile_run(self):
-        for result in ("passed", "skipped"):
-            with self.subTest(result=result):
-                self.calls = []
-                self.write(*recorded(result, []))
-                self.assertEqual(self.post(self.api()), (0, "May Swift checks: nothing to post; the compile may run\n"))
-                self.assertEqual(self.calls, [])
+    def test_a_pass_posts_nothing_and_lets_the_compile_run(self):
+        self.write(*recorded("passed", []))
+        self.assertEqual(self.post(self.api()), (0, "May Swift checks: nothing to post; the compile may run\n"))
+        self.assertEqual(self.calls, [])
+
+    def test_missing_checks_are_posted_and_fail(self):
+        outcome, failed = recorded("failed", [])
+        self.write(dict(outcome, missing=True), failed)
+        code, _ = self.post(self.api())
+        self.assertEqual(code, 1, "a commit without the checks never lets the compile run")
+        self.assertIn("may-app main has both, so a pull request must keep them.", self.posted()[0])
 
     def test_a_timeout_is_posted_and_fails(self):
         self.write(*recorded("timeout", []))
@@ -267,6 +291,9 @@ class PostTests(unittest.TestCase):
 
     def test_a_malformed_record_is_refused(self):
         for outcome, failed in (({"result": "maybe", "problems": 0}, {"failures": [], "total": 0}),
+                                ({"result": "skipped", "problems": 0}, {"failures": [], "total": 0}),
+                                ({"result": "passed", "problems": 0, "missing": False}, {"failures": [], "total": 0}),
+                                ({"result": "passed", "problems": 0, "other": 1}, {"failures": [], "total": 0}),
                                 ({"result": "failed", "problems": 1},
                                  {"failures": [{"kind": "fail", "test": "x", "lines": ["a\nb"]}], "total": 1})):
             with self.subTest(outcome=outcome["result"]):
