@@ -63,7 +63,8 @@ class AgentRunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_and_judge(self, records, judged, truth=(200, True), cleaned=3, env=None, selection="chat,notes,routines",
-                      asked=None, exhausted=False, delivered=None, calls_left=None, fail_mint=(), noted=None):
+                      asked=None, exhausted=False, delivered=None, calls_left=None, fail_mint=(), noted=None,
+                      made=None):
         calls, minted, seen = [], [], {}
         self.last_seen = seen
 
@@ -146,6 +147,8 @@ class AgentRunTests(unittest.TestCase):
                                        cleaned=clean, agent=agent, deleted_by=delete,
                                        delivered=delivered or deliver,
                                        calls_left=calls_left or (lambda base, token: 100),
+                                       made=made or (lambda base, token, tag: seen.setdefault("chats", []).append(
+                                           (token, tag, [argv[-1] for argv in calls if "start" in argv])) or True),
                                        install=lambda root: root / "may-claude" / "claude")
             self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", os.environ)
@@ -234,6 +237,28 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("pass", None), ("fail", device_tests.NOT_JUDGED), ("fail", device_tests.NO_TRUTH)])
 
+    def test_each_chat_scenario_talks_in_a_chat_of_its_own_made_before_the_app_starts(self):
+        """Coordinator, 26 Oct: every run wrote to the shared May chat, so one run's cards and replies met the next's.
+        A row with "chat" gets its own chat, named with its tag, made with its own session before the app starts; the
+        test session's cleanup removes it with the run's tag."""
+        _, _, seen, report, run_out, _ = self.run_and_judge([record(), record(), record()], [("pass", "")] * 3)
+        self.assertEqual(seen.get("chats"), [(TOKEN + "1", "qa-39557415738-a-chat", []),
+                                         (TOKEN + "3", "qa-39557415738-a-routines", [TOKEN + "1", TOKEN + "2"])],
+                         "chat and routines alone, each with its own session and tag, each before its app starts")
+        self.assertTrue(seen["cleanup"][2] in "qa-39557415738-a-chat chat", "the run's cleanup tag covers the chat")
+        self.assertNotIn("qa-39557415738", run_out)
+        refused = []
+        _, _, seen, report, run_out, _ = self.reset_and(lambda: self.run_and_judge(
+            [record()], [("pass", "")], made=lambda base, token, tag: refused.append(tag) or False))
+        self.assertEqual(refused, ["qa-39557415738-a-chat", "qa-39557415738-a-routines"])
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("chat", "skipped", device_tests.NO_CHAT), ("notes", "pass", None),
+            ("routines", "skipped", device_tests.NO_CHAT)],
+            "a scenario whose chat staging did not make never runs in the shared chat instead")
+        self.assertEqual([tag for _, tag, *_ in seen["goals"]], ["qa-39557415738-a-notes"])
+        self.assertEqual(sorted(self.signed_out), [TOKEN + str(n) for n in range(1, 5)],
+                         "a skipped scenario's session is signed out all the same")
+
     def test_server_truth_counts_chats_delivery_and_never_passes_a_task_it_could_not_reach(self):
         """Coordinator, 25 Oct: chat's succeeded delivery is its server truth; notes' tagged task beyond the agenda's
         first page is unverified, never a pass; a fail on the screen or any read is a fail."""
@@ -245,9 +270,9 @@ class AgentRunTests(unittest.TestCase):
 
         _, _, _, report, run_out, judge_out = self.run_and_judge(
             [record(), record(), record()], [("pass", "")] * 3, noted=beyond)
-        self.assertEqual(seen_notes, [(TOKEN + "2", "qa-39557415738-a-notes",
+        self.assertEqual(seen_notes, [(TOKEN + "2", "qa-39557415738-a-notes task",
                                        "qa-39557415738-a-notes note from the device test")],
-                         "the notes read, with notes' own session, tag and the goal's words")
+                         "the notes read, with notes' own session, its task's title and the goal's words")
         self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("chat", "pass", None), ("notes", device_tests.UNVERIFIED, device_tests.NOT_REACHED),
             ("routines", "pass", None)])
@@ -280,7 +305,8 @@ class AgentRunTests(unittest.TestCase):
             ("fail", device_tests.DELIVERY_FAILED), ("pass", None), ("pass", None)])
         self.assertEqual([evidence.get("truth") for evidence in seen["evidence"]],
                          [["every tagged message this run sent has a succeeded reply: not confirmed"],
-                          ["the tagged task holds the goal's note: confirmed"],
+                          ["the task titled with the tag holds the goal's note and none of that title is left "
+                           "open: confirmed"],
                           ["an item holding the tag is listed by GET /v1/routines: confirmed",
                            "May's question card in this run's tagged chat is answered: confirmed"]],
                          "the judge sees what each server read checked and how it came out")
@@ -595,10 +621,12 @@ def chat_server(chats, messages, agents_status=200):
 
 
 class ServerTruthTests(unittest.TestCase):
-    def test_the_note_is_read_from_the_tagged_tasks_description_on_the_agendas_first_page(self):
+    def test_the_note_is_read_from_the_task_titled_with_the_tag_which_is_left_closed(self):
         """may-app: GET /v1/commitments gives {commitments, next_cursor}, 200 to a page; a task's notes are its
-        description. The task is found by the scenario's tag alone."""
-        tag, note = "qa-39557415738-notes", "qa-39557415738-notes note from the device test"
+        description, and a deleted (cancelled) task is still listed. Coordinator, 26 Oct: the note must be in the task
+        titled exactly "<tag> task", and none of that title may be left open, so a note typed into another task (run
+        40243708096's "file taxes") never passes."""
+        tag, note = "qa-39557415738-notes task", "qa-39557415738-notes note from the device test"
         asked = []
 
         def get(body, status=200):
@@ -609,14 +637,24 @@ class ServerTruthTests(unittest.TestCase):
                 return FakeReply(json.dumps(body).encode())
             return reply
 
-        mine = {"title": "qa-39557415738-notes task", "description": note}
-        other = {"title": "qa-39557415738-notes-old task", "description": note}
+        mine = {"title": "qa-39557415738-notes task", "description": note, "status": "cancelled"}
+        other = {"title": "qa-39557415738-notes-old task", "description": note, "status": "cancelled"}
+        taxes = {"title": "file taxes", "description": "keep receipts\n" + note, "status": "accepted"}
         cases = (({"commitments": [{"title": "file taxes", "description": None}, mine], "next_cursor": None},
                   200, (200, "found")),
+                 ({"commitments": [dict(mine, status="completed")], "next_cursor": None}, 200, (200, "found")),
+                 ({"commitments": [dict(mine, title=" QA-39557415738-notes Task ")], "next_cursor": None},
+                  200, (200, "found")),
+                 ({"commitments": [dict(mine, status="accepted")], "next_cursor": None}, 200, (200, "open")),
+                 ({"commitments": [mine, dict(mine, description=None, status="accepted")], "next_cursor": None},
+                  200, (200, "open")),
                  ({"commitments": [dict(mine, description="qa-39557415738-notes note from the d")], "next_cursor": None},
                   200, (200, "absent")),
+                 ({"commitments": [taxes], "next_cursor": None}, 200, (200, "absent")),
+                 ({"commitments": [dict(mine, title="qa-39557415738-notes task copy")], "next_cursor": None},
+                  200, (200, "absent")),
                  ({"commitments": [dict(mine, description=None)], "next_cursor": "c2"}, 200, (200, "absent")),
-                 ({"commitments": [other], "next_cursor": "c2"}, 200, (200, "beyond")),
+                 ({"commitments": [other, taxes], "next_cursor": "c2"}, 200, (200, "beyond")),
                  ({"commitments": [other], "next_cursor": None}, 200, (200, "absent")),
                  ({"commitments": [], "next_cursor": ""}, 200, (200, "absent")),
                  ({"commitments": [mine]}, 401, (401, "absent")),
@@ -626,6 +664,93 @@ class ServerTruthTests(unittest.TestCase):
                 self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(body, status)),
                                  expected)
         self.assertEqual(set(asked), {"https://s/v1/commitments"}, "the first page alone, no cursor")
+
+    def test_make_chat_posts_the_tagged_name_with_the_session_and_reads_its_id(self):
+        seen = []
+
+        def post(status, body):
+            def answer(request, timeout):
+                seen.append((request.full_url, request.get_method(), json.loads(request.data),
+                             request.headers.get("Authorization")))
+                if status >= 400:
+                    raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+                reply = FakeReply(json.dumps(body).encode())
+                reply.status = status
+                return reply
+            return answer
+
+        tag = "qa-39557415738-a-chat"
+        self.assertTrue(device_tests.make_chat("https://s", TOKEN, tag, post(201, {"agent": {"id": "a7"}})))
+        self.assertEqual(seen, [("https://s/v1/agents", "POST", {"client_key": tag, "name": tag + " chat"},
+                                 "Bearer " + TOKEN)])
+        self.assertTrue(device_tests.make_chat("https://s", TOKEN, tag, post(200, {"agent": {"id": "a7"}})),
+                        "a repeat with the same key is the same chat")
+        for status, body in ((201, {"agent": {}}), (201, {"agent": {"id": "../x"}}), (201, []), (403, {}),
+                             (202, {"agent": {"id": "a7"}})):
+            with self.subTest(status=status, body=body):
+                self.assertFalse(device_tests.make_chat("https://s", TOKEN, tag, post(status, body)))
+
+    def test_tidy_removes_only_whole_leftover_note_lines_from_file_taxes(self):
+        """Coordinator, 26 Oct: earlier notes runs left their lines in the shared account's "file taxes" task."""
+        note = "qa-40243708096-i-notes note from the device test"
+        text = "\n".join(["Gather W-2s", note, note + ". " + note.upper(), "  " + note + "  ",
+                          "call the accountant about " + note, "qa-1 notes", ""])
+        kept, removed, mixed = device_tests.tidy_lines(text)
+        self.assertEqual((kept, removed, mixed),
+                         ("\n".join(["Gather W-2s", "call the accountant about " + note, "qa-1 notes", ""]), 3, 1))
+        agenda = {"/v1/commitments": {"commitments": [
+                      {"id": "11111111-1111-1111-1111-111111111111", "title": "File taxes ", "revision": 4,
+                       "description": "Gather W-2s\n" + note, "status": "accepted"},
+                      {"id": "22222222-2222-2222-2222-222222222222", "title": "qa-1 task", "revision": 1,
+                       "description": note}], "next_cursor": "p2"},
+                  "/v1/commitments?cursor=p2": {"commitments": [
+                      {"id": "33333333-3333-3333-3333-333333333333", "title": "file taxes", "revision": 2,
+                       "description": "only mine"}], "next_cursor": None}}
+        asked, saved = [], []
+
+        def get(request, timeout):
+            asked.append(request.full_url[len("https://s"):])
+            return FakeReply(json.dumps(agenda[asked[-1]]).encode())
+
+        def patch_(status):
+            def answer(request, timeout):
+                saved.append((request.full_url, request.get_method(), json.loads(request.data)))
+                if status != 200:
+                    raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+                return FakeReply(b"{}")
+            return answer
+
+        counts = device_tests.tidy_notes("https://s", TOKEN, get=get, post=patch_(200))
+        self.assertEqual(asked, ["/v1/commitments", "/v1/commitments?cursor=p2"], "every page of the Agenda")
+        self.assertEqual(saved, [("https://s/v1/commitments/11111111-1111-1111-1111-111111111111", "PATCH",
+                                  {"expected_revision": 4, "description": "Gather W-2s"})],
+                         "the file taxes task alone, at its revision, with its own lines kept")
+        self.assertEqual(counts, {"tasks": 2, "lines": 1, "mixed": 0, "saved": 1, "failed": 0})
+        saved.clear()
+        self.assertEqual(device_tests.tidy_notes("https://s", TOKEN, get=get, post=patch_(409))["failed"], 1)
+        self.assertIsNone(device_tests.tidy_notes("https://s", TOKEN, get=lambda r, timeout: (_ for _ in ()).throw(
+            urllib.error.HTTPError(r.full_url, 401, "no", {}, None)), post=patch_(200)))
+
+    def test_the_tidy_step_prints_counts_and_signs_its_session_out(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environ = {"RUNNER_TEMP": directory.name, "MAY_TEST_SIGNIN_SECRET": "s" * 32,
+                   "MAY_STAGING_API_URL": device_tests.STAGING_BASE, "PATH": "/usr/bin"}
+        signed_out = []
+        counts = {"tasks": 1, "lines": 3, "mixed": 1, "saved": 1, "failed": 0}
+        with patch.dict(os.environ, environ, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
+            device_tests.tidy(minted=lambda base, secret: TOKEN, tidied=lambda base, token: counts,
+                              revoked_by=lambda base, token: signed_out.append(token) or True)
+            self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
+        self.assertEqual(out.getvalue(), "May device tests: 1 file taxes tasks found; 3 leftover note lines removed "
+                                         "from 1 of them, 0 not saved; 1 mixed lines kept\n")
+        self.assertEqual(signed_out, [TOKEN])
+        for answer, message in ((None, "The Agenda could not be read"), (dict(counts, failed=1), "could not be saved")):
+            with self.subTest(answer=answer), patch.dict(os.environ, environ, clear=True), \
+                    patch("sys.stdout", new_callable=io.StringIO), self.assertRaisesRegex(device_tests.DeviceTestsError, message):
+                device_tests.tidy(minted=lambda base, secret: TOKEN, tidied=lambda base, token: answer,
+                                  revoked_by=lambda base, token: signed_out.append(token) or True)
+        self.assertEqual(signed_out, [TOKEN] * 3, "signed out whatever the tidy found")
 
     def test_a_delivery_truth_records_whether_every_tagged_message_succeeded(self):
         row = {"driver": "agent", "goal": "Send this message: hi {tag}", "server": [], "truth": [{"delivery": "succeeded"}]}
@@ -666,6 +791,19 @@ class ServerTruthTests(unittest.TestCase):
         get, _ = server([{"id": "may", "name": "May"}], {"/v1/conversations/may/messages": [question]})
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
                          "a question in a chat without the tag is someone else's")
+        closed = {"id": "m3", "kind": "question", "question": {"state": "closed"}}
+        get, _ = server([{"id": "a7", "name": tag + " chat"}],
+                        {"/v1/conversations/a7/messages": [{"kind": "text", "text": tag}, closed, question]})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
+                         "coordinator, 26 Oct: the first card after the run's message is the one judged, never a later "
+                         "one")
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "closed", tag, get=get), (200, True))
+        get, seen = server([{"id": "may", "name": "May"}, {"id": "a7", "name": tag + " chat"}],
+                           {"/v1/conversations/may/messages": [{"kind": "text", "text": tag}, question],
+                            "/v1/conversations/a7/messages": [{"kind": "text", "text": tag}]})
+        self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False),
+                         "with a chat of its own, a card in May's shared chat is never the run's")
+        self.assertEqual(seen, ["/v1/agents", "/v1/conversations/a7/messages"])
         get, seen = server([{"id": "../../v1/account", "name": tag}], {})
         self.assertEqual(device_tests.question_truth("https://s", TOKEN, "answered", tag, get=get), (200, False))
         self.assertEqual(seen, ["/v1/agents"], "an id that is not a plain id is never put in a path")
@@ -727,8 +865,13 @@ class ServerTruthTests(unittest.TestCase):
                 {"author": "user", "text": "Again " + tag},
                 {"author": "user", "text": "Odd " + tag, "latest_run": {"status": "Sent!", "error_code": "<b>"}}]})
         codes = device_tests.message_codes("https://s", TOKEN, tag, get=get)
-        self.assertEqual(sorted(codes), sorted(["failed (model_cap_reached)", "succeeded", "no run", "unknown"]))
-        self.assertEqual(set(seen), {"/v1/agents", "/v1/conversations/may/messages", "/v1/conversations/a7/messages"})
+        self.assertEqual(sorted(codes), sorted(["succeeded", "no run", "unknown"]),
+                         "coordinator, 26 Oct: the run's own chat alone, never May's shared one beside it")
+        self.assertEqual(set(seen), {"/v1/agents", "/v1/conversations/a7/messages"})
+        get, seen = server(may[:1], {"/v1/conversations/may/messages": [
+            {"author": "user", "text": "Hello " + tag, "latest_run": {"status": "failed", "error_code": "model_cap_reached"}}]})
+        self.assertEqual(device_tests.message_codes("https://s", TOKEN, tag, get=get), ["failed (model_cap_reached)"],
+                         "with no chat of its own, May's is read")
         for text in ("Hello", "Plan", "Sent!", "<b>", "other"):
             self.assertNotIn(text, json.dumps(codes), "codes alone leave the reader")
         get, _ = server(may, {"/v1/conversations/may/messages": [{"author": "user", "text": "untagged"}]})
@@ -995,7 +1138,8 @@ class AgentRunnerTests(unittest.TestCase):
             ("poll-skip", [{"get": "/v1/agents", "status": 200, "pass": False}],
              ["May's question card in this run's tagged chat is closed: not confirmed"]),
             ("notes", [{"get": "/v1/commitments", "status": 200, "pass": False, "unverified": True}],
-             ["the tagged task holds the goal's note: could not be checked"]),
+             ["the task titled with the tag holds the goal's note and none of that title is left open: could "
+              "not be checked"]),
             ("chat", [{"get": "/v1/agents", "status": 200, "pass": True}],
              ["every tagged message this run sent has a succeeded reply: confirmed"]))
         for scenario, reads, lines in cases:

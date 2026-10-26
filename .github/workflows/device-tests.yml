@@ -22,6 +22,11 @@ on:
         required: false
         type: boolean
         default: false
+      tidy_file_taxes:
+        description: One-off, instead of the scenarios - remove earlier runs' leftover note lines from the test account's "file taxes" task
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "17 3 * * *"
 permissions:
@@ -56,8 +61,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha || 'main' }}
         run: python3 -I -S -B tools/may_release/gate.py --action device-tests --source-sha "$MAY_SOURCE_SHA"
+  tidy:
+    # The one-off clean-up (tidy_file_taxes): a shared-account test session, earlier notes runs' leftover lines removed
+    # from its "file taxes" task, the session signed out (device_tests.py tidy). No may-app code and no device: the
+    # secret is in this one step's environment, and the log carries counts alone.
+    needs: admission
+    if: ${{ inputs.tidy_file_taxes }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Remove the leftover note lines from the test account's file taxes task
+        env:
+          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}
+          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
+        run: python3 -I -S -B tools/may_release/device_tests.py tidy
   android:
     needs: admission
+    if: ${{ !inputs.tidy_file_taxes }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 120
@@ -131,6 +157,7 @@ jobs:
     # the test session handed over in SIMCTL_CHILD_MAY_TEST_SESSION, the agent acting through Maestro's driver. The
     # Claude token is in its scenarios and judge steps alone, as on Android.
     needs: admission
+    if: ${{ !inputs.tidy_file_taxes }}
     runs-on: macos-15
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 120
@@ -195,7 +222,7 @@ jobs:
     # live in one step. Recordings never enter may-renders' git history: they are assets of the run's release.
     # It publishes whatever the device jobs sealed, even when one then failed its verdict.
     needs: [admission, android, ios]
-    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    if: ${{ !cancelled() && needs.admission.result == 'success' && !inputs.tidy_file_taxes }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 30

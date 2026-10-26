@@ -52,6 +52,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -84,10 +85,18 @@ SERVER_PATH = re.compile(r"/v1/[a-z0-9/_-]{1,120}")
 TRUTH_PATHS = ("/v1/approvals", "/v1/inbox", "/v1/commitments", "/v1/routines")
 QUESTION_STATES = ("answered", "closed")
 # Server truth a row can ask for besides those reads (coordinator, 25 Oct): {"delivery": "succeeded"}, every tagged
-# message's reply run succeeded (chat); {"get": NOTE_PATH, "note": "{tag} ..."}, the Agenda task whose title holds the
-# scenario's tag has those words in its notes, which the server keeps as the commitment's description (notes). A
-# row's plain "server" reads expect one of EXPECTS: 401 is a session the app signed out (sign-out).
+# message's reply run succeeded (chat); {"get": NOTE_PATH, "task": "{tag} task", "note": "{tag} ..."}, the Agenda task
+# titled exactly "task" has those words in its notes, which the server keeps as the commitment's description, and no
+# task of that title is left open (CLOSED: the goal deletes it at its end), so a note typed into another task never
+# passes (coordinator, 26 Oct: run 40243708096's notes left lines in an older task). A row's plain "server" reads
+# expect one of EXPECTS: 401 is a session the app signed out (sign-out).
 DELIVERY_TRUTH, NOTE_PATH, EXPECTS, MAX_NOTE = {"delivery": "succeeded"}, "/v1/commitments", (200, 401), 200
+CLOSED = ("completed", "cancelled")
+NOTE_GOAL = "Do not open any existing task; create a new one."
+# A row with "chat": true talks to May in a chat of its own, made for it before its agent starts (make_chat: POST
+# /v1/agents, named CHAT_NAME with its tag, removed by the test session's cleanup with the tag), never in the shared
+# May chat that every earlier run wrote to (coordinator, 26 Oct). Its goal opens that chat by name.
+CHAT_NAME, CHAT_GOAL = "{tag} chat", "open the chat named {tag} chat"
 AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 MAX_CHATS = 10
 MAX_GOAL = 1500
@@ -201,6 +210,7 @@ MODEL_CAP = "skipped: the test account's model calls for today are nearly used u
 MINT_FAILED = "skipped: staging did not mint a test session for it"
 MINT_RETRY_SECONDS = 30
 MINT_FATAL = (401, 403, 404)
+NO_CHAT = "skipped: staging did not make the scenario's own chat"
 
 
 def fresh_switch():
@@ -278,10 +288,14 @@ def scenarios(selection="all", platform="android"):
                     all(isinstance(c, dict) and (set(c) == {"get"} and c["get"] in TRUTH_PATHS or
                                                  set(c) == {"question"} and c["question"] in QUESTION_STATES or
                                                  c == DELIVERY_TRUTH and "Send this message" in row["goal"] or
-                                                 set(c) == {"get", "note"} and c["get"] == NOTE_PATH and
+                                                 set(c) == {"get", "task", "note"} and c["get"] == NOTE_PATH and
+                                                 c["task"] == "{tag} task" and NOTE_GOAL in row["goal"] and
+                                                 row["goal"].endswith(f"then delete the {c['task']}.") and
                                                  isinstance(c["note"], str) and c["note"].startswith("{tag} ") and
                                                  len(c["note"]) <= MAX_NOTE and c["note"][6:] in row["goal"])
-                        for c in row["truth"]) or
+                        for c in row["truth"]) and
+                    ("chat" not in row or row["chat"] is True and "Send this message" in row["goal"] and
+                     CHAT_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
                     isinstance(row.get("goal"), str) and len(row["goal"]) <= MAX_GOAL and row.get("server") == [])
                 and isinstance(row.get("title"), str) and
@@ -290,7 +304,7 @@ def scenarios(selection="all", platform="android"):
                 ("steps" not in row or driver == "agent" and type(row["steps"]) is int and
                  device_mcp.MAX_ACTIONS < row["steps"] <= device_mcp.MOST_ACTIONS) and
                 ("onboarding" not in row or row["onboarding"] == RECORD and driver == "agent" and
-                 row.get("fresh") is True) and
+                 row.get("fresh") is True) and ("chat" not in row or driver == "agent") and
                 isinstance(row.get("server"), list) and
                 all(isinstance(c, dict) and isinstance(c.get("get"), str) and SERVER_PATH.fullmatch(c["get"]) and
                     c.get("expect") in EXPECTS and type(c.get("expect")) is int for c in row["server"])):
@@ -449,20 +463,27 @@ def run_messages(messages, tag):
     return messages[start:]
 
 
+def run_chats(data, tag):
+    """The chats a scenario's messages are read in (GET /v1/agents' reply): those named with its tag (its own, made by
+    make_chat), or, when there is none, May's own (the first), at most MAX_CHATS."""
+    agents = [row for row in listed(data, "agents") if isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
+    chosen = [row for row in agents if holds(row.get("name"), tag)] or agents[:1]
+    return list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]
+
+
 def question_truth(base, token, state, tag, get=urllib.request.urlopen):
     """K's route to a question card (21 Oct): every chat is an agent (GET /v1/agents, May's own first), and a chat's
-    id is its conversation's. True when a chat named with the tag, or May's own, holds the tag and a question
-    message whose state is state (answered, or closed: the app's Skipped)."""
+    id is its conversation's. True when the run's chat (run_chats) holds the tag, and the first question card after
+    it is in state (answered, or closed: the app's Skipped): a later card, or another run's, never passes."""
     status, data = read_json(base, token, "/v1/agents", get)
     if status != 200:
         return status, False
-    agents = [row for row in listed(data, "agents") if isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
-    chosen = [row for row in agents if holds(row.get("name"), tag)] + agents[:1]
-    for agent in list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]:
+    for agent in run_chats(data, tag):
         status, messages = chat_messages(base, token, agent["id"], get)
         # A question card counts only after the run's own first tagged message: an older run's card never passes.
-        if any(message.get("kind") == "question" and isinstance(message.get("question"), dict)
-               and message["question"].get("state") == state for message in run_messages(messages, tag)):
+        card = next((message["question"] for message in run_messages(messages, tag)
+                     if message.get("kind") == "question" and isinstance(message.get("question"), dict)), None)
+        if card is not None and card.get("state") == state:
             return 200, True
     return 200, False
 
@@ -474,20 +495,107 @@ NONE_STORED = "none stored"
 MAX_DELIVERY = 10
 
 
-def commitment_note(base, token, tag, note, get=urllib.request.urlopen):
-    """The Agenda's first page (GET NOTE_PATH, without a cursor: up to the server's 200 items) read for the task whose
-    title holds tag: (HTTP status, "found" when its notes, the commitment's description, hold note; "absent" when the
-    tagged task is not there, or its notes do not hold it; "beyond" when it is not there and the page has more after
-    it, so the run cannot tell). Only the tag and the note are looked for; nothing read is kept or printed."""
+def commitment_note(base, token, title, note, get=urllib.request.urlopen):
+    """The Agenda's first page (GET NOTE_PATH, without a cursor: up to the server's 200 items) read for the tasks titled
+    exactly title (case and outer spaces aside; a deleted task is still listed, closed): (HTTP status, "found" when
+    one's notes, the commitment's description, hold note and none is left open; "open" when the note is there but a
+    task of that title is still open; "absent" when no such task is there, or none's notes hold it; "beyond" when none
+    is there and the page has more after it, so the run cannot tell). Only the title and the note are looked for;
+    nothing read is kept or printed."""
     status, data = read_json(base, token, NOTE_PATH, get)
     if status != 200:
         return status, "absent"
-    tasks = [task for task in listed(data, "commitments") if holds(task.get("title"), tag)]
+    tasks = [task for task in listed(data, "commitments")
+             if isinstance(task.get("title"), str) and task["title"].strip().lower() == title.lower()]
     if not tasks:
         more = isinstance(data, dict) and isinstance(data.get("next_cursor"), str) and data["next_cursor"] != ""
         return status, "beyond" if more else "absent"
-    noted = any(isinstance(task.get("description"), str) and note in task["description"] for task in tasks)
-    return status, "found" if noted else "absent"
+    if not any(isinstance(task.get("description"), str) and note in task["description"] for task in tasks):
+        return status, "absent"
+    return status, "open" if any(task.get("status") not in CLOSED for task in tasks) else "found"
+
+
+# A one-off (coordinator, 26 Oct): earlier notes runs typed their note into the shared account's "file taxes" task
+# instead of a task of their own. `tidy` removes only those lines from it: a line made of nothing but such notes
+# (LEFTOVER_NOTE, the notes goal's words after a run's tag); any other line, a mixed one included, is kept.
+TIDY_TITLE = "file taxes"
+LEFTOVER_NOTE = re.compile(r"(?:\s*qa-[0-9]+(?:-[a-z0-9]+)* note from the device test\.?)+\s*", re.IGNORECASE)
+MAX_AGENDA_PAGES = 20
+
+
+def tidy_lines(text):
+    """(notes without the leftover note lines, lines removed, mixed lines kept: those holding such a note among other
+    words)."""
+    kept, removed, mixed = [], 0, 0
+    for line in text.split("\n"):
+        if LEFTOVER_NOTE.fullmatch(line):
+            removed += 1
+            continue
+        mixed += LEFTOVER_NOTE.search(line) is not None
+        kept.append(line)
+    return "\n".join(kept), removed, mixed
+
+
+def tidy_notes(base, token, get=urllib.request.urlopen, post=urllib.request.urlopen):
+    """The shared account's tasks titled TIDY_TITLE, every Agenda page read (at most MAX_AGENDA_PAGES), each with
+    leftover note lines saved without them (PATCH /v1/commitments/<id> at its revision): counts alone, {"tasks",
+    "lines", "mixed", "saved", "failed"}, or None when the Agenda could not be read. Nothing read is kept or printed."""
+    tasks, cursor = [], None
+    for _ in range(MAX_AGENDA_PAGES):
+        status, data = read_json(base, token, NOTE_PATH + (f"?cursor={urllib.parse.quote(cursor)}" if cursor else ""),
+                                 get)
+        if status != 200 or not isinstance(data, dict):
+            return None
+        tasks += [task for task in listed(data, "commitments")
+                  if isinstance(task.get("title"), str) and task["title"].strip().lower() == TIDY_TITLE]
+        cursor = data.get("next_cursor")
+        if not (isinstance(cursor, str) and cursor):
+            break
+    counts = {"tasks": len(tasks), "lines": 0, "mixed": 0, "saved": 0, "failed": 0}
+    for task in tasks:
+        if not (isinstance(task.get("description"), str) and isinstance(task.get("id"), str) and
+                AGENT_ID.fullmatch(task["id"]) and type(task.get("revision")) is int):
+            continue
+        notes, removed, mixed = tidy_lines(task["description"])
+        counts["mixed"] += mixed
+        if not removed:
+            continue
+        counts["lines"] += removed
+        request = urllib.request.Request(base + f"{NOTE_PATH}/{task['id']}", method="PATCH",
+                                         data=json.dumps({"expected_revision": task["revision"],
+                                                          "description": notes.strip() or None}).encode(),
+                                         headers={"Authorization": "Bearer " + token,
+                                                  "Content-Type": "application/json"})
+        try:
+            with post(request, timeout=60) as reply:
+                saved = reply.status == 200
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            saved = False
+        counts["saved" if saved else "failed"] += 1
+    return counts
+
+
+def tidy(minted=mint, tidied=tidy_notes, revoked_by=None):
+    """The `tidy` step (device-tests.yml, tidy_file_taxes): one shared-account session, the leftover note lines
+    removed from its TIDY_TITLE tasks, the session signed out (revoke, defined below). Prints counts alone."""
+    revoked_by = revoked_by or revoke
+    require_step_secrets((SIGNIN_SECRET,))
+    secret = os.environ.pop(SIGNIN_SECRET, "")
+    base = staging(secret, True)
+    token = minted(base, secret)
+    secret = ""
+    try:
+        counts = tidied(base, token)
+    finally:
+        revoked_by(base, token)
+        token = ""
+    if counts is None:
+        raise DeviceTestsError("The Agenda could not be read; nothing was changed")
+    tasks, lines, saved, failed, mixed = (counts[key] for key in ("tasks", "lines", "saved", "failed", "mixed"))
+    print(f"May device tests: {tasks} file taxes tasks found; {lines} leftover note lines removed from {saved} of "
+          f"them, {failed} not saved; {mixed} mixed lines kept")
+    if failed:
+        raise DeviceTestsError("A task's notes could not be saved")
 
 
 def server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted):
@@ -506,7 +614,7 @@ def server_reads(row, entry, base, token, own, checked, truth, asked, delivered,
             path, status = "/v1/agents", 0 if codes is None else 200
             found = bool(codes) and all(code == "succeeded" for code in codes)
         elif "note" in check:
-            status, state = noted(base, token, own, check["note"].replace("{tag}", own))
+            status, state = noted(base, token, check["task"].replace("{tag}", own), check["note"].replace("{tag}", own))
             if state == "beyond":
                 entry["server"].append({"get": NOTE_PATH, "status": status, "pass": False, "unverified": True})
                 continue
@@ -522,17 +630,15 @@ def sends_messages(row):
 
 
 def message_codes(base, token, tag, get=urllib.request.urlopen):
-    """For each of the user's messages holding the tag, in May's own chat and any named with it (as question_truth),
+    """For each of the user's messages holding the tag, in the run's chats (run_chats, as question_truth),
     its reply run's "<status>" or "<status> (<error_code>)" (latest_run), or "no run": at most MAX_DELIVERY. None
     stored at all ([NONE_STORED]) means no tagged user message was found in the chats read. None when the chats
     could not be read. The text is read here only to find the tag."""
     status, data = read_json(base, token, "/v1/agents", get)
     if status != 200:
         return None
-    agents = [row for row in listed(data, "agents") if isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
-    chosen = [row for row in agents if holds(row.get("name"), tag)] + agents[:1]
     codes = []
-    for agent in list({row["id"]: row for row in chosen}.values())[:MAX_CHATS]:
+    for agent in run_chats(data, tag):
         status, messages = chat_messages(base, token, agent["id"], get)
         for message in messages:
             if message.get("author") == "user" and holds(message, tag):
@@ -562,6 +668,36 @@ def cleanup(base, token, since, tag, post=urllib.request.urlopen):
     counts = [data.get(key) for key in ("chats", "tasks", "notes", "routines", "for_you", "approvals_expired")] \
         if isinstance(data, dict) else []
     return sum(count for count in counts if type(count) is int and count >= 0)
+
+
+def make_chat(base, token, tag, post=urllib.request.urlopen):
+    """A scenario's own chat (CHAT_NAME with its tag), made with its session before its agent starts: POST /v1/agents
+    {client_key, name}, keyed by the tag so a repeat makes no second one. True when staging answered 200 or 201 with
+    the chat's id. Nothing from the reply is kept or printed."""
+    request = urllib.request.Request(base + "/v1/agents", method="POST",
+                                     data=json.dumps({"client_key": tag, "name": CHAT_NAME.replace("{tag}", tag)})
+                                     .encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            status, data = reply.status, json.loads(reply.read(1024 * 1024))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+    found = data.get("agent", data) if isinstance(data, dict) else None
+    return status in (200, 201) and isinstance(found, dict) and isinstance(found.get("id"), str) and \
+        AGENT_ID.fullmatch(found["id"]) is not None
+
+
+def own_chat(row, entry, base, token, own, made):
+    """Whether a scenario may start: True, or, for a row with "chat" whose chat staging did not make, False with
+    entry's reason NO_CHAT."""
+    if not row.get("chat"):
+        return True
+    at(f"{row['id']}: making its own chat")
+    if made(base, token, own):
+        return True
+    entry["reason"] = NO_CHAT
+    return False
 
 
 def model_calls_left(base, token, get=urllib.request.urlopen):
@@ -1280,7 +1416,7 @@ def settle(entry, row, passed):
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None, revoked_by=revoke,
-                  noted=commitment_note):
+                  noted=commitment_note, made=make_chat):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -1356,6 +1492,10 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 token = ""
                 continue
             own = scenario_tag(tag, row)  # the scenario's own tag
+            if not own_chat(row, entry, base, token, own, made):
+                accounts.finish(row, base, token)
+                token = ""
+                continue
             at(f"{row['id']}: launching the app")
             launch(adb, env, token, log)
             recorder = Recorder(adb, env, row["id"], log)
@@ -1581,7 +1721,7 @@ def truth_lines(row, entry):
         elif check == DELIVERY_TRUTH:
             what = "every tagged message this run sent has a succeeded reply"
         elif "note" in check:
-            what = "the tagged task holds the goal's note"
+            what = "the task titled with the tag holds the goal's note and none of that title is left open"
         else:
             what = f"an item holding the tag is listed by GET {check['get']}"
         lines.append(what + ": " + ("could not be checked" if read.get("unverified") else
@@ -1604,10 +1744,13 @@ def smoke_rows(platform):
 # publish job that holds the publish secrets (review of may-releases #88). A dot is never in a scenario id, so a
 # preview never shares a name with a recording; publish.py only checks and uploads them.
 PREVIEW, PREVIEW_WIDTH, PREVIEW_SECONDS = ".preview.mp4", 270, 300
-# A preview is a timelapse of the whole recording, at most PREVIEW_MAX_SECONDS long at PREVIEW_FPS and about
-# PREVIEW_BITRATE, so it stays well under MAX_PREVIEW (run 40075535088: a 10-minute iOS chat preview came to 15.9 MB,
-# over the artifact's 15 MB limit). One over MAX_PREVIEW is left out.
+# A preview is a timelapse of the whole recording, every part of it in order (coordinator, 26 Oct: previews showed only
+# the first part, 3 minutes on Android and 5 on iOS, of a 15-minute run), at most PREVIEW_MAX_SECONDS long at
+# PREVIEW_FPS and about PREVIEW_BITRATE, so it stays well under MAX_PREVIEW (run 40075535088: a 10-minute iOS chat
+# preview came to 15.9 MB, over the artifact's 15 MB limit). One over MAX_PREVIEW is left out. On Android a small
+# "×N" in a corner says how much faster than life it plays, when the image has PREVIEW_FONT.
 PREVIEW_MAX_SECONDS, PREVIEW_FPS, PREVIEW_BITRATE = 60, 8, 160_000
+PREVIEW_FONT = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 MAX_PREVIEW = 2 * 1024 * 1024
 # The preview step's own timeout is 8 minutes (device-tests.yml), so the seal always has its turn before the job's 120
 # (run 40075535088: a 25-minute step after a full 100-minute run could outlast the job and lose the report). No new
@@ -1617,8 +1760,9 @@ PREVIEW_STEP_SECONDS = 6 * 60
 
 
 def preview_sources(folder):
-    """(scenario, recording) for each scenario the device report recorded, keyed by the report's own rows (never
-    worked out from a file name, which an id ending "-partN" would confuse): its first recording."""
+    """(scenario, recordings) for each scenario the device report recorded, keyed by the report's own rows (never
+    worked out from a file name, which an id ending "-partN" would confuse): its recordings in the report's order, the
+    whole run, each a plain MP4 in the run folder."""
     try:
         rows = json.loads((folder / "report.json").read_text())["scenarios"]
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
@@ -1626,11 +1770,13 @@ def preview_sources(folder):
     for row in rows if isinstance(rows, list) else []:
         videos = row.get("videos") if isinstance(row, dict) else None
         if not (isinstance(row.get("id") if isinstance(row, dict) else None, str) and SCENARIO_ID.fullmatch(row["id"])
-                and isinstance(videos, list) and videos and isinstance(videos[0], str)):
+                and isinstance(videos, list) and videos and all(isinstance(video, str) for video in videos)):
             continue
-        video = folder / videos[0]
-        if video.parent == folder and video.suffix == ".mp4" and video.is_file() and not video.is_symlink():
-            yield row["id"], video
+        parts = [folder / video for video in videos]
+        parts = [part for part in parts if part.parent == folder and part.suffix == ".mp4" and part.is_file() and
+                 not part.is_symlink()]
+        if parts:
+            yield row["id"], parts
 
 
 def mp4_seconds(path):
@@ -1665,6 +1811,11 @@ def timelapse(seconds):
     return max(1.0, (seconds or 0) / PREVIEW_MAX_SECONDS)
 
 
+def recorded_seconds(videos):
+    """A scenario's recorded length, its parts' together; a part whose header gives none counts as 0."""
+    return sum(mp4_seconds(video) or 0 for video in videos)
+
+
 def ffmpeg_encoder(root, log):
     """Ubuntu's ffmpeg from apt (its current, patched build; apt checks the archive's signature): the function that
     makes one preview. Raises DeviceTestsError when it will not install."""
@@ -1674,15 +1825,24 @@ def ffmpeg_encoder(root, log):
         if flows.run_private(argv, log, env=env, check=False, timeout=600):
             raise DeviceTestsError("ffmpeg did not install")
 
-    def encode(video, target):
-        speed = timelapse(mp4_seconds(video))
-        return not flows.run_private(
-            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(video), "-an", "-vf",
-             f"setpts=PTS/{speed:.4f},fps={PREVIEW_FPS},scale={PREVIEW_WIDTH}:-2", "-c:v", "libx264", "-preset",
-             "veryfast", "-crf", "34", "-maxrate", str(PREVIEW_BITRATE), "-bufsize", str(2 * PREVIEW_BITRATE),
-             "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", str(PREVIEW_MAX_SECONDS), "-n", str(target)],
-            log, env=env, check=False, timeout=PREVIEW_SECONDS)
+    def encode(videos, target):
+        return not flows.run_private(preview_argv(videos, target), log, env=env, check=False, timeout=PREVIEW_SECONDS)
     return encode
+
+
+def preview_argv(videos, target):
+    """ffmpeg's command for one preview: the parts joined in order (concat), sped up (setpts) so the whole lasts
+    PREVIEW_MAX_SECONDS at most, then thinned, scaled and, when the image has PREVIEW_FONT and the preview is sped up,
+    marked "×N" (N the speed-up, rounded)."""
+    speed, font = timelapse(recorded_seconds(videos)), PREVIEW_FONT
+    joined = "".join(f"[{at}:v:0]" for at in range(len(videos))) + f"concat=n={len(videos)}:v=1:a=0,"
+    label = f",drawtext=fontfile={font}:text=\u00d7{round(speed)}:fontsize=14:fontcolor=white:box=1:" \
+        "boxcolor=black@0.5:boxborderw=3:x=w-tw-6:y=6" if font.is_file() and speed > 1 else ""
+    return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            *(arg for video in videos for arg in ("-i", str(video))), "-an", "-filter_complex",
+            f"{joined}setpts=PTS/{speed:.4f},fps={PREVIEW_FPS},scale={PREVIEW_WIDTH}:-2{label}", "-c:v", "libx264",
+            "-preset", "veryfast", "-crf", "34", "-maxrate", str(PREVIEW_BITRATE), "-bufsize", str(2 * PREVIEW_BITRATE),
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", str(PREVIEW_MAX_SECONDS), "-n", str(target)]
 
 
 def render_prototypes(copied=device_prototypes.copy_paths, rendered=device_prototypes.render):
@@ -1765,14 +1925,14 @@ def previews_in(platform, encoder, clock=time.monotonic):
     except Exception:
         return 0, None
     made = failed = 0
-    for scenario, video in sources:
+    for scenario, videos in sources:
         if clock() - started > PREVIEW_STEP_SECONDS:
             failed += 1
             continue
         target, part = folder / (scenario + PREVIEW), log.parent / (scenario + PREVIEW)
         try:
             part.unlink(missing_ok=True)
-            ok = encoder(video, part) and part.is_file() and not part.is_symlink() and \
+            ok = encoder(videos, part) and part.is_file() and not part.is_symlink() and \
                 part.stat().st_size <= MAX_PREVIEW and part.read_bytes()[4:8] == b"ftyp"
             if ok:
                 os.replace(part, target)
@@ -1836,7 +1996,8 @@ def verdict(platform="android"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("build", "run", "judge", "previews", "prototypes", "seal", "verdict"))
+    parser.add_argument("command", choices=("build", "run", "judge", "previews", "prototypes", "seal", "verdict",
+                                            "tidy"))
     parser.add_argument("--scenarios", default="all")
     parser.add_argument("--platform", choices=PLATFORMS, default="android")
     args = parser.parse_args()
@@ -1856,7 +2017,7 @@ if __name__ == "__main__":
         else:
             {"judge": lambda: judge_scenarios(platform=args.platform), "seal": lambda: seal(args.platform),
              "previews": lambda: make_previews(args.platform), "prototypes": render_prototypes,
-             "verdict": lambda: verdict(args.platform)}[args.command]()
+             "verdict": lambda: verdict(args.platform), "tidy": tidy}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None
     except Exception as error:

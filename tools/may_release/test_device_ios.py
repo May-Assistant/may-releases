@@ -155,7 +155,7 @@ class RunTests(Workspace):
             minted.append("fresh" if fresh else secret)
             return TOKEN + str(len(minted))
 
-        self.deleted, self.cleaned_tags = [], []
+        self.deleted, self.cleaned_tags, self.chats = [], [], []
 
         environ = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin", **(env or {})}
@@ -170,6 +170,7 @@ class RunTests(Workspace):
                                      revoked_by=lambda base, token: self.signed_out.append(token) or True,
                                      truth=lambda base, token, path, tag: (200, True),
                                      noted=lambda base, token, tag, note: (200, "found"),
+                                     made=lambda base, token, tag: self.chats.append(tag) or True,
                                      asked=lambda base, token, state, tag: (200, True),
                                      cleaned=lambda base, token, since, tag: self.cleaned_tags.append(tag) or 2,
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
