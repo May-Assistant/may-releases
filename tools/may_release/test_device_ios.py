@@ -209,7 +209,7 @@ class RunTests(Workspace):
                 events.append(("keep", scenario, token, list(test.signed_out)))
                 super().keep(folder, scenario, token, driver, onboarding)
 
-        calls, minted, report, out, run = self.run_it(diagnosed=Keeping)
+        calls, minted, report, out, run = self.run_it(diagnosed=Keeping, env={device_ios.DIAGNOSTICS: "true"})
         self.assertEqual(events, ["begin", ("keep", "sign-in", TOKEN + "1", []),
                                   "begin", ("keep", "connections", TOKEN + "2", [TOKEN + "1"])],
                          "kept before its own sign-out, with its own session for the redaction")
@@ -225,6 +225,44 @@ class RunTests(Workspace):
         self.assertEqual(spans, ["May device tests (ios): main-thread span event-store: 2, the longest 1180 ms",
                                  "May device tests (ios): main-thread span recognizer: 2, the longest 410 ms"],
                          "per name across the scenarios, in the agreed order, only the names seen")
+
+    def test_the_watchdog_and_change_log_are_asked_for_at_launch_only_when_dispatched(self):
+        """may-app #1338: both are opt-in at launch; ios_diagnostics asks for them on evidence runs alone."""
+        def launches(calls):
+            return [env for argv, env in calls if argv[:3] == ["xcrun", "simctl", "launch"]]
+
+        calls, minted, report, out, run = self.run_it(env={device_ios.DIAGNOSTICS: "true"})
+        self.assertTrue(launches(calls))
+        for env in launches(calls):
+            self.assertEqual((env.get("SIMCTL_CHILD_MAY_DIAG_WATCHDOG"), env.get("SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES")),
+                             ("1", "1"))
+        self.assertIn("May device tests (ios): the main-thread watchdog and SwiftUI's change log are on for this run",
+                      out.splitlines())
+        for value in (None, "false", "", "TRUE "):
+            with self.subTest(value=value):
+                (self.private / device_tests.AGENTS).unlink(missing_ok=True)
+                calls, minted, report, out, run = self.run_it(env={device_ios.DIAGNOSTICS: value})
+                self.assertTrue(launches(calls))
+                for env in launches(calls):
+                    self.assertFalse([k for k in env if k.startswith("SIMCTL_CHILD_MAY_DIAG_")])
+                self.assertNotIn("watchdog", out)
+
+    def test_a_plain_run_says_its_stalls_were_not_collected_never_zero(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        test = self
+
+        class Keeping(device_ios.Diagnostics):
+            def __init__(self, udid, env):
+                super().__init__(udid, env, reports=test.root / "no-reports", shown=lambda *a: b"")
+
+            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
+                super().keep(folder, scenario, token, driver, b"onboarding line\n")
+
+        calls, minted, report, out, run = self.run_it(diagnosed=Keeping)
+        self.assertIn("May device tests (ios): diagnostics kept for 2 scenarios (main-thread stalls not collected: "
+                      "dispatch with ios_diagnostics for them; 0 with a crash; 0 with refused device acts)",
+                      out.splitlines())
+        self.assertNotIn("0 main-thread stalls", out)
 
     def test_reduce_motion_is_turned_on_before_the_app_starts_only_when_dispatched(self):
         """The coordinator's A/B switch (25 Oct): ios_reduce_motion, off unless dispatched true."""
