@@ -1,6 +1,7 @@
 """Failing Android unit tests, posted on the may-app pull request only (android_unit.py --record-outcome,
 android_unit_post.py, android-unit-pr.yml)."""
 
+import contextlib
 import io
 import json
 import os
@@ -16,6 +17,7 @@ from xml.sax.saxutils import escape, quoteattr
 import android_unit
 import android_unit_post as tool
 from android_unit_post import UnitPostError, comment_body
+import sealed
 import static_check
 from store import StoreError
 from test_android_unit import PRIVATE, Fixture
@@ -26,6 +28,7 @@ WORKFLOW = ".github/workflows/android-unit-pr.yml"
 PULLS = "/repos/May-Assistant/may-app/pulls/42"
 COMMENTS = "/repos/May-Assistant/may-app/issues/42/comments"
 SECRET_TEXT = "PRIVATE-ASSERTION-TEXT-91f3"
+HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
 
 
 def junit(tests, name=PRIVATE):
@@ -310,7 +313,7 @@ class CommentTests(unittest.TestCase):
             comment_body("main", None, *recorded())
 
 
-class PostTests(unittest.TestCase):
+class PostCase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name).resolve()
@@ -352,6 +355,8 @@ class PostTests(unittest.TestCase):
     def posted(self):
         return [payload["body"] for method, path, payload in self.calls if method == "POST"]
 
+
+class PostTests(PostCase):
     def test_failures_are_posted_once_and_the_job_fails_with_a_fixed_line(self):
         code, out = self.post(self.api())
         self.assertEqual(code, 1)
@@ -371,20 +376,64 @@ class PostTests(unittest.TestCase):
         self.assertIn("MAY_APP_PR_COMMENT_TOKEN is not set", out)
         self.assertEqual(self.calls, [])
 
-    def test_the_step_summary_carries_counts_only_with_or_without_the_token(self):
-        for token in (None, TOKEN):
-            with self.subTest(token=bool(token)):
-                summary = self.root / "summary.md"
-                summary.unlink(missing_ok=True)
-                self.write(*recorded(unreadable=2))
-                self.post(self.api(), token=token, extra={"GITHUB_STEP_SUMMARY": str(summary)})
-                self.assertEqual(summary.read_text(), "\n".join([
-                    "### May Android unit suites: failed", "", "| Suite | Tests | Failed | Skipped |", "|---|---|---|---|",
-                    "| core | 2 | 1 | 0 |", "| playground | 5 | 0 | 0 |", "| production | 2 | 0 | 0 |", "",
-                    "1 failing tests and 2 unreadable reports. Which tests failed goes only to the may-app pull request, "
-                    "never here."]) + "\n")
-                self.assertNotIn(PRIVATE, summary.read_text())
-                self.assertNotIn(SECRET_TEXT, summary.read_text())
+    def verdict(self, extra=None):
+        out = io.StringIO()
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), **(extra or {})}, clear=True), patch("sys.stdout", out):
+            code = tool.verdict()
+        return code, out.getvalue()
+
+    def test_the_verdict_fails_the_unit_job_when_the_suites_failed_in_fixed_lines(self):
+        self.assertEqual(self.verdict(), (1, "May Android unit suites failed; which tests goes to the may-app pull "
+                                             "request only\n"))
+        self.write(*recorded("passed", []))
+        self.assertEqual(self.verdict(), (0, "May Android unit suites passed\n"))
+        with self.assertRaises(StoreError):
+            self.verdict({"MAY_APP_READ_KEY": "x"})
+
+    def test_without_a_record_or_a_unit_result_nothing_is_posted(self):
+        (self.root / "may-private" / android_unit.OUTCOME).unlink()
+        for result in (None, "cancelled", "skipped", "success; x"):
+            with self.subTest(result=result):
+                self.calls = []
+                code, out = self.post(self.api(), extra={tool.JOB_RESULT: result} if result else None)
+                self.assertEqual((code, out), (0, "May Android unit suites: no record and no unit result to post; nothing posted\n"))
+                self.assertEqual(self.calls, [])
+
+    def test_without_a_record_the_unit_jobs_result_alone_is_posted_head_marked(self):
+        """Coordinator, 26 Oct: with the key pair unset a post was silent and the may-app merge gate had no result to
+        read. The unit job's own pass or fail is posted alone, with no detail, still head-marked."""
+        (self.root / "may-private" / android_unit.OUTCOME).unlink()
+        for result, passed in (("success", True), ("failure", False)):
+            with self.subTest(result=result):
+                self.calls = []
+                word = "passed" if passed else "failed"
+                code, out = self.post(self.api(), extra={tool.JOB_RESULT: result})
+                self.assertEqual((code, out), (0 if passed else 1, f"May Android unit suites {word}; the result alone posted to may-app "
+                                                                   "#42 (no sealed record: no details)\n"))
+                self.assertEqual([(m, path) for m, path, _ in self.calls][0], ("GET", PULLS), "the pull request read again")
+                body = self.posted()[0]
+                self.assertTrue(body.startswith(f"### May Android unit suites: {word}\n\n`{SHA}`: the unit job {word}."))
+                self.assertIn(f"<!-- may-android-unit-pr head={SHA} -->", body)
+                self.assertNotIn(SECRET_TEXT, body)
+        self.calls = []
+        code, out = self.post(self.api(comments=[{"body": f"x <!-- may-android-unit-pr head={SHA} -->"}]),
+                              extra={tool.JOB_RESULT: "failure"})
+        self.assertEqual((code, self.posted()), (1, []))
+        self.assertIn("already posted", out)
+
+    def test_the_step_summary_carries_counts_only(self):
+        summary = self.root / "summary.md"
+        self.write(*recorded(unreadable=2))
+        self.verdict({"GITHUB_STEP_SUMMARY": str(summary)})
+        self.post(self.api(), extra={"GITHUB_STEP_SUMMARY": str(self.root / "post-summary.md")})
+        self.assertFalse((self.root / "post-summary.md").exists(), "the post job writes no summary")
+        self.assertEqual(summary.read_text(), "\n".join([
+            "### May Android unit suites: failed", "", "| Suite | Tests | Failed | Skipped |", "|---|---|---|---|",
+            "| core | 2 | 1 | 0 |", "| playground | 5 | 0 | 0 |", "| production | 2 | 0 | 0 |", "",
+            "1 failing tests and 2 unreadable reports. Which tests failed goes only to the may-app pull request, "
+            "never here."]) + "\n")
+        self.assertNotIn(PRIVATE, summary.read_text())
+        self.assertNotIn(SECRET_TEXT, summary.read_text())
 
     def test_a_suite_that_did_not_run_is_summarised_as_such(self):
         outcome, failed = recorded()
@@ -435,7 +484,7 @@ class PostTests(unittest.TestCase):
                 with self.assertRaises(UnitPostError):
                     self.post(self.api())
                 self.assertEqual(self.calls, [])
-        (self.root / "may-private" / android_unit.OUTCOME).unlink()
+        (self.root / "may-private" / android_unit.FAILURES).unlink()
         with self.assertRaises(UnitPostError):
             self.post(self.api())
 
@@ -452,10 +501,85 @@ class PostTests(unittest.TestCase):
             tool.github("DELETE", COMMENTS + "/1", None, TOKEN)
 
 
+class SealTests(PostCase):
+    """The unit job's seal (no secret) and the post job's open (the decrypt key alone), before age is run."""
+
+    def step(self, call, extra=None, tools=None):
+        out = io.StringIO()
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin:/bin", **(extra or {})}, clear=True), \
+                patch("sys.stdout", out), patch.object(tool, "head_revision", lambda checkout: SHA), \
+                patch("sealed.toolchain.tool_path", side_effect=tools or self.no_age):
+            value = call()
+        return value, out.getvalue()
+
+    def no_age(self, name, relative):
+        raise AssertionError("age was run")
+
+    def test_without_the_public_key_nothing_is_sealed_and_one_fixed_line_says_so(self):
+        _, out = self.step(lambda: tool.seal(SHA))
+        self.assertEqual(out, "May Android unit suites: MAY_RENDERS_RECIPIENT is not set in may-native-compile-pr; "
+                              "nothing is sealed, so nothing will be posted\n")
+        self.assertFalse((self.root / sealed.SEALED).exists())
+
+    def test_a_moved_checkout_a_bad_record_or_any_secret_seals_nothing(self):
+        with patch.object(tool, "head_revision", lambda checkout: OTHER), self.assertRaisesRegex(
+                UnitPostError, "not the dispatched commit; nothing was sealed"):
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True):
+                tool.seal(SHA)
+        for secret in ("MAY_APP_READ_KEY", "MAY_APP_PR_COMMENT_TOKEN", "MAY_RENDERS_DECRYPT_KEY"):
+            with self.subTest(secret=secret), self.assertRaises(StoreError):
+                self.step(lambda: tool.seal(SHA), {secret: "x"})
+        self.write({"result": "maybe"}, {})
+        with self.assertRaises(UnitPostError):
+            self.step(lambda: tool.seal(SHA), {sealed.RECIPIENT: "age1" + "q" * 58})
+        self.assertFalse((self.root / sealed.SEALED).exists())
+
+    def test_with_nothing_downloaded_the_open_says_so_and_holds_no_other_secret(self):
+        _, out = self.step(lambda: tool.open_record(SHA), {sealed.DECRYPT_KEY: "k"})
+        self.assertEqual(out, "May Android unit suites: no sealed record from this run attempt; nothing will be posted\n")
+        for secret in ("MAY_APP_READ_KEY", "MAY_APP_PR_COMMENT_TOKEN"):
+            with self.subTest(secret=secret), self.assertRaises(StoreError):
+                self.step(lambda: tool.open_record(SHA), {sealed.DECRYPT_KEY: "k", secret: "x"})
+
+
+@unittest.skipUnless(HAS_AGE or os.environ.get("CI"), "age and age-keygen are required for the round trip")
+class RoundTripTests(SealTests):
+    """seal in the unit job, the one upload, open and post in the post job, with the system's age."""
+
+    def setUp(self):
+        super().setUp()
+        # Found now, on the job's own PATH: each step runs with PATH /usr/bin:/bin, which CI's pinned age is not on.
+        self.found = {name: shutil.which(name) for name in ("age", "age-keygen")}
+        self.secret = next(line for line in subprocess.run([self.found["age-keygen"]], capture_output=True, text=True,
+                                                           check=True).stdout.splitlines()
+                           if line.startswith("AGE-SECRET-KEY-1"))
+        self.public = subprocess.run([self.found["age-keygen"], "-y"], input=self.secret, capture_output=True, text=True,
+                                     check=True).stdout.strip()
+
+    def with_age(self, name, relative):
+        return self.found[relative]
+
+    def test_the_failing_tests_cross_sealed_and_are_posted(self):
+        _, out = self.step(lambda: tool.seal(SHA), {sealed.RECIPIENT: self.public}, self.with_age)
+        self.assertEqual(out, "May Android unit suites: their record is encrypted for the post job\n")
+        data = (self.root / sealed.SEALED / sealed.NAME).read_bytes()
+        self.assertNotIn(SECRET_TEXT.encode(), data)
+        # The post job is a fresh runner: nothing of the unit job's but the download.
+        shutil.rmtree(self.root / "may-private")
+        (self.root / sealed.DOWNLOAD).mkdir()
+        (self.root / sealed.DOWNLOAD / sealed.NAME).write_bytes(data)
+        _, out = self.step(lambda: tool.open_record(SHA), {sealed.RECIPIENT: self.public, sealed.DECRYPT_KEY: self.secret},
+                           self.with_age)
+        self.assertEqual(out, "May Android unit suites: their record is decrypted\n")
+        code, out = self.post(self.api())
+        self.assertEqual((code, out), (1, "May Android unit suites failed; 1 failing tests posted to may-app #42\n"))
+        self.assertIn(SECRET_TEXT, self.posted()[0])
+
+
 class CliTests(unittest.TestCase):
     def test_a_refusal_prints_only_a_fixed_line(self):
         with tempfile.TemporaryDirectory() as raw:
-            result = subprocess.run([sys.executable, "-I", "-S", "-B", tool.__file__, "--source-sha", SHA, "--pr-number", "42"],
+            result = subprocess.run([sys.executable, "-I", "-S", "-B", tool.__file__, "seal", "--source-sha", SHA],
                                     capture_output=True, env={"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": raw})
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, b"")
@@ -501,7 +625,50 @@ class WorkflowTests(unittest.TestCase):
                                                 "          MAY_APP_PR_COMMENT_TOKEN", secret),
             "the suites failing the step": (suites, "--source-sha \"$MAY_SOURCE_SHA\" --core-breakdown \"$MAY_CORE_BREAKDOWN\"\n", runs),
             "no post": ("      - name: Post the failing tests on the may-app pull request, never in this log\n", "      - name: Gone\n",
-                        name + "unit's steps are not exactly"),
+                        name + "the jobs' steps are not exactly"),
+        }
+        for case, (old, new, message) in cases.items():
+            with self.subTest(case=case):
+                self.flagged(WORKFLOW, old, new, message, case)
+
+    def test_the_unit_jobs_result_reaches_the_post_alone(self):
+        secret = "android-unit-pr.yml: a secret or env entry other than"
+        result = "          MAY_UNIT_RESULT: ${{ needs.unit.result }}\n"
+        sealer = "          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n        run: python3 -I -S -B " \
+            "tools/may_release/android_unit_post.py seal"
+        for old, new in ((result, ""), (result, "          MAY_UNIT_RESULT: ${{ needs.admission.result }}\n"),
+                         (sealer, result + sealer)):
+            with self.subTest(new=new[:60]):
+                self.flagged(WORKFLOW, old, new, secret, new[:60])
+
+    def test_the_job_that_runs_the_pull_requests_code_holds_no_app_key_token_or_decrypt_key(self):
+        """The independent review of #133: the runner user has sudo and can read every secret its job references."""
+        name = "android-unit-pr.yml: "
+        secret = name + "a secret or env entry other than"
+        jdk = "      - name: Install the pinned, checksum-verified JDK\n"
+        mint = ("      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code\n"
+                "        id: ci-read\n        if: vars.MAY_CI_APP_ID != ''\n"
+                "        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n"
+                "        with:\n          app-id: ${{ vars.MAY_CI_APP_ID }}\n"
+                "          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}\n          owner: May-Assistant\n"
+                "          repositories: may-app\n          permission-pull-requests: read\n")
+        seal_env = "          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n        run: python3 -I -S -B tools/may_release/android_unit_post.py seal"
+        open_env = "          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}\n"
+        cases = {
+            "the read mint in unit": (jdk, mint + jdk, "a GitHub App token is minted or used other than by its pinned"),
+            "the decrypt key on the seal": (seal_env, open_env + seal_env, secret),
+            "the open without its key": (open_env, "", secret),
+            "the seal without the public key": ("          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n", "", secret),
+            "the record in the clear": ("          path: ${{ runner.temp }}/may-sealed/record.age\n",
+                                        "          path: ${{ runner.temp }}/may-private\n", "sealed record as the only artifact"),
+            "a longer-lived record": ("          retention-days: 1\n", "          retention-days: 7\n",
+                                      "sealed record as the only artifact"),
+            "the post only on success": ("    if: ${{ !cancelled() && needs.admission.result == 'success' }}\n", "",
+                                         "a condition or a timeout other than its own"),
+            "the post in the unit job's needs only": ("    needs: [admission, unit]\n", "    needs: unit\n",
+                                                      "environment is not the one admission chose"),
+            "no verdict": ("        run: python3 -I -S -B tools/may_release/android_unit_post.py verdict\n",
+                           "        run: echo\n", name + "runs something other than"),
         }
         for case, (old, new, message) in cases.items():
             with self.subTest(case=case):
@@ -551,7 +718,7 @@ class WorkflowTests(unittest.TestCase):
         cases = {
             "a printed body": (posted, posted + "\n    print(body)", "prints something other than a fixed line"),
             "a printed failure": (posted, 'print(f"failed: {failed}")', "prints something other than a fixed line"),
-            "a formatted refusal": ('raise UnitPostError("The tested checkout is not the dispatched commit; nothing was posted")',
+            "a formatted refusal": ('raise UnitPostError("The tested checkout is not the dispatched commit; nothing was sealed")',
                                     'raise UnitPostError("not " + str(checkout))', "printed error message is not one string literal"),
             "an exit built from data": ('raise SystemExit("May Android unit post stopped; check may-native-compile-pr, its secrets and the inputs") from None',
                                         'raise SystemExit("stopped: " + str(sys.exc_info()))', "exits with a message that is not a fixed literal"),

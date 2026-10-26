@@ -24,8 +24,8 @@ name, message or path.
 
 With --record-outcome (backend-unit-pr.yml), a red stage does not fail this step. The outcome and the detail (each
 failing test's name, the first line of its error and its location, repo-relative; tsc's errors; and, for a stage
-with neither, the last lines of its log, cleaned) go to private files (OUTCOME, FAILURES), and backend_unit_post.py,
-the next step, posts them on the may-app pull request and then fails the job. Every check before the stages (secrets,
+with neither, the last lines of its log, cleaned) go to private files (OUTCOME, FAILURES), and backend_unit_post.py
+seals them for the post job, which posts them on the may-app pull request, and then fails the job. Every check before the stages (secrets,
 the prepared checkout, the pinned Node, Postgres) still fails here. The detail is never printed.
 """
 

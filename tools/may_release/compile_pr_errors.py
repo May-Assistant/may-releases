@@ -55,7 +55,10 @@ SOURCE, PRIVATE = "may-source", "may-private"
 # The sealed record: written by seal into SEALED, uploaded, downloaded by the post job into DOWNLOAD, opened into RECORD.
 SEALED, DOWNLOAD, SEALED_NAME, RECORD = "may-compile-sealed", "may-compile-download", "compile.age", "compile-record.json"
 # Every sealed record is padded to MAX_RECORD bytes (JSON then spaces), so the ciphertext's size says nothing about how
-# many errors it holds (independent review of #133); a record that would not fit is refused.
+# many errors it holds (independent review of #133); a record that would not fit is refused. Its JSON is UTF-8, not
+# escaped to ASCII (where one character outside the BMP is 12 bytes), so the longest record fits: MAX_ERRORS lines, each
+# a path and a message of at most 240 characters (ds_compile.diagnostics, which keeps no control character) of at most
+# 4 bytes, under 200 KB (the review of #133, LOW 1).
 MAX_RECORD, MAX_ERROR_LINE, MAX_TOTAL = 256 * 1024, 600, 1_000_000
 LOG = "ios-compile.log"
 SCHEME, DESTINATION = "MayPlayground", "generic/platform=iOS Simulator"
@@ -180,7 +183,7 @@ def seal(sha):
         raise CompilePrError("MAY_RENDERS_RECIPIENT is not an age public key")
     plain, sealed = private / RECORD, root / SEALED
     sealed.mkdir(mode=0o700, exist_ok=True)
-    data = json.dumps(record).encode()
+    data = json.dumps(record, ensure_ascii=False).encode()
     if len(data) > MAX_RECORD:
         raise CompilePrError("The compile record is too large to seal")
     try:

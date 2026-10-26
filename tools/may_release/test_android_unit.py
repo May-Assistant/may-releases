@@ -301,7 +301,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_each_widening_is_flagged(self):
         name = "android-unit-pr.yml: "
-        secret = name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, the post's comment token and the dispatch's inputs"
+        secret = name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys"
         runs = name + "runs something other than the gate"
         shape = name + "is not the Linux unit-test run"
         suites_step = "      - name: Run the unit suites without any credential, printing only pass or fail and counts\n        env:\n"
@@ -333,7 +333,7 @@ class WorkflowTests(unittest.TestCase):
             "suites that may fail quietly": ("      - name: Run the unit suites without any credential, printing only pass or fail and counts\n",
                                              "      - name: Run the unit suites without any credential, printing only pass or fail and counts\n"
                                              "        continue-on-error: true\n", name + "sets a shell, defaults, a condition"),
-            "a cleanup that is not always run": ("        if: always()\n", "", name + "unit's steps are not exactly"),
+            "a cleanup that is not always run": ("        if: always()\n", "", name + "the jobs' steps are not exactly"),
             "a store environment": ("    environment: ${{ needs.admission.outputs.environment }}\n",
                                     "    environment: may-android-playground-internal\n", name + "unit's environment is not the one admission chose"),
             "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n  workflow_dispatch:\n",
@@ -343,8 +343,8 @@ class WorkflowTests(unittest.TestCase):
             "a shared concurrency group": ("  group: may-android-unit-pr\n", "  group: may-native-compile-pr\n",
                                            name + "does not run one at a time in its own concurrency group"),
             "a longer timeout": ("    timeout-minutes: 55\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
-            "a macOS runner": ("  unit:\n    needs: admission\n    runs-on: ubuntu-24.04\n",
-                               "  unit:\n    needs: admission\n    runs-on: macos-15\n", shape),
+            "a macOS runner": ("    needs: [admission, pull]\n    runs-on: ubuntu-24.04\n",
+                               "    needs: [admission, pull]\n    runs-on: macos-15\n", shape),
         }
         for case, (old, new, message) in cases.items():
             with self.subTest(case=case):
