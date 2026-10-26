@@ -26,6 +26,7 @@ import static_check
 from store import SECRET_NAMES, StoreError, require_step_secrets
 
 SHA, OTHER = "a" * 40, "b" * 40
+HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
 TOKEN = "github_pat_" + "D" * 50
 WORKFLOW = ".github/workflows/native-compile-pr.yml"
 TOOL = "tools/may_release/compile_pr_errors.py"
@@ -241,8 +242,16 @@ class PostCase(unittest.TestCase):
         return env
 
     def write(self, result="failed", log=None):
+        """The native job's outcome and log, and the record its seal step makes of them, opened in the post job."""
         (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": result}))
         (self.private / tool.LOG).write_text((log or self.LOG).replace(CK, str(self.checkout)))
+        self.record()
+
+    def record(self, head=SHA):
+        with patch("compile_pr_errors.head_revision", return_value=head):
+            record = tool.compile_record(SHA, self.root)
+        (self.private / tool.RECORD).write_text(json.dumps(record))
+        return record
 
     def call_api(self, method, path, payload, token, status=201):
         self.calls.append((method, path, payload, token))
@@ -287,6 +296,7 @@ class PostTests(PostCase):
         elsewhere.write_text(f"{self.checkout}/ios/Secret.swift:1:1: error: {MARKER}")
         (self.private / tool.LOG).unlink()
         (self.private / tool.LOG).symlink_to(elsewhere)
+        self.record()
         code, error, out, _ = self.post()
         self.assertEqual((code, error), (1, None))
         body = self.calls[-1][2]["body"]
@@ -333,12 +343,14 @@ class PostTests(PostCase):
         _, error, _, _ = self.post(call_api=lambda *a: (404, None))
         self.assertIn("could not be read again", error.args[0])
 
-    def test_nothing_is_posted_without_an_outcome_the_compiled_head_or_with_another_secret(self):
-        _, error, _, _ = self.post()
-        self.assertEqual(error.args[0], "No compile outcome is recorded; nothing was posted")
+    def test_nothing_is_posted_without_a_record_or_with_another_secret(self):
+        """With no key pair set yet nothing is sealed, so the post job has no record: one fixed line, and native's own
+        verdict stands (independent review of may-releases #130)."""
+        code, error, out, err = self.post()
+        self.assertEqual((code, error, err), (0, None, ""))
+        self.assertEqual(out, "May iOS compile: no record to post (MAY_RENDERS_RECIPIENT or MAY_RENDERS_DECRYPT_KEY may "
+                              "be unset in may-native-compile-pr); the native job's verdict stands\n")
         self.write()
-        _, error, _, _ = self.post(head=OTHER)
-        self.assertIn("not the dispatched commit", error.args[0])
         for name in ("MAY_APP_READ_KEY", "MAY_APP_PR_READ_TOKEN", "MAY_DS_PR_COMMENT_TOKEN"):
             with self.subTest(secret=name):
                 _, error, _, _ = self.post(env=self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, **{name: "k"}))
@@ -423,7 +435,7 @@ class CommandLineTests(PostCase):
             return FakeResponse(b"{}", 201)
 
         out, err = io.StringIO(), io.StringIO()
-        with patch.object(sys, "argv", ["compile_pr_errors.py", "--source-sha", SHA, "--pr-number", "42"]), \
+        with patch.object(sys, "argv", ["compile_pr_errors.py", "post", "--source-sha", SHA, "--pr-number", "42"]), \
                 patch.dict(os.environ, self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN), clear=True), \
                 patch("urllib.request.urlopen", urlopen), patch("compile_pr_errors.head_revision", return_value=SHA), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -437,6 +449,183 @@ class CommandLineTests(PostCase):
         self.assertIn("MAY_APP_PR_COMMENT_TOKEN", SECRET_NAMES)
         with patch.dict(os.environ, {"MAY_APP_PR_COMMENT_TOKEN": TOKEN}), self.assertRaises(StoreError):
             require_step_secrets(("MAY_APP_READ_KEY", "MAY_DS_READ_KEY"))
+
+
+# ---- the native job seals its record; the post job opens it (independent review of may-releases #130) ----
+
+class SealTests(PostCase):
+    def seal(self, env, head=SHA, tools=None):
+        out = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch("compile_pr_errors.head_revision", return_value=head), \
+                patch("compile_pr_errors.toolchain.tool_path", side_effect=tools or (lambda name, rel: rel)), \
+                contextlib.redirect_stdout(out):
+            tool.seal(SHA)
+        return out.getvalue()
+
+    def test_the_record_comes_from_the_log_and_the_compiled_head(self):
+        (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": "failed"}))
+        (self.private / tool.LOG).write_text(self.LOG.replace(CK, str(self.checkout)))
+        with patch("compile_pr_errors.head_revision", return_value=SHA):
+            record = tool.compile_record(SHA, self.root)
+        self.assertEqual(record, {"sha": SHA, "passed": False, "total": 2, "errors": [
+            "ios/May/Home/HomeView.swift:12:5: error: cannot find 'Foo' in scope",
+            "ios/MayPlayground/App.swift:2:1: error: expected '}'"]})
+        with patch("compile_pr_errors.head_revision", return_value=OTHER), self.assertRaisesRegex(
+                CompilePrError, "not the dispatched commit"):
+            tool.compile_record(SHA, self.root)
+        (self.private / compile_tool.OUTCOME).unlink()
+        with self.assertRaisesRegex(CompilePrError, "No compile outcome is recorded"):
+            tool.compile_record(SHA, self.root)
+
+    def test_without_the_recipient_nothing_is_sealed_and_one_fixed_line_says_so(self):
+        self.write()
+        for env in (self.environ(), self.environ(MAY_RENDERS_RECIPIENT=" ")):
+            with self.subTest(set="MAY_RENDERS_RECIPIENT" in env):
+                self.assertEqual(self.seal(env), "May iOS compile: MAY_RENDERS_RECIPIENT is not set in "
+                                                 "may-native-compile-pr; nothing is sealed, so nothing will be posted\n")
+                self.assertFalse((self.root / tool.SEALED).exists())
+
+    def test_the_seal_holds_no_secret_and_refuses_a_bad_recipient(self):
+        self.write()
+        for name in ("MAY_APP_PR_COMMENT_TOKEN", "MAY_RENDERS_DECRYPT_KEY", "MAY_APP_READ_KEY"):
+            with self.subTest(secret=name), self.assertRaises(StoreError):
+                self.seal(self.environ(**{name: "k"}))
+        with self.assertRaisesRegex(CompilePrError, "not an age public key"):
+            self.seal(self.environ(MAY_RENDERS_RECIPIENT="age1short"))
+
+    def test_the_verdict_fails_the_native_job_on_a_failed_compile(self):
+        for result, code, line in (("failed", 1, "May iOS compile failed; its errors go to the may-app pull request "
+                                                 "only\n"), ("passed", 0, "May iOS compile passed with Xcode 26.3\n")):
+            with self.subTest(result=result):
+                self.write(result)
+                out = io.StringIO()
+                with patch.dict(os.environ, self.environ(), clear=True), contextlib.redirect_stdout(out):
+                    self.assertEqual(tool.verdict(), code)
+                self.assertEqual(out.getvalue(), line)
+        with patch.dict(os.environ, self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN), clear=True), \
+                self.assertRaises(StoreError):
+            tool.verdict()
+
+    def test_a_record_is_checked_whole(self):
+        good = {"sha": SHA, "passed": False, "errors": ["ios/A.swift:1:1: error: e"], "total": 3}
+        self.assertEqual(tool.checked_record(dict(good), SHA), good)
+        for change in ({"sha": OTHER}, {"passed": "no"}, {"errors": "x"}, {"errors": ["a\nb"]}, {"errors": [""]},
+                       {"errors": ["x" * 601]}, {"errors": ["e"] * 101, "total": 101}, {"total": 0}, {"total": -1},
+                       {"total": True}, {"passed": True}, {"extra": 1}):
+            with self.subTest(change=change), self.assertRaises(CompilePrError):
+                tool.checked_record(dict(good, **change), SHA)
+        self.assertEqual(tool.checked_record({"sha": SHA, "passed": True, "errors": [], "total": 0}, SHA)["passed"], True)
+
+    def test_opening_with_nothing_sealed_or_a_bad_key(self):
+        def opened(env):
+            out = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out):
+                tool.open_record(SHA)
+            return out.getvalue()
+
+        self.assertEqual(opened(self.environ(MAY_RENDERS_DECRYPT_KEY="AGE-SECRET-KEY-1x")),
+                         "May iOS compile: no sealed record from this run attempt; nothing will be posted\n")
+        (self.root / tool.DOWNLOAD).mkdir()
+        (self.root / tool.DOWNLOAD / tool.SEALED_NAME).write_bytes(b"sealed")
+        with self.assertRaisesRegex(CompilePrError, "MAY_RENDERS_RECIPIENT is not set"):
+            opened(self.environ(MAY_RENDERS_DECRYPT_KEY="k"))
+        recipient = "age1" + "q" * 58
+        with self.assertRaisesRegex(CompilePrError, "decryption key is malformed"):
+            opened(self.environ(MAY_RENDERS_DECRYPT_KEY="AGE-SECRET-KEY-1short", MAY_RENDERS_RECIPIENT=recipient))
+        for name in ("MAY_APP_PR_COMMENT_TOKEN", "MAY_APP_READ_KEY"):
+            with self.subTest(secret=name), self.assertRaises(StoreError):
+                opened(self.environ(MAY_RENDERS_DECRYPT_KEY="k", **{name: "k"}))
+        self.assertFalse((self.private / tool.RECORD).exists())
+
+
+@unittest.skipUnless(HAS_AGE or os.environ.get("CI"), "age and age-keygen are required for the round trip")
+class SealedRoundTripTests(PostCase):
+    """The native job's seal, the one upload, the post job's open and post, with the system's age."""
+
+    def setUp(self):
+        super().setUp()
+        # Found now, on the job's own PATH: each step below runs with a cleared environment whose PATH is
+        # /usr/bin:/bin, which CI's pinned age (toolchain.py age --export) is not on.
+        self.found = {name: shutil.which(name) for name in ("age", "age-keygen")}
+        self.secret = next(line for line in subprocess.run(["age-keygen"], capture_output=True, text=True,
+                                                            check=True).stdout.splitlines()
+                           if line.startswith("AGE-SECRET-KEY-1"))
+        self.public = subprocess.run(["age-keygen", "-y"], input=self.secret, capture_output=True, text=True,
+                                     check=True).stdout.strip()
+
+    def tools(self, name, relative):
+        return self.found[relative]
+
+    def run_step(self, call, env):
+        out = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch("compile_pr_errors.head_revision", return_value=SHA), \
+                patch("compile_pr_errors.toolchain.tool_path", side_effect=self.tools), contextlib.redirect_stdout(out):
+            value = call()
+        return value, out.getvalue()
+
+    def sealed_and_handed_over(self):
+        (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": "failed"}))
+        (self.private / tool.LOG).write_text(self.LOG.replace(CK, str(self.checkout)))
+        _, out = self.run_step(lambda: tool.seal(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public))
+        self.assertEqual(out, "May iOS compile: its record is encrypted for the post job\n")
+        sealed = (self.root / tool.SEALED / tool.SEALED_NAME).read_bytes()
+        self.assertNotIn(b"HomeView", sealed, "nothing in the clear leaves the native job")
+        self.assertEqual([p.name for p in self.private.iterdir() if p.name == tool.RECORD], [], "no plain record left")
+        # The upload and download stand in for the artifact; the post job is a fresh runner with no native files.
+        shutil.rmtree(self.private)
+        self.private.mkdir()
+        shutil.rmtree(self.root / tool.DOWNLOAD, ignore_errors=True)
+        (self.root / tool.DOWNLOAD).mkdir()
+        (self.root / tool.DOWNLOAD / tool.SEALED_NAME).write_bytes(sealed)
+
+    def test_the_record_crosses_from_native_to_post_sealed_and_is_posted(self):
+        self.sealed_and_handed_over()
+        _, out = self.run_step(lambda: tool.open_record(SHA),
+                               self.environ(MAY_RENDERS_RECIPIENT=self.public, MAY_RENDERS_DECRYPT_KEY=self.secret))
+        self.assertEqual(out, "May iOS compile: its record is decrypted and checked\n")
+        self.assertEqual(sorted(p.name for p in self.private.iterdir()), [tool.RECORD], "the key file is gone")
+        code, error, out, _ = self.post()
+        self.assertEqual((code, error, out), (1, None, "May iOS compile failed; 2 errors posted to may-app #42\n"))
+        self.assertIn("ios/MayPlayground/App.swift:2:1: error: expected '}'", self.calls[-1][2]["body"])
+
+    def test_every_sealed_record_is_the_same_size(self):
+        """Independent review of #133: the ciphertext's size must not say how many errors a compile had."""
+        sizes = []
+        for result, log in (("passed", ""), ("failed", self.LOG),
+                            ("failed", "\n".join(f"{CK}/ios/A{n}.swift:1:1: error: {'x' * 200}" for n in range(150)))):
+            (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": result}))
+            (self.private / tool.LOG).write_text(log.replace(CK, str(self.checkout)))
+            self.run_step(lambda: tool.seal(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public))
+            sizes.append((self.root / tool.SEALED / tool.SEALED_NAME).stat().st_size)
+        self.assertEqual(len(set(sizes)), 1, sizes)
+        # An unpadded record, sealed by anything but seal, is refused when opened.
+        plain = self.root / "short.json"
+        plain.write_text(json.dumps({"sha": SHA, "passed": True, "errors": [], "total": 0}))
+        (self.root / tool.DOWNLOAD).mkdir()
+        subprocess.run(["age", "-r", self.public, "-o", str(self.root / tool.DOWNLOAD / tool.SEALED_NAME), str(plain)],
+                       check=True)
+        with self.assertRaisesRegex(CompilePrError, "failed to decrypt or authenticate"):
+            self.run_step(lambda: tool.open_record(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public,
+                                                                    MAY_RENDERS_DECRYPT_KEY=self.secret))
+
+    def test_another_key_a_tampered_record_or_another_commit_is_refused(self):
+        self.sealed_and_handed_over()
+        other = next(line for line in subprocess.run(["age-keygen"], capture_output=True, text=True,
+                                                     check=True).stdout.splitlines() if line.startswith("AGE-SECRET"))
+        env = self.environ(MAY_RENDERS_RECIPIENT=self.public, MAY_RENDERS_DECRYPT_KEY=other)
+        with self.assertRaisesRegex(CompilePrError, "does not match MAY_RENDERS_RECIPIENT"):
+            self.run_step(lambda: tool.open_record(SHA), env)
+        sealed = self.root / tool.DOWNLOAD / tool.SEALED_NAME
+        data = bytearray(sealed.read_bytes())
+        data[-5] ^= 1
+        sealed.write_bytes(bytes(data))
+        env = self.environ(MAY_RENDERS_RECIPIENT=self.public, MAY_RENDERS_DECRYPT_KEY=self.secret)
+        with self.assertRaisesRegex(CompilePrError, "failed to decrypt or authenticate"):
+            self.run_step(lambda: tool.open_record(SHA), env)
+        self.sealed_and_handed_over()
+        with self.assertRaisesRegex(CompilePrError, "for another commit"):
+            self.run_step(lambda: tool.open_record(OTHER), env)
+        self.assertEqual(list(self.private.iterdir()), [], "nothing opened is left for the post")
 
 
 # ---- the workflow and the printing are pinned ----
@@ -472,15 +661,41 @@ class ShapeTests(unittest.TestCase):
         build = "      - name: Compile without signing, store access or any credential\n"
         post = "      - name: Post the errors on the may-app pull request, never in this log\n"
         comment = "          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}\n"
+        post_block = post + "        env:\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n" \
+            "          MAY_PR_NUMBER: ${{ inputs.pr_number }}\n" + comment
+        seal = "      - name: Seal the errors for the post job, with no secret\n        env:\n" \
+            "          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n"
+        recipient = "          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n"
+        decrypt = "          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}\n"
         fetch_key = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
+        mint = ("      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code\n"
+                "        id: ci-comment\n        if: vars.MAY_CI_APP_ID != ''\n"
+                "        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n"
+                "        with:\n          app-id: ${{ vars.MAY_CI_APP_ID }}\n"
+                "          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}\n          owner: May-Assistant\n"
+                "          repositories: may-app\n          permission-pull-requests: write\n")
+        age = "      - name: Install pinned age, before any pull request code\n"
+        upload_path = "          path: ${{ runner.temp }}/may-compile-sealed/compile.age\n"
+        verdict = "      - name: Fail if the compile failed\n        run: python3 -I -S -B tools/may_release/compile_pr_errors.py verdict\n"
         cases = {
             "the comment token on the compile": (build, build + "        env:\n" + comment, secret),
             "the comment token in the fetch": (fetch_key, fetch_key + comment, secret),
-            "a read key in the post": (comment, comment + fetch_key, secret),
-            "the read token in the post": (comment, comment + "          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n", secret),
-            "the runner token in the post": (comment, comment + "          GH_TOKEN: ${{ github.token }}\n", secret),
+            "the comment token on the seal": (seal, seal + comment, secret),
+            "the decrypt key on the seal": (seal, seal + decrypt, secret),
+            "the decrypt key on the post": (post_block, post_block + decrypt, secret),
+            "a seal without the environment's key": (seal + recipient, seal, secret),
+            "a read key in the post": (post_block, post_block + fetch_key, secret),
+            "the read token in the post": (post_block, post_block + "          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n", secret),
+            "the runner token in the post": (post_block, post_block + "          GH_TOKEN: ${{ github.token }}\n", secret),
             "a compile that fails before the post": ("--target playground --record-outcome\n", "--target playground\n", runs),
-            "no post": (post + "        env:\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n", "      - name: Other\n        env:\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n", name + "native's steps are not exactly"),
+            "no verdict in native": (verdict, "", runs),
+            "the comment token minted in native again": (age, mint + age, name + "a GitHub App token is minted or used other "
+                                                         "than by its pinned"),
+            "the private log uploaded": (upload_path, "          path: ${{ runner.temp }}/may-private/ios-compile.log\n",
+                                         name + "is not the iOS-only"),
+            "a post that does not wait for native": ("    needs: [admission, native]\n", "    needs: admission\n",
+                                                     name + "native's environment is not the one admission chose"),
+            "no post": (post + "        env:\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n", "      - name: Other\n        env:\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n", name + "the jobs' steps are not exactly"),
             "printing the log": (post, "      - name: Show\n        run: cat \"$RUNNER_TEMP/may-private/ios-compile.log\"\n" + post, runs),
             "a step summary": (post, "      - name: Summary\n        run: echo x >> \"$GITHUB_STEP_SUMMARY\"\n" + post, name + "is not the iOS-only"),
             "a post that always runs": (post, post + "        if: always()\n", name + "sets a shell, defaults, a condition"),

@@ -312,8 +312,10 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
 
     def test_each_widening_is_flagged(self):
         name = "native-compile-pr.yml: "
-        secret = name + "a secret or env entry other than the pull request check's PR token, the fetch step's two source-read keys and the post's comment token"
-        runs = name + "runs something other than the gate, the fetch, the compile, the post and the cleanup"
+        secret = name + ("a secret or env entry other than the pull request check's PR token, the fetch step's two "
+                         "source-read keys, the seal's public key, the open's decrypt key and the post's comment token")
+        runs = name + ("runs something other than the gate, age, the fetch, the compile, the seal, the verdict, the open, "
+                       "the post and the cleanups")
         compile_step = "      - name: Compile without signing, store access or any credential\n"
         fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
         cases = {
@@ -329,11 +331,25 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
             "a job-level env": ("    timeout-minutes: 55\n", "    timeout-minutes: 55\n    env:\n      CI: '1'\n", secret),
             "the main-history fetch instead": ('--source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"\n      - name: Compile',
                 '--source-sha "$MAY_SOURCE_SHA"\n      - name: Compile', runs),
-            "an input interpolated into shell": ('--pr-number "$MAY_PR_NUMBER"\n  native:', "--pr-number '${{ inputs.pr_number }}'\n  native:", runs),
+            "an input interpolated into shell": ('--pr-number "$MAY_PR_NUMBER"\n  pull:', "--pr-number '${{ inputs.pr_number }}'\n  pull:", runs),
+            # Independent review of #133: native runs the pull request's build code, so it references no App key and no
+            # token; the read mint and the pull request check are pull's, on a runner with no pull request code.
+            "the read mint back in native": ("      - name: Install pinned age, before any pull request code\n",
+                "      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code\n"
+                "        id: ci-read\n        if: vars.MAY_CI_APP_ID != ''\n"
+                "        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n"
+                "        with:\n          app-id: ${{ vars.MAY_CI_APP_ID }}\n"
+                "          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}\n          owner: May-Assistant\n"
+                "          repositories: may-app\n          permission-pull-requests: read\n"
+                "      - name: Install pinned age, before any pull request code\n", name + "a GitHub App token is minted"),
+            "the PR read token on native's fetch": ("          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha \"$MAY_SOURCE_SHA\" --pr-number \"$MAY_PR_NUMBER\"\n      - name: Compile",
+                "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n        run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha \"$MAY_SOURCE_SHA\" --pr-number \"$MAY_PR_NUMBER\"\n      - name: Compile", secret),
+            "native not waiting for the pull request check": ("    needs: [admission, pull, swift-checks]\n", "    needs: [admission, swift-checks]\n",
+                name + "native's environment is not the one admission chose"),
             "a store environment": ("    environment: ${{ needs.admission.outputs.environment }}\n",
                 "    environment: may-ios-playground-internal\n", name + "native's environment is not the one admission chose"),
             "an artifact": (compile_step, "      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n" + compile_step,
-                name + "is not the iOS-only May Playground compile with no artifact"),
+                name + "is not the iOS-only May Playground compile with its one sealed record as the only artifact"),
             "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n  workflow_dispatch:\n",
                 name + "is not dispatched with exactly pr_number and source_sha"),
             "the PR token in admission": ('          GH_TOKEN: ${{ github.token }}\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n          MAY_PR_NUMBER',

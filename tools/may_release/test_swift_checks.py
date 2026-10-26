@@ -333,7 +333,7 @@ class WorkflowTests(unittest.TestCase):
                  "        env:\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n"
         swift_post = "      - name: Post the failing Swift checks on the may-app pull request, never in this log\n"
         cases = {
-            "the compile not waiting for the checks": ("    needs: [admission, swift-checks]\n", "    needs: admission\n",
+            "the compile not waiting for the checks": ("    needs: [admission, pull, swift-checks]\n", "    needs: [admission, pull]\n",
                                                        name + "native's environment is not the one admission chose"),
             "a read key on the checks": (checks, checks + "          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}\n", secret),
             "the comment token on the checks": (checks, checks + "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n", secret),
@@ -347,10 +347,10 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(case=case):
                 self.flagged(WORKFLOW, old, new, message)
         workflow = (static_check.ROOT / WORKFLOW).read_text()
-        swift = workflow[workflow.index("  swift-checks:\n"):]
+        swift = workflow[workflow.index("  swift-checks:\n"):workflow.index("  post:\n")]
         self.flagged(WORKFLOW, swift, swift.replace("    runs-on: ubuntu-24.04\n", "    runs-on: macos-15\n", 1),
-                     name + "is not the iOS-only May Playground compile with no artifact")
-        self.flagged(WORKFLOW, swift, "", name + "jobs are not exactly admission, native and swift-checks")
+                     name + "is not the iOS-only May Playground compile")
+        self.flagged(WORKFLOW, swift, "", name + "jobs are not exactly admission, pull, native, swift-checks and post")
 
     def test_printing_anything_from_may_app_is_flagged(self):
         anchor = '        print("May Swift checks passed")\n'
