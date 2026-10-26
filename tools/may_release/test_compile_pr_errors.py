@@ -344,12 +344,14 @@ class PostTests(PostCase):
         self.assertIn("could not be read again", error.args[0])
 
     def test_nothing_is_posted_without_a_record_or_with_another_secret(self):
-        """With no key pair set yet nothing is sealed, so the post job has no record: one fixed line, and native's own
-        verdict stands (independent review of may-releases #130)."""
-        code, error, out, err = self.post()
-        self.assertEqual((code, error, err), (0, None, ""))
-        self.assertEqual(out, "May iOS compile: no record to post (MAY_RENDERS_RECIPIENT or MAY_RENDERS_DECRYPT_KEY may "
-                              "be unset in may-native-compile-pr); the native job's verdict stands\n")
+        """With no record and no native result (native cancelled or skipped) nothing is posted: one fixed line
+        (independent review of may-releases #130)."""
+        for result in (None, "cancelled", "skipped", "success; x"):
+            with self.subTest(result=result):
+                env = self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, **({tool.NATIVE_RESULT: result} if result else {}))
+                code, error, out, err = self.post(env=env)
+                self.assertEqual((code, error, err), (0, None, ""))
+                self.assertEqual(out, "May iOS compile: no record and no native result to post; nothing posted\n")
         self.write()
         for name in ("MAY_APP_READ_KEY", "MAY_APP_PR_READ_TOKEN", "MAY_DS_PR_COMMENT_TOKEN"):
             with self.subTest(secret=name):
@@ -358,6 +360,32 @@ class PostTests(PostCase):
         _, error, _, _ = self.post(env=self.environ(MAY_APP_PR_COMMENT_TOKEN="short"))
         self.assertIn("malformed", error.args[0])
         self.assertEqual(self.calls, [])
+
+    def test_without_a_record_native_s_result_alone_is_posted_head_marked(self):
+        """Coordinator, 26 Oct: with the key pair unset #133's post was silent, and the may-app merge gate had no result
+        to read. Native's own pass or fail is posted alone, with no detail, still head-marked."""
+        for result, passed in (("success", True), ("failure", False)):
+            with self.subTest(result=result):
+                self.calls = []
+                code, error, out, err = self.post(env=self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN,
+                                                                   **{tool.NATIVE_RESULT: result}))
+                word = "passed" if passed else "failed"
+                self.assertEqual((code, error, err), (0 if passed else 1, None, ""))
+                self.assertEqual(out, f"May iOS compile {word}; the result alone posted to may-app #42 (no sealed "
+                                      "record: no details)\n")
+                self.assertEqual([(m, p) for m, p, _, _ in self.calls],
+                                 [("GET", PULLS), ("GET", COMMENTS + "?per_page=100&page=1"), ("POST", COMMENTS)],
+                                 "the pull request is read again and the head's marker checked first")
+                body = self.calls[2][2]["body"]
+                self.assertTrue(body.startswith(f"### May iOS compile: {word}\n\n`{SHA}`: the native job {word}."))
+                self.assertIn(f"<!-- {tool.MARKER} head={SHA} -->", body)
+                self.assertNotIn("error", body.split("<!--")[0].lower().replace("errors", ""), "no detail")
+        self.calls = []
+        self.pages = {1: [{"body": f"x <!-- {tool.MARKER} head={SHA} -->"}]}
+        code, _, out, _ = self.post(env=self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, **{tool.NATIVE_RESULT: "failure"}))
+        self.assertEqual(code, 1)
+        self.assertIn("already posted", out)
+        self.assertNotIn("POST", [m for m, _, _, _ in self.calls])
 
     def test_a_refused_post_or_a_body_holding_the_token_prints_nothing(self):
         self.write()
@@ -653,6 +681,16 @@ class ShapeTests(unittest.TestCase):
     def test_the_committed_workflow_and_tool_pass(self):
         self.assertEqual(static_check.compile_pr_workflow_problems((static_check.ROOT / WORKFLOW).read_text()), [])
         self.assertEqual(static_check.compile_pr_errors_print_problems(static_check.ROOT), [])
+
+    def test_native_s_result_reaches_the_post_alone(self):
+        secret = "native-compile-pr.yml: a secret or env entry other than"
+        result = "          MAY_NATIVE_RESULT: ${{ needs.native.result }}\n"
+        sealer = "          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n        run: python3 -I -S -B " \
+            "tools/may_release/compile_pr_errors.py seal"
+        for old, new in ((result, ""), (result, "          MAY_NATIVE_RESULT: ${{ needs.swift-checks.result }}\n"),
+                         (sealer, result + sealer)):
+            with self.subTest(new=new[:60]):
+                self.flagged(WORKFLOW, old, new, secret)
 
     def test_each_widening_of_the_post_is_flagged(self):
         name = "native-compile-pr.yml: "
