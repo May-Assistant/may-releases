@@ -257,6 +257,8 @@ class PostCase(unittest.TestCase):
         self.calls.append((method, path, payload, token))
         if method == "GET" and "/comments?" in path:
             return 200, self.pages.get(int(path.rsplit("=", 1)[1]), [])
+        if method == "PATCH":
+            return getattr(self, "patch_status", 200), {}
         return (200, self.pull) if method == "GET" else (status, {})
 
     def post(self, env=None, call_api=None, head=SHA):
@@ -380,12 +382,13 @@ class PostTests(PostCase):
                 self.assertTrue(body.startswith(f"### May iOS compile: {word}\n\n`{SHA}`: the native job {word}."))
                 self.assertIn(f"<!-- {tool.MARKER} head={SHA} -->", body)
                 self.assertNotIn("error", body.split("<!--")[0].lower().replace("errors", ""), "no detail")
+        posted = body
         self.calls = []
-        self.pages = {1: [{"body": f"x <!-- {tool.MARKER} head={SHA} -->"}]}
+        self.pages = {1: [{"id": 5, "body": posted}]}
         code, _, out, _ = self.post(env=self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, **{tool.NATIVE_RESULT: "failure"}))
         self.assertEqual(code, 1)
-        self.assertIn("already posted", out)
-        self.assertNotIn("POST", [m for m, _, _, _ in self.calls])
+        self.assertIn("already posted", out, "the same result for the same head is not posted twice")
+        self.assertEqual([m for m, _, _, _ in self.calls if m != "GET"], [])
 
     def test_a_refused_post_or_a_body_holding_the_token_prints_nothing(self):
         self.write()
@@ -400,22 +403,63 @@ class PostTests(PostCase):
 
 
 class DedupeTests(PostCase):
-    def marked(self, sha, name="may-ios-compile-pr"):
-        return {"body": f"x\n\n<!-- {name} head={sha} -->\n---"}
+    """One comment per head, and the newest result in it (review of may-releases #137): a marked comment is edited in
+    place, unless it already reads the same."""
 
-    def test_a_head_already_reported_is_not_posted_again(self):
+    def marked(self, sha, name="may-ios-compile-pr", body="x", id=7):
+        return {"id": id, "body": f"{body}\n\n<!-- {name} head={sha} -->\n---"}
+
+    def edits(self):
+        return [(m, p, b["body"]) for m, p, b, _ in self.calls if m in ("PATCH", "POST")]
+
+    def test_a_head_already_reading_the_same_is_not_posted_again(self):
         self.write()
-        self.pages = {1: [{"body": "other"}] * 100, 2: [self.marked(SHA)]}
+        self.post()
+        body = self.calls[-1][2]["body"]
+        self.calls, self.pages = [], {1: [{"body": "other"}] * 100, 2: [{"id": 9, "body": body}]}
         code, error, out, _ = self.post()
         self.assertEqual((code, error), (1, None))
         self.assertEqual(out, "May iOS compile result already posted for this head on may-app #42; nothing posted again\n")
-        self.assertNotIn("POST", [m for m, _, _, _ in self.calls])
+        self.assertEqual(self.edits(), [])
 
-    def test_another_head_or_the_design_system_marker_does_not_stop_the_post(self):
+    def test_a_re_runs_result_replaces_an_earlier_failure_in_place(self):
+        """A fetch error or runner loss posts "failed"; the successful re-run must not leave it for the gate."""
+        self.pages = {1: [self.marked(SHA, body="### May iOS compile: failed", id=11)]}
+        code, error, out, _ = self.post(env=self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, **{tool.NATIVE_RESULT: "success"}))
+        self.assertEqual((code, error), (0, None))
+        self.assertEqual([(m, p) for m, p, _ in self.edits()], [("PATCH", "/repos/May-Assistant/may-app/issues/comments/11")],
+                         "the head's marked comment is edited in place, never skipped or doubled")
+        body = self.edits()[0][2]
+        self.assertTrue(body.startswith("### May iOS compile: passed"))
+        self.assertEqual(out, "May iOS compile: this head's comment on may-app #42 is updated with this run's result\n"
+                              "May iOS compile passed; the result alone posted to may-app #42 (no sealed record: no "
+                              "details)\n")
+
+    def test_a_detailed_record_replaces_a_result_only_comment(self):
+        """With the key pair set later, the details are not blocked by the result-only comment."""
+        self.pages = {1: [self.marked(SHA, body="### May iOS compile: failed\n\nIts details are not posted", id=12)]}
         self.write()
-        self.pages = {1: [self.marked(OTHER), self.marked(SHA, "may-ds-swift-compile"), {"body": None}, "x"]}
+        code, error, _, _ = self.post()
+        self.assertEqual((code, error), (1, None))
+        self.assertEqual([(m, p) for m, p, _ in self.edits()], [("PATCH", "/repos/May-Assistant/may-app/issues/comments/12")],
+                         "the head's marked comment is edited in place, never skipped or doubled")
+        body = self.edits()[0][2]
+        self.assertIn("**2 errors**", body)
+
+    def test_a_marked_comment_the_token_cannot_edit_is_left_and_a_new_one_posted(self):
+        self.patch_status = 403
+        self.pages = {1: [self.marked(SHA, id=13)]}
+        self.write()
         self.assertEqual(self.post()[:2], (1, None))
-        self.assertEqual([m for m, _, _, _ in self.calls].count("POST"), 1)
+        self.assertEqual([(m, p) for m, p, _ in self.edits()],
+                         [("PATCH", "/repos/May-Assistant/may-app/issues/comments/13"), ("POST", COMMENTS)])
+
+    def test_another_head_the_design_system_marker_or_an_odd_id_does_not_stop_the_post(self):
+        self.write()
+        self.pages = {1: [self.marked(OTHER), self.marked(SHA, "may-ds-swift-compile"), {"body": None}, "x",
+                          self.marked(SHA, id="7; x"), self.marked(SHA, id=0)]}
+        self.assertEqual(self.post()[:2], (1, None))
+        self.assertEqual([m for m, _, _ in self.edits()], ["POST"])
 
 
 class GitHubCallTests(unittest.TestCase):
@@ -430,19 +474,24 @@ class GitHubCallTests(unittest.TestCase):
             self.assertEqual(tool.github("GET", PULLS, None, TOKEN)[0], 200)
             self.assertEqual(tool.github("GET", COMMENTS + "?per_page=100&page=10", None, TOKEN)[0], 200)
             self.assertEqual(tool.github("POST", COMMENTS, {"body": "b"}, TOKEN)[0], 201)
+            self.assertEqual(tool.github("PATCH", "/repos/May-Assistant/may-app/issues/comments/5", {"body": "b"},
+                                         TOKEN)[0], 200)
             for method, path in (("POST", "/repos/May-Assistant/may-design-system/issues/42/comments"),
                                  ("GET", "/repos/May-Assistant/may-design-system/pulls/42"),
                                  ("PATCH", PULLS), ("PUT", PULLS + "/merge"), ("POST", PULLS),
                                  ("POST", PULLS + "/reviews"), ("POST", PULLS + "/comments"),
                                  ("GET", COMMENTS), ("POST", COMMENTS + "?per_page=100&page=1"),
                                  ("GET", COMMENTS + "?per_page=100&page=11"), ("GET", COMMENTS + "?per_page=100&page=1&x=1"),
-                                 ("POST", COMMENTS + "/../../43/comments"), ("PATCH", "/repos/May-Assistant/may-app/issues/comments/5"),
+                                 ("POST", COMMENTS + "/../../43/comments"), ("PATCH", "/repos/May-Assistant/may-app/issues/comments/x"),
+                                 ("PATCH", "/repos/May-Assistant/may-app/issues/comments/0"),
+                                 ("PATCH", "/repos/May-Assistant/may-design-system/issues/comments/5"),
                                  ("DELETE", COMMENTS), ("GET", "/repos/May-Assistant/may-app/contents/ios"),
                                  ("POST", "/repos/May-Assistant/may-releases/issues/42/comments")):
                 with self.subTest(method=method, path=path), self.assertRaises(CompilePrError):
                     tool.github(method, path, {"body": "b"}, TOKEN)
         self.assertEqual([(m, u.split("api.github.com", 1)[1]) for m, u, _ in seen],
-                         [("GET", PULLS), ("GET", COMMENTS + "?per_page=100&page=10"), ("POST", COMMENTS)])
+                         [("GET", PULLS), ("GET", COMMENTS + "?per_page=100&page=10"), ("POST", COMMENTS),
+                          ("PATCH", "/repos/May-Assistant/may-app/issues/comments/5")])
         self.assertTrue(all(h["Authorization"] == "Bearer " + TOKEN for _, _, h in seen))
 
     def test_an_http_error_is_a_status_never_its_body(self):

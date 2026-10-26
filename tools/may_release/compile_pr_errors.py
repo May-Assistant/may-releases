@@ -40,8 +40,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from compile import OUTCOME
-from ds_compile import (DsCompileError, MAX_BODY, MAX_ERRORS, SHA, XCODE, diagnostics, fence_for, post_once, request,
-                        run_url)
+from ds_compile import (DsCompileError, MAX_BODY, MAX_ERRORS, SHA, XCODE, diagnostics, fence_for, post_or_update,
+                        request, run_url)
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
@@ -115,12 +115,15 @@ def comment_body(sha, url, passed, errors, total):
 _PR = r"/repos/" + re.escape(APP_REPO) + r"/{}/[1-9][0-9]{{0,6}}"
 ALLOWED_CALLS = (("GET", _PR.format("pulls")),
                  ("GET", _PR.format("issues") + r"/comments\?per_page=100&page=(?:[1-9]|10)"),
-                 ("POST", _PR.format("issues") + r"/comments"))
+                 ("POST", _PR.format("issues") + r"/comments"),
+                 # The head's own marked comment, edited in place (ds_compile.post_or_update).
+                 ("PATCH", r"/repos/" + re.escape(APP_REPO) + r"/issues/comments/[1-9][0-9]{0,19}"))
 
 
 def github(method, path, payload, token):
     """One may-app API call: (status, parsed JSON or None). Only ALLOWED_CALLS are made: the pull request read, a page
-    of its comments, and its comment post. Nothing from the call is printed."""
+    of its comments, its comment post, and the edit of this head's own marked comment. Nothing from the call is
+    printed."""
     if not any(method == allowed and re.fullmatch(pattern, path) for allowed, pattern in ALLOWED_CALLS):
         raise CompilePrError("Only the may-app pull request and its comments are reachable")
     return request(method, path, payload, token)
@@ -299,9 +302,12 @@ def post(sha, pr, call_api=github):
         validate_pull_request(pull, number, sha)
     except GateDenial:
         raise CompilePrError("The pull request is no longer open at the compiled head; nothing was posted") from None
-    if not post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
+    done = post_or_update(call_api, APP_REPO, number, sha, body, token, MARKER)
+    if done == "same":
         print(f"May iOS compile result already posted for this head on may-app #{number}; nothing posted again")
         return 0 if passed else 1
+    if done == "updated":
+        print(f"May iOS compile: this head's comment on may-app #{number} is updated with this run's result")
     if not sealed and passed:
         print(f"May iOS compile passed; the result alone posted to may-app #{number} (no sealed record: no details)")
         return 0

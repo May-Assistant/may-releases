@@ -262,6 +262,32 @@ ALLOWED_CALLS = (("GET", _PR.format("pulls")),
 MAX_COMMENT_PAGES = 10
 
 
+def post_or_update(call_api, repo, number, sha, body, token, name=MARKER):
+    """Post body on the pull request, or, when a comment already carries this head's marker, edit that comment in
+    place: "posted", "updated", or "same" when it already reads body. The newest result for a head wins: a re-run's
+    pass replaces an earlier run's failure, and a detailed comment replaces a result-only one (review of may-releases
+    #137). A marked comment GitHub will not let the token edit (another author's) is left, and body is posted anew."""
+    found = None
+    for page in range(1, MAX_COMMENT_PAGES + 1):
+        status, comments = call_api("GET", f"/repos/{repo}/issues/{number}/comments?per_page=100&page={page}", None, token)
+        if status != 200 or not isinstance(comments, list):
+            raise DsCompileError("The pull request's comments could not be read; nothing was posted")
+        marked = [c for c in comments if already_posted([c], sha, name) and type(c.get("id")) is int and c["id"] > 0]
+        found = marked[-1] if marked else found
+        if len(comments) < 100:
+            break
+    if found is not None and found.get("body") == body:
+        return "same"
+    if found is not None:
+        status, _ = call_api("PATCH", f"/repos/{repo}/issues/comments/{found['id']}", {"body": body}, token)
+        if status == 200:
+            return "updated"
+    status, _ = call_api("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body}, token)
+    if status != 201:
+        raise DsCompileError("GitHub did not accept the comment; nothing from the compile is shown here")
+    return "posted"
+
+
 def already_posted(comments, sha, name=MARKER):
     """Whether a comment in one page of the pull request's comments already carries this head's marker."""
     marker = f"<!-- {name} head={sha} -->"
