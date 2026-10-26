@@ -64,6 +64,10 @@ class RunTests(unittest.TestCase):
         self.private.mkdir()
         self.bin = self.root / "may-tools/swift/bin"
         self.calls = []
+        # No test makes the real user or copies as root: a run that reaches admin without run_it's fake fails here.
+        guard = patch.object(tool, "admin", side_effect=AssertionError("a real sudo command in a test"))
+        guard.start()
+        self.addCleanup(guard.stop)
 
     def tearDown(self):
         self.directory.cleanup()
@@ -89,6 +93,8 @@ class RunTests(unittest.TestCase):
         def run_tool(argv, log, cwd, env, deadline):
             self.calls.append((list(argv), cwd, dict(env)))
             self.assertGreater(deadline, time.monotonic())
+            self.admin_calls.append(["run_tool"])
+            argv = argv[argv.index("swift"):] if "swift" in argv else argv
             with log.open("a") as stream:
                 if argv[:2] == ["swift", "build"]:
                     stream.write(build_output)
@@ -99,11 +105,17 @@ class RunTests(unittest.TestCase):
             raise AssertionError("unexpected tool " + argv[0])
         return run_tool
 
-    def run_it(self, sha, run_tool=None, version="6.2.4", extra=None):
+    def run_it(self, sha, run_tool=None, version="6.2.4", extra=None, admin_fails=None):
         environ = {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin:/bin", "HOME": "/home/runner",
                    "SOMETHING_ELSE": "x", **(extra or {})}
         out = io.StringIO()
+        self.admin_calls = []
+
+        def admin(argv, log):
+            self.admin_calls.append(list(argv))
+            return 1 if admin_fails and argv[0] == admin_fails else 0
         with patch.dict(os.environ, environ, clear=True), patch("sys.stdout", out), \
+                patch.object(tool, "admin", admin), \
                 patch.object(tool, "run_tool", run_tool or self.fake()), \
                 patch.object(tool, "swift_version", lambda env: version), \
                 patch.object(tool, "pinned_swift_bin", lambda: self.bin):
@@ -123,16 +135,16 @@ class RunTests(unittest.TestCase):
 
     def test_build_then_tests_in_the_package_with_no_fetch_no_secret_and_private_folders(self):
         self.run_it(self.commit(), extra={"MAY_APP_PR_TOKEN_UNRELATED": "x"})
-        work = self.root / tool.WORK
-        scratch = ["--scratch-path", str(work / "build")]
+        scratch = ["--scratch-path", str(tool.SANDBOX / "build")]
         self.assertEqual([argv for argv, _, _ in self.calls], [
-            ["swift", "build", "--build-tests", "--disable-automatic-resolution"] + scratch,
-            ["swift", "test", "--skip-build", "--disable-automatic-resolution"] + scratch])
+            tool.sandboxed(["swift", "build", "--build-tests", "--disable-automatic-resolution"] + scratch),
+            tool.sandboxed(["swift", "test", "--skip-build", "--disable-automatic-resolution"] + scratch)])
+        self.assertEqual(tool.sandboxed(["x"]), [
+            "sudo", "-n", "-u", "may-core", "--", "/usr/bin/env", "-i",
+            f"PATH={tool.SANDBOX}/swift/usr/bin:/usr/bin:/bin", f"HOME={tool.SANDBOX}/home", "x"])
         for argv, cwd, env in self.calls:
             with self.subTest(tool=argv[:2]):
-                self.assertEqual(cwd, self.source / "ios/MayCore")
-                self.assertEqual(env["HOME"], str(work / "home"))
-                self.assertTrue(env["PATH"].startswith(str(self.bin) + os.pathsep))
+                self.assertEqual(cwd, tool.SANDBOX / "src/ios/MayCore")
                 for name in ("SOMETHING_ELSE", "MAY_APP_PR_TOKEN_UNRELATED"):
                     self.assertNotIn(name, env)
         with self.assertRaises(store.StoreError):
@@ -171,7 +183,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out.splitlines(), [
             "May iOS core build: failed", "May iOS core tests: did not run (the build stopped it)",
             "May iOS core suite: 1 failures found, which go to the may-app pull request only"])
-        self.assertEqual([argv[:2] for argv, _, _ in self.calls], [["swift", "build"]])
+        self.assertEqual([argv[argv.index("swift"):][:2] for argv, _, _ in self.calls], [["swift", "build"]])
         self.assertEqual(outcome, {"result": "failed", "stages": {"build": "failed", "tests": "not run"},
                                    "tests": None, "problems": 1})
         self.assertEqual(failures["failures"], [{"test": None, "message": f"cannot find '{PRIVATE}' in scope",
@@ -202,11 +214,57 @@ class RunTests(unittest.TestCase):
                     self.run_it(self.commit(manifest, extra))
                 self.assertEqual(self.calls, [])
 
-    def test_a_commit_without_maycore_is_skipped(self):
-        out, outcome, failures = self.run_it(self.commit(None))
-        self.assertEqual(out, "May iOS core suite: this commit has no ios/MayCore package; skipped\n")
-        self.assertEqual((outcome["result"], failures), ("skipped", {"failures": [], "total": 0}))
-        self.assertEqual(self.calls, [])
+    def test_a_commit_without_maycore_fails_and_never_skips(self):
+        """Review of #128: removing or linking the package away was a green skip."""
+        cases = {"no package": (None, None), "a linked package": (None, "link")}
+        for case, (manifest, how) in cases.items():
+            with self.subTest(case=case):
+                self.calls = []
+                sha = self.commit(manifest)
+                if how == "link":
+                    (self.source / "elsewhere").mkdir(exist_ok=True)
+                    (self.source / "elsewhere/Package.swift").write_text(MANIFEST)
+                    (self.source / "ios").mkdir(exist_ok=True)
+                    (self.source / "ios/MayCore").symlink_to(self.source / "elsewhere")
+                    for argv in (["git", "add", "-A"], ["git", "commit", "-q", "-m", "link"]):
+                        subprocess.run(argv, cwd=self.source, env=GIT_ENV, check=True, capture_output=True)
+                    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.source, env=GIT_ENV,
+                                         capture_output=True, check=True).stdout.decode().strip()
+                out, outcome, failures = self.run_it(sha)
+                self.assertEqual(out, "May iOS core suite: this commit has no ios/MayCore package; failed\n")
+                self.assertEqual((outcome["result"], failures), ("failed", {"failures": [], "total": 0}))
+                self.assertEqual(self.calls, [])
+
+    def test_the_pull_requests_swift_runs_as_the_unprivileged_user_in_its_own_copies_and_is_stopped_after_each_step(self):
+        self.run_it(self.commit())
+        swift_top = self.bin.parent.parent
+        setup = tool.sandbox_setup(self.source, swift_top)
+        self.assertEqual(self.admin_calls[:len(setup)], setup)
+        self.assertEqual(self.admin_calls[len(setup):], [
+            ["run_tool"], ["pkill", "-KILL", "-u", "may-core"], ["run_tool"], ["pkill", "-KILL", "-u", "may-core"],
+            ["pkill", "-KILL", "-u", "may-core"], ["rm", "-rf", "--", str(tool.SANDBOX)]])
+        useradd = [argv for argv in setup if argv[0] == "useradd"]
+        self.assertEqual(len(useradd), 1)
+        for flag in ("-G", "--groups", "-aG", "sudo"):
+            self.assertNotIn(flag, useradd[0], "the user joins no group but its own")
+        self.assertEqual(useradd[0][-1], "may-core")
+        self.assertIn(["chown", "-R", "may-core:may-core", "--", str(tool.SANDBOX / "src")], setup)
+        self.assertNotIn(str(swift_top), [a for argv in setup if argv[0] == "chown" for a in argv],
+                         "the toolchain's copy is not theirs")
+
+    def test_a_sandbox_that_cannot_be_made_runs_nothing_and_is_still_removed(self):
+        for step in ("useradd", "cp", "chown", "install"):
+            with self.subTest(step=step):
+                self.calls = []
+                with self.assertRaises(tool.IosCoreError):
+                    self.run_it(self.commit(), admin_fails=step)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.admin_calls[-2:], [["pkill", "-KILL", "-u", "may-core"],
+                                                         ["rm", "-rf", "--", str(tool.SANDBOX)]])
+
+    def test_failures_in_the_sandboxs_copy_are_repo_relative(self):
+        out, outcome, failures = self.run_it(self.commit(), self.fake(test=1, test_output=failing(tool.SANDBOX / "src")))
+        self.assertEqual(failures["failures"][0]["at"], "ios/MayCore/Tests/MayCoreTests/FixtureTests.swift:162")
 
     def test_only_the_pinned_swift_runs(self):
         for version in ("6.2.3", None):
@@ -319,8 +377,18 @@ class PostTests(unittest.TestCase):
             with self.subTest(result=result):
                 self.calls = []
                 self.write(*recorded(result, [], {"build": "passed", "tests": "passed"}))
+                if result == "skipped":
+                    with self.assertRaises(tool.IosCoreError, msg="a skip is no longer a result"):
+                        self.post(self.api())
+                    continue
                 self.assertEqual(self.post(self.api()), (0, "May iOS core suite: nothing to post\n"))
                 self.assertEqual(self.calls, [])
+
+    def test_a_missing_package_is_posted_as_such(self):
+        self.write(*recorded("failed", [], {"build": "not run", "tests": "not run"}, None))
+        code, _ = self.post(self.api())
+        self.assertEqual(code, 1)
+        self.assertIn("This commit has no `ios/MayCore` package (or it is a link), so nothing ran.", self.posted()[0])
 
     def test_a_timeout_is_posted_and_fails(self):
         self.write(*recorded("timeout", [], {"build": "timeout", "tests": "not run"}, None))
@@ -423,8 +491,10 @@ class WorkflowTests(unittest.TestCase):
                                        name + "is not dispatched with exactly pr_number and source_sha"),
             "write permission": ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  contents: write\nconcurrency:",
                                  name + "permissions are not exactly read-only"),
-            "another concurrency group": ("  group: may-ios-core-pr\n", "  group: may-native-compile-pr\n",
-                                          name + "does not run one at a time"),
+            "one group for every pull request": ("  group: may-ios-core-pr-${{ inputs.pr_number }}\n",
+                                                 "  group: may-ios-core-pr\n", name + "does not run one at a time"),
+            "another lane's group": ("  group: may-ios-core-pr-${{ inputs.pr_number }}\n",
+                                     "  group: may-native-compile-pr\n", name + "does not run one at a time"),
             "a store environment": ("    environment: ${{ needs.admission.outputs.environment }}\n",
                                     "    environment: may-ios-playground-internal\n", name + "core's environment is not"),
             "inputs in shell": ('ios_core.py run --source-sha "$MAY_SOURCE_SHA"',
@@ -434,8 +504,23 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(case=case):
                 self.flagged(WORKFLOW, old, new, message, case)
 
+    def test_the_pull_requests_swift_must_run_sandboxed(self):
+        tool_path = "tools/may_release/ios_core.py"
+        message = "ios_core.py: the pull request's Swift does not run as the unprivileged may-core user alone"
+        cases = {
+            "the build as the runner": ("run_tool(sandboxed(BUILD + scratch)", "run_tool(BUILD + scratch", message),
+            "the tests as the runner": ("run_tool(sandboxed(TEST + scratch)", "run_tool(TEST + scratch", message),
+            "no stop after the build": ("    stop_all(log)\n    stages[\"build\"]", "    stages[\"build\"]", message),
+            "the user in sudo": ('"--shell", "/usr/sbin/nologin", SANDBOX_USER]', '"--shell", "/usr/sbin/nologin", "-G", "sudo", SANDBOX_USER]', message),
+            "the version as the runner": ('sandboxed(["swift", "--version"])', '["swift", "--version"]', message),
+            "the runner's environment kept": ('"/usr/bin/env", "-i",', '"/usr/bin/env",', message),
+        }
+        for case, (old, new, msg) in cases.items():
+            with self.subTest(case=case):
+                self.flagged(tool_path, old, new, msg, case)
+
     def test_printing_anything_from_may_app_is_flagged(self):
-        anchor = '        print("May iOS core suite: this commit has no ios/MayCore package; skipped")\n'
+        anchor = '        print("May iOS core suite: this commit has no ios/MayCore package; failed")\n'
         for mutation in ('        print(text)\n', '        print(entries[0])\n', '        sys.stdout.write(text)\n',
                          '        raise SystemExit(text)\n', '        print(f"{manifest}")\n'):
             with self.subTest(mutation=mutation.strip()):

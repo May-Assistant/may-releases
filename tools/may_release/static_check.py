@@ -1700,7 +1700,7 @@ IOS_CORE_RUN = 'python3 -I -S -B tools/may_release/ios_core.py run --source-sha 
 IOS_CORE_POST = ('python3 -I -S -B tools/may_release/ios_core.py post --source-sha "$MAY_SOURCE_SHA" '
                  '--pr-number "$MAY_PR_NUMBER"')
 IOS_CORE_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
-                    '"$RUNNER_TEMP/may-swift" "$RUNNER_TEMP/may-tools"')
+                    '"$RUNNER_TEMP/may-tools"')
 IOS_CORE_STEP_NAMES = ["Install the pinned, checksum-verified Swift",
                        "Check the pull request head and environment before fetching",
                        "Fetch the pull request head and pinned design system quietly",
@@ -1730,8 +1730,9 @@ def ios_core_workflow_problems(text):
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
             re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
         found.append(name + "is not dispatched with exactly pr_number and source_sha")
-    if "\nconcurrency:\n  group: may-ios-core-pr\n" not in text:
-        found.append(name + "does not run one at a time in its own concurrency group")
+    if "\nconcurrency:\n  group: may-ios-core-pr-${{ inputs.pr_number }}\n  cancel-in-progress: false\n" not in text or \
+            text.count("group:") != 1:
+        found.append(name + "does not run one at a time per pull request in its own concurrency group")
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
             [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "core")] != [1, 1] or \
             text.count("permissions:") != 3:
@@ -1780,7 +1781,35 @@ def ios_core_workflow_problems(text):
 
 
 def ios_core_print_problems(root):
-    return quiet_tool_problems(root, IOS_CORE_TOOL, IOS_CORE_PRINT_VALUES, IOS_CORE_EXIT_CLASSES)
+    return quiet_tool_problems(root, IOS_CORE_TOOL, IOS_CORE_PRINT_VALUES, IOS_CORE_EXIT_CLASSES) + \
+        ios_core_sandbox_problems(root)
+
+
+# Review of #128: the pull request's Swift runs only as SANDBOX_USER, a fresh system user in no group but its own, so it
+# never holds the runner user's sudo or files: every run_tool call and the version check run sandboxed(...), the user
+# is made with no other group, and every step is followed by stop_all.
+def ios_core_sandbox_problems(root):
+    path = root / "tools/may_release" / IOS_CORE_TOOL
+    tree = ast.parse(path.read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "run_tool"]
+    version, setup, sandboxed = (function_source(tree, name) for name in ("swift_version", "sandbox_setup", "sandboxed"))
+    body = function_source(tree, "run_sandboxed")
+    # Each statement holding a run_tool call is followed, in its own block, by stop_all(log).
+    blocks = [n.body for n in ast.walk(body) if hasattr(n, "body") and isinstance(n.body, list)] if body else []
+    stopped = [i + 1 < len(block) and ast.unparse(block[i + 1]) == "stop_all(log)"
+               for block in blocks for i, statement in enumerate(block)
+               if not isinstance(statement, (ast.If, ast.For, ast.While, ast.With, ast.Try))
+               and "run_tool(" in ast.unparse(statement)]
+    if assigned_literal(path, "SANDBOX_USER") != "may-core" or not calls or version is None or setup is None or \
+            sandboxed is None or any(not (n.args and isinstance(n.args[0], ast.Call) and
+                                          ast.unparse(n.args[0].func) == "sandboxed") for n in calls) or \
+            "sandboxed(['swift', '--version'])" not in ast.unparse(version) or \
+            re.search(r"'(-G|--groups|-aG|sudo|wheel|admin)'", ast.unparse(setup)) or \
+            "'-u', SANDBOX_USER" not in ast.unparse(sandboxed) or "'-i'" not in ast.unparse(sandboxed) or \
+            len(stopped) != len(calls) or not all(stopped):
+        return [IOS_CORE_TOOL + ": the pull request's Swift does not run as the unprivileged may-core user alone, "
+                "stopped after each step"]
+    return []
 
 # The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py) each
 # dispatch their lane's workflow (android-unit-pr.yml, backend-unit-pr.yml) for at most one may-app head a run. Each is

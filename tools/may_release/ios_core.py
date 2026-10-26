@@ -7,17 +7,17 @@ tests read contracts/, shared/test-vectors/, ios/App and ios/project.yml, and sk
 
   run   (no secret) checks the pinned Swift answers `swift --version` with exactly 6.2.4, refuses a package that
         declares a dependency (nothing is fetched: --disable-automatic-resolution), then runs `swift build
-        --build-tests` and `swift test --skip-build` in ios/MayCore, together within RUN_SECONDS, with HOME and the build
-        folder under $RUNNER_TEMP/may-swift (the cleanup removes both; no cache). Every line they print goes to a
-        private log. The outcome (passed, failed, skipped: no ios/MayCore in this commit, or timeout), XCTest's own
+        --build-tests` and `swift test --skip-build` in ios/MayCore, together within RUN_SECONDS, as SANDBOX_USER (no
+        sudo, no write access to this job's files) in its own copies of the checkout and toolchain under SANDBOX, all
+        removed at the end (no cache). Every line they print goes to a private log. The outcome (passed, failed, also
+        when this commit has no ios/MayCore, or timeout), XCTest's own
         closing counts (`Executed N tests, with S tests skipped and F failures`) plus Swift Testing's (`Test run with N
         tests ... with K issues`), and each compiler error or failing test (where, which, and its message, repo-relative,
         cleaned as android_unit.py cleans) go to private files. Public output is fixed lines and counts. It never fails
         the step: post does.
   post  (MAY_APP_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts a failed outcome as one comment
         on the pull request, after reading it again and finding it still open at the checked head, unless a comment
-        already carries this head's marker (swift_checks.py's model and calls). A passed or skipped outcome posts
-        nothing. It fails the job when the suite failed or did not finish.
+        already carries this head's marker (swift_checks.py's model and calls). A passed outcome posts nothing. It fails the job when the suite failed or did not finish.
 
 This repository is public; may-app is private. Nothing derived from may-app (a test name, a message, a path, a compiler
 line) is printed, summarised or uploaded here: every printed line is fixed apart from the pull request number and
@@ -53,9 +53,17 @@ TEST = ["swift", "test", "--skip-build", "--disable-automatic-resolution"]
 COMMANDS = "`swift build --build-tests` and `swift test --skip-build` in `ios/MayCore`"
 # The build and the tests together (the job's 35 minutes leave room for the fetch and the 1 GB toolchain).
 RUN_SECONDS = 25 * 60
-WORK = "may-swift"
+# Independent review of #128 (26 Oct): the runner user has passwordless sudo, and the post step that holds the comment
+# token runs in this job after the pull request's own Swift. So that Swift runs as SANDBOX_USER, a system user with no
+# sudo, no login shell and no write access to the workspace, the runner's files or this job's command files, in its own
+# copies of the checkout and the toolchain under SANDBOX (made and removed here as root, never by the pull request's
+# code), with its output on the private log's descriptor alone. After each step, and on a timeout, every process of
+# that user is killed, so nothing it started outlives its step.
+SANDBOX_USER = "may-core"
+SANDBOX = Path("/opt/may-core")
+ADMIN_SECONDS = 10 * 60
 LOG, OUTCOME, FAILURES = "ios-core.log", "ios-core-result.json", "ios-core-failures.json"
-RESULTS = ("passed", "failed", "skipped", "timeout")
+RESULTS = ("passed", "failed", "timeout")
 STAGES = ("build", "tests")
 MAX_FAILURES, MAX_NAME, MAX_MESSAGE = 100, 200, 300
 MARKER = "may-ios-core-pr"
@@ -133,6 +141,42 @@ def failing_tests(text, roots):
     return found[:MAX_FAILURES], len(found)
 
 
+def admin(argv, log):
+    """One root command of the sandbox's own setup or teardown (never the pull request's code); its status, or None."""
+    try:
+        with log.open("ab") as output:
+            return subprocess.run(["sudo", "-n", *argv], stdout=output, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, timeout=ADMIN_SECONDS).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def sandboxed(argv):
+    """argv as SANDBOX_USER, with only the pinned Swift's copy and the system on PATH and its own HOME."""
+    return ["sudo", "-n", "-u", SANDBOX_USER, "--", "/usr/bin/env", "-i",
+            f"PATH={SANDBOX / 'swift/usr/bin'}:/usr/bin:/bin", f"HOME={SANDBOX / 'home'}", *argv]
+
+
+def sandbox_setup(source, swift_top):
+    """The root commands that make the sandbox: a fresh system user, the toolchain's copy (readable, not theirs), and
+    the checkout's copy, HOME and build folder (theirs)."""
+    user = f"{SANDBOX_USER}:{SANDBOX_USER}"
+    return [["rm", "-rf", "--", str(SANDBOX)],
+            ["useradd", "--system", "--user-group", "--no-create-home", "--home-dir", str(SANDBOX / "home"),
+             "--shell", "/usr/sbin/nologin", SANDBOX_USER],
+            ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", str(SANDBOX)],
+            ["cp", "-a", "--", str(swift_top), str(SANDBOX / "swift")],
+            ["cp", "-a", "--", str(source), str(SANDBOX / "src")],
+            ["chown", "-R", user, "--", str(SANDBOX / "src")],
+            ["install", "-d", "-o", SANDBOX_USER, "-g", SANDBOX_USER, "-m", "0700", str(SANDBOX / "home"),
+             str(SANDBOX / "build")]]
+
+
+def stop_all(log):
+    """Every process of SANDBOX_USER, killed (none left is fine)."""
+    admin(["pkill", "-KILL", "-u", SANDBOX_USER], log)
+
+
 def pinned_swift_bin():
     try:
         return Path(toolchain.tool_path("swift", "usr/bin/swift-driver")).parent
@@ -155,8 +199,8 @@ def run_tool(argv, log, cwd, env, deadline):
 
 def swift_version(env):
     try:
-        result = subprocess.run(["swift", "--version"], env=env, capture_output=True, stdin=subprocess.DEVNULL,
-                                timeout=60)
+        result = subprocess.run(sandboxed(["swift", "--version"]), env=env, capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=60, cwd=SANDBOX)
     except (OSError, subprocess.SubprocessError):
         return None
     match = VERSION.search(result.stdout.decode("utf-8", errors="replace"))
@@ -181,28 +225,42 @@ def run_suite(source_sha):
     package = source / PACKAGE
     manifest = package / "Package.swift"
     if package.is_symlink() or not package.is_dir() or manifest.is_symlink() or not manifest.is_file():
-        record(private, "skipped", dict.fromkeys(STAGES, "not run"), None, [], 0)
-        print("May iOS core suite: this commit has no ios/MayCore package; skipped")
+        # Review of #128: a pull request that removes or links the package away fails; it is never a green skip.
+        record(private, "failed", dict.fromkeys(STAGES, "not run"), None, [], 0)
+        print("May iOS core suite: this commit has no ios/MayCore package; failed")
         return
     if DEPENDENCY.search(manifest.read_text(errors="replace")) or (package / "Package.resolved").exists():
         raise IosCoreError("ios/MayCore declares a package dependency, which this job does not fetch; nothing ran")
-    work = root / WORK
-    (work / "home").mkdir(parents=True, mode=0o700, exist_ok=True)
-    env = child_env(PATH=str(pinned_swift_bin()) + os.pathsep + os.environ.get("PATH", ""), HOME=str(work / "home"))
-    if swift_version(env) != SWIFT_VERSION:
-        raise IosCoreError("Swift is not the pinned 6.2.4; nothing ran")
-    scratch = ["--scratch-path", str(work / "build")]
+    swift_top = pinned_swift_bin().parent.parent
     log = private / LOG
     log.write_bytes(b"")
-    roots = [str(source), str(source.resolve())]
+    try:
+        run_sandboxed(source, swift_top, private, log)
+    finally:
+        stop_all(log)
+        admin(["rm", "-rf", "--", str(SANDBOX)], log)
+
+
+def run_sandboxed(source, swift_top, private, log):
+    for argv in sandbox_setup(source, swift_top):
+        if admin(argv, log) != 0:
+            raise IosCoreError("The unprivileged build user could not be set up; nothing ran")
+    env = child_env()
+    if swift_version(env) != SWIFT_VERSION:
+        raise IosCoreError("Swift is not the pinned 6.2.4; nothing ran")
+    package = SANDBOX / "src" / PACKAGE
+    scratch = ["--scratch-path", str(SANDBOX / "build")]
+    roots = [str(SANDBOX / "src"), str(source), str(source.resolve())]
     deadline = time.monotonic() + RUN_SECONDS
     stages = dict.fromkeys(STAGES, "not run")
-    status = run_tool(BUILD + scratch, log, package, env, deadline)
+    status = run_tool(sandboxed(BUILD + scratch), log, package, env, deadline)
+    stop_all(log)
     stages["build"] = "timeout" if status is None else "failed" if status else "passed"
     counts, entries, total = None, [], 0
     if stages["build"] == "passed":
         start = log.stat().st_size
-        status = run_tool(TEST + scratch, log, package, env, deadline)
+        status = run_tool(sandboxed(TEST + scratch), log, package, env, deadline)
+        stop_all(log)
         with log.open("rb") as written:
             written.seek(start)
             text = written.read().decode("utf-8", errors="replace")
@@ -282,6 +340,8 @@ def comment_body(sha, url, outcome, failed, shown=None):
         fence = fence_for(block)
         lines += ["", f"**{failed['total']} {what}{'s' if failed['total'] != 1 else ''}**: where, which, and the "
                   f"message.{extra}", "", fence + "text", *block, fence]
+    elif outcome["result"] == "failed" and stages["build"] == "not run":
+        lines += ["", "This commit has no `ios/MayCore` package (or it is a link), so nothing ran."]
     elif outcome["result"] == "failed":
         lines += ["", "The suite failed without a readable error or failing test. Nothing else from the log is posted."]
     if url:
@@ -307,7 +367,7 @@ def post(sha, pr, call_api=github):
     root = Path(raw).resolve()
     checkout, private = root / "may-source", root / "may-private"
     outcome, failed = read_record(private)
-    if outcome["result"] in ("passed", "skipped"):
+    if outcome["result"] == "passed":
         print("May iOS core suite: nothing to post")
         return 0
     total = failed["total"]
