@@ -93,7 +93,7 @@ jobs:
           MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
-      # The pull request's Swift runs as an unprivileged user with no sudo, in its own copies (ios_core.SANDBOX_USER),
+      # The pull request's Swift runs as an unprivileged user with no sudo, in its own copies (sandbox.py),
       # so it cannot reach the post step below, its token, the tools or this job's files.
       - name: Build and test MayCore without any credential, printing only pass or fail and counts
         env:

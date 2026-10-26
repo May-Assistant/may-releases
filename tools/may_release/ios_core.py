@@ -7,9 +7,9 @@ tests read contracts/, shared/test-vectors/, ios/App and ios/project.yml, and sk
 
   run   (no secret) checks the pinned Swift answers `swift --version` with exactly 6.2.4, refuses a package that
         declares a dependency (nothing is fetched: --disable-automatic-resolution), then runs `swift build
-        --build-tests` and `swift test --skip-build` in ios/MayCore, together within RUN_SECONDS, as SANDBOX_USER (no
-        sudo, no write access to this job's files) in its own copies of the checkout and toolchain under SANDBOX, all
-        removed at the end (no cache). Every line they print goes to a private log. The outcome (passed, failed, also
+        --build-tests` and `swift test --skip-build` in ios/MayCore, together within RUN_SECONDS, as sandbox.py's
+        unprivileged user (no sudo, no write access to this job's files) in its own copies of the checkout and toolchain,
+        all removed at the end (no cache). Every line they print goes to a private log. The outcome (passed, failed, also
         when this commit has no ios/MayCore, or timeout), XCTest's own
         closing counts (`Executed N tests, with S tests skipped and F failures`) plus Swift Testing's (`Test run with N
         tests ... with K issues`), and each compiler error or failing test (where, which, and its message, repo-relative,
@@ -42,6 +42,8 @@ from ds_compile import DsCompileError, MAX_BODY, SHA, fence_for, post_once, run_
 from gate import APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
+import sandbox
+from sandbox import SandboxError, stop_all
 from store import StoreError, child_env, prepared, require_step_secrets, runner_root
 import toolchain
 
@@ -53,24 +55,8 @@ TEST = ["swift", "test", "--skip-build", "--disable-automatic-resolution"]
 COMMANDS = "`swift build --build-tests` and `swift test --skip-build` in `ios/MayCore`"
 # The build and the tests together (the job's 35 minutes leave room for the fetch and the 1 GB toolchain).
 RUN_SECONDS = 25 * 60
-# Independent review of #128 (26 Oct): the runner user has passwordless sudo, and the post step that holds the comment
-# token runs in this job after the pull request's own Swift. So that Swift runs as SANDBOX_USER, a system user with no
-# sudo, no login shell and no write access to the workspace, the runner's files or this job's command files, in its own
-# copies of the checkout and the toolchain under SANDBOX (made and removed here as root, never by the pull request's
-# code), with its output on the private log's descriptor alone. After each step, and on a timeout, every process of
-# that user is killed, so nothing it started outlives its step.
-SANDBOX_USER = "may-core"
-SANDBOX = Path("/opt/may-core")
-ADMIN_SECONDS = 10 * 60
-# Second re-review of #128: that user may not schedule work to outlive the run (DENY_FILES), may not enter the runner's
-# home or runner temp (where the job's command files and the token mints' outputs live: checked as that user), is killed
-# until none of its processes is left (STOP_ROUNDS), and its files anywhere on the runner go with it (LEFTOVERS).
-DENY_FILES = ("/etc/cron.deny", "/etc/at.deny")
-STOP_ROUNDS = 20
-# Third re-review of #128: the world-writable places, each its own mount or not (-xdev keeps each scan in its own), and the
-# sandbox; never the whole root, which cost minutes of the job.
-LEFTOVER_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mqueue", "/var/crash", "/var/lib/php/sessions",
-                 "/mnt", str(SANDBOX))
+# The pull request's Swift runs in sandbox.py's unprivileged user (reviews of #128), in its own copies of the checkout and
+# the toolchain (at sandbox.ROOT / "swift").
 LOG, OUTCOME, FAILURES = "ios-core.log", "ios-core-result.json", "ios-core-failures.json"
 RESULTS = ("passed", "failed", "timeout")
 STAGES = ("build", "tests")
@@ -150,73 +136,9 @@ def failing_tests(text, roots):
     return found[:MAX_FAILURES], len(found)
 
 
-def admin(argv, log, data=None):
-    """One root command of the sandbox's own setup or teardown (never the pull request's code), with data on its
-    stdin when given; its status, or None."""
-    try:
-        with log.open("ab") as output:
-            return subprocess.run(["sudo", "-n", *argv], stdout=output, stderr=subprocess.STDOUT, input=data,
-                                  stdin=None if data is not None else subprocess.DEVNULL,
-                                  timeout=ADMIN_SECONDS).returncode
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def as_sandbox(argv, log):
-    """A check run as SANDBOX_USER (never the pull request's code); its status, or None."""
-    try:
-        with log.open("ab") as output:
-            return subprocess.run(sandboxed(argv), stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                  cwd=SANDBOX, timeout=60).returncode
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def sandboxed(argv):
-    """argv as SANDBOX_USER, with only the pinned Swift's copy and the system on PATH and its own HOME."""
-    return ["sudo", "-n", "-u", SANDBOX_USER, "--", "/usr/bin/env", "-i",
-            f"PATH={SANDBOX / 'swift/usr/bin'}:/usr/bin:/bin", f"HOME={SANDBOX / 'home'}", *argv]
-
-
-def sandbox_setup(source, swift_top):
-    """The root commands that make the sandbox: a fresh system user, the toolchain's copy (readable, not theirs), and
-    the checkout's copy, HOME and build folder (theirs)."""
-    user = f"{SANDBOX_USER}:{SANDBOX_USER}"
-    return [["rm", "-rf", "--", str(SANDBOX)],
-            ["useradd", "--system", "--user-group", "--no-create-home", "--home-dir", str(SANDBOX / "home"),
-             "--shell", "/usr/sbin/nologin", SANDBOX_USER],
-            ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", str(SANDBOX)],
-            ["cp", "-a", "--", str(swift_top), str(SANDBOX / "swift")],
-            ["cp", "-a", "--", str(source), str(SANDBOX / "src")],
-            ["chown", "-R", user, "--", str(SANDBOX / "src")],
-            ["install", "-d", "-o", SANDBOX_USER, "-g", SANDBOX_USER, "-m", "0700", str(SANDBOX / "home"),
-             str(SANDBOX / "build")]]
-
-
-def stop_all(log, strict=True):
-    """Every process of SANDBOX_USER killed, as that user (kill -1: all it may signal, forks during a scan included),
-    round after round until pgrep finds none; strict, refuses if any is left."""
-    for _ in range(STOP_ROUNDS):
-        admin(["-u", SANDBOX_USER, "/usr/bin/kill", "-KILL", "-1"], log)
-        if admin(["pgrep", "-u", SANDBOX_USER], log) == 1:
-            return
-        time.sleep(0.25)
-    if strict:
-        raise IosCoreError("A process of the unprivileged build user could not be stopped")
-
-
-def leftovers():
-    """The root command that deletes SANDBOX_USER's files in each of LEFTOVER_DIRS that exists here."""
-    return ["find", *(d for d in LEFTOVER_DIRS if os.path.isdir(d)), "-xdev", "-user", SANDBOX_USER, "-delete"]
-
-
-def teardown(log):
-    """The sandbox gone: its user's processes, its files anywhere on the runner, its copies and the user itself."""
-    stop_all(log, strict=False)
-    if admin(leftovers(), log) != 0:
-        print("May iOS core suite: some files of the build user could not be removed")
-    admin(["rm", "-rf", "--", str(SANDBOX)], log)
-    admin(["userdel", SANDBOX_USER], log)
+def swift(argv):
+    """argv as the sandbox's user, with the pinned Swift's copy on PATH."""
+    return sandbox.sandboxed(argv, path=[sandbox.ROOT / "swift/usr/bin"])
 
 
 def pinned_swift_bin():
@@ -226,31 +148,10 @@ def pinned_swift_bin():
         raise IosCoreError("The pinned Swift is not installed; nothing ran") from None
 
 
-def run_tool(argv, log, cwd, env, deadline):
-    """The tool's exit status, or None when it ran past the deadline; its output goes to the private log alone. Its
-    direct child is root's sudo, which this runner user may not signal (re-review of #128): past the deadline, every
-    SANDBOX_USER process is killed instead (stop_all), and sudo then exits on its own."""
-    left = deadline - time.monotonic()
-    if left <= 0:
-        return None
-    with log.open("ab") as output:
-        process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
-                                   stdin=subprocess.DEVNULL)
-    try:
-        return process.wait(timeout=left)
-    except subprocess.TimeoutExpired:
-        stop_all(log, strict=False)  # a process that survives fails the run at the step's own stop_all
-        try:
-            process.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            pass
-        return None
-
-
 def swift_version(env):
     try:
-        result = subprocess.run(sandboxed(["swift", "--version"]), env=env, capture_output=True,
-                                stdin=subprocess.DEVNULL, timeout=60, cwd=SANDBOX)
+        result = subprocess.run(swift(["swift", "--version"]), env=env, capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=60, cwd=sandbox.ROOT)
     except (OSError, subprocess.SubprocessError):
         return None
     match = VERSION.search(result.stdout.decode("utf-8", errors="replace"))
@@ -287,37 +188,27 @@ def run_suite(source_sha):
     try:
         run_sandboxed(source, swift_top, private, log)
     finally:
-        teardown(log)
+        if not sandbox.teardown(log):
+            print("May iOS core suite: some files of the build user could not be removed")
 
 
 def run_sandboxed(source, swift_top, private, log):
-    home = Path(os.environ.get("HOME") or Path.home())
-    if admin(["chmod", "0700", "--", str(home)], log) != 0:
-        raise IosCoreError("The unprivileged build user could not be set up; nothing ran")
-    for argv in sandbox_setup(source, swift_top):
-        if admin(argv, log) != 0:
-            raise IosCoreError("The unprivileged build user could not be set up; nothing ran")
-    for path in DENY_FILES:
-        if admin(["tee", "-a", "--", path], log, data=(SANDBOX_USER + "\n").encode()) != 0:
-            raise IosCoreError("The unprivileged build user could not be set up; nothing ran")
-    for path in (home, runner_root()):
-        if as_sandbox(["/usr/bin/test", "!", "-x", str(path)], log) != 0:
-            raise IosCoreError("The unprivileged build user can reach the runner's files; nothing ran")
+    sandbox.setup(log, source, runner_root(), {"swift": swift_top})
     env = child_env()
     if swift_version(env) != SWIFT_VERSION:
         raise IosCoreError("Swift is not the pinned 6.2.4; nothing ran")
-    package = SANDBOX / "src" / PACKAGE
-    scratch = ["--scratch-path", str(SANDBOX / "build")]
-    roots = [str(SANDBOX / "src"), str(source), str(source.resolve())]
+    package = sandbox.ROOT / "src" / PACKAGE
+    scratch = ["--scratch-path", str(sandbox.ROOT / "build")]
+    roots = [str(sandbox.ROOT / "src"), str(source), str(source.resolve())]
     deadline = time.monotonic() + RUN_SECONDS
     stages = dict.fromkeys(STAGES, "not run")
-    status = run_tool(sandboxed(BUILD + scratch), log, package, env, deadline)
+    status = sandbox.step(swift(BUILD + scratch), log, package, deadline)
     stop_all(log)
     stages["build"] = "timeout" if status is None else "failed" if status else "passed"
     counts, entries, total = None, [], 0
     if stages["build"] == "passed":
         start = log.stat().st_size
-        status = run_tool(sandboxed(TEST + scratch), log, package, env, deadline)
+        status = sandbox.step(swift(TEST + scratch), log, package, deadline)
         stop_all(log)
         with log.open("rb") as written:
             written.seek(start)
@@ -470,7 +361,7 @@ if __name__ == "__main__":
         failed = main()
     except GateDenial as denial:
         raise SystemExit("May iOS core suite denied: " + denial.args[0]) from None
-    except (IosCoreError, CompilePrError, DsCompileError, StoreError) as error:
+    except (IosCoreError, SandboxError, CompilePrError, DsCompileError, StoreError) as error:
         raise SystemExit("May iOS core suite stopped: " + error.args[0]) from None
     except (PrepareError, OSError, subprocess.SubprocessError):
         raise SystemExit("May iOS core suite stopped; no may-app source, path or credential was printed") from None

@@ -7,14 +7,16 @@ macOS compile needs it, so a slip they catch fails in a minute instead of after 
 
   run   (no secret) runs `python3 -I -m unittest discover -s tools/ios -p 'test_swift_*.py'` and then the same with
         -p 'test_parity_*.py' (may-app's parity checks: a screens.json row iOS doesn't draw) in the checkout, each
-        pattern with a file, every line they print going to a private log. The outcome (passed, failed, skipped: no such check in this commit, or
-        timeout) and each failing check (its test id and the lines of its assertion, repo-relative, cleaned as
+        pattern with a file, every line they print going to a private log. The outcome (passed, failed or timeout) and
+        each failing check (its test id and the lines of its assertion, repo-relative, cleaned as
         android_unit.py cleans) go to private files. Public output is one fixed line and a count. It never fails the
-        step: post does.
+        step: post does. A commit whose tools/ios is gone or a symlink, that lacks a check of either pattern, or whose
+        checks find no test (unittest's exit 5) has failed, with "missing" in its outcome: may-app main has both, so a
+        pull request that drops them never passes (independent review of may-releases #130).
   post  (MAY_APP_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts a failed outcome's checks as one
         comment on the pull request, after reading it again and finding it still open at the checked head, unless a
-        comment already carries this head's marker (compile_pr_errors.py's model and calls). A passed or skipped
-        outcome posts nothing. It fails the job when the checks failed or did not finish, so the compile never starts.
+        comment already carries this head's marker (compile_pr_errors.py's model and calls). A passed outcome posts
+        nothing. It fails the job when the checks failed or did not finish, so the compile never starts.
 
 -s tools/ios, not -s tools: neither tools/ nor tools/ios/ is a package, so discovery from tools/ finds no test.
 
@@ -30,6 +32,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it after the standard library.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -40,7 +43,9 @@ from ds_compile import DsCompileError, MAX_BODY, SHA, fence_for, post_once, run_
 from gate import APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
-from store import StoreError, child_env, prepared, require_step_secrets, runner_root
+import sandbox
+from sandbox import SandboxError, stop_all
+from store import StoreError, prepared, require_step_secrets, runner_root
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
 # The Swift checks, then the parity checks (a screens.json row iOS does not draw fails the pull request, not main:
@@ -48,7 +53,7 @@ COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
 CHECKS_DIR, PATTERNS = "tools/ios", ("test_swift_*.py", "test_parity_*.py")
 COMMANDS = " and ".join(f"`python3 -I -m unittest discover -s tools/ios -p '{p}'`" for p in PATTERNS)
 LOG, OUTCOME, FAILURES = "swift-checks.log", "swift-checks-result.json", "swift-checks-failures.json"
-RESULTS = ("passed", "failed", "skipped", "timeout")
+RESULTS = ("passed", "failed", "timeout")
 CHECK_SECONDS = 10 * 60
 # unittest's exit status when discovery found no test (Python 3.12 and later).
 NO_TESTS = 5
@@ -100,6 +105,27 @@ def problem_count(text, blocks):
     return blocks
 
 
+def run_patterns(present, log, roots, codes, found):
+    """Each pattern's own discovery, one after the other into the log, as the sandbox's user in its copy of the
+    checkout (reviews of may-releases #128: the post step that holds the comment token runs in this job); each run's
+    part is read on its own, since unittest's summary line counts that run alone."""
+    for pattern in present:
+        start = log.stat().st_size
+        status = sandbox.step(sandbox.sandboxed(["/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s",
+                                                CHECKS_DIR, "-p", pattern]), log, sandbox.ROOT / "src",
+                             time.monotonic() + CHECK_SECONDS)
+        stop_all(log)
+        codes.append(status)
+        if status is None:
+            break
+        if status not in (0, NO_TESTS):
+            with log.open("rb") as written:
+                written.seek(start)
+                text = written.read().decode("utf-8", errors="replace")
+            entries, blocks = failing_checks(text, roots)
+            found.append((entries, problem_count(text, blocks)))
+
+
 def run_checks(source_sha):
     require_step_secrets(())
     if not SHA.fullmatch(source_sha or ""):
@@ -107,42 +133,33 @@ def run_checks(source_sha):
     source, private = prepared(runner_root(), source_sha)
     log = private / LOG
     checks = source / CHECKS_DIR
-    present = [pattern for pattern in PATTERNS if checks.is_dir() and not checks.is_symlink() and
-               any(p.is_file() for p in checks.glob(pattern))]
-    roots = [str(source), str(source.resolve())]
+    real = checks.is_dir() and not any(path.is_symlink() for path in (source / "tools", checks))
+    present = [pattern for pattern in PATTERNS if real and any(p.is_file() for p in checks.glob(pattern))]
+    roots = [str(sandbox.ROOT / "src"), str(source), str(source.resolve())]
     codes, entries, problems = [], [], 0
     log.write_bytes(b"")
-    # Each pattern's own discovery, one after the other into the log; each run's part is read on its own, since
-    # unittest's summary line counts that run alone.
-    for pattern in present:
-        start = log.stat().st_size
-        try:
-            with log.open("ab") as output:
-                codes.append(subprocess.run([sys.executable, "-I", "-m", "unittest", "discover", "-s", CHECKS_DIR,
-                                             "-p", pattern], cwd=source, env=child_env(), stdout=output,
-                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                            timeout=CHECK_SECONDS).returncode)
-        except subprocess.TimeoutExpired:
-            codes.append(None)
-            break
-        if codes[-1] not in (0, NO_TESTS):
-            with log.open("rb") as written:
-                written.seek(start)
-                text = written.read().decode("utf-8", errors="replace")
-            found, blocks = failing_checks(text, roots)
-            entries += found
-            problems += problem_count(text, blocks)
-    result = ("timeout" if None in codes else "failed" if any(code not in (0, NO_TESTS) for code in codes)
-              else "passed" if 0 in codes else "skipped")
+    try:
+        if present:
+            sandbox.setup(log, source, runner_root())
+        run_patterns(present, log, roots, codes, entries)
+    finally:
+        if present and not sandbox.teardown(log):
+            print("May Swift checks: some files of the sandbox user could not be removed")
+    problems = sum(count for _, count in entries)
+    entries = [entry for group, _ in entries for entry in group]
+    missing = len(present) != len(PATTERNS) or NO_TESTS in codes
+    result = ("timeout" if None in codes else "failed" if missing or any(code != 0 for code in codes) else "passed")
     entries = entries[:MAX_FAILURES] if result == "failed" else []
     problems = problems if result == "failed" else 0
     (private / FAILURES).write_text(json.dumps({"failures": [{"kind": k, "test": t, "lines": l} for k, t, l in entries],
                                                 "total": problems}))
-    (private / OUTCOME).write_text(json.dumps({"result": result, "problems": problems}))
+    (private / OUTCOME).write_text(json.dumps({"result": result, "problems": problems,
+                                               **({"missing": True} if missing and result == "failed" else {})}))
     if result == "passed":
         print("May Swift checks passed")
-    elif result == "skipped":
-        print("May Swift checks: this commit has none (tools/ios/test_swift_*.py, test_parity_*.py); skipped")
+    elif result == "failed" and missing:
+        print("May Swift checks failed: this commit has no tools/ios/test_swift_*.py or test_parity_*.py check, or "
+              "they found no test")
     elif result == "timeout":
         print("May Swift checks did not finish within 10 minutes")
     else:
@@ -157,7 +174,8 @@ def read_record(private):
     except (OSError, ValueError):
         raise SwiftChecksError("No Swift checks outcome is recorded; nothing was posted") from None
     count = lambda v: type(v) is int and 0 <= v <= 1_000_000
-    if not isinstance(outcome, dict) or outcome.get("result") not in RESULTS or not count(outcome.get("problems")):
+    if not isinstance(outcome, dict) or outcome.get("result") not in RESULTS or not count(outcome.get("problems")) or \
+            set(outcome) - {"result", "problems", "missing"} or outcome.get("missing", True) is not True:
         raise SwiftChecksError("The Swift checks outcome is malformed; nothing was posted")
     entries = failed.get("failures") if isinstance(failed, dict) else None
     line = lambda v, limit: isinstance(v, str) and len(v) <= limit and "\n" not in v
@@ -189,6 +207,9 @@ def comment_body(sha, url, outcome, failed, shown=None):
         fence = fence_for(block)
         lines += ["", f"**{failed['total']} failing check{'s' if failed['total'] != 1 else ''}**: each one's test and "
                   f"the lines of its assertion.{extra}", "", fence + "text", *block, fence]
+    elif outcome.get("missing"):
+        lines += ["", "This commit has no tools/ios/test_swift_*.py or test_parity_*.py check, or they found no test. "
+                  "may-app main has both, so a pull request must keep them."]
     elif outcome["result"] == "failed":
         lines += ["", "The checks failed without a readable failing test (for example an import error before any test "
                   "ran). Nothing else from the log is posted."]
@@ -215,7 +236,7 @@ def post(sha, pr, call_api=github):
     root = Path(raw).resolve()
     checkout, private = root / "may-source", root / "may-private"
     outcome, failed = read_record(private)
-    if outcome["result"] in ("passed", "skipped"):
+    if outcome["result"] == "passed":
         print("May Swift checks: nothing to post; the compile may run")
         return 0
     total = failed["total"]
@@ -260,7 +281,7 @@ if __name__ == "__main__":
         failed = main()
     except GateDenial as denial:
         raise SystemExit("May Swift checks denied: " + denial.args[0]) from None
-    except (SwiftChecksError, CompilePrError, DsCompileError, StoreError) as error:
+    except (SwiftChecksError, SandboxError, CompilePrError, DsCompileError, StoreError) as error:
         raise SystemExit("May Swift checks stopped: " + error.args[0]) from None
     except (PrepareError, OSError, subprocess.SubprocessError):
         raise SystemExit("May Swift checks stopped; no may-app source, path or credential was printed") from None
