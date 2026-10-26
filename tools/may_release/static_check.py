@@ -1740,6 +1740,7 @@ def backend_unit_lock_problems(path, tree, checks):
             assigned_literal(path, "TEST_OWNER_SQL") != BACKEND_TEST_OWNER_SQL or \
             assigned_literal(path, "CLOSE_SQL") != "ALTER ROLE may_admin NOLOGIN" or lock is None or \
             "LOCKED_SQL" not in ast.unparse(lock) or "'SELECT 1'" not in ast.unparse(lock) or \
+            assigned_literal(path, "LOCKED") != "false,false,true,set, inherit" or \
             [ast.unparse(k.value) for k in env] != ["TEST_ADMIN_URL"] or not users <= BACKEND_ADMIN_USERS:
         return [BACKEND_TOOL + ": the tests hold more than the non-superuser ci_admin, or the superuser is not closed "
                 "to them (LOCK_SQL, CLOSE_SQL)"]

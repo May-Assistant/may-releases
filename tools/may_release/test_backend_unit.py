@@ -112,7 +112,7 @@ class Fixture(unittest.TestCase):
         return quiet
 
     def value(self, node="v22.22.0", server="16.15 (Debian 16.15-1.pgdg120+1)", applied="2", silent=None,
-              locked="false,false", superuser_login=None):
+              locked="false,false,true,set, inherit", superuser_login=None):
         settings = dict(backend_unit.SILENT, **(silent or {}))
 
         def answer(argv, env):
@@ -299,8 +299,10 @@ class RunTests(Fixture):
         cases = {
             "a lock statement refused": (dict(lock=1), dict()),
             "a lock statement timed out": (dict(lock=None), dict()),
-            "the tests' admin a superuser": (dict(), dict(locked="true,false")),
-            "the superuser still able to log in by its flag": (dict(), dict(locked="false,true")),
+            "the tests' admin a superuser": (dict(), dict(locked="true,false,true,set, inherit")),
+            "the superuser still able to log in by its flag": (dict(), dict(locked="false,true,true,set, inherit")),
+            "may_owner not the admin's to SET (the setup's hang)": (dict(), dict(locked="false,false,false,set, inherit")),
+            "no self-grant in a new session": (dict(), dict(locked="false,false,true,")),
             "the lock unreadable": (dict(), dict(locked=None)),
             "the superuser's login still answered": (dict(), dict(superuser_login="1")),
         }
@@ -620,7 +622,7 @@ class WorkflowTests(unittest.TestCase):
             "the superuser handed to the tests": ("MAY_TEST_ADMIN_URL=TEST_ADMIN_URL,", "MAY_TEST_ADMIN_URL=ADMIN_URL,", message),
             "a superuser test admin": ('"CREATE ROLE ci_admin LOGIN NOSUPERUSER CREATEDB', '"CREATE ROLE ci_admin LOGIN SUPERUSER CREATEDB', message),
             "the superuser left open": ('CLOSE_SQL = "ALTER ROLE may_admin NOLOGIN"', 'CLOSE_SQL = "SELECT 1"', message),
-            "the close unchecked": ('    if value(["psql", TEST_ADMIN_URL, "-Atc", LOCKED_SQL], env) != "false,false" or \\\n'
+            "the close unchecked": ('    if value(["psql", TEST_ADMIN_URL, "-Atc", LOCKED_SQL], env) != LOCKED or \\\n'
                                     '            value(["psql", ADMIN_URL, "-Atc", "SELECT 1"], env) is not None:\n',
                                     '    if False:\n', message),
             "the migrations as the superuser": ('        if quiet(["psql", TEST_ADMIN_URL, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:\n            return "failed", None, None',

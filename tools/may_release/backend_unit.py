@@ -71,9 +71,13 @@ LOCK_SQL = ("CREATE ROLE ci_admin LOGIN NOSUPERUSER CREATEDB CREATEROLE BYPASSRL
 TEST_OWNER_SQL = ("CREATE ROLE may_owner LOGIN NOSUPERUSER NOBYPASSRLS CREATEROLE",
                   "GRANT SET ON PARAMETER session_replication_role TO may_owner")
 CLOSE_SQL = "ALTER ROLE may_admin NOLOGIN"
-# Read as the tests' admin once the superuser is closed: itself no superuser, and may_admin unable to log in.
-LOCKED_SQL = ("SELECT r.rolsuper::text || ',' || a.rolcanlogin::text FROM pg_roles r, pg_roles a "
-              "WHERE r.rolname = current_user AND a.rolname = 'may_admin'")
+# Read as the tests' admin once the superuser is closed: itself no superuser, may_admin unable to log in, and what the
+# suite's shared setup needs on Postgres 16 (K, may-app #1352): SET ROLE may_owner, and createrole_self_grant in a new
+# session, without which that setup fails ("must be able to SET ROLE") and the run hangs instead of exiting.
+LOCKED_SQL = ("SELECT r.rolsuper::text || ',' || a.rolcanlogin::text || ',' || "
+              "pg_has_role(current_user, 'may_owner', 'SET')::text || ',' || current_setting('createrole_self_grant') "
+              "FROM pg_roles r, pg_roles a WHERE r.rolname = current_user AND a.rolname = 'may_admin'")
+LOCKED = "false,false,true,set, inherit"
 OWNER_SQL = ("CREATE DATABASE may_ci_migrate OWNER may_owner",)
 # The same filename rule as may-app's src/db/migrate.ts (and backend-ci.yml's find).
 MIGRATION_FILE = re.compile(r"[0-9]{3}_[a-z0-9_]+\.sql")
@@ -326,7 +330,7 @@ def lock(env, log):
     for url, sql in steps:
         if quiet(["psql", url, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:
             raise BackendTestsError("The Postgres service's superuser could not be closed to the tests; nothing ran")
-    if value(["psql", TEST_ADMIN_URL, "-Atc", LOCKED_SQL], env) != "false,false" or \
+    if value(["psql", TEST_ADMIN_URL, "-Atc", LOCKED_SQL], env) != LOCKED or \
             value(["psql", ADMIN_URL, "-Atc", "SELECT 1"], env) is not None:
         raise BackendTestsError("The Postgres service's superuser could not be closed to the tests; nothing ran")
 
