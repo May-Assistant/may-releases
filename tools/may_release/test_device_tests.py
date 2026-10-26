@@ -156,8 +156,9 @@ class MainHeadTests(unittest.TestCase):
 class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
-        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "onboarding", "chat", "notes",
-                               "poll", "poll-skip", "routines"])
+        # Onboarding runs last (coordinator, 26 Oct), so its account's time never crowds out chat and notes.
+        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "notes", "poll",
+                               "poll-skip", "routines", "onboarding"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ids, "both devices run all")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
@@ -238,12 +239,21 @@ class ScenarioTests(unittest.TestCase):
         # The run's own chat is an agent of its own, whose composer may not read "Ask May": the field by place.
         for step in ("Tap the message field at the bottom", "wait until May's reply is posted under your message"):
             self.assertIn(step, goals["chat"])
-        for step in ("tap Accept and continue", "on I have my own computer tap Continue", "tap Purple, then Continue",
-                     "tap Turn on notifications and allow it", "tap Start chatting"):
+        for step in ("tap Accept and continue", "on I have my own computer tap Continue", "tap Purple, then Continue"):
             self.assertIn(step, goals["onboarding"])
-        for never in ("never making an address or getting a number", "never connecting an app"):
+        for never in ("never making an address or getting a number", "never connecting an app",
+                      "never turning on notifications"):
             self.assertIn(never, goals["onboarding"])
-        self.assertNotRegex(goals["onboarding"], r"tap (Use this address|Get this number|Allow\b|Connect\b)")
+        self.assertNotRegex(goals["onboarding"], r"tap (Use this address|Get this number|Allow\b|Connect\b|Turn on)")
+
+    def test_onboarding_ends_at_not_now_on_let_me_reach_you_or_the_main_tabs(self):
+        """Run 40290647340: the iOS agent reached Let me reach you and never finished, so its 20 minutes left chat,
+        notes and poll-skip no budget. Coordinator, 26 Oct: Not now there, or the main tabs, is done."""
+        goal = device_tests.scenarios("onboarding", "ios")[0]["goal"]
+        self.assertIn("on Let me reach you tap Not now", goal)
+        self.assertIn("You are done, and must stop at once and report success, as soon as you have tapped Not now on Let "
+                      "me reach you, or as soon as the app's main tabs (Chats, Agenda) show", goal)
+        self.assertNotIn("Start chatting", goal)
 
     def test_every_agent_scenario_fits_inside_one_test_session(self):
         """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
@@ -314,6 +324,31 @@ class ScenarioTests(unittest.TestCase):
                 path.write_text(json.dumps([shared if "_without_chat" in change else dict(chat, **change)]))
                 with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
                     device_tests.scenarios()
+
+    def test_onboarding_is_capped_at_600_seconds_on_both_platforms_and_other_rows_keep_the_default(self):
+        rows = {row["id"]: row for row in device_tests.scenarios("chat,onboarding", "ios")}
+        self.assertEqual(rows["onboarding"]["seconds"], 600)
+        for default in (device_agent.AGENT_SECONDS, device_agent.IOS_AGENT_SECONDS):
+            with self.subTest(default=default):
+                self.assertEqual(device_tests.agent_seconds(rows["onboarding"], default), 600)
+                self.assertEqual(device_tests.cap(rows["onboarding"], default), 600)
+                self.assertEqual(device_tests.agent_seconds(rows["chat"], default), default)
+        # A row's seconds only ever shortens the platform's own cap.
+        self.assertEqual(device_tests.agent_seconds({"seconds": 900}, 600), 600)
+        agent = device_tests.scenarios("notes")[0]
+        for change in ({"seconds": 299}, {"seconds": device_agent.AGENT_SECONDS + 1}, {"seconds": 600.0},
+                       {"seconds": "600"}, {"seconds": True}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "s.json"
+                path.write_text(json.dumps([dict(agent, **change)]))
+                with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
+                    device_tests.scenarios()
+        maestro = device_tests.scenarios("sign-in")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "s.json"
+            path.write_text(json.dumps([dict(maestro, seconds=600)]))
+            with patch("device_tests.SCENARIOS", path), self.assertRaises(DeviceTestsError):
+                device_tests.scenarios()
 
     def test_only_an_agent_row_sets_its_own_steps_above_the_default(self):
         skip = device_tests.scenarios("poll-skip")[0]
@@ -395,12 +430,23 @@ class SealedAgentTests(unittest.TestCase):
             self.assertNotIn(secret, sealed["summary"])
         self.assertTrue(publish.agent_ok(sealed))
         odd = device_tests.sealed_agent({"outcome": "finished", "summary": 7, "actions": "80"})
-        self.assertEqual(odd, {"outcome": None, "actions": 0, "summary": "7", "hierarchy_failure": None})
+        self.assertEqual(odd, {"outcome": None, "actions": 0, "summary": "7", "hierarchy_failure": None,
+                               "hierarchy_cause": None, "refusal_cause": None})
         failing = device_tests.sealed_agent({"outcome": "completed", "summary": "ok", "hierarchy_failure": "no idle state"})
         self.assertEqual(failing["hierarchy_failure"], "no idle state", "why the judge had no screen, sealed")
         self.assertTrue(publish.agent_ok(failing))
         for odd_failure in ("<b>", "No Idle State", 3):
             self.assertIsNone(device_tests.sealed_agent({"hierarchy_failure": odd_failure})["hierarchy_failure"])
+        # The iOS driver's cause (coordinator, 26 Oct): fixed words alone, sealed and accepted by publish.
+        caused = device_tests.sealed_agent({"hierarchy_failure": "iOS hierarchy failed", "hierarchy_cause": "not idle",
+                                            "refusal_cause": "lost connection"})
+        self.assertEqual((caused["hierarchy_cause"], caused["refusal_cause"]), ("not idle", "lost connection"))
+        self.assertTrue(publish.agent_ok(caused))
+        for odd_cause in ("Connection refused 10.0.0.1", "Not Idle", 3):
+            self.assertIsNone(device_tests.sealed_agent({"hierarchy_cause": odd_cause})["hierarchy_cause"])
+            self.assertFalse(publish.agent_ok(dict(caused, refusal_cause=odd_cause)))
+        self.assertTrue(publish.agent_ok({"outcome": None, "actions": 0, "summary": "", "hierarchy_failure": None}),
+                        "a report sealed before the causes is read as null")
 
     def test_joining_redacted_lines_never_makes_a_secret_shaped_summary(self):
         """The security read of #110: "may_token:" and an opaque value, harmless line by line, joined into one."""
@@ -861,7 +907,8 @@ class RunTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None, diagnosed=None):
+    def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None, diagnosed=None,
+               start_fails=False, adb_said=None):
         calls, self.maestro_envs = [], []
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
@@ -884,14 +931,23 @@ class RunTests(unittest.TestCase):
             path.write_bytes(png())
             return path.name
 
+        def shell(adb, env, log, line):
+            calls.append([STDIN, *line.split()])
+            if not start_fails:
+                return 0
+            with log.open("ab") as output:
+                output.write(b"Error: Activity class does not exist\n")
+            return 1
+
         environ = dict(self.env, **(env or {}))
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
                 patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
-                patch("device_tests.adb_shell", side_effect=lambda adb, env, log, line: calls.append(
-                    [STDIN, *line.split()]) or 0), \
+                patch("device_tests.adb_shell", side_effect=shell), \
+                patch("device_tests.adb_output", side_effect=lambda adb, env, argv: calls.append(["adb_output", *argv])
+                      or (adb_said or {}).get(argv[-1])), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \
@@ -906,6 +962,38 @@ class RunTests(unittest.TestCase):
         runs = list((self.root / device_tests.OUT).iterdir())
         report = json.loads((runs[0] / "android" / "report.json").read_text())
         return calls, report, out.getvalue(), runs[0]
+
+    def test_a_launch_failure_seals_its_diagnostics_and_stops_the_run_with_a_report(self):
+        """Run 40290647340 (coordinator and M, 26 Oct): the app did not start and the run removed everything, so the
+        cause could not be named. Now the failed start, the crash and main logs and the top activity are sealed."""
+        said = {"crash,main": b"E AndroidRuntime: FATAL EXCEPTION: main\nBearer " + TOKEN.encode() + b"\n",
+                "top": b"ACTIVITY io.github.mayassistant.may.playground/.MainActivity\n"}
+        try:
+            with patch("device_tests.flows.sleep") as slept:
+                calls, report, out, run = self.run_it(start_fails=True, adb_said=said)
+            slept.assert_called_once_with(device_tests.LAUNCH_RETRY_SECONDS)
+        except device_tests.DeviceTestsError as error:
+            self.fail("a launch failure stopped the run with no report or diagnostics: " + error.args[0])
+        sign_in, connections = report["scenarios"]
+        self.assertEqual((sign_in["verdict"], sign_in["reason"]), ("fail", device_tests.NOT_STARTED))
+        self.assertEqual((connections["verdict"], connections["reason"]), ("skipped", device_tests.HALTED),
+                         "nothing after it is started")
+        self.assertEqual(sum(1 for call in calls if call[:3] == [STDIN, "am", "start"]), 2, "one retry, then the stop")
+        path = run / "android" / ("sign-in" + device_tests.DIAG)
+        self.assertTrue(path.is_file(), "the launch failure's diagnostics are in the sealed run folder")
+        diag = path.read_bytes()
+        for section in (b"== am start ==\nError: Activity class does not exist", b"== logcat crash,main ==\nE "
+                        b"AndroidRuntime: FATAL EXCEPTION: main", b"== dumpsys activity top ==\nACTIVITY "):
+            self.assertIn(section, diag)
+        self.assertNotIn(TOKEN.encode(), diag, "redacted with the scenario's session")
+        self.assertIn(["adb_output", "logcat", "-d", "-t", str(device_tests.LAUNCH_LOG_LINES), "-b", "crash,main"], calls)
+        self.assertIn(["adb_output", "shell", "dumpsys", "activity", "top"], calls)
+        self.assertIn("May device tests (android): May Playground did not start on the emulator after one retry; the "
+                      "run stopped there, and its diagnostics are sealed", out)
+        self.assertIn("diagnostics kept for 1 scenarios", out)
+        self.assertNotIn(b"FATAL", out.encode(), "the public log has counts and fixed lines alone")
+        for reason in (device_tests.NOT_STARTED, device_tests.HALTED):
+            self.assertIn(reason, publish.REASONS)
 
     def test_a_scenario_the_budget_cannot_fit_is_not_started_and_the_rest_is_still_reported(self):
         """Run 40035089599: iOS agent scenarios could outlast the job, losing every report."""

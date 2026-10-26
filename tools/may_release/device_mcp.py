@@ -181,6 +181,7 @@ def flow(config, command):
     status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], both=True)
     if status:
         refused(config, command, said, started, utc_now())
+        config["refusal_cause"] = driver_cause(said)
     return status
 
 
@@ -236,12 +237,15 @@ def ios_hierarchy(config):
     """The hierarchy in the screenshot's pixels (the same lines as Android's); "" when the screen's scale is unknown."""
     scale = screen_scale(config)
     if not scale:
+        config["dump_cause"] = "scale unknown"
         return ""
-    status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy"])
+    status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy"], both=True)
     try:
-        tree = json.loads(data[data.find(b"{"):]) if not status else None
+        # The output holds stderr after stdout (for driver_cause); the tree is the first JSON value in it.
+        tree = json.JSONDecoder().raw_decode(data[data.find(b"{"):].decode("utf-8", "replace"))[0] if not status else None
     except ValueError:
         tree = None
+    config["dump_cause"] = None if isinstance(tree, dict) else driver_cause(data)
     nodes = list(ios_nodes(tree))
     boxes = [re.fullmatch(r"\[(-?\d+),(-?\d+)\]\[(\d+),(\d+)\]", str(n.get("bounds", ""))) for n in nodes]
     lines = []
@@ -330,6 +334,21 @@ def compact(xml):
 # agent's private record, in fixed words: DUMP_FAILURES.
 DUMP_RETRY_SECONDS = 2
 DUMP_FAILURES = ("adb failed", "no idle state", "unreadable", "iOS hierarchy failed")
+# Coordinator, 26 Oct (run 40290647340): "iOS hierarchy failed" never said why. The driver's own output for a failed
+# iOS hierarchy read, and for the last refused act, is sorted into DRIVER_CAUSES' fixed words (first match in
+# CAUSE_PATTERNS' order, else "other"); only the word is kept in the agent's record and the sealed report.
+CAUSE_PATTERNS = (("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
+                  ("snapshot timeout", re.compile(rb"timed? ?out|timeout|snapshot", re.IGNORECASE)),
+                  ("lost connection", re.compile(rb"connection (?:refused|reset|lost|closed)|broken pipe|unavailable|"
+                                                 rb"failed to connect|lost connection|xctestdriver|end of stream",
+                                                 re.IGNORECASE)),
+                  ("app not running", re.compile(rb"not running|terminated|crash", re.IGNORECASE)))
+DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "other")
+
+
+def driver_cause(output):
+    """The fixed word for what the driver said when it failed (CAUSE_PATTERNS), "other" when nothing matches."""
+    return next((cause for cause, pattern in CAUSE_PATTERNS if pattern.search(output or b"")), "other")
 
 
 def android_dump(config):
@@ -385,6 +404,7 @@ def current_hierarchy(config, still=False):
     if config["platform"] == "ios":
         text = ios_hierarchy(config)
         config["dump_failure"] = None if text else "iOS hierarchy failed"
+        config["dump_cause"] = None if text else config.get("dump_cause") or "other"
         return text
     xml, config["dump_failure"] = (stilled_dump if still else android_dump)(config)
     return "" if xml is None else compact(xml)
@@ -398,6 +418,7 @@ def record(config, outcome, summary):
         json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
                    "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
                    "hierarchy_failure": config.get("hierarchy_failure"),
+                   "hierarchy_cause": config.get("hierarchy_cause"), "refusal_cause": config.get("refusal_cause"),
                    **({"wedged": True} if config.get("wedged") else {})}, output)
 
 
@@ -423,6 +444,7 @@ def act(name, args, config):
         # read the agent's last look, from before it sent the message, and failed a delivered chat).
         fresh = current_hierarchy(config, still=True)
         config["hierarchy_failure"] = None if fresh else config.get("dump_failure")
+        config["hierarchy_cause"] = None if fresh else config.get("dump_cause")
         why = config["hierarchy_failure"] or "an empty screen"
         config["hierarchy"] = fresh or (f"(no fresh hierarchy at done: {why}; the agent's last look follows)\n" +
                                         config["hierarchy"] if config["hierarchy"] else

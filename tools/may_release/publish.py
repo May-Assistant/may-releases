@@ -80,7 +80,8 @@ REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no
            device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO,
            device_tests.BUDGET, *device_tests.UNTAGGED.values(), device_tests.FRESH_EXHAUSTED, device_tests.NOT_FRESH,
            device_tests.MODEL_CAP, device_tests.MINT_FAILED, device_tests.FLOW_IDS, device_tests.DELIVERY_FAILED,
-           device_tests.NOT_REACHED, device_tests.WEDGED, device_tests.NO_CHAT)
+           device_tests.NOT_REACHED, device_tests.WEDGED, device_tests.NO_CHAT,
+           device_tests.NO_FIRST, device_tests.NOT_STARTED, device_tests.HALTED)
 MAX_NOTES = 600
 # A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
 DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)
@@ -405,11 +406,16 @@ def agent_ok(agent):
     """A report row's sealed agent account (device_tests.sealed_agent): its fixed shape, the summary capped and with
     nothing kept_lines would drop or mask. It stays in report.json; the pages never show it."""
     summary = agent.get("summary") if isinstance(agent, dict) else None
-    # A report sealed before hierarchy_failure was (#116) has no such key: read as null, never as malformed.
-    agent = {"hierarchy_failure": None, **agent} if isinstance(agent, dict) else agent
-    return (isinstance(agent, dict) and set(agent) == {"outcome", "actions", "summary", "hierarchy_failure"} and
+    # A report sealed before hierarchy_failure (#116) or the driver's causes were has no such key: read as null, never
+    # as malformed.
+    agent = {"hierarchy_failure": None, "hierarchy_cause": None, "refusal_cause": None, **agent} \
+        if isinstance(agent, dict) else agent
+    return (isinstance(agent, dict) and
+            set(agent) == {"outcome", "actions", "summary", "hierarchy_failure", "hierarchy_cause", "refusal_cause"} and
             agent["outcome"] in ("completed", "blocked", None) and type(agent["actions"]) is int and
             agent["hierarchy_failure"] in (*device_tests.device_mcp.DUMP_FAILURES, None) and
+            all(agent[key] in (*device_tests.device_mcp.DRIVER_CAUSES, None)
+                for key in ("hierarchy_cause", "refusal_cause")) and
             0 <= agent["actions"] <= device_tests.device_mcp.MOST_ACTIONS and isinstance(summary, str) and
             len(summary) <= device_tests.MAX_AGENT_SUMMARY and
             device_tests.kept_lines(summary.encode(), "") == (summary.encode(), 0))
