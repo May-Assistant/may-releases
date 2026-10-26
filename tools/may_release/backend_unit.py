@@ -12,7 +12,7 @@ against the job's Postgres 16.15 service container (pinned by digest in backend-
   every backend/migrations/NNN_name.sql to be applied exactly once (schema_migrations), the first run to say
   `applied <n> migration(s)` and the second to end with `schema up to date`;
 - tests: `npm test` (node --test, which bounds each file itself) with the job's Postgres as MAY_TEST_ADMIN_URL,
-  stopped after 15 minutes (backend-ci.yml's step timeout).
+  stopped after 25 minutes (the suite outgrew backend-ci.yml's 15 by 25 Oct).
 An install that fails stops the stages after it; a failed typecheck or migration run still runs the stages after it,
 so one red stage does not hide another (as Gradle's --continue in android_unit.py).
 
@@ -62,7 +62,19 @@ MIGRATION_FILE = re.compile(r"[0-9]{3}_[a-z0-9_]+\.sql")
 INSTALL_SECONDS = 10 * 60
 TYPECHECK_SECONDS = 10 * 60
 MIGRATE_SECONDS = 5 * 60
-TEST_SECONDS = 15 * 60
+# Run 9 (40239424875) stopped at 15 minutes with no summary; the suite (2,562 tests on 24 Oct, its whole stage list in
+# 14:41) now needs about 17-18. Headroom inside the job's 30 minutes and the one-hour app token.
+TEST_SECONDS = 25 * 60
+# The service container's own log goes into this public job log at teardown (docker logs --details), and Postgres
+# logs each failing statement's text with it: runs 1-9 published may-app's SQL that way. Before anything else, the
+# cluster logs nothing but a panic. ALTER SYSTEM runs outside a transaction, so each is its own psql call.
+SILENCE_SQL = ("ALTER SYSTEM SET log_min_messages = 'panic'", "ALTER SYSTEM SET log_min_error_statement = 'panic'",
+               "ALTER SYSTEM SET log_checkpoints = off", "SELECT pg_reload_conf()")
+SILENT = {"log_min_messages": "panic", "log_min_error_statement": "panic", "log_checkpoints": "off"}
+# The second guard: the service log's lines that carry a statement, its detail or its context fail the job, counted
+# alone; the log itself goes to a private file and is never printed.
+LEAKY = re.compile(rb"\b(?:ERROR|STATEMENT|DETAIL|CONTEXT|HINT):")
+SERVICE_LOG = "backend-service.log"
 # node --test's closing summary, TAP (`# tests 12`, Node 22 when not on a terminal) or spec (`ℹ tests 12`).
 SUMMARY = re.compile(r"(?:# |ℹ )(tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ([0-9]{1,7})(?:\.[0-9]+)?")
 # tsc's error lines (no colour when not on a terminal): `src/x.ts(12,5): error TS2322: message`.
@@ -273,6 +285,18 @@ def check_toolchain(env, log):
     server = value(["psql", ADMIN_URL, "-Atc", "SHOW server_version"], env) or ""
     if server != POSTGRES_VERSION and not server.startswith(POSTGRES_VERSION + " "):
         raise BackendTestsError("The Postgres service is not 16.15, or not reachable; nothing ran")
+    silence(env, log)
+
+
+def silence(env, log):
+    """The service logs nothing a statement, test or migration could put in it (SILENCE_SQL), checked; refuses
+    otherwise, before any of the pull request's code runs."""
+    for sql in SILENCE_SQL:
+        if quiet(["psql", ADMIN_URL, "-v", "ON_ERROR_STOP=1", "-qc", sql], log, env=env, timeout=60) != 0:
+            raise BackendTestsError("The Postgres service's log could not be silenced; nothing ran")
+    for setting, wanted in SILENT.items():
+        if value(["psql", ADMIN_URL, "-Atc", "SHOW " + setting], env) != wanted:
+            raise BackendTestsError("The Postgres service's log could not be silenced; nothing ran")
 
 
 def run_checks(source_sha, record=False):
@@ -351,19 +375,49 @@ def report(stages, counts):
         tests, passed, failed, skipped = (int(n) for n in counts)
         print(f"May backend tests: {int(tests)} tests, {int(passed)} passed, {int(failed)} failed, {int(skipped)} skipped")
     if stages["tests"] == "timeout":
-        raise BackendTestsError("npm test did not finish within 15 minutes")
+        raise BackendTestsError("npm test did not finish within 25 minutes")
     if any(stages[name] != "passed" for name in STAGES):
         raise BackendTestsError("At least one May backend check did not pass")
     print("Every May backend check passed")
 
 
+def check_service_log(container):
+    """The guard after the checks: the service container's log, read into a private file, holds no line that could
+    carry an error, a statement, its detail, context or hint; fails the step with their count otherwise. Never prints the log."""
+    require_step_secrets(())
+    if not re.fullmatch(r"[0-9a-f]{12,64}", container or ""):
+        raise BackendTestsError("The Postgres service's container is unknown, so its log was not checked")
+    private = runner_root() / "may-private"
+    private.mkdir(mode=0o700, exist_ok=True)
+    path = private / SERVICE_LOG
+    with path.open("wb") as output:
+        try:
+            done = subprocess.run(["docker", "logs", "--details", container], stdout=output, stderr=output,
+                                  stdin=subprocess.DEVNULL, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+    if done is None or done.returncode:
+        raise BackendTestsError("The Postgres service's log could not be read, so it was not checked")
+    leaked = sum(1 for line in path.read_bytes().splitlines() if LEAKY.search(line))
+    if leaked:
+        print(f"May backend database log: {int(leaked)} lines that could carry may-app's SQL or data")
+        raise BackendTestsError("The Postgres service's log is not silent")
+    print("May backend database log: no error, statement, detail, context or hint lines")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--source-sha")
     parser.add_argument("--record-outcome", action="store_true")
+    parser.add_argument("--check-service-log", metavar="CONTAINER")
     args = parser.parse_args()
     try:
-        run_checks(args.source_sha, args.record_outcome)
+        if args.check_service_log is not None:
+            check_service_log(args.check_service_log)
+        elif args.source_sha:
+            run_checks(args.source_sha, args.record_outcome)
+        else:
+            raise BackendTestsError("--source-sha or --check-service-log is required")
     except (BackendTestsError, StoreError) as error:
         raise SystemExit("May backend checks: " + error.args[0]) from None
     except Exception:
