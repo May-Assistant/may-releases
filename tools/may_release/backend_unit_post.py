@@ -8,10 +8,19 @@ from may-app (a test name, a message, a path, a log line) is printed, summarised
 script prints is fixed, apart from the dispatch's own pull request number and two counts, and every error is a fixed
 literal (static_check.py). The step summary carries each stage's verdict and the test counts, nothing else.
 
-It runs in its own step, after the checks, holding MAY_APP_PR_COMMENT_TOKEN alone (taken out of the environment at
-once). The comment is posted after the pull request is read again and is still open at the tested head, and unless a
-comment already carries this head's marker. Only that pull request, its comments and its comment post are reachable.
-Without the token, nothing is posted and one fixed line says so. Either way, the job fails when the checks failed.
+The checks run the pull request's own npm scripts and tests as the runner user, so their job references no GitHub App
+key and no token (independent review of may-releases #133); the post is a job of its own, on a fresh runner:
+
+  seal     (backend job, no secret, after the checks) checks the checkout is still the dispatched commit and seals the
+           outcome and failures to the environment's own age key (sealed.py) for the one upload. Without the key pair
+           nothing is sealed and one fixed line says so.
+  verdict  (backend job, no secret) writes the step summary (verdicts and counts) and fails the job when the checks
+           failed, so a failure shows whether or not the post job can post it.
+  open     (post job, MAY_RENDERS_DECRYPT_KEY alone) opens the sealed record into the private folder (sealed.py).
+  post     (post job, MAY_APP_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts it after the pull
+           request is read again and is still open at the tested head, and unless a comment already carries this
+           head's marker. Only that pull request, its comments and its comment post are reachable. Without the token or
+           a record, nothing is posted and one fixed line says so; it fails when the record says the checks failed.
 """
 
 import argparse
@@ -29,6 +38,8 @@ from ds_compile import DsCompileError, MAX_BODY, SHA, fence_for, post_once, run_
 from gate import APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
+import sealed
+from sealed import SealedError
 from store import StoreError, require_step_secrets
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
@@ -173,6 +184,51 @@ def comment_body(sha, url, outcome, failed, shown=None):
     return body
 
 
+def runner_root():
+    raw = os.environ.get("RUNNER_TEMP")
+    if not raw or not Path(raw).is_dir():
+        raise BackendPostError("Runner temporary directory is unavailable")
+    return Path(raw).resolve()
+
+
+def seal(sha):
+    """The backend job's outcome and failures, checked and sealed for the post job (sealed.py)."""
+    require_step_secrets(())
+    if not SHA.fullmatch(sha or ""):
+        raise BackendPostError("Source SHA is not an exact lowercase commit SHA")
+    root = runner_root()
+    read_record(root / PRIVATE)
+    # A sanity check only: the pull request's own code could have changed the checkout. The pull request's own head,
+    # read again by the post job, is the check that counts.
+    if head_revision(root / SOURCE) != sha:
+        raise BackendPostError("The tested checkout is not the dispatched commit; nothing was sealed")
+    if sealed.seal(root, sha, (OUTCOME, FAILURES)):
+        print("May backend checks: their record is encrypted for the post job")
+    else:
+        print("May backend checks: MAY_RENDERS_RECIPIENT is not set in may-native-compile-pr; nothing is sealed, so "
+              "nothing will be posted")
+
+
+def verdict():
+    """The backend job's last word: the step summary (verdicts and counts), and a failure when the checks failed."""
+    require_step_secrets(())
+    outcome, failed = read_record(runner_root() / PRIVATE)
+    write_summary(summary_lines(outcome, failed))
+    if outcome["result"] == "passed":
+        print("May backend checks passed")
+        return 0
+    print("May backend checks failed; which tests goes to the may-app pull request only")
+    return 1
+
+
+def open_record(sha):
+    require_step_secrets((sealed.DECRYPT_KEY,))
+    if sealed.open_sealed(runner_root(), sha, (OUTCOME, FAILURES)):
+        print("May backend checks: their record is decrypted")
+    else:
+        print("May backend checks: no sealed record from this run attempt; nothing will be posted")
+
+
 def post(sha, pr, call_api=github):
     require_step_secrets((COMMENT_TOKEN,))
     # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
@@ -180,13 +236,12 @@ def post(sha, pr, call_api=github):
     if not SHA.fullmatch(sha or ""):
         raise BackendPostError("Source SHA is not an exact lowercase commit SHA")
     number = pull_number(pr)
-    raw = os.environ.get("RUNNER_TEMP")
-    if not raw or not Path(raw).is_dir():
-        raise BackendPostError("Runner temporary directory is unavailable")
-    root = Path(raw).resolve()
-    checkout, private = root / SOURCE, root / PRIVATE
+    private = runner_root() / PRIVATE
+    if not (private / OUTCOME).is_file():
+        print("May backend checks: no record to post (MAY_RENDERS_RECIPIENT or MAY_RENDERS_DECRYPT_KEY may be unset in "
+              "may-native-compile-pr); the backend job's verdict stands")
+        return 0
     outcome, failed = read_record(private)
-    write_summary(summary_lines(outcome, failed))
     passed = outcome["result"] == "passed"
     total, errors = failed["total"], failed["typecheck_total"]
     if not token:
@@ -194,10 +249,6 @@ def post(sha, pr, call_api=github):
         return 0 if passed else 1
     if len(token) < 20:
         raise BackendPostError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")
-    # A sanity check only: the pull request's own code ran on this runner and could have changed the checkout. The
-    # pull request's head, read again below, is the check that counts.
-    if head_revision(checkout) != sha:
-        raise BackendPostError("The tested checkout is not the dispatched commit; nothing was posted")
     body = comment_body(sha, run_url(os.environ), outcome, failed)
     if holds(body, token):
         raise BackendPostError("The comment holds a credential; nothing was posted")
@@ -220,9 +271,16 @@ def post(sha, pr, call_api=github):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--pr-number", required=True)
+    parser.add_argument("command", choices=("seal", "verdict", "open", "post"))
+    parser.add_argument("--source-sha")
+    parser.add_argument("--pr-number")
     args = parser.parse_args()
+    if args.command == "seal":
+        return seal(args.source_sha)
+    if args.command == "verdict":
+        return verdict()
+    if args.command == "open":
+        return open_record(args.source_sha)
     return post(args.source_sha, args.pr_number)
 
 
@@ -231,7 +289,7 @@ if __name__ == "__main__":
         failed = main()
     except GateDenial as denial:
         raise SystemExit("May backend post denied: " + denial.args[0]) from None
-    except (BackendPostError, CompilePrError, DsCompileError, StoreError) as error:
+    except (BackendPostError, SealedError, CompilePrError, DsCompileError, StoreError) as error:
         raise SystemExit("May backend post stopped: " + error.args[0]) from None
     except (PrepareError, OSError):
         raise SystemExit("May backend post stopped; no may-app source, path or credential was printed") from None

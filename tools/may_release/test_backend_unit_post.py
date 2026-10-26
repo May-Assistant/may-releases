@@ -15,6 +15,7 @@ from unittest.mock import patch
 import backend_unit
 import backend_unit_post as tool
 from backend_unit_post import BackendPostError, comment_body
+import sealed
 import static_check
 from store import StoreError
 
@@ -26,6 +27,7 @@ COMMENTS = "/repos/May-Assistant/may-app/issues/42/comments"
 PRIVATE = "PRIVATE-BACKEND-TEST-NAME-4b1d"
 SECRET_TEXT = "PRIVATE-ASSERTION-TEXT-91f3"
 STAGES_PASSED = dict.fromkeys(backend_unit.STAGES, "passed")
+HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
 
 
 def recorded(result="failed", failures=None, total=None, stages=None, typecheck=None, tails=None, tests=None):
@@ -89,7 +91,7 @@ class CommentTests(unittest.TestCase):
             comment_body("main", None, *recorded())
 
 
-class PostTests(unittest.TestCase):
+class PostCase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name).resolve()
@@ -131,6 +133,30 @@ class PostTests(unittest.TestCase):
     def posted(self):
         return [payload["body"] for method, path, payload in self.calls if method == "POST"]
 
+
+class PostTests(PostCase):
+    def verdict(self, extra=None):
+        out = io.StringIO()
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), **(extra or {})}, clear=True), patch("sys.stdout", out):
+            code = tool.verdict()
+        return code, out.getvalue()
+
+    def test_the_verdict_fails_the_backend_job_when_the_checks_failed_in_fixed_lines(self):
+        self.assertEqual(self.verdict(), (1, "May backend checks failed; which tests goes to the may-app pull request "
+                                             "only\n"))
+        self.write(*recorded("passed", []))
+        self.assertEqual(self.verdict(), (0, "May backend checks passed\n"))
+        with self.assertRaises(StoreError):
+            self.verdict({"MAY_APP_READ_KEY": "x"})
+
+    def test_without_a_record_the_post_posts_nothing_and_leaves_the_verdict_to_backend(self):
+        (self.root / "may-private" / backend_unit.OUTCOME).unlink()
+        code, out = self.post(self.api())
+        self.assertEqual((code, out), (0, "May backend checks: no record to post (MAY_RENDERS_RECIPIENT or "
+                                          "MAY_RENDERS_DECRYPT_KEY may be unset in may-native-compile-pr); the backend "
+                                          "job's verdict stands\n"))
+        self.assertEqual(self.calls, [])
+
     def test_failures_are_posted_once_and_the_job_fails_with_a_fixed_line(self):
         code, out = self.post(self.api())
         self.assertEqual(code, 1)
@@ -150,22 +176,21 @@ class PostTests(unittest.TestCase):
         self.assertIn("MAY_APP_PR_COMMENT_TOKEN is not set", out)
         self.assertEqual(self.calls, [])
 
-    def test_the_step_summary_carries_verdicts_and_counts_only_with_or_without_the_token(self):
-        for token in (None, TOKEN):
-            with self.subTest(token=bool(token)):
-                summary = self.root / "summary.md"
-                summary.unlink(missing_ok=True)
-                stages = dict(STAGES_PASSED, typecheck="failed", migrations="timeout", tests="failed")
-                self.write(*recorded(stages=stages, typecheck=[{"at": "backend/x.ts:1:1", "code": "TS1", "message": SECRET_TEXT}]))
-                self.post(self.api(), token=token, extra={"GITHUB_STEP_SUMMARY": str(summary)})
-                self.assertEqual(summary.read_text(), "\n".join([
-                    "### May backend checks: failed", "", "| Stage | Result |", "|---|---|",
-                    "| toolchain | passed |", "| install | passed |", "| typecheck | failed |",
-                    "| migrations | did not finish in time |", "| tests | failed |", "",
-                    "Tests: 3 tests, 2 passed, 1 failed, 0 skipped.", "",
-                    "1 failing tests and 1 type errors. Which ones goes only to the may-app pull request, never here."]) + "\n")
-                self.assertNotIn(PRIVATE, summary.read_text())
-                self.assertNotIn(SECRET_TEXT, summary.read_text())
+    def test_the_step_summary_carries_verdicts_and_counts_only(self):
+        summary = self.root / "summary.md"
+        stages = dict(STAGES_PASSED, typecheck="failed", migrations="timeout", tests="failed")
+        self.write(*recorded(stages=stages, typecheck=[{"at": "backend/x.ts:1:1", "code": "TS1", "message": SECRET_TEXT}]))
+        self.verdict({"GITHUB_STEP_SUMMARY": str(summary)})
+        self.post(self.api(), extra={"GITHUB_STEP_SUMMARY": str(self.root / "post-summary.md")})
+        self.assertFalse((self.root / "post-summary.md").exists(), "the post job writes no summary")
+        self.assertEqual(summary.read_text(), "\n".join([
+            "### May backend checks: failed", "", "| Stage | Result |", "|---|---|",
+            "| toolchain | passed |", "| install | passed |", "| typecheck | failed |",
+            "| migrations | did not finish in time |", "| tests | failed |", "",
+            "Tests: 3 tests, 2 passed, 1 failed, 0 skipped.", "",
+            "1 failing tests and 1 type errors. Which ones goes only to the may-app pull request, never here."]) + "\n")
+        self.assertNotIn(PRIVATE, summary.read_text())
+        self.assertNotIn(SECRET_TEXT, summary.read_text())
 
     def test_a_run_with_no_test_summary_is_summarised_as_such(self):
         outcome, failed = recorded(stages=dict(STAGES_PASSED, install="failed", typecheck="not run", migrations="not run",
@@ -228,7 +253,7 @@ class PostTests(unittest.TestCase):
                 with self.assertRaises(BackendPostError):
                     self.post(self.api())
                 self.assertEqual(self.calls, [])
-        (self.root / "may-private" / backend_unit.OUTCOME).unlink()
+        (self.root / "may-private" / backend_unit.FAILURES).unlink()
         with self.assertRaises(BackendPostError):
             self.post(self.api())
 
@@ -249,10 +274,85 @@ class PostTests(unittest.TestCase):
         self.assertIn("Last lines of the install log", self.posted()[0])
 
 
+class SealTests(PostCase):
+    """The backend job's seal (no secret) and the post job's open (the decrypt key alone), before age is run."""
+
+    def step(self, call, extra=None, tools=None):
+        out = io.StringIO()
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin:/bin", **(extra or {})}, clear=True), \
+                patch("sys.stdout", out), patch.object(tool, "head_revision", lambda checkout: SHA), \
+                patch("sealed.toolchain.tool_path", side_effect=tools or self.no_age):
+            value = call()
+        return value, out.getvalue()
+
+    def no_age(self, name, relative):
+        raise AssertionError("age was run")
+
+    def test_without_the_public_key_nothing_is_sealed_and_one_fixed_line_says_so(self):
+        _, out = self.step(lambda: tool.seal(SHA))
+        self.assertEqual(out, "May backend checks: MAY_RENDERS_RECIPIENT is not set in may-native-compile-pr; nothing is "
+                              "sealed, so nothing will be posted\n")
+        self.assertFalse((self.root / sealed.SEALED).exists())
+
+    def test_a_moved_checkout_a_bad_record_or_any_secret_seals_nothing(self):
+        with patch.object(tool, "head_revision", lambda checkout: OTHER), self.assertRaisesRegex(
+                BackendPostError, "not the dispatched commit; nothing was sealed"):
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True):
+                tool.seal(SHA)
+        for secret in ("MAY_APP_READ_KEY", "MAY_APP_PR_COMMENT_TOKEN", "MAY_RENDERS_DECRYPT_KEY"):
+            with self.subTest(secret=secret), self.assertRaises(StoreError):
+                self.step(lambda: tool.seal(SHA), {secret: "x"})
+        self.write({"result": "maybe"}, {})
+        with self.assertRaises(BackendPostError):
+            self.step(lambda: tool.seal(SHA), {sealed.RECIPIENT: "age1" + "q" * 58})
+        self.assertFalse((self.root / sealed.SEALED).exists())
+
+    def test_with_nothing_downloaded_the_open_says_so_and_holds_no_other_secret(self):
+        _, out = self.step(lambda: tool.open_record(SHA), {sealed.DECRYPT_KEY: "k"})
+        self.assertEqual(out, "May backend checks: no sealed record from this run attempt; nothing will be posted\n")
+        for secret in ("MAY_APP_READ_KEY", "MAY_APP_PR_COMMENT_TOKEN"):
+            with self.subTest(secret=secret), self.assertRaises(StoreError):
+                self.step(lambda: tool.open_record(SHA), {sealed.DECRYPT_KEY: "k", secret: "x"})
+
+
+@unittest.skipUnless(HAS_AGE or os.environ.get("CI"), "age and age-keygen are required for the round trip")
+class RoundTripTests(SealTests):
+    """seal in the backend job, the one upload, open and post in the post job, with the system's age."""
+
+    def setUp(self):
+        super().setUp()
+        # Found now, on the job's own PATH: each step runs with PATH /usr/bin:/bin, which CI's pinned age is not on.
+        self.found = {name: shutil.which(name) for name in ("age", "age-keygen")}
+        self.secret = next(line for line in subprocess.run([self.found["age-keygen"]], capture_output=True, text=True,
+                                                           check=True).stdout.splitlines()
+                           if line.startswith("AGE-SECRET-KEY-1"))
+        self.public = subprocess.run([self.found["age-keygen"], "-y"], input=self.secret, capture_output=True, text=True,
+                                     check=True).stdout.strip()
+
+    def with_age(self, name, relative):
+        return self.found[relative]
+
+    def test_the_failures_cross_sealed_and_are_posted(self):
+        _, out = self.step(lambda: tool.seal(SHA), {sealed.RECIPIENT: self.public}, self.with_age)
+        self.assertEqual(out, "May backend checks: their record is encrypted for the post job\n")
+        data = (self.root / sealed.SEALED / sealed.NAME).read_bytes()
+        self.assertNotIn(SECRET_TEXT.encode(), data)
+        # The post job is a fresh runner: nothing of the backend job's but the download.
+        shutil.rmtree(self.root / "may-private")
+        (self.root / sealed.DOWNLOAD).mkdir()
+        (self.root / sealed.DOWNLOAD / sealed.NAME).write_bytes(data)
+        _, out = self.step(lambda: tool.open_record(SHA), {sealed.RECIPIENT: self.public, sealed.DECRYPT_KEY: self.secret},
+                           self.with_age)
+        self.assertEqual(out, "May backend checks: their record is decrypted\n")
+        code, out = self.post(self.api())
+        self.assertEqual((code, out), (1, "May backend checks failed; 1 failing tests and 0 type errors posted to may-app #42\n"))
+        self.assertIn(SECRET_TEXT, self.posted()[0])
+
+
 class CliTests(unittest.TestCase):
     def test_a_refusal_prints_only_a_fixed_line(self):
         with tempfile.TemporaryDirectory() as raw:
-            result = subprocess.run([sys.executable, "-I", "-S", "-B", tool.__file__, "--source-sha", SHA, "--pr-number", "42"],
+            result = subprocess.run([sys.executable, "-I", "-S", "-B", tool.__file__, "seal", "--source-sha", SHA],
                                     capture_output=True, env={"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": raw})
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, b"")
@@ -291,7 +391,39 @@ class WorkflowTests(unittest.TestCase):
             "a read key on the post": (post_env, post_env + "          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}\n", secret),
             "the post without its token": (post_env, "", secret),
             "no post": ("      - name: Post the backend failures on the may-app pull request, never in this log\n", "      - name: Gone\n",
-                        name + "backend's steps are not exactly"),
+                        name + "the jobs' steps are not exactly"),
+        }
+        for case, (old, new, message) in cases.items():
+            with self.subTest(case=case):
+                self.flagged(WORKFLOW, old, new, message, case)
+
+    def test_the_job_that_runs_the_pull_requests_code_holds_no_app_key_token_or_decrypt_key(self):
+        """The independent review of #133: the runner user has sudo and can read every secret its job references."""
+        name = "backend-unit-pr.yml: "
+        secret = name + "a secret or env entry other than"
+        node = "      - name: Install the pinned, checksum-verified Node\n"
+        mint = ("      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code\n"
+                "        id: ci-comment\n        if: vars.MAY_CI_APP_ID != ''\n"
+                "        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n"
+                "        with:\n          app-id: ${{ vars.MAY_CI_APP_ID }}\n"
+                "          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}\n          owner: May-Assistant\n"
+                "          repositories: may-app\n          permission-pull-requests: write\n")
+        seal_env = "          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}\n        run: python3 -I -S -B tools/may_release/backend_unit_post.py seal"
+        open_env = "          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}\n"
+        guard = "      - name: Check the database log holds no statement text, never printing it\n        if: always()\n"
+        cases = {
+            "the comment mint in backend": (node, mint + node, "a GitHub App token is minted or used other than by its pinned"),
+            "the decrypt key on the seal": (seal_env, open_env + seal_env, secret),
+            "the open without its key": (open_env, "", secret),
+            "the record in the clear": ("          path: ${{ runner.temp }}/may-sealed/record.age\n",
+                                        "          path: ${{ runner.temp }}/may-private\n", "sealed record as the only artifact"),
+            "the post only on success": ("    if: ${{ !cancelled() && needs.admission.result == 'success' }}\n", "",
+                                         "a condition or a timeout other than its own"),
+            "the log guard only on success": (guard, guard.replace("        if: always()\n", ""),
+                                              name + "the jobs' steps are not exactly"),
+            "no service": ("    services:\n", "    servicez:\n", "the Postgres service is not exactly"),
+            "no verdict": ("        run: python3 -I -S -B tools/may_release/backend_unit_post.py verdict\n",
+                           "        run: echo\n", name + "runs something other than"),
         }
         for case, (old, new, message) in cases.items():
             with self.subTest(case=case):
@@ -320,7 +452,7 @@ class WorkflowTests(unittest.TestCase):
         cases = {
             "a printed body": (posted, posted + "\n    print(body)", "prints something other than a fixed line"),
             "a printed failure": (posted, 'print(f"failed: {failed}")', "prints something other than a fixed line"),
-            "a formatted refusal": ('raise BackendPostError("The tested checkout is not the dispatched commit; nothing was posted")',
+            "a formatted refusal": ('raise BackendPostError("The tested checkout is not the dispatched commit; nothing was sealed")',
                                     'raise BackendPostError("not " + str(checkout))', "printed error message is not one string literal"),
             "an exit built from data": ('raise SystemExit("May backend post stopped; check may-native-compile-pr, its secrets and the inputs") from None',
                                         'raise SystemExit("stopped: " + str(sys.exc_info()))', "exits with a message that is not a fixed literal"),

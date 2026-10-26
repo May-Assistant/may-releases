@@ -485,7 +485,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_each_widening_is_flagged(self):
         name = "backend-unit-pr.yml: "
-        secret = name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, the post's comment token and the dispatch's inputs"
+        secret = name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys"
         runs = name + "runs something other than the gate"
         shape = name + "is not the Linux backend run"
         service = name + "the Postgres service is not exactly backend-ci.yml's 16.15, pinned by digest"
@@ -524,7 +524,7 @@ class WorkflowTests(unittest.TestCase):
             "checks that may fail quietly": ("      - name: Run the backend checks without any credential, printing only pass or fail and counts\n",
                                              "      - name: Run the backend checks without any credential, printing only pass or fail and counts\n"
                                              "        continue-on-error: true\n", name + "sets a shell, defaults, a condition"),
-            "a cleanup that is not always run": ("        if: always()\n", "", name + "backend's steps are not exactly"),
+            "a cleanup that is not always run": ("        if: always()\n", "", name + "the jobs' steps are not exactly"),
             "a store environment": ("    environment: ${{ needs.admission.outputs.environment }}\n",
                                     "    environment: may-android-playground-internal\n", name + "backend's environment is not the one admission chose"),
             "a pull_request trigger": ("on:\n  workflow_dispatch:\n", "on:\n  pull_request:\n  workflow_dispatch:\n",
@@ -534,11 +534,11 @@ class WorkflowTests(unittest.TestCase):
             "the Android lane's concurrency group": ("  group: may-backend-unit-pr\n", "  group: may-android-unit-pr\n",
                                                      name + "does not run one at a time in its own concurrency group"),
             "a longer timeout": ("    timeout-minutes: 30\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
-            "a macOS runner": ("  backend:\n    needs: admission\n    runs-on: ubuntu-24.04\n",
-                               "  backend:\n    needs: admission\n    runs-on: macos-15\n", shape),
+            "a macOS runner": ("    needs: [admission, pull]\n    runs-on: ubuntu-24.04\n",
+                               "    needs: [admission, pull]\n    runs-on: macos-15\n", shape),
             "no log guard": ("      - name: Check the database log holds no statement text, never printing it\n        if: always()\n",
                              "      - name: Check the database log holds no statement text, never printing it\n",
-                             name + "backend's steps are not exactly"),
+                             name + "the jobs' steps are not exactly"),
             "a guard holding a token": ("          MAY_PG_CONTAINER: ${{ job.services.postgres.id }}\n",
                                         "          MAY_PG_CONTAINER: ${{ job.services.postgres.id }}\n          GH_TOKEN: ${{ github.token }}\n",
                                         name + "a secret or env entry"),

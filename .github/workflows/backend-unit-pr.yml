@@ -24,10 +24,11 @@ jobs:
     # may-app pull request on a free Linux runner: the pinned Node 22.22.0, a Postgres 16.15 service container pinned
     # by digest, then npm ci, typecheck, migrations from scratch twice with the ledger check, and npm test
     # (backend_unit.py STAGES). The same gate, fetch and environment as android-unit-pr.yml (gate.py --action
-    # compile-pr: may-native-compile-pr, no required reviewer, main only), because it holds the same things: two
-    # read-only deploy keys and a pull-request read token, each in its own step, and the pull-request comment token in
-    # the post alone. Nothing is signed or uploaded. Every stage's output stays in a private log, only fixed lines with
-    # counts are printed, and the failures go only to the may-app pull request (backend_unit_post.py).
+    # compile-pr: may-native-compile-pr, no required reviewer, main only), and the same split: pull mints the read
+    # token and checks the pull request, backend runs the pull request's code with the two read-only deploy keys alone,
+    # and post mints the comment token. Nothing is signed. Every stage's output stays in a private log, only fixed lines
+    # with counts are printed, the one upload is the sealed record, and the failures go only to the may-app pull
+    # request (backend_unit_post.py).
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -44,8 +45,44 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
         run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
-  backend:
+  pull:
+    # The pull request check, on a runner that runs no pull request code: the May CI App's key is referenced only in jobs
+    # like this one and post, never in the job that runs the pull request's own install scripts and tests as the runner
+    # user, who has sudo and can read every secret that job references (independent review of may-releases #133).
+    # backend needs it, and its fetch checks again that refs/pull/<number>/head is source_sha.
     needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code
+        id: ci-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: read
+      - name: Check the pull request head and environment before fetching
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
+  backend:
+    # The pull request's own install scripts, typecheck, migrations and tests, with the two read-only deploy keys in
+    # its fetch and no other secret: its outcome and failures leave it only sealed to the environment's own age key,
+    # and it fails when the checks failed.
+    needs: [admission, pull]
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     # npm test alone stops at 25 minutes (backend_unit.TEST_SECONDS); the rest of the job takes about 2.
@@ -73,35 +110,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code
-        id: ci-read
-        if: vars.MAY_CI_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.MAY_CI_APP_ID }}
-          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
-          owner: May-Assistant
-          repositories: may-app
-          permission-pull-requests: read
-      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code
-        id: ci-comment
-        if: vars.MAY_CI_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.MAY_CI_APP_ID }}
-          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
-          owner: May-Assistant
-          repositories: may-app
-          permission-pull-requests: write
       - name: Install the pinned, checksum-verified Node
         run: python3 -I -S -B tools/may_release/toolchain.py node
-      - name: Check the pull request head and environment before fetching
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
-          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
-          MAY_PR_NUMBER: ${{ inputs.pr_number }}
-        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
       # prepare.py's pull-request fetch, exactly as android-unit-pr.yml's: it also places the design system at its
       # Android pin, which the backend never reads.
       - name: Fetch the pull request head and pinned design system quietly
@@ -115,12 +127,20 @@ jobs:
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
         run: python3 -I -S -B tools/may_release/backend_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome
-      - name: Post the backend failures on the may-app pull request, never in this log
+      - name: Seal the backend failures for the post job, with no secret
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
-          MAY_PR_NUMBER: ${{ inputs.pr_number }}
-          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
-        run: python3 -I -S -B tools/may_release/backend_unit_post.py --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/backend_unit_post.py seal --source-sha "$MAY_SOURCE_SHA"
+      - name: Hand over only the sealed record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-backend-unit-record-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-sealed/record.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the checks failed
+        run: python3 -I -S -B tools/may_release/backend_unit_post.py verdict
       # GitHub prints the service container's log here at teardown, so it must hold no statement text
       # (backend_unit.SILENCE_SQL); this fails the job, with a count alone, if it does.
       - name: Check the database log holds no statement text, never printing it
@@ -130,4 +150,53 @@ jobs:
         run: python3 -I -S -B tools/may_release/backend_unit.py --check-service-log "$MAY_PG_CONTAINER"
       - name: Remove private source, logs, dependencies and the pinned Node
         if: always()
-        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-npm" "$RUNNER_TEMP/may-tools"
+        run: rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-npm" "$RUNNER_TEMP/may-tools" "$RUNNER_TEMP/may-sealed"
+  post:
+    # A fresh runner that runs no may-app code: the comment token is minted here alone, the decrypt key and the comment
+    # token each live in one step. It runs once backend has finished, passed or failed; with nothing sealed (no key
+    # pair set yet) it posts nothing and backend's verdict stands.
+    needs: [admission, backend]
+    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_COMMENT_TOKEN, before any pull request code
+        id: ci-comment
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: write
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Nothing to download (no key pair yet, or backend stopped before its seal) is reported by the next step.
+        continue-on-error: true
+        with:
+          name: may-backend-unit-record-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-sealed-download
+      - name: Decrypt and check the record
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
+        run: python3 -I -S -B tools/may_release/backend_unit_post.py open --source-sha "$MAY_SOURCE_SHA"
+      - name: Post the backend failures on the may-app pull request, never in this log
+        env:
+          MAY_SOURCE_SHA: ${{ inputs.source_sha }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
+        run: python3 -I -S -B tools/may_release/backend_unit_post.py post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+      - name: Remove the decrypted record
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-sealed-download"

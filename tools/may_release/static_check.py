@@ -248,10 +248,12 @@ WORKFLOW_MINTS = {
     # native runs the pull request's build code as the runner, so it mints nothing and the App key is never referenced
     # there: the read token is minted in pull, the comment token in post (reviews of #130 and #133).
     "native-compile-pr.yml": {"pull": ("ci-read",), "swift-checks": ("ci-read", "ci-comment"), "post": ("ci-comment",)},
-    "android-unit-pr.yml": {"unit": ("ci-read", "ci-comment")},
+    # unit runs the pull request's Gradle build as the runner, so it mints nothing either (the review of #133).
+    "android-unit-pr.yml": {"pull": ("ci-read",), "post": ("ci-comment",)},
     "ios-archive-rehearsal.yml": {"rehearsal": ("ci-read",)},
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
-    "backend-unit-pr.yml": {"backend": ("ci-read", "ci-comment")},
+    # backend runs the pull request's install scripts and tests as the runner, so it mints nothing (the same review).
+    "backend-unit-pr.yml": {"pull": ("ci-read",), "post": ("ci-comment",)},
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
@@ -1491,11 +1493,13 @@ def device_tests_print_problems(root):
 
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same
 # admission, pull request check, fetch and environment as native-compile-pr.yml (gate.py --action compile-pr,
-# may-native-compile-pr), so it holds nothing that compile does not: the PR read token in the check alone, the two
-# source-read keys in the fetch alone, the comment token in the post alone (compile_pr_errors.py's model), and no
-# secret or GitHub token on the suites' step (it runs the pull request's own build and test code) or the cleanup. It is pinned whole: dispatch with exactly pr_number and source_sha,
-# read-only, Linux runners, the pinned JDK installed without carrying a value to later steps (android_unit.py finds it
-# by path), nothing run but its seven commands, and no artifact, step summary or carried value. android_unit.py prints
+# may-native-compile-pr), and the same split (independent review of #133): the PR read token minted and used in pull's
+# check alone, the two source-read keys in unit's fetch alone (unit runs the pull request's own build and test code,
+# so it references no other secret), the decrypt key in post's open alone and the comment token in post's post alone,
+# and nothing on the suites, the seal, the verdict or the cleanups. It is pinned whole: dispatch with exactly pr_number
+# and source_sha, read-only, Linux runners, the pinned JDK and age installed without carrying a value to later steps
+# (each found by path), nothing run but its thirteen commands, the sealed record as the only artifact, and no step
+# summary but the verdict's counts and no carried value. android_unit.py prints
 # only fixed lines, a suite's name and verdict from its own words, and integer counts; android_unit_post.py only fixed
 # lines, the pull request number and the failing-test count (android_unit_print_problems).
 UNIT = "android-unit-pr.yml"
@@ -1507,16 +1511,50 @@ UNIT_RUN = ('python3 -I -S -B tools/may_release/android_unit.py --source-sha "$M
 UNIT_BREAKDOWN_ENV = ("MAY_CORE_BREAKDOWN", "${{ inputs.core_breakdown }}")
 UNIT_BREAKDOWN_INPUT = ("      core_breakdown:\n        description: [^\n]+\n        required: false\n"
                         "        type: boolean\n        default: false$")
-UNIT_POST = 'python3 -I -S -B tools/may_release/android_unit_post.py --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"'
+UNIT_POST_CMD = "python3 -I -S -B tools/may_release/android_unit_post.py "
+UNIT_SEAL = UNIT_POST_CMD + 'seal --source-sha "$MAY_SOURCE_SHA"'
+UNIT_VERDICT = UNIT_POST_CMD + "verdict"
+UNIT_OPEN = UNIT_POST_CMD + 'open --source-sha "$MAY_SOURCE_SHA"'
+UNIT_POST = UNIT_POST_CMD + 'post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"'
 UNIT_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
-                '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-tools"')
-UNIT_RUNS = [GATE_COMPILE_PR, UNIT_JDK, GATE_CHECK_PULL, PREPARE_ANDROID_PR, UNIT_RUN, UNIT_POST, UNIT_CLEANUP]
+                '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-tools" "$RUNNER_TEMP/may-sealed"')
+SEALED_POST_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-sealed-download"'
+UNIT_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL,
+             UNIT_JDK, AGE_INSTALL, PREPARE_ANDROID_PR, UNIT_RUN, UNIT_SEAL, UNIT_VERDICT, UNIT_CLEANUP,
+             AGE_INSTALL, UNIT_OPEN, UNIT_POST, SEALED_POST_CLEANUP]
 UNIT_STEP_NAMES = ["Install the pinned, checksum-verified JDK",
-                   "Check the pull request head and environment before fetching",
+                   "Install pinned age, before any pull request code",
                    "Fetch the pull request head and pinned design system quietly",
                    "Run the unit suites without any credential, printing only pass or fail and counts",
-                   "Post the failing tests on the may-app pull request, never in this log",
+                   "Seal the failing tests for the post job, with no secret",
+                   "Hand over only the sealed record",
+                   "Fail if the suites failed",
                    "Remove private source, logs, build outputs and the pinned JDK"]
+UNIT_POST_STEP_NAMES = ["Install pinned age", "", "Decrypt and check the record",
+                        "Post the failing tests on the may-app pull request, never in this log",
+                        "Remove the decrypted record"]
+
+
+def sealed_upload(artifact):
+    """A PR-code job's one upload, exactly: its sealed record (sealed.py), kept a day."""
+    return ("name: Hand over only the sealed record\n"
+            "        uses: " + UPLOAD_ARTIFACT + " # v4\n"
+            "        with:\n"
+            f"          name: {artifact}-${{{{ github.run_attempt }}}}\n"
+            "          path: ${{ runner.temp }}/may-sealed/record.age\n"
+            "          if-no-files-found: ignore\n"
+            "          retention-days: 1\n")
+
+
+def sealed_download(artifact, job):
+    """The post job's one download, exactly: that record into may-sealed-download."""
+    return ("uses: " + DOWNLOAD_ARTIFACT + " # v4\n"
+            f"        # Nothing to download (no key pair yet, or {job} stopped before its seal) is reported by the next "
+            "step.\n"
+            "        continue-on-error: true\n"
+            "        with:\n"
+            f"          name: {artifact}-${{{{ github.run_attempt }}}}\n"
+            "          path: ${{ runner.temp }}/may-sealed-download\n")
 UNIT_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}")}
 UNIT_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}"), UNIT_BREAKDOWN_ENV} | \
     {(name, "${{ secrets." + name + " }}") for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET)}
@@ -1527,13 +1565,21 @@ UNIT_RUN_NAME = "\nrun-name: 'May Android unit suites for may-app #${{ inputs.pr
 
 @with_app_tokens("android-unit-pr.yml")
 def android_unit_workflow_problems(text):
+    """admission, then pull (the read mint and the pull request check, on a runner with no pull request code), then
+    unit (the pull request's own build and tests, with the two read-only deploy keys alone, its record sealed), then
+    post (the comment mint, the open with the decrypt key alone, the post with the comment token alone); independent
+    review of may-releases #133."""
     name = UNIT + ": "
     found = []
-    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or \
+    jobs = ("admission", "pull", "unit", "post")
+    upload, download = sealed_upload("may-android-unit-record"), sealed_download("may-android-unit-record", "unit")
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or \
             "GITHUB_PATH" in text or "--export" in text or "--platform ios" in text or \
-            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "unit")] != [1, 1] or \
-            text.count("runs-on:") != 2:
-        found.append(name + "is not the Linux unit-test run with no artifact, step summary or carried value")
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in jobs] != [1, 1, 1, 1] or \
+            text.count("runs-on:") != 4 or text.count("upload-artifact") != 1 or text.count("download-artifact") != 1 or \
+            upload not in job_text(text, "unit") or download not in job_text(text, "post"):
+        found.append(name + "is not the Linux unit-test run with its sealed record as the only artifact, and no step "
+                     "summary or carried value")
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + "top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
     if UNIT_RUN_NAME not in text or text.count("run-name:") != 1:
@@ -1547,44 +1593,59 @@ def android_unit_workflow_problems(text):
     if "\nconcurrency:\n  group: may-android-unit-pr\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
-            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "unit")] != [1, 1] or \
-            text.count("permissions:") != 3:
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1, 1] or \
+            text.count("permissions:") != 5:
         found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
-    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "unit"]:
-        found.append(name + "jobs are not exactly admission and unit")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs):
+        found.append(name + "jobs are not exactly admission, pull, unit and post")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
     if runs != UNIT_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
-        found.append(name + "runs something other than the gate, the JDK install, the check, the fetch, the suites, "
-                     "the post and the cleanup")
-    steps = {job: job_steps(text, job)[1] for job in ("admission", "unit")}
+        found.append(name + "runs something other than the gate, the check, the JDK and age installs, the fetch, the "
+                     "suites, the seal, the verdict, the open, the post and the cleanups")
+    steps = {job: job_steps(text, job)[1] for job in jobs}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
-    names = [step for step, _ in steps["unit"]]
-    cleanup = steps["unit"][-1][1] if steps["unit"] else ""
-    if leading != {"admission": ["uses", "id"], "unit": ["uses"] + ["name"] * len(UNIT_STEP_NAMES)} or \
-            names != [""] + UNIT_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
-            uses_in(text) != [CHECKOUT, CHECKOUT]:
-        found.append(name + "unit's steps are not exactly the JDK install, check, fetch, suites, post and an always-run cleanup")
-    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 55\n" not in job_text(text, "unit"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than unit's 55 minutes")
-    job = job_text(text, "unit")
-    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
-            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+    names = {job: [step for step, _ in steps[job]] for job in ("pull", "unit", "post")}
+    if leading != {"admission": ["uses", "id"], "pull": ["uses", "name"],
+                   "unit": ["uses"] + ["name"] * len(UNIT_STEP_NAMES),
+                   "post": ["uses", "name", "uses", "name", "name", "name"]} or \
+            names != {"pull": ["", "Check the pull request head and environment before fetching"],
+                      "unit": [""] + UNIT_STEP_NAMES, "post": [""] + UNIT_POST_STEP_NAMES} or \
+            any("\n        if: always()\n" not in (steps[job][-1][1] if steps[job] else "") for job in ("unit", "post")) or \
+            uses_in(text) != [CHECKOUT, CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT]:
+        found.append(name + "the jobs' steps are not exactly the check; the installs, fetch, suites, seal, upload, "
+                     "verdict and an always-run cleanup; and the open, post and an always-run cleanup")
+    if re.findall(r"(?m)^\s+(if: .+)$", text) != ["if: always()",
+                                                   "if: ${{ !cancelled() && needs.admission.result == 'success' }}",
+                                                   "if: always()"] or \
+            re.search(r"(?m)^\s*(defaults|shell):", text) or text.count("continue-on-error:") != 1 or \
+            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["10", "55", "10"]:
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
+    unit, puller, poster = (job_text(text, job) for job in ("unit", "pull", "post"))
+    if any("    environment: ${{ needs.admission.outputs.environment }}\n" not in job for job in (puller, unit, poster)) or \
+            "    needs: admission\n" not in puller or "    needs: [admission, pull]\n" not in unit or \
+            "    needs: [admission, unit]\n" not in poster or re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + "unit's environment is not the one admission chose, after admission")
-    by_name = dict(steps["unit"])
-    jdk, check, fetch, suites, post, clean = (by_name.get(n, "") for n in UNIT_STEP_NAMES)
-    # Each secret bound exactly once: the PR token in the pull request check, the read keys in the fetch, the comment
-    # token in the post (after the pull request's own build and test code has run). The suites get the source SHA
-    # alone; the post the inputs and its token, no GitHub token; the JDK install and the cleanup no env.
-    if secrets_in(text) != set(UNIT_SECRETS) or any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS) or \
-            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
-            secrets_in(post) != {PR_COMMENT_SECRET} or \
-            secrets_in(jdk + suites + clean) or "GH_TOKEN" in fetch + suites + post or "env:" in jdk + clean or \
-            env_entries(suites) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), UNIT_BREAKDOWN_ENV] or \
+    check = dict(steps["pull"]).get("Check the pull request head and environment before fetching", "")
+    jdk, age, fetch, suites, seal, handover, verdict, clean = (dict(steps["unit"]).get(n, "") for n in UNIT_STEP_NAMES)
+    opener, post, post_clean = (dict(steps["post"]).get(n, "") for n in UNIT_POST_STEP_NAMES[2:])
+    recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
+    decrypt = ("MAY_RENDERS_DECRYPT_KEY", "${{ secrets.MAY_RENDERS_DECRYPT_KEY }}")
+    sha = ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")
+    # Each secret bound exactly once: the PR token in pull's check, the read keys in unit's fetch (unit references no
+    # other secret: it runs the pull request's own code), the decrypt key in the open, the comment token in the post.
+    if secrets_in(text) != set(UNIT_SECRETS) | {decrypt[0]} or \
+            any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS + (decrypt[0],)) or \
+            secrets_in(unit) != set(COMPILE_SECRETS) or secrets_in(fetch) != set(COMPILE_SECRETS) or \
+            secrets_in(check) != {PR_READ_SECRET} or secrets_in(post) != {PR_COMMENT_SECRET} or \
+            secrets_in(opener) != {decrypt[0]} or \
+            secrets_in(jdk + age + suites + seal + handover + verdict + clean + post_clean) or \
+            "GH_TOKEN" in fetch + suites + post or "env:" in jdk + age + verdict + clean + post_clean or \
+            env_entries(suites) != [sha, UNIT_BREAKDOWN_ENV] or set(env_entries(seal)) != {sha, recipient} or \
+            set(env_entries(opener)) != {sha, recipient, decrypt} or text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or \
             sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
-            any(e not in UNIT_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+            any(e not in UNIT_ENV | {recipient, decrypt} for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
-                     "the post's comment token and the dispatch's inputs")
+                     "the seal's public key, the open's decrypt key, the post's comment token and the dispatch's inputs")
     if "${{ inputs." in "\n".join(runs):
         found.append(name + "interpolates inputs into shell")
     return found
@@ -1598,7 +1659,7 @@ UNIT_EXIT_CLASSES = {"UnitTestsError", "StoreError"}
 
 UNIT_POST_TOOL = "android_unit_post.py"
 UNIT_POST_PRINT_VALUES = {"number", "int(total)"}
-UNIT_POST_EXIT_CLASSES = {"GateDenial", "UnitPostError", "CompilePrError", "DsCompileError", "StoreError"}
+UNIT_POST_EXIT_CLASSES = {"GateDenial", "UnitPostError", "SealedError", "CompilePrError", "DsCompileError", "StoreError"}
 
 
 # The post's step summary (android_unit_post.summary_lines): fixed words, the suite's own name and integer counts only.
@@ -1625,33 +1686,44 @@ def android_unit_print_problems(root):
 # May's backend checks at an open may-app pull request head (backend-unit-pr.yml, backend_unit.py, backend_unit_post.py):
 # may-app's switched-off backend-ci.yml, run here. The same admission, pull request check, fetch and environment as
 # android-unit-pr.yml (gate.py --action compile-pr, may-native-compile-pr; prepare.py's Android pull-request fetch), so
-# it holds nothing that lane does not: the PR read token in the check alone, the two source-read keys in the fetch alone,
-# the comment token in the post alone, and no secret or GitHub token on the checks' step (it runs the pull request's own
-# install scripts, typecheck, migrations and tests) or the cleanup. It is pinned whole: dispatch with exactly pr_number
+# it holds nothing that lane does not, split the same way: the PR read token in pull's check alone, the two source-read
+# keys in backend's fetch alone (backend runs the pull request's own install scripts, typecheck, migrations and tests,
+# so it references no other secret), the decrypt key in post's open alone and the comment token in post's post alone,
+# and nothing on the checks, the seal, the verdict or the cleanups. It is pinned whole: dispatch with exactly pr_number
 # and source_sha, read-only, Linux runners, backend-ci.yml's Postgres service exactly (BACKEND_SERVICES: 16.15 by digest,
 # trust auth on the runner's loopback, no secret), the pinned Node installed without carrying a value to later steps
-# (backend_unit.py finds it by path), nothing run but its eight commands, a 30-minute job timeout (the suite outgrew
+# (backend_unit.py finds it by path), nothing run but its fourteen commands, a 30-minute job timeout (the suite outgrew
 # backend-ci.yml's 20), the service's log silenced before any pull request code and checked for statement text at the
-# end (GitHub prints it at teardown), and no artifact (backend-ci.yml's log upload is dropped: this repository's artifacts are public), step summary or carried
-# value. backend_unit.py prints only fixed lines, a stage's name and verdict from its own words, and integer test counts;
+# end (GitHub prints it at teardown), and no artifact but the sealed record (backend-ci.yml's log upload is dropped:
+# this repository's artifacts are public), no step summary but the verdict's counts and no carried value. backend_unit.py prints only fixed lines, a stage's name and verdict from its own words, and integer test counts;
 # backend_unit_post.py only fixed lines, the pull request number and two counts (backend_unit_print_problems).
 BACKEND = "backend-unit-pr.yml"
 BACKEND_NODE = "python3 -I -S -B tools/may_release/toolchain.py node"
 BACKEND_RUN = 'python3 -I -S -B tools/may_release/backend_unit.py --source-sha "$MAY_SOURCE_SHA" --record-outcome'
-BACKEND_POST = ('python3 -I -S -B tools/may_release/backend_unit_post.py --source-sha "$MAY_SOURCE_SHA" '
-                '--pr-number "$MAY_PR_NUMBER"')
+BACKEND_POST_CMD = "python3 -I -S -B tools/may_release/backend_unit_post.py "
+BACKEND_SEAL = BACKEND_POST_CMD + 'seal --source-sha "$MAY_SOURCE_SHA"'
+BACKEND_VERDICT = BACKEND_POST_CMD + "verdict"
+BACKEND_OPEN = BACKEND_POST_CMD + 'open --source-sha "$MAY_SOURCE_SHA"'
+BACKEND_POST = BACKEND_POST_CMD + 'post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"'
 BACKEND_LOG_GUARD = 'python3 -I -S -B tools/may_release/backend_unit.py --check-service-log "$MAY_PG_CONTAINER"'
 BACKEND_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
-                   '"$RUNNER_TEMP/may-npm" "$RUNNER_TEMP/may-tools"')
-BACKEND_RUNS = [GATE_COMPILE_PR, BACKEND_NODE, GATE_CHECK_PULL, PREPARE_ANDROID_PR, BACKEND_RUN, BACKEND_POST,
-                BACKEND_LOG_GUARD, BACKEND_CLEANUP]
+                   '"$RUNNER_TEMP/may-npm" "$RUNNER_TEMP/may-tools" "$RUNNER_TEMP/may-sealed"')
+BACKEND_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL,
+                BACKEND_NODE, AGE_INSTALL, PREPARE_ANDROID_PR, BACKEND_RUN, BACKEND_SEAL, BACKEND_VERDICT,
+                BACKEND_LOG_GUARD, BACKEND_CLEANUP,
+                AGE_INSTALL, BACKEND_OPEN, BACKEND_POST, SEALED_POST_CLEANUP]
 BACKEND_STEP_NAMES = ["Install the pinned, checksum-verified Node",
-                      "Check the pull request head and environment before fetching",
+                      "Install pinned age, before any pull request code",
                       "Fetch the pull request head and pinned design system quietly",
                       "Run the backend checks without any credential, printing only pass or fail and counts",
-                      "Post the backend failures on the may-app pull request, never in this log",
+                      "Seal the backend failures for the post job, with no secret",
+                      "Hand over only the sealed record",
+                      "Fail if the checks failed",
                       "Check the database log holds no statement text, never printing it",
                       "Remove private source, logs, dependencies and the pinned Node"]
+BACKEND_POST_STEP_NAMES = ["Install pinned age", "", "Decrypt and check the record",
+                           "Post the backend failures on the may-app pull request, never in this log",
+                           "Remove the decrypted record"]
 BACKEND_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}"), ("MAY_PG_CONTAINER", "${{ job.services.postgres.id }}")} | \
     {(name, "${{ secrets." + name + " }}") for name in UNIT_SECRETS}
 BACKEND_RUN_NAME = "\nrun-name: 'May backend checks for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
@@ -1676,17 +1748,25 @@ BACKEND_SERVICES = (
 
 @with_app_tokens("backend-unit-pr.yml")
 def backend_unit_workflow_problems(text):
+    """admission, then pull (the read mint and the pull request check, on a runner with no pull request code), then
+    backend (the pull request's own install scripts and checks beside the Postgres service, with the two read-only
+    deploy keys alone, its record sealed), then post (the comment mint, the open with the decrypt key alone, the post
+    with the comment token alone); independent review of may-releases #133."""
     name = BACKEND + ": "
     found = []
+    jobs = ("admission", "pull", "backend", "post")
     if job_text(text, "backend").count(BACKEND_SERVICES) != 1 or text.count("services:") != 1 or \
             text.count("image:") != 1 or text.count("options:") != 1 or text.count("ports:") != 1:
         found.append(name + "the Postgres service is not exactly backend-ci.yml's 16.15, pinned by digest")
     text = text.replace(BACKEND_SERVICES, "", 1)
-    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or \
+    upload, download = sealed_upload("may-backend-unit-record"), sealed_download("may-backend-unit-record", "backend")
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or \
             "GITHUB_PATH" in text or "--export" in text or "--platform ios" in text or "toolchain.py jdk" in text or \
-            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "backend")] != [1, 1] or \
-            text.count("runs-on:") != 2:
-        found.append(name + "is not the Linux backend run with no artifact, step summary or carried value")
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in jobs] != [1, 1, 1, 1] or \
+            text.count("runs-on:") != 4 or text.count("upload-artifact") != 1 or text.count("download-artifact") != 1 or \
+            upload not in job_text(text, "backend") or download not in job_text(text, "post"):
+        found.append(name + "is not the Linux backend run with its sealed record as the only artifact, and no step "
+                     "summary or carried value")
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + "top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
     if BACKEND_RUN_NAME not in text or text.count("run-name:") != 1:
@@ -1699,47 +1779,64 @@ def backend_unit_workflow_problems(text):
     if "\nconcurrency:\n  group: may-backend-unit-pr\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
-            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "backend")] != [1, 1] or \
-            text.count("permissions:") != 3:
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1, 1] or \
+            text.count("permissions:") != 5:
         found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
-    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "backend"]:
-        found.append(name + "jobs are not exactly admission and backend")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs):
+        found.append(name + "jobs are not exactly admission, pull, backend and post")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
     if runs != BACKEND_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
-        found.append(name + "runs something other than the gate, the Node install, the check, the fetch, the backend "
-                     "checks, the post, the database log guard and the cleanup")
-    steps = {job: job_steps(text, job)[1] for job in ("admission", "backend")}
+        found.append(name + "runs something other than the gate, the check, the Node and age installs, the fetch, the "
+                     "backend checks, the seal, the verdict, the database log guard, the open, the post and the cleanups")
+    steps = {job: job_steps(text, job)[1] for job in jobs}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
-    names = [step for step, _ in steps["backend"]]
-    cleanup = steps["backend"][-1][1] if steps["backend"] else ""
-    if leading != {"admission": ["uses", "id"], "backend": ["uses"] + ["name"] * len(BACKEND_STEP_NAMES)} or \
-            names != [""] + BACKEND_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+    names = {job: [step for step, _ in steps[job]] for job in ("pull", "backend", "post")}
+    if leading != {"admission": ["uses", "id"], "pull": ["uses", "name"],
+                   "backend": ["uses"] + ["name"] * len(BACKEND_STEP_NAMES),
+                   "post": ["uses", "name", "uses", "name", "name", "name"]} or \
+            names != {"pull": ["", "Check the pull request head and environment before fetching"],
+                      "backend": [""] + BACKEND_STEP_NAMES, "post": [""] + BACKEND_POST_STEP_NAMES} or \
             "\n        if: always()\n" not in (steps["backend"][-2][1] if len(steps["backend"]) > 1 else "") or \
-            uses_in(text) != [CHECKOUT, CHECKOUT]:
-        found.append(name + "backend's steps are not exactly the Node install, check, fetch, checks, post, an "
-                     "always-run database log guard and an always-run cleanup")
-    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 2)) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 30\n" not in job_text(text, "backend"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than backend's 30 minutes")
-    job = job_text(text, "backend")
-    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
-            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+            any("\n        if: always()\n" not in (steps[job][-1][1] if steps[job] else "") for job in ("backend", "post")) or \
+            uses_in(text) != [CHECKOUT, CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT]:
+        found.append(name + "the jobs' steps are not exactly the check; the installs, fetch, checks, seal, upload, "
+                     "verdict, an always-run database log guard and an always-run cleanup; and the open, post and an "
+                     "always-run cleanup")
+    if re.findall(r"(?m)^\s+(if: .+)$", text) != ["if: always()", "if: always()",
+                                                   "if: ${{ !cancelled() && needs.admission.result == 'success' }}",
+                                                   "if: always()"] or \
+            re.search(r"(?m)^\s*(defaults|shell):", text) or text.count("continue-on-error:") != 1 or \
+            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["10", "30", "10"]:
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
+    backend, puller, poster = (job_text(text, job) for job in ("backend", "pull", "post"))
+    if any("    environment: ${{ needs.admission.outputs.environment }}\n" not in job
+           for job in (puller, backend, poster)) or \
+            "    needs: admission\n" not in puller or "    needs: [admission, pull]\n" not in backend or \
+            "    needs: [admission, backend]\n" not in poster or re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + "backend's environment is not the one admission chose, after admission")
-    by_name = dict(steps["backend"])
-    node, check, fetch, checks, post, guard, clean = (by_name.get(n, "") for n in BACKEND_STEP_NAMES)
-    # Each secret bound exactly once: the PR token in the pull request check, the read keys in the fetch, the comment
-    # token in the post (after the pull request's own install scripts and tests have run). The checks get the source
-    # SHA alone; the post the inputs and its token, no GitHub token; the Node install and the cleanup no env.
-    if secrets_in(text) != set(UNIT_SECRETS) or any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS) or \
-            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
-            secrets_in(post) != {PR_COMMENT_SECRET} or \
-            secrets_in(node + checks + guard + clean) or "GH_TOKEN" in fetch + checks + post + guard or \
-            "env:" in node + clean or env_entries(guard) != [("MAY_PG_CONTAINER", "${{ job.services.postgres.id }}")] or \
-            env_entries(checks) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")] or \
+    check = dict(steps["pull"]).get("Check the pull request head and environment before fetching", "")
+    node, age, fetch, checks, seal, handover, verdict, guard, clean = (
+        dict(steps["backend"]).get(n, "") for n in BACKEND_STEP_NAMES)
+    opener, post, post_clean = (dict(steps["post"]).get(n, "") for n in BACKEND_POST_STEP_NAMES[2:])
+    recipient = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
+    decrypt = ("MAY_RENDERS_DECRYPT_KEY", "${{ secrets.MAY_RENDERS_DECRYPT_KEY }}")
+    sha = ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")
+    # Each secret bound exactly once: the PR token in pull's check, the read keys in backend's fetch (backend references
+    # no other secret: it runs the pull request's own code), the decrypt key in the open, the comment token in the post.
+    if secrets_in(text) != set(UNIT_SECRETS) | {decrypt[0]} or \
+            any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS + (decrypt[0],)) or \
+            secrets_in(backend) != set(COMPILE_SECRETS) or secrets_in(fetch) != set(COMPILE_SECRETS) or \
+            secrets_in(check) != {PR_READ_SECRET} or secrets_in(post) != {PR_COMMENT_SECRET} or \
+            secrets_in(opener) != {decrypt[0]} or \
+            secrets_in(node + age + checks + seal + handover + verdict + guard + clean + post_clean) or \
+            "GH_TOKEN" in fetch + checks + post + guard or "env:" in node + age + verdict + clean + post_clean or \
+            env_entries(guard) != [("MAY_PG_CONTAINER", "${{ job.services.postgres.id }}")] or \
+            env_entries(checks) != [sha] or set(env_entries(seal)) != {sha, recipient} or \
+            set(env_entries(opener)) != {sha, recipient, decrypt} or text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or \
             sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
-            any(e not in BACKEND_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+            any(e not in BACKEND_ENV | {recipient, decrypt} for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
-                     "the post's comment token and the dispatch's inputs")
+                     "the seal's public key, the open's decrypt key, the post's comment token and the dispatch's inputs")
     if "${{ inputs." in "\n".join(runs):
         found.append(name + "interpolates inputs into shell")
     return found
@@ -1750,7 +1847,7 @@ BACKEND_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(passed)", "int(fai
 BACKEND_EXIT_CLASSES = {"BackendTestsError", "StoreError"}
 BACKEND_POST_TOOL = "backend_unit_post.py"
 BACKEND_POST_PRINT_VALUES = {"number", "int(total)", "int(errors)"}
-BACKEND_POST_EXIT_CLASSES = {"GateDenial", "BackendPostError", "CompilePrError", "DsCompileError", "StoreError"}
+BACKEND_POST_EXIT_CLASSES = {"GateDenial", "BackendPostError", "SealedError", "CompilePrError", "DsCompileError", "StoreError"}
 # The post's step summary (backend_unit_post.summary_lines): fixed words, the stage's own name and verdict word (WORDS,
 # from a recorded verdict read_record checked), and integer counts only.
 BACKEND_SUMMARY_VALUES = {"verdict", "name", "WORDS[outcome['stages'][name]]", "int(counts[0])", "int(counts[1])",
@@ -2521,6 +2618,8 @@ def control_problems(root):
     found += ios_rehearsal_print_problems(root)
     found += android_unit_workflow_problems((flows / UNIT).read_text())
     found += android_unit_print_problems(root)
+    # sealed.py carries a lane's private record between jobs: it prints nothing, and raises fixed literals alone.
+    found += quiet_tool_problems(root, "sealed.py", set(), {"SealedError"})
     found += android_ci_schedule_workflow_problems((flows / SCHEDULE).read_text())
     found += android_ci_schedule_tool_problems(root)
     found += backend_unit_workflow_problems((flows / BACKEND).read_text())

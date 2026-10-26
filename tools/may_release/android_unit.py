@@ -17,8 +17,8 @@ Test results committed to the pull request are refused before Gradle runs, so a 
 With --record-outcome (android-unit-pr.yml), a suite that fails, errors, ran no test or did not report, and Gradle
 failing or timing out, do not fail this step. The outcome, each suite's counts, and each failing test (its class and
 method, its kind, the first line of its message and the line of the test's own source it failed at, repo-relative)
-go to private files (OUTCOME, FAILURES), and android_unit_post.py, the next step, posts them on the may-app pull
-request and then fails the job. Every check before Gradle (secrets, the pinned JDK, the SDK, fetch-design-system.sh,
+go to private files (OUTCOME, FAILURES), and android_unit_post.py seals them for the post job, which posts them on
+the may-app pull request, and then fails the job. Every check before Gradle (secrets, the pinned JDK, the SDK, fetch-design-system.sh,
 committed results) still fails here. The failing tests are never printed.
 
 With --core-breakdown true (the dispatch's core_breakdown input), each failing core test is also located by numbers

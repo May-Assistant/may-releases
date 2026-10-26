@@ -608,6 +608,28 @@ class SealedRoundTripTests(PostCase):
             self.run_step(lambda: tool.open_record(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public,
                                                                     MAY_RENDERS_DECRYPT_KEY=self.secret))
 
+    def test_the_longest_record_of_non_ascii_errors_seals_and_opens(self):
+        """The review of #133, LOW 1: escaped to ASCII, MAX_ERRORS errors whose paths and messages are characters
+        outside the BMP (12 bytes each) would not fit MAX_RECORD, and a compile that failed that way posted nothing."""
+        wide = "\U0001D11E"
+        (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": "failed"}))
+        (self.private / tool.LOG).write_text("\n".join(
+            f"{self.checkout}/ios/{wide * 200}{n}.swift:1:1: error: {wide * 300}" for n in range(150)))
+        try:
+            self.run_step(lambda: tool.seal(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public))
+        except CompilePrError as error:
+            self.fail("the longest record was refused: " + error.args[0])
+        sealed = (self.root / tool.SEALED / tool.SEALED_NAME).read_bytes()
+        shutil.rmtree(self.private)
+        self.private.mkdir()
+        (self.root / tool.DOWNLOAD).mkdir()
+        (self.root / tool.DOWNLOAD / tool.SEALED_NAME).write_bytes(sealed)
+        self.run_step(lambda: tool.open_record(SHA),
+                      self.environ(MAY_RENDERS_RECIPIENT=self.public, MAY_RENDERS_DECRYPT_KEY=self.secret))
+        record = json.loads((self.private / tool.RECORD).read_text())
+        self.assertEqual((len(record["errors"]), record["total"]), (100, 150))
+        self.assertTrue(record["errors"][0].endswith(wide * 239 + "…"))
+
     def test_another_key_a_tampered_record_or_another_commit_is_refused(self):
         self.sealed_and_handed_over()
         other = next(line for line in subprocess.run(["age-keygen"], capture_output=True, text=True,
