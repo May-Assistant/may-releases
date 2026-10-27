@@ -423,6 +423,23 @@ class GitHubCallTests(unittest.TestCase):
         with patch("urllib.request.urlopen", urlopen):
             self.assertEqual(tool.github("GET", PULLS, None, TOKEN), (422, None))
 
+    def test_the_may_app_pull_request_read_is_tried_again_after_no_answer(self):
+        """Run 40468630357: android_unit_post's read of the may-app pull request (this github()) failed once, and two
+        failing tests were never posted (coordinator, 27 Oct)."""
+        answers, slept = [0, 502], []
+
+        def urlopen(request, timeout):
+            status = answers.pop(0) if answers else 200
+            if status == 0:
+                raise urllib.error.URLError("no answer")
+            if status != 200:
+                raise urllib.error.HTTPError(request.full_url, status, MARKER, {}, io.BytesIO(MARKER.encode()))
+            return FakeResponse(b"{}", 200)
+
+        with patch("urllib.request.urlopen", urlopen), patch("time.sleep", slept.append):
+            self.assertEqual(tool.github("GET", PULLS, None, TOKEN), (200, {}))
+        self.assertEqual(len(slept), 2)
+
 
 class CommandLineTests(PostCase):
     def test_the_cli_prints_fixed_lines_and_exits_non_zero_on_a_failed_compile(self):
