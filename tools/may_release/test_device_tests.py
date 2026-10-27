@@ -253,7 +253,9 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("on Let me reach you tap Not now", goal)
         self.assertIn("You are done, and must stop at once and report success, as soon as you have tapped Not now on Let "
                       "me reach you, or as soon as the app's main tabs (Chats, Agenda) show", goal)
-        self.assertNotIn("Start chatting", goal)
+        # may-app #1430 (M, 27 Oct): with notifications already allowed (the Android emulator), Let me reach you is
+        # skipped, and only Start chatting on I'm all set leaves onboarding for the main tabs.
+        self.assertIn("on I'm all set, tap Start chatting", goal)
 
     def test_every_agent_scenario_fits_inside_one_test_session(self):
         """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
