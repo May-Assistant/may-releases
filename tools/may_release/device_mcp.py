@@ -233,12 +233,8 @@ def ios_nodes(node, depth=0):
         yield from ios_nodes(child, depth + 1)
 
 
-def ios_hierarchy(config):
-    """The hierarchy in the screenshot's pixels (the same lines as Android's); "" when the screen's scale is unknown."""
-    scale = screen_scale(config)
-    if not scale:
-        config["dump_cause"] = "scale unknown"
-        return ""
+def ios_tree(config):
+    """`maestro hierarchy`'s JSON tree, or None (and the driver's cause in config["dump_cause"])."""
     status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy"], both=True)
     try:
         # The output holds stderr after stdout (for driver_cause); the tree is the first JSON value in it.
@@ -246,7 +242,27 @@ def ios_hierarchy(config):
     except ValueError:
         tree = None
     config["dump_cause"] = None if isinstance(tree, dict) else driver_cause(data)
-    nodes = list(ios_nodes(tree))
+    return tree if isinstance(tree, dict) else None
+
+
+def ios_focused_value(config):
+    """The focused element's value (its text when it has none) as the simulator holds it, unredacted, for the check
+    alone: "" when it shows only its placeholder (an empty field's value can be its placeholder); None when the
+    hierarchy could not be read or no element has focus."""
+    field = next((node for node in ios_nodes(ios_tree(config)) if node.get("focused") in (True, "true")), None)
+    if field is None:
+        return None
+    value = str(field.get("value") or field.get("text") or "")
+    return "" if value == str(field.get("hintText") or "") else value
+
+
+def ios_hierarchy(config):
+    """The hierarchy in the screenshot's pixels (the same lines as Android's); "" when the screen's scale is unknown."""
+    scale = screen_scale(config)
+    if not scale:
+        config["dump_cause"] = "scale unknown"
+        return ""
+    nodes = list(ios_nodes(ios_tree(config)))
     boxes = [re.fullmatch(r"\[(-?\d+),(-?\d+)\]\[(\d+),(\d+)\]", str(n.get("bounds", ""))) for n in nodes]
     lines = []
     for attributes, box in zip(nodes, boxes):
@@ -343,7 +359,9 @@ CAUSE_PATTERNS = (("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
                                                  rb"failed to connect|lost connection|xctestdriver|end of stream",
                                                  re.IGNORECASE)),
                   ("app not running", re.compile(rb"not running|terminated|crash", re.IGNORECASE)))
-DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "other")
+# "typed nothing": an iOS type act Maestro took, after which the focused field holds none of the typed words
+# (coordinator, 28 Oct: inputText COMPLETED and no text appeared).
+DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "typed nothing", "other")
 
 
 def driver_cause(output):
@@ -519,8 +537,13 @@ def focused_text(xml):
     field = next((node for node in root.iter("node") if node.get("focused") == "true"), None)
     if field is None:
         return None
-    text = field.get("text", "").replace("\n", " ").replace("\r", " ")
-    kept, dropped = kept_lines(text.encode(), "")
+    return shown_field(field.get("text", ""))
+
+
+def shown_field(text):
+    """A field's text through kept_lines (a field that could hold a credential is "(hidden)", an email address keeps
+    its domain alone), on one line and at most MAX_FIELD characters."""
+    kept, dropped = kept_lines(text.replace("\n", " ").replace("\r", " ").encode(), "")
     return "(hidden)" if dropped else kept.decode("utf-8", "replace")[:MAX_FIELD]
 
 
@@ -528,6 +551,12 @@ def focused_text(xml):
 # COMPLETED and then never returned, and the driver took nothing after it. Each act's settle wait is capped (Maestro
 # calls the cap best effort), so a screen that keeps redrawing cannot hold the act.
 SETTLE_MS = 3000
+# Coordinator, 28 Oct (runs 40478288501 and 40666988126): iOS inputText into a focused field came back COMPLETED and
+# no text appeared, and the agent was told "Done". After a type Maestro took, the hierarchy is read once and the agent
+# is told what the focused field holds, as on Android. A field holding none of the typed words is a refused act
+# (refusal_cause "typed nothing", counted toward FAIL_FAST, kept in DRIVER_FILE); a field that cannot be read is said
+# so and counts as taken.
+TYPED_NOTHING_LINE = b"typed nothing: Maestro took the act, and the focused field holds none of the typed words\n"
 
 
 def ios_act(name, args, ints, config):
@@ -547,14 +576,37 @@ def ios_act(name, args, ints, config):
         command = f'- swipe:\n    start: "1%,50%"\n    end: "80%,50%"\n    duration: 300{settle}'
     else:
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
+    started = utc_now() if name == "type" else None
     status = flow(config, command)
+    landed = None
+    if name == "type" and not status:
+        landed = ios_focused_value(config)
+        if landed is not None and not typed_landed(args["text"], landed):
+            status = 1
+            refused(config, command, TYPED_NOTHING_LINE, started, utc_now())
+            config["refusal_cause"] = "typed nothing"
     config["refusals"] = config["refusals"] + 1 if status else 0
     if config["refusals"] >= FAIL_FAST:
         config["wedged"] = True
         # Recorded now, so a stopped agent that never calls done still leaves its reason; a later done replaces it.
         record(config, "blocked", WEDGED_TEXT)
         return True, [{"type": "text", "text": WEDGED_TEXT}]
+    if name == "type" and landed is not None:
+        said = "Done. The focused field now reads:" if not status else "The device did not take it: the focused field reads"
+        return bool(status), [{"type": "text", "text": f"{said} {shown_field(landed)!r}"}]
+    if name == "type" and not status:
+        return False, [{"type": "text", "text": "Done; the focused field could not be read, so take a hierarchy"}]
     return bool(status), [{"type": "text", "text": "Done" if not status else "The device did not take it"}]
+
+
+WORD = re.compile(r"[\w@.:-]+")
+
+
+def typed_landed(text, value):
+    """Whether any whole word of the typed text is a word of the field after the act (autocorrect may change some of
+    them; a part of a word never counts, so "note" is not in "Add notes")."""
+    held = set(WORD.findall(value.casefold()))
+    return any(word in held for word in WORD.findall(text.casefold()))
 
 
 def answer(message, config):
