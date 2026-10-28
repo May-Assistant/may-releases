@@ -21,6 +21,8 @@ from ds_tests import DsTestsError
 from gate import GateDenial
 from store import StoreError
 
+HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
+
 SHA, OTHER = "a" * 40, "b" * 40
 TOKEN = "ghs_" + "C" * 40
 # Text that stands for design-system source: it must never reach stdout, stderr or anything but the comment.
@@ -230,14 +232,16 @@ class StatusTests(Case):
             self.quiet(tool.set_status, SHA, lambda *a: (422, None))
 
 
+@unittest.skipUnless(HAS_AGE or os.environ.get("CI"), "age and age-keygen are required for the round trip")
 class SealOpenPostTests(Case):
     def setUp(self):
-        super().setUp()
+        # Found before Case narrows PATH: CI's pinned age is on the runner's PATH, not in /usr/bin.
         self.found = {name: shutil.which(name) for name in ("age", "age-keygen")}
-        self.secret = next(line for line in subprocess.run(["age-keygen"], capture_output=True, text=True,
+        super().setUp()
+        self.secret = next(line for line in subprocess.run([self.found["age-keygen"]], capture_output=True, text=True,
                                                             check=True).stdout.splitlines()
                            if line.startswith("AGE-SECRET-KEY-1"))
-        self.public = subprocess.run(["age-keygen", "-y"], input=self.secret, capture_output=True, text=True,
+        self.public = subprocess.run([self.found["age-keygen"], "-y"], input=self.secret, capture_output=True, text=True,
                                      check=True).stdout.strip()
         tools = patch("ds_tests.toolchain.tool_path", side_effect=lambda name, relative: self.found[relative])
         tools.start()
