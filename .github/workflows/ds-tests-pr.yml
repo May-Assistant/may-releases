@@ -183,6 +183,16 @@ jobs:
           owner: May-Assistant
           repositories: may-design-system
           permission-pull-requests: write
+      - name: Mint the May CI token for MAY_DS_STATUS_TOKEN, before any pull request code
+        id: ci-ds-status
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-design-system
+          permission-statuses: write
       - name: Install pinned age
         run: python3 -I -S -B tools/may_release/toolchain.py age
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -202,6 +212,13 @@ jobs:
           MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
           MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
         run: python3 -I -S -B tools/may_release/ds_tests.py open --ds-sha "$MAY_DS_SHA"
+      - name: Set the may-ds-tests commit status on the design-system head, with counts alone
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_STATUS_TOKEN: ${{ steps.ci-ds-status.outputs.token || secrets.MAY_DS_STATUS_TOKEN }}
+          MAY_SWIFT_RESULT: ${{ needs.swift.result }}
+          MAY_ANDROID_RESULT: ${{ needs.android.result }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py status --ds-sha "$MAY_DS_SHA"
       - name: Post both suites' results on the design-system pull request, never in this log
         env:
           MAY_DS_SHA: ${{ inputs.source_sha }}

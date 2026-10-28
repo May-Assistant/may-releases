@@ -177,6 +177,54 @@ class VerdictTests(Case):
             tool.verdict("ios")
 
 
+class StatusTests(Case):
+    def status(self, **env):
+        os.environ.update({tool.STATUS_TOKEN: TOKEN, "GITHUB_RUN_ID": "88", **env})
+        sent = []
+        code, out = self.quiet(tool.set_status, SHA, lambda m, p, payload, t: sent.append((m, p, payload, t)) or (201, {}))
+        return code, out, sent
+
+    def test_the_head_gets_success_only_when_both_suites_passed(self):
+        self.record("swift")
+        self.record("android")
+        code, out, sent = self.status()
+        self.assertEqual((code, out), (0, "May DS tests: the may-ds-tests commit status is success on the design-system "
+                                          "head\n"))
+        method, path, payload, token = sent[0]
+        self.assertEqual((method, path, token), ("POST", f"/repos/May-Assistant/may-design-system/statuses/{SHA}", TOKEN))
+        self.assertEqual(payload, {"state": "success", "context": "may-ds-tests", "target_url":
+                                   "https://github.com/May-Assistant/may-releases/actions/runs/88",
+                                   "description": "swift 283 tests, 0 failed; android 1533 tests, 0 failed"})
+        self.record("android", passed=False, failed=2, failures=[{"name": MARKER, "message": MARKER}])
+        _, out, sent = self.status()
+        self.assertEqual(sent[0][2]["state"], "failure")
+        self.assertNotIn(MARKER, json.dumps(sent[0][2]) + out, "no test name reaches the status or the log")
+
+    def test_a_suite_with_no_record_counts_by_its_job_and_none_finished_is_an_error(self):
+        _, _, sent = self.status(MAY_SWIFT_RESULT="success", MAY_ANDROID_RESULT="failure")
+        self.assertEqual((sent[0][2]["state"], sent[0][2]["description"]), ("failure", "swift passed; android failed"))
+        _, _, sent = self.status(MAY_SWIFT_RESULT="cancelled", MAY_ANDROID_RESULT="skipped")
+        self.assertEqual((sent[0][2]["state"], sent[0][2]["description"]), ("error", "neither suite finished"))
+
+    def test_no_token_sets_nothing_and_only_a_status_is_writable(self):
+        code, out = self.quiet(tool.set_status, SHA, lambda *a: self.fail("no call without a token"))
+        self.assertEqual((code, out), (0, "May DS tests: MAY_DS_STATUS_TOKEN is not set in may-ds-renders; no commit "
+                                          "status set\n"))
+        with patch("ds_tests.request", return_value=(201, {})) as sent:
+            tool.status_api("POST", f"/repos/May-Assistant/may-design-system/statuses/{SHA}", {}, TOKEN)
+            for method, path in (("POST", f"/repos/May-Assistant/may-app/statuses/{SHA}"),
+                                 ("POST", "/repos/May-Assistant/may-design-system/statuses/main"),
+                                 ("GET", f"/repos/May-Assistant/may-design-system/statuses/{SHA}"),
+                                 ("POST", "/repos/May-Assistant/may-design-system/issues/40/comments")):
+                with self.subTest(method=method, path=path), self.assertRaises(DsTestsError):
+                    tool.status_api(method, path, {}, TOKEN)
+        self.assertEqual(sent.call_count, 1)
+        self.record("swift")
+        os.environ.update({tool.STATUS_TOKEN: TOKEN})
+        with self.assertRaises(DsTestsError):
+            self.quiet(tool.set_status, SHA, lambda *a: (422, None))
+
+
 class SealOpenPostTests(Case):
     def setUp(self):
         super().setUp()
@@ -275,6 +323,8 @@ class SealOpenPostTests(Case):
         for step, other in ((lambda: tool.seal(SHA, "swift"), tool.DECRYPT_KEY),
                             (lambda: tool.post(SHA, "40", self.api()[0]), tool.DECRYPT_KEY),
                             (lambda: tool.open_records(SHA), tool.COMMENT_TOKEN),
+                            (lambda: tool.set_status(SHA), tool.COMMENT_TOKEN),
+                            (lambda: tool.post(SHA, "40", self.api()[0]), tool.STATUS_TOKEN),
                             (lambda: tool.run_android(SHA), "MAY_DS_READ_KEY")):
             with self.subTest(other=other), patch.dict(os.environ, {other: "x" * 40}):
                 with self.assertRaises(StoreError):

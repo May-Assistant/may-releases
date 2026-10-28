@@ -24,6 +24,9 @@ hands over only that; a fresh post job opens both and posts (the split of may-re
   verdict  (the same job, no secret) fails the job when the suite did not pass, whether or not the post job can post.
   open     (post job, MAY_RENDERS_DECRYPT_KEY alone) decrypts each sealed record after checking the key against the
            recipient, and checks its shape and commit before anything reads it.
+  status   (post job, MAY_DS_STATUS_TOKEN alone, before post) sets the head commit's "may-ds-tests" status: success
+           when both suites passed, failure otherwise (error when neither finished), with counts alone, so a merge can
+           gate on one check (coordinator, 28 Oct).
   post     (post job, MAY_DS_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts one comment for both
            suites on the pull request, after it is read again and is still open at that head, unless a comment already
            carries this head's marker. A suite whose record never arrived is reported from its job's result alone
@@ -44,7 +47,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from android_unit import UnitTestsError, clean, install_sdk, parsed_report, pinned_java_home, sdk_home
 from compile import credentials_left
 from ds_compile import (DEVELOPER, PACKAGES, PRIVATE, SOURCE, XCODE, DsCompileError, build_env, fence_for, github,
-                        post_once, run_url, runner_root, schemes_of)
+                        post_once, request, run_url, runner_root, schemes_of)
 from gate import AGE_RECIPIENT, DS_REPO, GateDenial, pull_number, validate_ds_pull_request
 from prepare import PrepareError, head_revision
 from renders import DEVICE, RendersError, quiet, simulator
@@ -53,6 +56,10 @@ from store import StoreError, child_env, require_step_secrets, write_private
 import toolchain
 
 COMMENT_TOKEN = "MAY_DS_PR_COMMENT_TOKEN"
+STATUS_TOKEN = "MAY_DS_STATUS_TOKEN"
+# The one call status makes: a commit status on a design-system commit.
+STATUS_CALL = r"/repos/May-Assistant/may-design-system/statuses/[0-9a-f]{40}"
+CONTEXT = "may-ds-tests"
 RECIPIENT, DECRYPT_KEY = "MAY_RENDERS_RECIPIENT", "MAY_RENDERS_DECRYPT_KEY"
 AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -390,12 +397,9 @@ def comment_body(sha, url, records, results):
     return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
 
 
-def post(sha, pr, call_api=github):
-    require_step_secrets((COMMENT_TOKEN,))
-    # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
-    token = os.environ.pop(COMMENT_TOKEN, "")
-    exact(sha)
-    number = pull_number(pr)
+def gathered(sha):
+    """(records, results, passed, finished): the opened records, each suite job's own result, whether both suites
+    passed, and whether either finished at all."""
     private = runner_root() / PRIVATE
     records = {}
     for suite in SUITES:
@@ -406,10 +410,65 @@ def post(sha, pr, call_api=github):
             except (OSError, ValueError, RecursionError):
                 raise DsTestsError("A suite record is malformed or for another commit; nothing was posted") from None
     results = {suite: os.environ.get(RESULT_ENV[suite], "") for suite in SUITES}
-    if not records and not any(results[s] in ("success", "failure") for s in SUITES):
+    passed = all((records[s]["passed"] if s in records else results[s] == "success") for s in SUITES)
+    finished = bool(records) or any(results[s] in ("success", "failure") for s in SUITES)
+    return records, results, passed, finished
+
+
+def status_api(method, path, payload, token):
+    """The one call status makes; anything else is refused before a request is made."""
+    if method != "POST" or not re.fullmatch(STATUS_CALL, path):
+        raise DsTestsError("Only a design-system commit's status is written")
+    return request(method, path, payload, token)
+
+
+def status_description(records, results):
+    parts = []
+    for suite in SUITES:
+        record = records.get(suite)
+        if record is None:
+            parts.append(f"{suite} {'passed' if results.get(suite) == 'success' else 'failed'}")
+        elif not record["ran"]:
+            parts.append(f"{suite} did not run")
+        else:
+            parts.append(f"{suite} {int(record['total'])} tests, {int(record['failed'])} failed")
+    return "; ".join(parts)[:140]
+
+
+def set_status(sha, call_api=status_api):
+    require_step_secrets((STATUS_TOKEN,))
+    # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
+    token = os.environ.pop(STATUS_TOKEN, "")
+    exact(sha)
+    records, results, passed, finished = gathered(sha)
+    state = "success" if passed and finished else "failure" if finished else "error"
+    if not token:
+        print("May DS tests: MAY_DS_STATUS_TOKEN is not set in may-ds-renders; no commit status set")
+        return 0
+    if len(token) < 20:
+        raise DsTestsError("The design-system status token is malformed (MAY_DS_STATUS_TOKEN); no status was set")
+    payload = {"state": state, "context": CONTEXT,
+               "description": status_description(records, results) if finished else "neither suite finished"}
+    url = run_url(os.environ)
+    if url:
+        payload["target_url"] = url
+    status, _ = call_api("POST", f"/repos/{DS_REPO}/statuses/{sha}", payload, token)
+    if status != 201:
+        raise DsTestsError("GitHub did not accept the commit status")
+    print(f"May DS tests: the may-ds-tests commit status is {state} on the design-system head")
+    return 0
+
+
+def post(sha, pr, call_api=github):
+    require_step_secrets((COMMENT_TOKEN,))
+    # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
+    token = os.environ.pop(COMMENT_TOKEN, "")
+    exact(sha)
+    number = pull_number(pr)
+    records, results, passed, finished = gathered(sha)
+    if not finished:
         print("May DS tests: neither suite finished (cancelled or skipped); nothing posted")
         return 1
-    passed = all((records[s]["passed"] if s in records else results[s] == "success") for s in SUITES)
     if not token:
         print("May DS tests: MAY_DS_PR_COMMENT_TOKEN is not set in may-ds-renders; no comment posted")
         return 0 if passed else 1
@@ -434,7 +493,7 @@ def post(sha, pr, call_api=github):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("swift", "android", "seal", "verdict", "open", "post"))
+    parser.add_argument("command", choices=("swift", "android", "seal", "verdict", "open", "status", "post"))
     parser.add_argument("--ds-sha")
     parser.add_argument("--pr-number")
     parser.add_argument("--suite")
@@ -449,6 +508,8 @@ def main():
         return verdict(args.suite)
     if args.command == "open":
         return open_records(args.ds_sha)
+    if args.command == "status":
+        return set_status(args.ds_sha)
     return post(args.ds_sha, args.pr_number)
 
 

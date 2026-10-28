@@ -238,6 +238,8 @@ CI_MINTS = {
     "ci-comment": ("MAY_APP_PR_COMMENT_TOKEN", "may-app", (("pull-requests", "write"),)),
     "ci-ds-read": ("MAY_DS_PR_READ_TOKEN", "may-design-system", (("pull-requests", "read"),)),
     "ci-ds-comment": ("MAY_DS_PR_COMMENT_TOKEN", "may-design-system", (("pull-requests", "write"),)),
+    # ds_tests.py status sets the may-ds-tests commit status on the tested design-system head (statuses).
+    "ci-ds-status": ("MAY_DS_STATUS_TOKEN", "may-design-system", (("statuses", "write"),)),
     # review.py fetches the head over HTTPS (contents) and posts its review and STARTED marker (pull requests).
     "ci-review": ("MAY_APP_REVIEW_TOKEN", "may-app", (("contents", "read"), ("pull-requests", "write"))),
     # publish.py device-release creates the run's may-renders release and uploads its assets (contents).
@@ -260,7 +262,7 @@ WORKFLOW_MINTS = {
     "device-tests.yml": {"publish": ("renders-release",)},
     # ds-tests-pr.yml splits like native-compile-pr.yml: swift and android run the design system's code and mint
     # nothing; the read token is minted in pull, the comment token in post.
-    "ds-tests-pr.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment",)},
+    "ds-tests-pr.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment", "ci-ds-status")},
     "ds-tests-schedule.yml": {"pick": ("ci-ds-read",)},
 }
 FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          persist-credentials: false\n"
@@ -2183,6 +2185,10 @@ DS_TESTS_JOBS = {
          [_DSI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}"),
           ("MAY_RENDERS_DECRYPT_KEY", "${{ secrets.MAY_RENDERS_DECRYPT_KEY }}")],
          'python3 -I -S -B tools/may_release/ds_tests.py open --ds-sha "$MAY_DS_SHA"'),
+        ("Set the may-ds-tests commit status on the design-system head, with counts alone", None,
+         [_DSI["sha"], ("MAY_DS_STATUS_TOKEN", "${{ secrets.MAY_DS_STATUS_TOKEN }}"),
+          ("MAY_SWIFT_RESULT", "${{ needs.swift.result }}"), ("MAY_ANDROID_RESULT", "${{ needs.android.result }}")],
+         'python3 -I -S -B tools/may_release/ds_tests.py status --ds-sha "$MAY_DS_SHA"'),
         ("Post both suites' results on the design-system pull request, never in this log", None,
          [_DSI["sha"], _DSI["pr"], ("MAY_DS_PR_COMMENT_TOKEN", "${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}"),
           ("MAY_SWIFT_RESULT", "${{ needs.swift.result }}"), ("MAY_ANDROID_RESULT", "${{ needs.android.result }}")],
@@ -2190,7 +2196,7 @@ DS_TESTS_JOBS = {
         ("Remove the decrypted records", None, [],
          'rm -rf -- "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-download" "$RUNNER_TEMP/may-tools"')]),
 }
-DS_TESTS_PRINT_VALUES = {"suite", "verdict", "total", "failed", "skipped", "len(found)", "number",
+DS_TESTS_PRINT_VALUES = {"suite", "verdict", "total", "failed", "skipped", "len(found)", "number", "state",
                          "'passed' if passed else 'failed'"}
 DS_TESTS_EXIT_CLASSES = {"GateDenial", "DsTestsError", "DsCompileError", "StoreError"}
 
@@ -2253,7 +2259,8 @@ def ds_tests_workflow_problems(text):
                        c, re.S)) for s, c in zip(("swift", "android"), downloads)] != [True, True] or \
             text.count(UPLOAD_ARTIFACT) != 2 or text.count(DOWNLOAD_ARTIFACT) != 2:
         found.append(name + "post does not download exactly the two sealed records")
-    if secrets_in(text) != {"MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_RENDERS_DECRYPT_KEY", "MAY_DS_PR_COMMENT_TOKEN"} \
+    if secrets_in(text) != {"MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_RENDERS_DECRYPT_KEY", "MAY_DS_PR_COMMENT_TOKEN",
+                            "MAY_DS_STATUS_TOKEN"} \
             or text.count("secrets.MAY_DS_READ_KEY") != 2 or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret is held outside its one step")
     return found
@@ -2286,6 +2293,9 @@ def ds_tests_print_problems(root):
     if post is None or "post_once(call_api, DS_REPO" not in ast.unparse(post) or \
             "validate_ds_pull_request" not in ast.unparse(post):
         found.append(DS_TESTS_TOOL + ": post does not read the pull request again before posting once on it")
+    if assigned_literal(path, "STATUS_CALL") != r"/repos/May-Assistant/may-design-system/statuses/[0-9a-f]{40}" or \
+            assigned_literal(path, "CONTEXT") != "may-ds-tests":
+        found.append(DS_TESTS_TOOL + ": its status call or context is not as pinned")
     return found
 
 
