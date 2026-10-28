@@ -205,6 +205,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
                          [["succeeded"], None, ["succeeded"]])
         self.assertEqual(run_out.splitlines(), [
+            "May device tests (android): emulator unknown, system image revision unknown",
             "May device tests (android): network ready after 4 s",
             # This may-app fixture has no onboarding subflow, so each agent starts from launch and the log says so.
             *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"

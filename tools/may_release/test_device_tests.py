@@ -891,6 +891,66 @@ class FlowIdTests(unittest.TestCase):
         self.assertIs(android(), android(), "read once a run")
 
 
+class EmulatorEvidenceTests(unittest.TestCase):
+    """Run 40666988126 (coordinator, 28 Oct): the emulator was gone after chat, and nothing said why or which
+    emulator and system image the unpinned install had taken."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.home = Path(self.directory.name)
+        (self.home / "emulator").mkdir()
+        (self.home / "emulator" / "emulator").write_text("")
+        self.image = self.home.joinpath(*device_tests.flows.SYSTEM_IMAGE.split(";"), "source.properties")
+        self.image.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def versions(self, said, properties):
+        self.image.write_bytes(properties)
+        with patch("device_tests.bounded_output", return_value=said) as ran:
+            found = device_tests.emulator_versions(self.home, {})
+        return found, ran
+
+    def test_the_versions_are_digits_and_dots_or_unknown(self):
+        found, ran = self.versions((0, b"INFO | Android emulator version 35.3.11.0 (build_id 13149407) (CL:N/A)\n"),
+                                   b"Pkg.Desc=Google APIs Intel x86_64 Atom System Image\nPkg.Revision=9\n")
+        self.assertEqual(found, ("35.3.11.0", "9"))
+        self.assertEqual(ran.call_args[0][0], [str(self.home / "emulator" / "emulator"), "-version"])
+        for said, properties, expected in (
+                ((0, b"emulator version 35.1;curl evil\n"), b"Pkg.Revision=9 extra\n", ("35.1", "unknown")),
+                ((1, b"version 35.3.11.0\n"), b"Pkg.Revision=12.1\n", ("unknown", "12.1")),
+                (None, b"", ("unknown", "unknown")),
+                ((0, b"version abc\n"), b"Pkg.Revision=$(id)\n", ("unknown", "unknown"))):
+            with self.subTest(said=said, properties=properties):
+                self.assertEqual(self.versions(said, properties)[0], expected)
+        (self.home / "emulator" / "emulator").unlink()
+        self.assertEqual(self.versions((0, b"version 1.2\n"), b"Pkg.Revision=9\n")[0], ("unknown", "9"),
+                         "no emulator binary is unknown, never an error")
+
+    def test_the_emulators_output_has_its_own_private_file(self):
+        root = self.home / "runner"
+        (root / "may-private").mkdir(parents=True)
+        log = root / "may-private" / "device-run.log"
+        opened = []
+
+        def popen(argv, stdout, stderr, stdin, env):
+            opened.append((argv, Path(stdout.name), Path(stderr.name)))
+            return unittest.mock.Mock(poll=lambda: None)
+
+        booted = subprocess.CompletedProcess([], 0, b"1\n", b"")
+        with patch("device_tests.flows.sdk", return_value=self.home), \
+                patch("device_tests.flows.sdk_tool", side_effect=lambda home, name: f"/sdk/{name}"), \
+                patch("device_tests.subprocess.run", return_value=booted), \
+                patch("device_tests.subprocess.Popen", side_effect=popen), \
+                patch("device_tests.flows.run_private"), patch("device_tests.settle_boot"):
+            device_tests.boot(root, log)
+        (argv, out, err), = opened
+        self.assertEqual(argv[0], "/sdk/emulator/emulator")
+        self.assertEqual((out, err), (log.parent / device_tests.EMULATOR_LOG,) * 2,
+                         "the emulator's stdout and stderr go to its own file in may-private")
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -908,7 +968,7 @@ class RunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None, diagnosed=None,
-               start_fails=False, adb_said=None):
+               start_fails=False, adb_said=None, exited=None, kernel=None):
         calls, self.maestro_envs = [], []
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
@@ -920,6 +980,18 @@ class RunTests(unittest.TestCase):
 
             def wait(self, timeout=None):
                 return 0
+
+            def poll(self):
+                return exited
+
+        (self.root / "vmstat").write_text("oom_kill 2\n")
+        (self.root / "meminfo").write_text("MemTotal: 16384000 kB\nMemAvailable:    1048576 kB\n")
+
+        def bounded(argv, env, seconds=None, limit=None):
+            calls.append(["bounded", *argv])
+            if argv == ["dmesg"] and kernel is not None:
+                return 0, kernel
+            return None
 
         def private(argv, log, *, cwd=None, env=None, check=True, timeout=None):
             calls.append(list(argv))
@@ -937,6 +1009,8 @@ class RunTests(unittest.TestCase):
                 return 0
             with log.open("ab") as output:
                 output.write(b"Error: Activity class does not exist\n")
+            if kernel is not None:
+                (self.root / "vmstat").write_text("oom_kill 3\n")  # the kill the kernel's lines tell of
             return 1
 
         environ = dict(self.env, **(env or {}))
@@ -949,6 +1023,8 @@ class RunTests(unittest.TestCase):
                 patch("device_tests.adb_output", side_effect=lambda adb, env, argv: calls.append(["adb_output", *argv])
                       or (adb_said or {}).get(argv[-1])), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
+                patch("device_tests.bounded_output", side_effect=bounded), \
+                patch("device_tests.VMSTAT", self.root / "vmstat"), patch("device_tests.MEMINFO", self.root / "meminfo"), \
                 patch("device_tests.Recorder", FakeRecorder), patch("device_tests.screenshot", side_effect=screenshot), \
                 patch("device_tests.head_revision", return_value=SHA), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
@@ -968,9 +1044,14 @@ class RunTests(unittest.TestCase):
         cause could not be named. Now the failed start, the crash and main logs and the top activity are sealed."""
         said = {"crash,main": b"E AndroidRuntime: FATAL EXCEPTION: main\nBearer " + TOKEN.encode() + b"\n",
                 "top": b"ACTIVITY io.github.mayassistant.may.playground/.MainActivity\n"}
+        # Run 40666988126 (coordinator, 28 Oct): the emulator was gone, and nothing said why.
+        (self.private / device_tests.EMULATOR_LOG).write_bytes(
+            b"".join(b"INFO | boot line %d\n" % n for n in range(300)) +
+            b"WARNING | session Bearer " + TOKEN.encode() + b"\nFATAL | qemu: out of memory\n")
+        kernel = b"".join(b"[%d.0] usb line\n" % n for n in range(80)) + b"[99.0] Out of memory: Killed process 123 (qemu)\n"
         try:
             with patch("device_tests.flows.sleep") as slept:
-                calls, report, out, run = self.run_it(start_fails=True, adb_said=said)
+                calls, report, out, run = self.run_it(start_fails=True, adb_said=said, exited=-9, kernel=kernel)
             slept.assert_called_once_with(device_tests.LAUNCH_RETRY_SECONDS)
         except device_tests.DeviceTestsError as error:
             self.fail("a launch failure stopped the run with no report or diagnostics: " + error.args[0])
@@ -982,6 +1063,16 @@ class RunTests(unittest.TestCase):
         path = run / "android" / ("sign-in" + device_tests.DIAG)
         self.assertTrue(path.is_file(), "the launch failure's diagnostics are in the sealed run folder")
         diag = path.read_bytes()
+        self.assertTrue(diag.startswith(b"== emulator ==\nexit status: -9\nadb state: none\n"
+                                        b"host memory available: 1024 MB\nhost OOM kills since boot: 1\n"
+                                        b"-- emulator output --\nINFO | boot line 102\n"), diag[:240])
+        self.assertIn(b"FATAL | qemu: out of memory\n-- kernel --\n[31.0] usb line\n", diag,
+                      "the emulator's last 200 lines, then the kernel's last 50")
+        self.assertIn(b"Out of memory: Killed process 123 (qemu)\n== am start ==", diag)
+        self.assertIn("May device tests (android): the emulator then: exit status -9, adb none, 1024 MB available on "
+                      "the host, 1 OOM kills since boot", out)
+        self.assertIn("May device tests (android): emulator unknown, system image revision unknown", out)
+        self.assertIn(["adb_output", "-s", device_tests.SERIAL, "get-state"], calls)
         for section in (b"== am start ==\nError: Activity class does not exist", b"== logcat crash,main ==\nE "
                         b"AndroidRuntime: FATAL EXCEPTION: main", b"== dumpsys activity top ==\nACTIVITY "):
             self.assertIn(section, diag)
@@ -992,6 +1083,7 @@ class RunTests(unittest.TestCase):
                       "run stopped there, and its diagnostics are sealed", out)
         self.assertIn("diagnostics kept for 1 scenarios", out)
         self.assertNotIn(b"FATAL", out.encode(), "the public log has counts and fixed lines alone")
+        self.assertNotIn(b"qemu", out.encode())
         for reason in (device_tests.NOT_STARTED, device_tests.HALTED):
             self.assertIn(reason, publish.REASONS)
 
@@ -1038,6 +1130,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual((connections["verdict"], connections["reason"]),
                          ("fail", "may-app has no Maestro flow for this scenario"))
         self.assertEqual(out.splitlines(), [
+            "May device tests (android): emulator unknown, system image revision unknown",
             "May device tests (android): network ready after 4 s",
             "May device tests (android): 2 scenarios ran; verdicts follow the judge step",
             "May device tests (android): 1 test sessions were signed out at their end",
