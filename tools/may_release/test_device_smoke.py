@@ -138,6 +138,7 @@ class AndroidSmokeTests(Workspace):
         self.assertEqual((row["id"], row["verdict"], row.get("reason"), row["videos"], row["screenshots"]),
                          ("smoke", "smoke-pass", None, ["smoke.mp4"], ["smoke-end.png"]))
         self.assertEqual(out.splitlines(), [
+            "May device tests (android): emulator unknown, system image revision unknown",
             "May device tests (android): 1 scenarios ran; verdicts follow the judge step",
             "May device tests (android): smoke: smoke-pass",
             "May device tests (android): 0 passed, 0 passed on screen alone (server checks not configured), 0 failed, "
