@@ -4,7 +4,7 @@ request only (ds-tests-pr.yml).
 
 Samuel's decision (27-28 Oct): every may-design-system pull request into claude/may-integration or main runs both of
 its suites here, on GitHub's runners, so no local Mac has to: the Swift package's `xcodebuild test` on an iPhone 16 Pro
-simulator (Xcode 26.3, macos-15) and Android's `./gradlew :components:testDebugUnitTest` (the pinned Temurin JDK 21,
+simulator (Xcode 26.3, macos-15) and Android's `android/gradlew :components:testDebugUnitTest` (the pinned Temurin JDK 21,
 ubuntu-24.04). Each suite's pass or fail and counts, and its failing tests, go as one comment on that private pull
 request. This repository is public, and so are its logs, step summaries and artifacts; may-design-system is private.
 So nothing derived from the design system (a test, file, class or scheme name, a message, a log line) is printed,
@@ -17,7 +17,7 @@ hands over only that; a fresh post job opens both and posts (the split of may-re
 
   swift    (macos-15, no secret) the package's -Package scheme, `xcodebuild test` on the simulator; the result bundle's
            summary (xcresulttool) is reduced to counts and the failing tests, in a private file.
-  android  (ubuntu-24.04, no secret) `./gradlew --no-daemon --continue :components:testDebugUnitTest`; its JUnit
+  android  (ubuntu-24.04, no secret) `./gradlew --no-daemon --continue :components:testDebugUnitTest` in android/; its JUnit
            reports are reduced the same way.
   seal     (the same job, no secret) that suite's record ({sha, suite, ran, passed, total, failed, skipped, failures})
            padded to MAX_RECORD and age-encrypted to MAY_RENDERS_RECIPIENT; without the recipient nothing is sealed.
@@ -71,8 +71,10 @@ SEALED, DOWNLOAD = "may-ds-tests-sealed", "may-ds-tests-download"
 MAX_RECORD = 262144  # 256 KiB
 MAX_FAILURES, MAX_NAME, MAX_MESSAGE, MAX_COUNT = 100, 200, 240, 1_000_000
 TEST_SECONDS = 45 * 60
+# The Gradle build is in the design system's android/ folder (settings.gradle.kts there includes :components).
+GRADLE_ROOT = "android"
 GRADLE_TASK = ":components:testDebugUnitTest"
-REPORTS = "components/build/test-results/testDebugUnitTest"
+REPORTS = "android/components/build/test-results/testDebugUnitTest"
 # The suites' sizes at b0e9c28 (coordinator, 27 Oct): fewer tests than this adds a warning line, never a failure.
 BASELINE_SHA = "b0e9c28"
 BASELINES = {"swift": 283, "android": 1533}
@@ -231,17 +233,18 @@ def run_android(sha, tool=quiet, sdk=install_sdk):
     reports = checkout / REPORTS
     if reports.exists() or reports.is_symlink():
         raise DsTestsError("The pull request carries test results of its own; no suite ran")
-    gradlew = checkout / "gradlew"
+    project = checkout / GRADLE_ROOT
+    gradlew = project / "gradlew"
     log = private / "android.log"
     results = None
-    if gradlew.is_file() and not gradlew.is_symlink():
+    if not project.is_symlink() and gradlew.is_file() and not gradlew.is_symlink():
         try:
             java_home, home = pinned_java_home(), sdk_home()
             env = child_env(JAVA_HOME=str(java_home), PATH=str(java_home / "bin") + os.pathsep + os.environ.get("PATH", ""),
                             ANDROID_HOME=str(home), GRADLE_USER_HOME=str(root / "may-ds-gradle"), GIT_TERMINAL_PROMPT="0",
                             JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=" + str(root))
             sdk(home, log, env)
-            tool(["bash", "./gradlew", "--no-daemon", "--continue", GRADLE_TASK], log, cwd=checkout, env=env,
+            tool(["bash", "./gradlew", "--no-daemon", "--continue", GRADLE_TASK], log, cwd=project, env=env,
                  timeout=TEST_SECONDS)
         except (subprocess.SubprocessError, OSError, UnitTestsError):
             pass

@@ -128,12 +128,13 @@ class SwiftTests(Case):
 class AndroidTests(Case):
     def run_android(self, cases, gradlew=True, sdk_ok=True):
         if gradlew:
-            (self.checkout / "gradlew").write_text("#!/bin/sh\n")
+            (self.checkout / "android").mkdir(exist_ok=True)
+            (self.checkout / "android" / "gradlew").write_text("#!/bin/sh\n")
         commands = []
 
         def tool_run(argv, log, cwd=None, env=None, timeout=None):
             commands.append((argv, cwd, sorted(env)))
-            reports = self.checkout / tool.REPORTS
+            reports = self.checkout / "android/components/build/test-results/testDebugUnitTest"
             reports.mkdir(parents=True)
             (reports / "TEST-one.xml").write_text(junit(cases))
             (reports / "notes.txt").write_text(MARKER)
@@ -147,18 +148,22 @@ class AndroidTests(Case):
         commands, out, record = self.run_android([("a", "pass"), ("b", "failure"), ("c", "error"), ("d", "skipped")])
         argv, cwd, env = commands[0]
         self.assertEqual(argv, ["bash", "./gradlew", "--no-daemon", "--continue", ":components:testDebugUnitTest"])
-        self.assertEqual(cwd, self.checkout)
+        self.assertEqual(cwd, self.checkout / "android", "the Gradle build is in android/")
         self.assertTrue({"JAVA_HOME", "ANDROID_HOME", "GRADLE_USER_HOME"} <= set(env))
         self.assertEqual((record["total"], record["failed"], record["skipped"], record["passed"]), (4, 2, 1, False))
         self.assertEqual(record["failures"][0]["name"], f"com.may.ds.{MARKER}Test > b")
         self.assertEqual(out, "May DS tests android: failed, 4 tests, 2 failed, 1 skipped\n")
-        shutil.rmtree(self.checkout / "components")
+        shutil.rmtree(self.checkout / "android" / "components")
         _, out, record = self.run_android([("a", "pass")] * 3)
         self.assertTrue(record["passed"])
 
     def test_no_gradlew_did_not_run_and_committed_results_are_refused(self):
         commands, out, record = self.run_android([], gradlew=False)
         self.assertEqual((commands, record["ran"]), ([], False))
+        (self.checkout / "gradlew").write_text("#!/bin/sh\n")
+        commands, out, record = self.run_android([], gradlew=False)
+        self.assertEqual((commands, record["ran"]), ([], False), "a gradlew outside android/ is not the build")
+        (self.checkout / "gradlew").unlink()
         (self.checkout / tool.REPORTS).mkdir(parents=True)
         with self.assertRaises(DsTestsError):
             self.run_android([("a", "pass")])
