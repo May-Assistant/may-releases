@@ -27,6 +27,20 @@ on:
         required: false
         type: boolean
         default: false
+      backfill_test_items:
+        description: One-off, instead of the scenarios - the earlier device-test runs' test-session cleanup on the shared account (dry counts only; real needs backfill_expect)
+        required: false
+        type: choice
+        options:
+          - none
+          - dry
+          - real
+        default: none
+      backfill_expect:
+        description: For real alone - the totals line of the approved dry run, exactly as its log printed it
+        required: false
+        type: string
+        default: ""
   schedule:
     - cron: "17 3 * * *"
 permissions:
@@ -81,9 +95,32 @@ jobs:
           MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}
           MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
         run: python3 -I -S -B tools/may_release/device_tests.py tidy
+  backfill:
+    # The one-off backfill (backfill_test_items, coordinator, 28 Oct): a shared-account test session runs the test-session
+    # cleanup once for each earlier device-test run's tag (device_tests.BACKFILL_RUNS, fixed in the code), dry first;
+    # real runs only when the same job's dry totals equal backfill_expect. No may-app code and no device: the secret is
+    # in this one step's environment, and the log carries totals alone.
+    needs: admission
+    if: ${{ inputs.backfill_test_items == 'dry' || inputs.backfill_test_items == 'real' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run the earlier runs' test-session cleanup on the shared test account
+        env:
+          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}
+          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}
+          MAY_BACKFILL_MODE: ${{ inputs.backfill_test_items }}
+          MAY_BACKFILL_EXPECT: ${{ inputs.backfill_expect }}
+        run: python3 -I -S -B tools/may_release/device_tests.py backfill
   android:
     needs: admission
-    if: ${{ !inputs.tidy_file_taxes }}
+    if: ${{ !inputs.tidy_file_taxes && inputs.backfill_test_items != 'dry' && inputs.backfill_test_items != 'real' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 120
@@ -157,7 +194,7 @@ jobs:
     # the test session handed over in SIMCTL_CHILD_MAY_TEST_SESSION, the agent acting through Maestro's driver. The
     # Claude token is in its scenarios and judge steps alone, as on Android.
     needs: admission
-    if: ${{ !inputs.tidy_file_taxes }}
+    if: ${{ !inputs.tidy_file_taxes && inputs.backfill_test_items != 'dry' && inputs.backfill_test_items != 'real' }}
     runs-on: macos-15
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 120
@@ -222,7 +259,7 @@ jobs:
     # live in one step. Recordings never enter may-renders' git history: they are assets of the run's release.
     # It publishes whatever the device jobs sealed, even when one then failed its verdict.
     needs: [admission, android, ios]
-    if: ${{ !cancelled() && needs.admission.result == 'success' && !inputs.tidy_file_taxes }}
+    if: ${{ !cancelled() && needs.admission.result == 'success' && !inputs.tidy_file_taxes && inputs.backfill_test_items != 'dry' && inputs.backfill_test_items != 'real' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 30

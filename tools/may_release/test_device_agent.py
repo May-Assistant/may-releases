@@ -863,6 +863,109 @@ class ServerTruthTests(unittest.TestCase):
                                   revoked_by=lambda base, token: signed_out.append(token) or True)
         self.assertEqual(signed_out, [TOKEN] * 3, "signed out whatever the tidy found")
 
+    def test_the_backfill_tags_are_the_fifty_finished_runs_ids_each_fourteen_characters(self):
+        """Coordinator, 28 Oct: one cleanup per earlier run, tag "qa-<run id>", the run list fixed in the code and the
+        run then in progress (40747123757) left out."""
+        tags = device_tests.backfill_tags()
+        self.assertEqual(len(tags), 50)
+        self.assertEqual((tags[0], tags[-1]), (("qa-39668495406", "2026-10-21"), ("qa-40708551639", "2026-10-28")))
+        self.assertNotIn("qa-40747123757", [tag for tag, _ in tags])
+        self.assertTrue(all(len(tag) == 14 for tag, _ in tags))
+        self.assertLess(device_tests.BACKFILL_SINCE, "2026-10-21T20:13:58Z", "since is before run 1")
+        for runs in ((("1234", "2026-10-21"),), (("4066698812x", "2026-10-28"),), (("04066698812", "2026-10-28"),),
+                     (("406669881260", "2026-10-28"),), (("40666988126", "2026-13-28"),), ((40666988126, "2026-10-28"),),
+                     (("40666988126", "2026-10-28"), ("40666988126", "2026-10-28"))):
+            with self.subTest(runs=runs), self.assertRaises(device_tests.DeviceTestsError):
+                device_tests.backfill_tags(runs)
+
+    def test_a_backfill_cleanup_call_sends_the_tag_since_and_dry_run_and_needs_every_count(self):
+        seen = []
+        counts = dict.fromkeys(device_tests.BACKFILL_KEYS, 0)
+
+        def post(body, status=200):
+            def answer(request, timeout):
+                seen.append((request.full_url, request.get_method(), json.loads(request.data),
+                             request.headers.get("Authorization")))
+                if status != 200:
+                    raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+                return FakeReply(json.dumps(body).encode())
+            return answer
+
+        self.assertEqual(device_tests.cleanup_counts("https://s", TOKEN, "qa-40666988126", True,
+                                                     post=post(dict(counts, hidden=3, extra=1))), dict(counts, hidden=3))
+        self.assertEqual(seen, [("https://s/v1/auth/test-session/cleanup", "POST",
+                                 {"since": "2026-10-21T20:00:00Z", "tag": "qa-40666988126", "dry_run": True},
+                                 "Bearer " + TOKEN)])
+        for body, status in ((dict(counts, hidden=-1), 200), ({k: v for k, v in counts.items() if k != "skipped"}, 200),
+                             (dict(counts, hidden="3"), 200), (dict(counts, hidden=True), 200), ([], 200), (counts, 409)):
+            with self.subTest(body=body, status=status):
+                self.assertIsNone(device_tests.cleanup_counts("https://s", TOKEN, "qa-40666988126", False,
+                                                              post=post(body, status)))
+
+    def backfill(self, mode, expect="", answer=None):
+        """device_tests.backfill with a fake cleanup: (its stdout, the calls (tag, dry), the sessions signed out)."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environ = {"RUNNER_TEMP": directory.name, "MAY_TEST_SIGNIN_SECRET": "s" * 32,
+                   "MAY_STAGING_API_URL": device_tests.STAGING_BASE, "PATH": "/usr/bin",
+                   "MAY_BACKFILL_MODE": mode, "MAY_BACKFILL_EXPECT": expect}
+        calls, signed_out = [], []
+        self.calls = calls
+
+        def cleaned(base, token, tag, dry):
+            calls.append((tag, dry))
+            if answer is not None:
+                return answer(tag, dry)
+            counts = dict.fromkeys(device_tests.BACKFILL_KEYS, 0)
+            # Each dry call counts the same pending approvals; the first real call closes them.
+            counts.update(hidden=2, tasks=1 if tag.endswith("6") else 0,
+                          approvals_expired=4 if dry or len(calls) == 51 else 0)
+            return counts
+
+        with patch.dict(os.environ, environ, clear=True), patch("sys.stdout", new_callable=io.StringIO) as out:
+            try:
+                device_tests.backfill(minted=lambda base, secret: TOKEN, cleaned=cleaned,
+                                      revoked_by=lambda base, token: signed_out.append(token) or True)
+            finally:
+                self.assertNotIn("MAY_TEST_SIGNIN_SECRET", os.environ)
+                self.output = out.getvalue()
+        return self.output, calls, signed_out
+
+    def test_a_dry_backfill_prints_totals_and_per_day_sums_alone_and_changes_nothing(self):
+        out, calls, signed_out = self.backfill("dry")
+        self.assertEqual([dry for _, dry in calls], [True] * 50, "dry calls alone")
+        lines = out.splitlines()
+        totals = "chats=0 tasks=6 notes=0 routines=0 for_you=0 messages=0 approvals_expired=4 hidden=100 skipped=0"
+        self.assertEqual(lines[0], "May device tests: backfill dry run over 50 runs: " + totals,
+                         "the approvals every call counts are counted once")
+        self.assertEqual(lines[1], "May device tests: backfill dry run, runs of 2026-10-21: chats=0 tasks=1 notes=0 "
+                                   "routines=0 for_you=0 messages=0 approvals_expired=0 hidden=10 skipped=0")
+        self.assertEqual([line.split(": ")[1] for line in lines[1:]],
+                         [f"backfill dry run, runs of 2026-10-{day}" for day in range(21, 29)])
+        self.assertEqual(len(lines), 9)
+        self.assertNotIn("qa-", out, "no tag, run id or title in the log")
+        self.assertEqual(signed_out, [TOKEN])
+
+    def test_a_real_backfill_runs_only_after_the_same_jobs_dry_pass_equals_the_approved_totals(self):
+        totals = "chats=0 tasks=6 notes=0 routines=0 for_you=0 messages=0 approvals_expired=4 hidden=100 skipped=0"
+        for expect in ("", totals.replace("hidden=100", "hidden=99"), "approve"):
+            with self.subTest(expect=expect):
+                with self.assertRaisesRegex(device_tests.DeviceTestsError, "not backfill_expect"):
+                    self.backfill("real", expect=expect)
+                self.assertEqual([dry for _, dry in self.calls], [True] * 50, "nothing real before the approval")
+        out, calls, signed_out = self.backfill("real", expect=totals)
+        self.assertEqual([dry for _, dry in calls], [True] * 50 + [False] * 50, "the dry pass first, then the real one")
+        self.assertEqual(out.splitlines()[0], "May device tests: backfill dry run over 50 runs: " + totals)
+        self.assertEqual(out.splitlines()[-1], "May device tests: backfill done over 50 runs: " + totals)
+
+    def test_a_backfill_refuses_an_odd_mode_and_stops_at_a_call_that_does_not_answer(self):
+        for mode in ("", "none", "REAL", "real "):
+            with self.subTest(mode=mode), self.assertRaisesRegex(device_tests.DeviceTestsError, "neither dry nor real"):
+                self.backfill(mode)
+        answers = iter([dict.fromkeys(device_tests.BACKFILL_KEYS, 0), None])
+        with self.assertRaisesRegex(device_tests.DeviceTestsError, "did not answer"):
+            self.backfill("real", expect="x", answer=lambda tag, dry: next(answers))
+
     def test_a_delivery_truth_records_whether_every_tagged_message_succeeded(self):
         row = {"driver": "agent", "goal": "Send this message: hi {tag}", "server": [], "truth": [{"delivery": "succeeded"}]}
         for codes, expected in ((["succeeded", "succeeded"], (200, True)), (["succeeded", "failed (x)"], (200, False)),

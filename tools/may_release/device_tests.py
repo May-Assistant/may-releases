@@ -624,6 +624,119 @@ def tidy(minted=mint, tidied=tidy_notes, revoked_by=None):
         raise DeviceTestsError("A task's notes could not be saved")
 
 
+
+# The one-off backfill (coordinator, 28 Oct; may-app #1467, live on staging at fb808571): the test-session cleanup,
+# which now also stamps a run's cancelled test tasks so the Agenda leaves them out, once for each earlier device-test
+# run, on the shared account. Each tag is "qa-" and that run's GitHub Actions id (run_tag): every title a run made
+# holds it, whatever its form ("qa-<run>" from 21 Oct, "qa-<run>-<a|i>", then "qa-<run>-<a|i>-<scenario>"), and no
+# hand-typed title holds an 11-digit run id. The runs are fixed here (device-tests.yml's 50 finished runs, run 1 on
+# 21 Oct to run 50 on 28 Oct), never listed at run time; BACKFILL_SINCE is before run 1. Dry counts what each call
+# would change and changes nothing; real first runs the dry pass in the same job and goes on only when its totals line
+# equals MAY_BACKFILL_EXPECT, the line the approved dry run printed. The log has totals and per-day sums alone.
+BACKFILL_SINCE = "2026-10-21T20:00:00Z"
+BACKFILL_RUNS = (
+    ("39668495406", "2026-10-21"), ("39671911872", "2026-10-21"), ("39677407348", "2026-10-21"), ("39683880243", "2026-10-21"),
+    ("39688827155", "2026-10-21"), ("39749763794", "2026-10-22"), ("39926037739", "2026-10-23"), ("40035089599", "2026-10-23"),
+    ("40046272749", "2026-10-24"), ("40051935128", "2026-10-24"), ("40055826521", "2026-10-24"), ("40057045702", "2026-10-24"),
+    ("40063426822", "2026-10-24"), ("40075535088", "2026-10-24"), ("40077167994", "2026-10-24"), ("40087626039", "2026-10-24"),
+    ("40095010166", "2026-10-24"), ("40113277692", "2026-10-24"), ("40116724299", "2026-10-24"), ("40119835677", "2026-10-24"),
+    ("40123018291", "2026-10-24"), ("40138900610", "2026-10-24"), ("40148178587", "2026-10-25"), ("40148200485", "2026-10-25"),
+    ("40155638626", "2026-10-25"), ("40164384433", "2026-10-25"), ("40176915345", "2026-10-25"), ("40181517145", "2026-10-25"),
+    ("40203481816", "2026-10-25"), ("40209923275", "2026-10-25"), ("40217931447", "2026-10-25"), ("40232904242", "2026-10-25"),
+    ("40243708096", "2026-10-25"), ("40253206363", "2026-10-26"), ("40290565440", "2026-10-26"), ("40290647340", "2026-10-26"),
+    ("40296637378", "2026-10-26"), ("40296647872", "2026-10-26"), ("40299931071", "2026-10-26"), ("40299946180", "2026-10-26"),
+    ("40309200520", "2026-10-26"), ("40319309252", "2026-10-26"), ("40340479808", "2026-10-26"), ("40478288501", "2026-10-27"),
+    ("40666988126", "2026-10-28"), ("40687078761", "2026-10-28"), ("40687752748", "2026-10-28"), ("40687849828", "2026-10-28"),
+    ("40697183658", "2026-10-28"), ("40708551639", "2026-10-28"),
+)
+BACKFILL_KEYS = ("chats", "tasks", "notes", "routines", "for_you", "messages", "approvals_expired", "hidden", "skipped")
+# The cleanup closes a test session's pending approvals by `since` alone, whatever the tag: each dry call counts the
+# same ones, and the first real call closes them all. So the totals take that count once, from the first call.
+BACKFILL_ONCE = ("approvals_expired",)
+BACKFILL_MODE, BACKFILL_EXPECT = "MAY_BACKFILL_MODE", "MAY_BACKFILL_EXPECT"
+RUN_ID = re.compile(r"[1-9][0-9]{10}")
+DAY = re.compile(r"2026-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])")
+
+
+def backfill_tags(runs=BACKFILL_RUNS):
+    """[(tag, day)] for runs, each id an 11-digit run id, each tag at least 14 characters, none twice; else an error."""
+    tags = [("qa-" + run, day) for run, day in runs
+            if isinstance(run, str) and RUN_ID.fullmatch(run) and isinstance(day, str) and DAY.fullmatch(day)]
+    if len(tags) != len(runs) or any(len(tag) < 14 for tag, _ in tags) or len({tag for tag, _ in tags}) != len(tags):
+        raise DeviceTestsError("The backfill's run list is not 11-digit run ids, each once, with their days")
+    return tags
+
+
+def cleanup_counts(base, token, tag, dry, post=urllib.request.urlopen):
+    """One test-session cleanup for tag since BACKFILL_SINCE (dry_run when dry): its counts, each a whole number, for
+    every BACKFILL_KEYS key, or None when it did not answer 200 with all of them."""
+    request = urllib.request.Request(base + "/v1/auth/test-session/cleanup", method="POST",
+                                     data=json.dumps({"since": BACKFILL_SINCE, "tag": tag, "dry_run": dry}).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            data = json.loads(reply.read(1024 * 1024))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return None
+    if not isinstance(data, dict) or any(type(data.get(key)) is not int or data[key] < 0 for key in BACKFILL_KEYS):
+        return None
+    return {key: data[key] for key in BACKFILL_KEYS}
+
+
+def counts_line(counts):
+    """The totals as one fixed line of key=number pairs, in BACKFILL_KEYS' order."""
+    return " ".join(f"{key}={int(counts[key])}" for key in BACKFILL_KEYS)
+
+
+def backfill_pass(base, token, tags, dry, cleaned=cleanup_counts):
+    """(totals, {day: sums}) over every tag, or an error at the first call that did not answer. BACKFILL_ONCE's
+    counts are the first call's alone, and never in the per-day sums."""
+    totals, days = dict.fromkeys(BACKFILL_KEYS, 0), {}
+    for index, (tag, day) in enumerate(tags):
+        counts = cleaned(base, token, tag, dry)
+        if counts is None:
+            raise DeviceTestsError("A cleanup call did not answer; the backfill stopped there")
+        sums = days.setdefault(day, dict.fromkeys(BACKFILL_KEYS, 0))
+        for key in BACKFILL_KEYS:
+            if key in BACKFILL_ONCE:
+                totals[key] = counts[key] if index == 0 else totals[key] + (0 if dry else counts[key])
+            else:
+                totals[key] += counts[key]
+                sums[key] += counts[key]
+    return totals, days
+
+
+def backfill(minted=mint, cleaned=cleanup_counts, revoked_by=None):
+    """The `backfill` step (device-tests.yml, backfill_test_items): one shared-account session, the dry pass over
+    BACKFILL_RUNS' tags printed, and for real, when its totals line equals MAY_BACKFILL_EXPECT, the real pass printed
+    too; the session signed out. Prints totals and per-day sums alone."""
+    revoked_by = revoked_by or revoke
+    require_step_secrets((SIGNIN_SECRET,))
+    secret = os.environ.pop(SIGNIN_SECRET, "")
+    mode, expect = os.environ.get(BACKFILL_MODE, ""), os.environ.get(BACKFILL_EXPECT, "").strip()
+    if mode not in ("dry", "real"):
+        raise DeviceTestsError("backfill_test_items is neither dry nor real; nothing was changed")
+    tags = backfill_tags()
+    base = staging(secret, True)
+    token = minted(base, secret)
+    secret = ""
+    try:
+        totals, days = backfill_pass(base, token, tags, True, cleaned)
+        runs, line = len(tags), counts_line(totals)
+        print(f"May device tests: backfill dry run over {runs} runs: {line}")
+        for day, sums in sorted(days.items()):
+            line = counts_line(sums)
+            print(f"May device tests: backfill dry run, runs of {day}: {line}")
+        if mode == "real":
+            if expect != counts_line(totals):
+                raise DeviceTestsError("The dry run's totals are not backfill_expect; nothing was changed")
+            totals, _ = backfill_pass(base, token, tags, False, cleaned)
+            line = counts_line(totals)
+            print(f"May device tests: backfill done over {runs} runs: {line}")
+    finally:
+        revoked_by(base, token)
+        token = ""
+
 def server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted):
     """A scenario's server reads with its own session, while it lasts, into entry: its plain reads (each expecting a
     status), its delivery codes when it sends May a message, and its truth, every read with the scenario's own tag."""
@@ -2123,7 +2236,7 @@ def verdict(platform="android"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("build", "run", "judge", "previews", "prototypes", "seal", "verdict",
-                                            "tidy"))
+                                            "tidy", "backfill"))
     parser.add_argument("--scenarios", default="all")
     parser.add_argument("--platform", choices=PLATFORMS, default="android")
     args = parser.parse_args()
@@ -2143,7 +2256,7 @@ if __name__ == "__main__":
         else:
             {"judge": lambda: judge_scenarios(platform=args.platform), "seal": lambda: seal(args.platform),
              "previews": lambda: make_previews(args.platform), "prototypes": render_prototypes,
-             "verdict": lambda: verdict(args.platform), "tidy": tidy}[args.command]()
+             "verdict": lambda: verdict(args.platform), "tidy": tidy, "backfill": backfill}[args.command]()
     except (DeviceTestsError, StoreError, AgentError) as error:
         raise SystemExit("May device tests stopped: " + error.args[0]) from None
     except Exception as error:
