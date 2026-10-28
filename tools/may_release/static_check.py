@@ -22,7 +22,7 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
                   "DsCompileError", "CompilePrError", "RehearsalError", "UnitTestsError", "UnitPostError",
-                  "BackendTestsError", "BackendPostError"}
+                  "BackendTestsError", "BackendPostError", "DsTestsError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -258,6 +258,10 @@ WORKFLOW_MINTS = {
     "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
     "may-app-review.yml": {"review": ("ci-review",)},
     "device-tests.yml": {"publish": ("renders-release",)},
+    # ds-tests-pr.yml splits like native-compile-pr.yml: swift and android run the design system's code and mint
+    # nothing; the read token is minted in pull, the comment token in post.
+    "ds-tests-pr.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment",)},
+    "ds-tests-schedule.yml": {"pick": ("ci-ds-read",)},
 }
 FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          persist-credentials: false\n"
 # review.py's schedule passes over heads whose STARTED marker is the token's own user's; an installation token has no
@@ -1996,7 +2000,16 @@ SCHEDULES = {
          "Dispatch the backend checks for the picked head, with no may-app credential",
          "Remove the carried numbers"],
         "May backend checks for may-app #{number} at {sha}", "actions/workflows/backend-unit-pr.yml/dispatches"),
+    "ds-tests-schedule.yml": (
+        "ds_tests_schedule.py", "may-ds-tests-schedule", "may-ds-tests-ci",
+        ["List the design-system test runs of the last 30 days, with no design-system credential",
+         "Pick the oldest may-design-system head with no run yet, with no GitHub token",
+         "Dispatch the design-system tests for the picked head, with no design-system credential",
+         "Remove the carried numbers"],
+        "May DS tests for may-design-system #{number} at {sha}", "actions/workflows/ds-tests-pr.yml/dispatches"),
 }
+# The pull-request read token each schedule's pick holds (may-app's, unless named here).
+SCHEDULE_READ_SECRETS = {"ds-tests-schedule.yml": "MAY_DS_PR_READ_TOKEN"}
 SCHEDULE = "android-ci-schedule.yml"
 SCHEDULE_TOOL = SCHEDULES[SCHEDULE][0]
 SCHEDULE_DISPATCH = SCHEDULES[SCHEDULE][5]
@@ -2051,8 +2064,9 @@ def schedule_workflow_problems(workflow, text):
     listed, picked, dispatched, clean = (by_name.get(n, "") for n in step_names)
     gate = steps["admission"][1][1] if len(steps["admission"]) > 1 else ""
     token = [("GH_TOKEN", "${{ github.token }}")]
-    if secrets_in(text) != {PR_READ_SECRET} or text.count("secrets." + PR_READ_SECRET) != 1 or \
-            env_entries(picked) != [(PR_READ_SECRET, "${{ secrets." + PR_READ_SECRET + " }}")] or \
+    read_secret = SCHEDULE_READ_SECRETS.get(workflow, PR_READ_SECRET)
+    if secrets_in(text) != {read_secret} or text.count("secrets." + read_secret) != 1 or \
+            env_entries(picked) != [(read_secret, "${{ secrets." + read_secret + " }}")] or \
             env_entries(listed) != token or env_entries(dispatched) != token or env_entries(gate) != token or \
             "env:" in clean or text.count("github.token") != 3 or re.search(r"(?m)^(    )?env:", text) or \
             "${{ inputs." in text:
@@ -2108,6 +2122,170 @@ def backend_ci_schedule_tool_problems(root):
     tree = ast.parse((root / "tools/may_release" / SCHEDULES[BACKEND_SCHEDULE][0]).read_text())
     if function_source(tree, "app_get") is not None or "APP_REPO}/" in ast.unparse(tree):
         found.append(SCHEDULES[BACKEND_SCHEDULE][0] + ": reads may-app other than through android_ci_schedule.app_get")
+    return found
+
+
+# The design system's own suites at a may-design-system pull request head (ds-tests-pr.yml, ds_tests.py; Samuel, 28
+# Oct), dispatched by ds-tests-schedule.yml (ds_tests_schedule.py, pinned with the other schedules above).
+# may-design-system is private and this repository public, so the workflow is pinned whole, job by job and step by
+# step: dispatch with exactly pr_number and source_sha, read-only permissions, admission then pull, swift and android
+# in the environment admission chose (may-ds-renders), the read token minted in pull alone and the comment token in post
+# alone, the read key in each suite's fetch alone and nothing else secret in the suites' jobs, each suite's only upload
+# its sealed record (one day), the decrypt key in open alone, and no step summary or carried value. ds_tests.py prints
+# only fixed lines, its inputs and counts.
+DS_TESTS = "ds-tests-pr.yml"
+DS_TESTS_SCHEDULE = "ds-tests-schedule.yml"
+DS_TESTS_TOOL = "ds_tests.py"
+_DSI = {"sha": ("MAY_DS_SHA", "${{ inputs.source_sha }}"), "pr": ("MAY_DS_PR", "${{ inputs.pr_number }}")}
+_DS_GATE = 'python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
+_DS_FETCH = ("Fetch the exact design-system commit quietly", None,
+             [_DSI["sha"], _DSI["pr"], ("MAY_DS_READ_KEY", "${{ secrets.MAY_DS_READ_KEY }}")],
+             'python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"')
+_DS_AGE = ("Install pinned age, before any pull request code", None, [],
+           "python3 -I -S -B tools/may_release/toolchain.py age")
+
+
+def _ds_suite_steps(suite, title, extra, cleanup):
+    return extra + [_DS_AGE, _DS_FETCH,
+                    (f"Run the {title} suite without any credential, printing only pass or fail and counts", None,
+                     [_DSI["sha"]], f'python3 -I -S -B tools/may_release/ds_tests.py {suite} --ds-sha "$MAY_DS_SHA"'),
+                    (f"Seal the {title} record for the post job, with no secret", None,
+                     [_DSI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")],
+                     f'python3 -I -S -B tools/may_release/ds_tests.py seal --suite {suite} --ds-sha "$MAY_DS_SHA"'),
+                    (f"Hand over only the sealed {title} record", UPLOAD_ARTIFACT, [], None),
+                    (f"Fail if the {title} suite did not pass", None, [],
+                     f"python3 -I -S -B tools/may_release/ds_tests.py verdict --suite {suite}"),
+                    (cleanup[0], None, [], cleanup[1])]
+
+
+# job: (runs-on, needs, timeout, [(step name, uses, env entries, run)]) after the checkout (and, in pull and post, the
+# mint, which unminted takes out first).
+DS_TESTS_JOBS = {
+    "admission": ("ubuntu-24.04", None, None, [("", None, [("GH_TOKEN", "${{ github.token }}"), _DSI["sha"], _DSI["pr"]],
+                                                _DS_GATE)]),
+    "pull": ("ubuntu-24.04", "admission", 10, [
+        ("Check the design-system pull request head and environment before fetching", None,
+         [("GH_TOKEN", "${{ github.token }}"), ("MAY_DS_PR_READ_TOKEN", "${{ secrets.MAY_DS_PR_READ_TOKEN }}"), _DSI["sha"],
+          _DSI["pr"]], _DS_GATE + " --check-pull")]),
+    "swift": ("macos-15", "[admission, pull]", 75, _ds_suite_steps("swift", "Swift", [], (
+        "Remove the design-system checkout, logs and products",
+        'rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-derived" '
+        '"$RUNNER_TEMP/may-ds-packages" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"'))),
+    "android": ("ubuntu-24.04", "[admission, pull]", 75, _ds_suite_steps("android", "Android", [
+        ("Install the pinned, checksum-verified JDK", None, [], "python3 -I -S -B tools/may_release/toolchain.py jdk")], (
+        "Remove the design-system checkout, logs, Gradle home and the pinned JDK",
+        'rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-gradle" '
+        '"$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"'))),
+    "post": ("ubuntu-24.04", "[admission, swift, android]", 10, [
+        ("Install pinned age", None, [], "python3 -I -S -B tools/may_release/toolchain.py age"),
+        ("", DOWNLOAD_ARTIFACT, [], None), ("", DOWNLOAD_ARTIFACT, [], None),
+        ("Decrypt and check the suite records", None,
+         [_DSI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}"),
+          ("MAY_RENDERS_DECRYPT_KEY", "${{ secrets.MAY_RENDERS_DECRYPT_KEY }}")],
+         'python3 -I -S -B tools/may_release/ds_tests.py open --ds-sha "$MAY_DS_SHA"'),
+        ("Post both suites' results on the design-system pull request, never in this log", None,
+         [_DSI["sha"], _DSI["pr"], ("MAY_DS_PR_COMMENT_TOKEN", "${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}"),
+          ("MAY_SWIFT_RESULT", "${{ needs.swift.result }}"), ("MAY_ANDROID_RESULT", "${{ needs.android.result }}")],
+         'python3 -I -S -B tools/may_release/ds_tests.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'),
+        ("Remove the decrypted records", None, [],
+         'rm -rf -- "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-download" "$RUNNER_TEMP/may-tools"')]),
+}
+DS_TESTS_PRINT_VALUES = {"suite", "verdict", "total", "failed", "skipped", "len(found)", "number",
+                         "'passed' if passed else 'failed'"}
+DS_TESTS_EXIT_CLASSES = {"GateDenial", "DsTestsError", "DsCompileError", "StoreError"}
+
+
+@with_app_tokens(DS_TESTS)
+def ds_tests_workflow_problems(text):
+    name, found = DS_TESTS + ": ", []
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or "--export" in text:
+        found.append(name + "writes a step summary or carries an environment")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"] or \
+            "\nrun-name: 'May DS tests for may-design-system #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\n" \
+            not in text:
+        found.append(name + "top-level keys or run-name are not exactly as ds_tests_schedule.py reads them")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly pr_number and source_sha")
+    if "\nconcurrency:\n  group: may-ds-tests\n  cancel-in-progress: false\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group, never cancelling a run")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r"(?m)^\s+[\w-]+:\s*write\b", text) or \
+            any(job_text(text, job).count(JOB_PERMISSIONS) != 1 for job in DS_TESTS_JOBS):
+        found.append(name + "permissions are not read-only everywhere")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(DS_TESTS_JOBS):
+        found.append(name + "jobs are not exactly admission, pull, swift, android and post")
+    for job, (runner, needs, timeout, expected) in DS_TESTS_JOBS.items():
+        header, steps = job_steps(text, job)
+        body = job_text(text, job)
+        if f"    runs-on: {runner}\n" not in header or \
+                (needs is None) != ("    needs:" not in header) or (needs and f"    needs: {needs}\n" not in header) or \
+                (timeout is None) != ("timeout-minutes:" not in header) or \
+                (timeout and f"    timeout-minutes: {timeout}\n" not in header) or \
+                (job != "admission") != ("    environment: ${{ needs.admission.outputs.environment }}\n" in header) or \
+                (job == "admission" and re.search(r"(?m)^    environment:", header)):
+            found.append(name + f"job {job}'s runner, needs, timeout or environment is not as pinned")
+        condition = "    if: ${{ !cancelled() && needs.admission.result == 'success' }}\n"
+        if (job == "post") != (condition in header) or re.search(r"(?m)^    if:", header.replace(condition, "")):
+            found.append(name + f"job {job} runs on a condition other than post's (every suite finished)")
+        if not steps or uses_in(steps[0][1]) != [CHECKOUT] or "persist-credentials: false" not in steps[0][1]:
+            found.append(name + f"job {job} does not start with the pinned checkout, without credentials")
+            continue
+        actual = [(step, (uses_in(chunk) or [None])[0], env_entries(chunk), (run_commands(chunk) or [None])[0])
+                  for step, chunk in steps[1:]]
+        if actual != expected:
+            found.append(name + f"job {job}'s steps, their environments or commands are not exactly as pinned")
+        for step, chunk in steps[1:]:
+            cond = step_condition(chunk)
+            if cond not in (None, "always()") or (cond == "always()") != step.startswith("Remove "):
+                found.append(name + f"job {job} has a step condition other than the cleanup's always()")
+            if "continue-on-error" in chunk and DOWNLOAD_ARTIFACT not in chunk:
+                found.append(name + f"job {job} lets a step other than a download fail quietly")
+    for suite in ("swift", "android"):
+        upload = next((c for s, c in job_steps(text, suite)[1] if UPLOAD_ARTIFACT in c), "")
+        if f"          name: may-ds-tests-{suite}-${{{{ github.run_attempt }}}}\n" not in upload or \
+                f"          path: ${{{{ runner.temp }}}}/may-ds-tests-sealed/{suite}.age\n" not in upload or \
+                "          retention-days: 1\n" not in upload or "          if-no-files-found: ignore\n" not in upload:
+            found.append(name + f"{suite}'s upload is not its sealed record alone, kept one day")
+    downloads = [c for s, c in job_steps(text, "post")[1] if DOWNLOAD_ARTIFACT in c]
+    if [bool(re.search(rf"name: may-ds-tests-{s}-\$\{{\{{ github.run_attempt \}}\}}\n.*may-ds-tests-download/{s}\n",
+                       c, re.S)) for s, c in zip(("swift", "android"), downloads)] != [True, True] or \
+            text.count(UPLOAD_ARTIFACT) != 2 or text.count(DOWNLOAD_ARTIFACT) != 2:
+        found.append(name + "post does not download exactly the two sealed records")
+    if secrets_in(text) != {"MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_RENDERS_DECRYPT_KEY", "MAY_DS_PR_COMMENT_TOKEN"} \
+            or text.count("secrets.MAY_DS_READ_KEY") != 2 or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret is held outside its one step")
+    return found
+
+
+@with_app_tokens(DS_TESTS_SCHEDULE)
+def ds_tests_schedule_workflow_problems(text):
+    return schedule_workflow_problems(DS_TESTS_SCHEDULE, text)
+
+
+def ds_tests_schedule_tool_problems(root):
+    found = schedule_tool_problems(root, DS_TESTS_SCHEDULE)
+    path = root / "tools/may_release" / SCHEDULES[DS_TESTS_SCHEDULE][0]
+    tree = ast.parse(path.read_text())
+    reader = function_source(tree, "ds_get")
+    if reader is None or "APP_REPO" in ast.unparse(tree) or "DS_REPO}/{path}" not in ast.unparse(reader) or \
+            not ast.unparse(reader.body[1]).startswith("if not re.fullmatch("):
+        found.append(SCHEDULES[DS_TESTS_SCHEDULE][0] + ": reads something other than may-design-system's open pull "
+                     "requests, through ds_get")
+    return found
+
+
+def ds_tests_print_problems(root):
+    found = quiet_tool_problems(root, DS_TESTS_TOOL, DS_TESTS_PRINT_VALUES, DS_TESTS_EXIT_CLASSES)
+    path = root / "tools/may_release" / DS_TESTS_TOOL
+    if assigned_literal(path, "MARKER") != "may-ds-tests" or assigned_literal(path, "MAX_RECORD") != 262144:
+        found.append(DS_TESTS_TOOL + ": its marker or sealed record size is not as pinned")
+    tree = ast.parse(path.read_text())
+    post = function_source(tree, "post")
+    if post is None or "post_once(call_api, DS_REPO" not in ast.unparse(post) or \
+            "validate_ds_pull_request" not in ast.unparse(post):
+        found.append(DS_TESTS_TOOL + ": post does not read the pull request again before posting once on it")
     return found
 
 
@@ -2534,6 +2712,10 @@ def control_problems(root):
     found += renders_print_problems(root)
     found += device_tests_workflow_problems((flows / DEVICE_TESTS).read_text())
     found += device_tests_print_problems(root)
+    found += ds_tests_workflow_problems((flows / DS_TESTS).read_text())
+    found += ds_tests_print_problems(root)
+    found += ds_tests_schedule_workflow_problems((flows / DS_TESTS_SCHEDULE).read_text())
+    found += ds_tests_schedule_tool_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

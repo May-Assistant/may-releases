@@ -1,0 +1,215 @@
+name: May design-system tests at a may-design-system pull request head (Swift and Android suites; pass or fail and counts only)
+# The pull request number and head SHA only (both public in this log already): ds_tests_schedule.py reads it to run a
+# head once.
+run-name: 'May DS tests for may-design-system #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open May-Assistant/may-design-system pull request against claude/may-integration or main (not from a fork)
+        required: true
+        type: string
+      source_sha:
+        description: That pull request's current 40-character head commit
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: may-ds-tests
+  cancel-in-progress: false
+jobs:
+  admission:
+    # may-design-system's own suites at the head of one of its pull requests (Samuel's decision, 28 Oct), in
+    # may-ds-renders (gate.py --action ds-compile: no required reviewer, administrator bypass off, main only). The same
+    # split as android-unit-pr.yml: pull mints the read token and checks the pull request, swift and android run the
+    # pull request's code with the read-only deploy key alone, and post mints the comment token. Nothing derived from
+    # the design system is printed or uploaded in the clear: only fixed lines with counts, and each suite's sealed record.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+  pull:
+    # The pull request check, on a runner that runs no design-system code.
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_DS_PR_READ_TOKEN, before any pull request code
+        id: ci-ds-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-design-system
+          permission-pull-requests: read
+      - name: Check the design-system pull request head and environment before fetching
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_DS_PR_READ_TOKEN: ${{ steps.ci-ds-read.outputs.token || secrets.MAY_DS_PR_READ_TOKEN }}
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR" --check-pull
+  swift:
+    # The Swift package's tests on an iPhone 16 Pro simulator, with the read-only deploy key in the fetch alone.
+    needs: [admission, pull]
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the exact design-system commit quietly
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Run the Swift suite without any credential, printing only pass or fail and counts
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py swift --ds-sha "$MAY_DS_SHA"
+      - name: Seal the Swift record for the post job, with no secret
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py seal --suite swift --ds-sha "$MAY_DS_SHA"
+      - name: Hand over only the sealed Swift record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-ds-tests-swift-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-sealed/swift.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the Swift suite did not pass
+        run: python3 -I -S -B tools/may_release/ds_tests.py verdict --suite swift
+      - name: Remove the design-system checkout, logs and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-derived" "$RUNNER_TEMP/may-ds-packages" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"
+  android:
+    # The Android components' unit tests, with the pinned JDK 21 and the read-only deploy key in the fetch alone.
+    needs: [admission, pull]
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned, checksum-verified JDK
+        run: python3 -I -S -B tools/may_release/toolchain.py jdk
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the exact design-system commit quietly
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Run the Android suite without any credential, printing only pass or fail and counts
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py android --ds-sha "$MAY_DS_SHA"
+      - name: Seal the Android record for the post job, with no secret
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py seal --suite android --ds-sha "$MAY_DS_SHA"
+      - name: Hand over only the sealed Android record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-ds-tests-android-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-sealed/android.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the Android suite did not pass
+        run: python3 -I -S -B tools/may_release/ds_tests.py verdict --suite android
+      - name: Remove the design-system checkout, logs, Gradle home and the pinned JDK
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-gradle" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"
+  post:
+    # A fresh runner that runs no design-system code: the comment token is minted here alone, and the decrypt key and
+    # the comment token each live in one step. It runs once both suites have finished, passed or failed; a suite whose
+    # record did not arrive is posted from its job's result alone, still head-marked.
+    needs: [admission, swift, android]
+    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_DS_PR_COMMENT_TOKEN, before any pull request code
+        id: ci-ds-comment
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-design-system
+          permission-pull-requests: write
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Nothing to download (no key pair, or the suite stopped before its seal) is reported by the open step.
+        continue-on-error: true
+        with:
+          name: may-ds-tests-swift-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-download/swift
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: may-ds-tests-android-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-download/android
+      - name: Decrypt and check the suite records
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py open --ds-sha "$MAY_DS_SHA"
+      - name: Post both suites' results on the design-system pull request, never in this log
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+          MAY_DS_PR_COMMENT_TOKEN: ${{ steps.ci-ds-comment.outputs.token || secrets.MAY_DS_PR_COMMENT_TOKEN }}
+          MAY_SWIFT_RESULT: ${{ needs.swift.result }}
+          MAY_ANDROID_RESULT: ${{ needs.android.result }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Remove the decrypted records
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-download" "$RUNNER_TEMP/may-tools"
