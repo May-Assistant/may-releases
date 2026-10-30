@@ -227,6 +227,10 @@ class AndroidSigningIsolationTests(unittest.TestCase):
             runner.assert_not_called()
 
 
+PUSH_ENTITLEMENTS = plistlib.dumps({"application-identifier": "T." + PLAYGROUND, "aps-environment": "production",
+                                     "get-task-allow": False})
+
+
 class IosSigningTests(unittest.TestCase):
     """Orchestration only: keychain and xcodebuild are faked on Linux."""
 
@@ -241,8 +245,9 @@ class IosSigningTests(unittest.TestCase):
     def tearDown(self):
         self.work.directory.cleanup()
 
-    def run_signing(self, build="9", icon=True):
-        """Run sign_ios for build 9; the faked export produces an IPA for `build` (with an icon unless not `icon`)."""
+    def run_signing(self, build="9", icon=True, entitlements=PUSH_ENTITLEMENTS, codesign_status=0):
+        """Run sign_ios for build 9; the faked export produces an IPA for `build` (with an icon unless not `icon`),
+        and codesign reads `entitlements` (bytes, as its --xml output) from the unpacked app."""
         calls = []
 
         def fake_tool(argv, cwd, log, env):
@@ -256,6 +261,11 @@ class IosSigningTests(unittest.TestCase):
 
         def fake_query(argv, **kwargs):
             calls.append((argv, kwargs.get("env")))
+            if argv[0] == sign.DITTO:
+                (Path(argv[-1]) / "Payload" / "May Playground.app").mkdir(parents=True)
+            if argv[0] == sign.CODESIGN:
+                self.unpacked = Path(argv[-1])
+                return subprocess.CompletedProcess(argv, codesign_status, entitlements, b"Executable=x\n")
             out = (fx.PROFILE_CERT_SHA1.encode() + b' "Apple Distribution"') if "find-identity" in argv else b""
             return subprocess.CompletedProcess(argv, 0, out, b"")
 
@@ -280,9 +290,10 @@ class IosSigningTests(unittest.TestCase):
     def test_signing_names_the_verified_icon(self):
         with patch("sys.stdout", new_callable=io.StringIO) as output:
             self.run_signing()
-        self.assertEqual(output.getvalue().splitlines()[-2:], [
+        self.assertEqual(output.getvalue().splitlines()[-3:], [
             "May iOS IPA signed for internal TestFlight and its profile verified",
-            "IPA app icon: Info.plist names CFBundleIconName AppIcon, and Assets.car names AppIcon"])
+            "IPA app icon: Info.plist names CFBundleIconName AppIcon, and Assets.car names AppIcon",
+            "IPA push: the app's signed entitlements have aps-environment, set to production"])
 
     def test_export_without_an_icon_is_refused_and_removed(self):
         """TestFlight build 7 had no icon in App Store Connect: an IPA without one never reaches the upload."""
@@ -292,6 +303,32 @@ class IosSigningTests(unittest.TestCase):
                          "IPA Info.plist names no CFBundleIconName AppIcon (App Store Connect shows no icon)")
         self.assertFalse((self.work.root / "may-release/May.ipa").exists())
         self.assertEqual(self.work.files(), [])
+
+    def test_the_exported_apps_signed_entitlements_must_carry_production_push(self):
+        """Coordinator, 30 Oct (F4): both targets' IPAs need aps-environment=production in what codesign says the app
+        was signed with; a fail names whether the key is there, never a value, and the IPA never reaches the upload."""
+        calls = self.run_signing()
+        reads = [argv for argv, _ in calls if argv != "options" and argv[0] == sign.CODESIGN]
+        self.assertEqual(len(reads), 1, "codesign read the exported app's entitlements once")
+        read = reads[0]
+        self.assertEqual(read[:5], [sign.CODESIGN, "-d", "--entitlements", "-", "--xml"])
+        self.assertEqual(Path(read[5]).name, "May Playground.app")
+        self.assertFalse(self.unpacked.exists(), "the unpacked IPA is removed")
+        (self.work.root / "may-release/May.ipa").unlink()
+        development = PUSH_ENTITLEMENTS.replace(b"<string>production</string>", b"<string>development</string>")
+        cases = ((plistlib.dumps({"application-identifier": "T." + PLAYGROUND}), "have no aps-environment"),
+                 (development, "have aps-environment, not production"),
+                 (b"\xfa\xde\x71\x71 not a plist", "could not be read"), (b"", "could not be read"))
+        for entitlements, said in cases:
+            with self.subTest(said=said):
+                with self.assertRaises(verify.VerifyError) as refused:
+                    self.run_signing(entitlements=entitlements)
+                self.assertEqual(refused.exception.args[0], "IPA push check failed: the app's signed entitlements " + said)
+                self.assertNotIn("development", refused.exception.args[0], "never a value")
+                self.assertFalse((self.work.root / "may-release/May.ipa").exists())
+                self.assertEqual(self.work.files(), [])
+        with self.assertRaises(verify.VerifyError):
+            self.run_signing(codesign_status=1)
 
     def test_export_with_wrong_build_is_removed(self):
         with self.assertRaises(verify.VerifyError):
