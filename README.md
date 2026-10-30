@@ -772,7 +772,7 @@ This repository is public and may-app is private, and anyone signed in to GitHub
    - `verdict` then fails the job if the build or tests failed, the manifest was not usable, or a render is missing. A failed build is still published first, with its log.
 3. **publish**, on a fresh Linux runner that runs no may-app code, has three steps, each holding one secret:
    - `publish.py open` decrypts with `MAY_RENDERS_DECRYPT_KEY`, after checking it against `MAY_RENDERS_RECIPIENT`, and accepts only the run folder's fixed layout.
-   - `push` adds `<may-app short sha>/` to may-renders' `main` with `MAY_APP_RENDERS_WRITE_KEY`, a deploy key on may-renders alone. It lists the run folders in `runs.json` and keeps the newest 10, and it never force-pushes.
+   - `push` adds `<may-app short sha>/` to may-renders' `main` with `MAY_APP_RENDERS_WRITE_KEY`, a deploy key on may-renders alone. It lists the run folders in `runs.json` and keeps the newest 10, and it never force-pushes. A push that may-renders rejects because its `main` moved after the fetch is tried once more, from a fresh clone of the new head (the log says so); any failed git step names its class in the log, from git's own words, which stay in the private log: rejected, auth, network or other (run 41068959429 failed with no reason at all). `device-push` does the same.
    - For a pull request, `comment` links the contact sheet first, as the run's `README.md` (GitHub renders it, on a phone too, where `index.html` shows as source), then the side-by-side PNGs, the run folder and the log, using `MAY_APP_PR_COMMENT_TOKEN`.
 
 **Setup** in the environment `may-ios-renders` (main only, administrator bypass off, no required reviewer):

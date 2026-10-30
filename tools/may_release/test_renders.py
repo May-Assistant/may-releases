@@ -636,13 +636,19 @@ class PublishPushTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def push(self, existing_runs=None, branch_exists=True, env=None):
-        calls, work = [], self.root / "may-publish-git"
+    def push(self, existing_runs=None, branch_exists=True, env=None, failures=()):
+        calls, work, failing = [], self.root / "may-publish-git", list(failures)
 
         def git(argv, log, env, cwd, capture=False):
             calls.append(argv)
+            if argv[0] == "push" and failing:
+                cause = failing.pop(0)
+                if cause:
+                    raise publish.GitFailed(cause)
             if argv[0] == "init":
-                Path(argv[-1]).mkdir()
+                if Path(argv[-1]).exists():
+                    calls.append(["init over an earlier attempt's clone"])
+                Path(argv[-1]).mkdir(exist_ok=True)
             if argv[0] == "checkout" and existing_runs is not None:
                 (work / "runs.json").write_text(json.dumps(existing_runs))
                 for run in existing_runs:
@@ -674,6 +680,60 @@ class PublishPushTests(unittest.TestCase):
         self.assertEqual(out.strip(), f"May iOS renders published to may-renders as {FOLDER}/ (10 run folders kept, "
                                       "1 removed)")
         self.assertFalse(any(p.name.endswith(".key") or p.name == "known_hosts" for p in self.root.rglob("*")))
+
+    def test_a_rejected_push_is_tried_once_more_from_may_renders_new_head(self):
+        """Run 41068959429 (N, 30 Oct): one push, rejected with nothing said. A rejected push now starts again from a
+        fresh clone of may-renders' main, once, never by force."""
+        runs = [{"folder": "%012x" % n} for n in range(1, 4)]
+        try:
+            calls, work, out = self.push(existing_runs=runs, failures=["rejected", None])
+        except publish.GitFailed:
+            self.fail("a rejected push was not tried again")
+        self.assertNotIn(["init over an earlier attempt's clone"], calls, "each attempt starts from a fresh clone")
+        self.assertEqual([argv[0] for argv in calls if argv[0] in ("init", "fetch", "push")],
+                         ["init", "fetch", "push", "init", "fetch", "push"])
+        self.assertFalse(any("--force" in argv or any(a.startswith("+") for a in argv[1:])
+                             for argv in calls if argv[0] == "push"))
+        self.assertEqual(out.strip().splitlines(), [
+            "May renders publish: may-renders moved during the push; trying once more from its new head",
+            f"May iOS renders published to may-renders as {FOLDER}/ (4 run folders kept, 0 removed)"])
+        self.assertTrue((work / FOLDER / "ios" / "a.png").is_file())
+        self.assertFalse(any(p.name.endswith(".key") or p.name == "known_hosts" for p in self.root.rglob("*")))
+
+    def test_a_second_rejection_or_any_other_failure_stops_with_its_class(self):
+        for failures, cause, pushes in ((["rejected", "rejected"], "rejected", 2), (["auth"], "auth", 1),
+                                        (["network"], "network", 1), (["other"], "other", 1)):
+            with self.subTest(failures=failures):
+                shutil.rmtree(self.root / "may-publish-git", ignore_errors=True)
+                with self.assertRaises(PublishError) as stopped:
+                    self.push(failures=failures)
+                self.assertEqual(str(stopped.exception), f"may-renders could not be updated ({cause}); inspect "
+                                                         "protected runner diagnostics")
+                self.assertFalse(any(p.name.endswith(".key") or p.name == "known_hosts" for p in self.root.rglob("*")))
+        self.assertEqual(publish.PUSH_ATTEMPTS, 2)
+
+    def test_a_failed_git_step_is_classed_from_its_output_which_stays_in_the_private_log(self):
+        said = {"rejected": b" ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs\n",
+                "auth": b"git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n",
+                "network": b"ssh: connect to host github.com port 22: Connection timed out\n",
+                "other": b"fatal: pathspec 'x' did not match any files\n"}
+        for cause, output in said.items():
+            with self.subTest(cause=cause):
+                self.assertEqual(publish.git_cause(output), cause)
+                log = self.root / f"{cause}.log"
+                done = subprocess.CompletedProcess([], 1, b"out-" + cause.encode() + b"\n", output)
+                with patch("publish.subprocess.run", return_value=done), self.assertRaises(PublishError) as stopped:
+                    publish.git(["push", "origin"], log, {}, self.root)
+                self.assertEqual(getattr(stopped.exception, "cause", None), cause)
+                self.assertNotIn(output.decode().strip(), str(stopped.exception))
+                self.assertEqual(log.read_bytes(), b"out-" + cause.encode() + b"\n" + output)
+        self.assertEqual(publish.git_cause(b" ! [remote rejected] main -> main (protected branch hook declined)\n"),
+                         "other", "a refusal by the remote is no race, so it is never tried again")
+        done = subprocess.CompletedProcess([], 0, b"abc\trefs/heads/main\n", b"warning\n")
+        log = self.root / "ok.log"
+        with patch("publish.subprocess.run", return_value=done):
+            self.assertEqual(publish.git(["ls-remote"], log, {}, self.root, capture=True), b"abc\trefs/heads/main\n")
+        self.assertEqual(log.read_bytes(), b"warning\n", "a captured stdout is returned, never logged")
 
     def test_main_is_created_when_may_renders_is_empty(self):
         calls, work, _ = self.push(branch_exists=False)
