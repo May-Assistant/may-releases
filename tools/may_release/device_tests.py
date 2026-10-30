@@ -86,13 +86,15 @@ TRUTH_PATHS = ("/v1/approvals", "/v1/inbox", "/v1/commitments", "/v1/routines")
 QUESTION_STATES = ("answered", "closed")
 # Server truth a row can ask for besides those reads (coordinator, 25 Oct): {"delivery": "succeeded"}, every tagged
 # message's reply run succeeded (chat); {"get": NOTE_PATH, "task": "{tag} task", "note": "{tag} ..."}, the Agenda task
-# titled exactly "task" has those words in its notes, which the server keeps as the commitment's description, and no
-# task of that title is left open (CLOSED: the goal deletes it at its end), so a note typed into another task never
-# passes (coordinator, 26 Oct: run 40243708096's notes left lines in an older task). A row's plain "server" reads
-# expect one of EXPECTS: 401 is a session the app signed out (sign-out).
+# titled exactly "task" has those words in its notes, which the server keeps as the commitment's description, so a
+# note typed into another task never passes (coordinator, 26 Oct: run 40243708096's notes left lines in an older task).
+# The goal ends on that task showing its note (NOTE_END), never deleting it: the judge reads the screen at done, and
+# after a delete it showed no note (run 40687078761 failed notes on the app that passed it on 25 Oct; coordinator,
+# 28 Oct). The run's tag cleanup cancels the task afterwards. A row's plain "server" reads expect one of EXPECTS: 401
+# is a session the app signed out (sign-out).
 DELIVERY_TRUTH, NOTE_PATH, EXPECTS, MAX_NOTE = {"delivery": "succeeded"}, "/v1/commitments", (200, 401), 200
-CLOSED = ("completed", "cancelled")
 NOTE_GOAL = "Do not open any existing task; create a new one."
+NOTE_END = "check that the note is shown on it."
 # A row with "chat": true talks to May in a chat of its own, made for it before its agent starts (make_chat: POST
 # /v1/agents, named CHAT_NAME with its tag, removed by the test session's cleanup with the tag), never in the shared
 # May chat that every earlier run wrote to (coordinator, 26 Oct). Its goal opens that chat by name.
@@ -203,7 +205,7 @@ NOT_JUDGED = "not judged"
 DELIVERY_FAILED = "May's server did not record a succeeded reply"
 UNCONFIGURED = "server checks not configured"
 UNVERIFIED = "unverified"
-NOT_REACHED = "the agenda's first page on the server did not reach the tagged task (unverified, never a pass)"
+NOT_REACHED = "the agenda's pages on the server ran out before the tagged task (unverified, never a pass)"
 SMOKE_MAESTRO = "Maestro did not drive the app"
 SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
 # The smoke scenario's flow: this repository's own, written to the private folder at run time.
@@ -321,7 +323,7 @@ def scenarios(selection="all", platform="android"):
                                                  c == DELIVERY_TRUTH and "Send this message" in row["goal"] or
                                                  set(c) == {"get", "task", "note"} and c["get"] == NOTE_PATH and
                                                  c["task"] == "{tag} task" and NOTE_GOAL in row["goal"] and
-                                                 row["goal"].endswith(f"then delete the {c['task']}.") and
+                                                 row["goal"].endswith(NOTE_END) and "delete" not in row["goal"].lower() and
                                                  isinstance(c["note"], str) and c["note"].startswith("{tag} ") and
                                                  len(c["note"]) <= MAX_NOTE and c["note"][6:] in row["goal"])
                         for c in row["truth"]) and
@@ -532,23 +534,26 @@ MAX_DELIVERY = 10
 
 
 def commitment_note(base, token, title, note, get=urllib.request.urlopen):
-    """The Agenda's first page (GET NOTE_PATH, without a cursor: up to the server's 200 items) read for the tasks titled
-    exactly title (case and outer spaces aside; a deleted task is still listed, closed): (HTTP status, "found" when
-    one's notes, the commitment's description, hold note and none is left open; "open" when the note is there but a
-    task of that title is still open; "absent" when no such task is there, or none's notes hold it; "beyond" when none
-    is there and the page has more after it, so the run cannot tell). Only the title and the note are looked for;
-    nothing read is kept or printed."""
-    status, data = read_json(base, token, NOTE_PATH, get)
-    if status != 200:
-        return status, "absent"
-    tasks = [task for task in listed(data, "commitments")
-             if isinstance(task.get("title"), str) and task["title"].strip().lower() == title.lower()]
-    if not tasks:
-        more = isinstance(data, dict) and isinstance(data.get("next_cursor"), str) and data["next_cursor"] != ""
-        return status, "beyond" if more else "absent"
-    if not any(isinstance(task.get("description"), str) and note in task["description"] for task in tasks):
-        return status, "absent"
-    return status, "open" if any(task.get("status") not in CLOSED for task in tasks) else "found"
+    """The Agenda read page by page (GET NOTE_PATH, then each next_cursor, at most MAX_AGENDA_PAGES) for the tasks
+    titled exactly title (case and outer spaces aside), open or closed: the reads come before the run's tag cleanup
+    cancels it, and a cancelled task stays listed. (HTTP status, "found" when one's notes, the commitment's
+    description, hold note; "absent" when every page was read and none does; "beyond" when the pages ran out first, so
+    the run cannot tell.) The Agenda puts undated tasks last, oldest first, so a new task is on the last page once the
+    shared account holds more than a page. Only the title and the note are looked for; nothing read is kept or printed."""
+    cursor, status = None, 0
+    for _ in range(MAX_AGENDA_PAGES):
+        status, data = read_json(base, token, NOTE_PATH + (f"?cursor={urllib.parse.quote(cursor)}" if cursor else ""),
+                                 get)
+        if status != 200:
+            return status, "absent"
+        if any(isinstance(task.get("title"), str) and task["title"].strip().lower() == title.lower() and
+               isinstance(task.get("description"), str) and note in task["description"]
+               for task in listed(data, "commitments")):
+            return status, "found"
+        cursor = data.get("next_cursor") if isinstance(data, dict) else None
+        if not (isinstance(cursor, str) and cursor):
+            return status, "absent"
+    return status, "beyond"
 
 
 # A one-off (coordinator, 26 Oct): earlier notes runs typed their note into the shared account's "file taxes" task

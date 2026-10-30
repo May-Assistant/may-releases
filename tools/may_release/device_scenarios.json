@@ -74,7 +74,7 @@
     "id": "notes",
     "title": "Add a note to a new agenda task",
     "driver": "agent",
-    "goal": "In May Playground, tap the Agenda tab in the bottom bar (not a chat). Do not open any existing task; create a new one. Add a new task titled {tag} task, then open that task. On its Details tab, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on it, then delete the {tag} task.",
+    "goal": "In May Playground, tap the Agenda tab in the bottom bar (not a chat). Do not open any existing task; create a new one. Add a new task titled {tag} task, then open that task. On its Details tab, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on it.",
     "platforms": [
       "android",
       "ios"
