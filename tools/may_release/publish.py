@@ -106,6 +106,8 @@ MAX_FILES = 2000
 MAX_FILE = 40 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
 DOWNLOAD, TREE = "may-renders-download/renders.age", "may-publish-tree"
+# The render job's upload's artifact id, set when it handed sealed renders over (ios-renders.yml, run 41068959429).
+HANDED = "MAY_RENDERS_HANDED"
 MARKER = "may-ios-renders"
 AUTHOR = ("-c", "user.name=May renders", "-c", "user.email=renders@may-releases.invalid")
 README = ("# May parity renders and device tests\n\nWritten by may-releases, never by hand.\n\n"
@@ -242,6 +244,12 @@ def open_renders(sha):
     root = runner_root()
     sealed = root / DOWNLOAD
     if not sealed.is_file() or sealed.is_symlink():
+        # Run 41068959429: publish alone re-run as attempt 2 looked for attempt 2's renders, found none, and the run
+        # went green with nothing published. Renders the render job handed over (its upload's artifact id) that never
+        # arrived fail the run.
+        if os.environ.get(HANDED, "").strip():
+            raise PublishError("The render job handed over sealed renders, but they did not reach this job; nothing "
+                               "was published")
         print("May iOS renders: no sealed renders from this run attempt; nothing will be published")
         return
     recipient = os.environ.get(RECIPIENT, "").strip()
@@ -391,7 +399,23 @@ def commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, 
     run_git(["add", "-A", "--", "."], log, env, work)
     run_git([*AUTHOR, "commit", "-q", "-m", message], log, env, work)
     run_git(["push", "--quiet", "origin", "HEAD:refs/heads/" + BRANCH], log, env, work)
+    landed(prefix, folder, run_git, log, env, work)
     return kept, removed, added
+
+
+def landed(prefix, folder, run_git, log, env, work):
+    """After a push git called a success: may-renders' main, fetched again, holds the run folder and lists it first in
+    runs.json (N, 30 Oct: check it rather than trust a green step), else the publish fails."""
+    try:
+        run_git(["fetch", "--quiet", "--no-tags", "--depth", "1", "origin",
+                 f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"], log, env, work)
+        run_git(["cat-file", "-e", f"refs/remotes/origin/{BRANCH}:{prefix}{folder}"], log, env, work)
+        listed = json.loads(run_git(["show", f"refs/remotes/origin/{BRANCH}:{prefix}runs.json"], log, env, work,
+                                    capture=True))
+    except (GitFailed, ValueError):
+        listed = None
+    if not (isinstance(listed, list) and any(isinstance(run, dict) and run.get("folder") == folder for run in listed)):
+        raise PublishError("may-renders main does not hold the run folder after the push; check may-renders")
 
 
 def write_key():

@@ -622,6 +622,40 @@ class PublishOpenTests(unittest.TestCase):
         self.assertFalse(any(p.name.endswith(".key") for p in self.root.rglob("*")))
 
 
+class HandedRendersTests(unittest.TestCase):
+    """Run 41068959429: publish re-run alone as attempt 2 asked for attempt 2's renders, found none, and the run went
+    green with nothing published. It now downloads the attempt that rendered, and renders handed over but missing fail."""
+
+    def test_renders_handed_over_that_never_arrived_fail_the_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for handed, fails in (("4123", True), ("", False), ("  ", False)):
+                with self.subTest(handed=handed), patch.dict(os.environ, {"RUNNER_TEMP": temp, "MAY_RENDERS_HANDED": handed,
+                                                                         "MAY_RENDERS_DECRYPT_KEY": "x"}, clear=True), \
+                        patch("sys.stdout", new_callable=io.StringIO) as out:
+                    if fails:
+                        with self.assertRaises(PublishError) as stopped:
+                            publish.open_renders(SHA)
+                        self.assertEqual(stopped.exception.args[0], "The render job handed over sealed renders, but "
+                                                                    "they did not reach this job; nothing was published")
+                    else:
+                        publish.open_renders(SHA)
+                        self.assertIn("no sealed renders from this run attempt", out.getvalue())
+
+    def test_publish_downloads_the_render_jobs_own_attempt_and_is_told_what_it_handed_over(self):
+        text = (static_check.ROOT / ".github/workflows/ios-renders.yml").read_text()
+        self.assertEqual(static_check.renders_workflow_problems(text), [])
+        self.assertIn("name: may-ios-renders-${{ needs.render.outputs.attempt }}\n", text)
+        for old, new in (("name: may-ios-renders-${{ needs.render.outputs.attempt }}",
+                          "name: may-ios-renders-${{ github.run_attempt }}"),
+                         ("          MAY_RENDERS_HANDED: ${{ needs.render.outputs.handed }}\n", ""),
+                         ("      attempt: ${{ github.run_attempt }}\n", ""),
+                         ("      handed: ${{ steps.handover.outputs.artifact-id }}\n", ""),
+                         ("        id: handover\n", "")):
+            with self.subTest(old=old.strip()):
+                self.assertEqual(text.count(old), 1, old)
+                self.assertNotEqual(static_check.renders_workflow_problems(text.replace(old, new)), [])
+
+
 class PublishPushTests(unittest.TestCase):
     KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "A" * 120 + "\n-----END OPENSSH PRIVATE KEY-----"
 
@@ -636,8 +670,8 @@ class PublishPushTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def push(self, existing_runs=None, branch_exists=True, env=None, failures=()):
-        calls, work, failing = [], self.root / "may-publish-git", list(failures)
+    def push(self, existing_runs=None, branch_exists=True, env=None, failures=(), lands=True):
+        calls, work, failing, remote = [], self.root / "may-publish-git", list(failures), {}
 
         def git(argv, log, env, cwd, capture=False):
             calls.append(argv)
@@ -645,6 +679,10 @@ class PublishPushTests(unittest.TestCase):
                 cause = failing.pop(0)
                 if cause:
                     raise publish.GitFailed(cause)
+            if argv[0] == "push" and lands:
+                remote["runs.json"] = (work / "runs.json").read_bytes()
+            if argv[0] == "show":
+                return remote.get("runs.json", b"[]")
             if argv[0] == "init":
                 if Path(argv[-1]).exists():
                     calls.append(["init over an earlier attempt's clone"])
@@ -691,7 +729,7 @@ class PublishPushTests(unittest.TestCase):
             self.fail("a rejected push was not tried again")
         self.assertNotIn(["init over an earlier attempt's clone"], calls, "each attempt starts from a fresh clone")
         self.assertEqual([argv[0] for argv in calls if argv[0] in ("init", "fetch", "push")],
-                         ["init", "fetch", "push", "init", "fetch", "push"])
+                         ["init", "fetch", "push", "init", "fetch", "push", "fetch"], "then the check that it landed")
         self.assertFalse(any("--force" in argv or any(a.startswith("+") for a in argv[1:])
                              for argv in calls if argv[0] == "push"))
         self.assertEqual(out.strip().splitlines(), [
@@ -735,10 +773,26 @@ class PublishPushTests(unittest.TestCase):
             self.assertEqual(publish.git(["ls-remote"], log, {}, self.root, capture=True), b"abc\trefs/heads/main\n")
         self.assertEqual(log.read_bytes(), b"warning\n", "a captured stdout is returned, never logged")
 
+    def test_a_push_that_did_not_land_on_main_fails(self):
+        """N, 30 Oct: a green push is checked on may-renders' main, fetched again: the run folder listed in runs.json."""
+        try:
+            calls, _, _ = self.push()
+        except PublishError as error:
+            self.fail("a push that landed was refused: " + error.args[0])
+        after = calls[[argv[0] for argv in calls].index("push") + 1:]
+        self.assertEqual([argv[0] for argv in after], ["fetch", "cat-file", "show"])
+        self.assertEqual(after[1], ["cat-file", "-e", f"refs/remotes/origin/main:{FOLDER}"])
+        shutil.rmtree(self.root / "may-publish-git")
+        with self.assertRaises(PublishError) as stopped:
+            self.push(lands=False)
+        self.assertEqual(stopped.exception.args[0], "may-renders main does not hold the run folder after the push; "
+                                                    "check may-renders")
+
     def test_main_is_created_when_may_renders_is_empty(self):
         calls, work, _ = self.push(branch_exists=False)
         self.assertIn(["checkout", "-q", "--orphan", "renders"], calls)
-        self.assertFalse(any(argv[0] == "fetch" for argv in calls))
+        self.assertFalse(any(argv[0] == "fetch" for argv in calls[:[a[0] for a in calls].index("push")]),
+                         "nothing to fetch before the first push")
         self.assertIn("never by hand", (work / "README.md").read_text())
 
     def test_without_the_key_nothing_is_pushed(self):

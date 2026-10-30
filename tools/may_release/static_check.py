@@ -1196,13 +1196,14 @@ RENDERS_RUNS = [
     '"$RUNNER_TEMP/may-publish-git"']
 RENDERS_UPLOAD = (
     "name: Hand over only the encrypted renders\n"
+    "        id: handover\n"
     "        uses: " + UPLOAD_ARTIFACT + " # v4\n"
     "        with:\n"
     "          name: may-ios-renders-${{ github.run_attempt }}\n"
     "          path: ${{ runner.temp }}/may-renders-sealed/renders.age\n"
     "          if-no-files-found: ignore\n"
     "          retention-days: 1\n")
-RENDERS_DOWNLOAD = ("name: may-ios-renders-${{ github.run_attempt }}\n"
+RENDERS_DOWNLOAD = ("name: may-ios-renders-${{ needs.render.outputs.attempt }}\n"
                     "          path: ${{ runner.temp }}/may-renders-download\n")
 RENDERS_CONDITIONS = ["if: inputs.pr_number != ''", "if: always()",
                       "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
@@ -1211,7 +1212,12 @@ RENDERS_SECRETS = set(COMPILE_SECRETS) | {PR_READ_SECRET, PR_COMMENT_SECRET, REN
 RENDERS_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
                   ("MAY_DS_SHA", "${{ inputs.ds_sha }}")}
 RENDERS_RECIPIENT = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
-RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}"), RENDERS_RECIPIENT} | \
+# The render job's outputs (run 41068959429): the attempt whose artifact publish downloads, and the upload's artifact id,
+# which the decrypt step is told so that renders handed over but missing fail the run instead of publishing nothing.
+RENDERS_OUTPUTS = ("    outputs:\n      attempt: ${{ github.run_attempt }}\n"
+                   "      handed: ${{ steps.handover.outputs.artifact-id }}\n    steps:\n")
+RENDERS_HANDED = ("MAY_RENDERS_HANDED", "${{ needs.render.outputs.handed }}")
+RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}"), RENDERS_RECIPIENT, RENDERS_HANDED} | \
     {(name, "${{ secrets." + name + " }}") for name in RENDERS_SECRETS}
 
 
@@ -1274,6 +1280,8 @@ def renders_workflow_problems(text):
             secrets_in(post) != {PR_COMMENT_SECRET} or any(secrets_in(chunk) for chunk in others) or \
             text.count("GH_TOKEN") != 2 or "GH_TOKEN" in fetch or text.count("vars.") != 2 or \
             RENDERS_RECIPIENT not in env_entries(seal) or RENDERS_RECIPIENT not in env_entries(decrypt) or \
+            RENDERS_HANDED not in env_entries(decrypt) or text.count("MAY_RENDERS_HANDED") != 1 or \
+            RENDERS_OUTPUTS not in job_text(text, "render") or text.count("outputs:") != 2 or \
             any(e not in RENDERS_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
                      "the decrypt key, the write key, the comment token (each in its one step) and the inputs")
