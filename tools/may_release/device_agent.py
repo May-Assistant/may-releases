@@ -26,7 +26,7 @@ import subprocess
 import sys
 import urllib.request
 
-from device_mcp import DRIVER_CAUSES, DUMP_FAILURES, kept_lines
+from device_mcp import DRIVER_CAUSES, DUMP_FAILURES, MAX_LOOKS, kept_lines
 from review import CLI_MAX_BYTES, CLI_SHA512, CLI_URL, checked_cli, header_safe, outcome
 
 # review.py's pinned release for macOS on Apple silicon (macos-15): npm's darwin-arm64 platform package, a single
@@ -171,7 +171,18 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
             DUMP_FAILURES else None,
             **{key: record.get(key) if record.get(key) in DRIVER_CAUSES else None
                for key in ("hierarchy_cause", "refusal_cause")},
-            **({"wedged": True} if record.get("wedged") is True else {})}
+            **({"wedged": True} if record.get("wedged") is True else {}),
+            **({"looks": looks(record["looks"])} if "looks" in record else {})}
+
+
+LOOK_SHOTS = tuple(f"look-{n}.png" for n in range(1, MAX_LOOKS + 1))
+
+
+def looks(found):
+    """The device server's chat looks (device_mcp.chat_look) in their fixed shape: a count and a file name or None."""
+    return [{"shown": look["shown"], "shot": look["shot"] if look.get("shot") in LOOK_SHOTS else None}
+            for look in (found if isinstance(found, list) else [])[:MAX_LOOKS]
+            if isinstance(look, dict) and type(look.get("shown")) is int and 0 <= look["shown"] <= 1000]
 
 
 def redacted(text):

@@ -55,6 +55,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # The attempt that sealed the renders, and whether it handed them over: a re-run of publish alone is a later
+    # attempt, and must still take this job's renders (run 41068959429 published nothing, all green).
+    outputs:
+      attempt: ${{ github.run_attempt }}
+      handed: ${{ steps.handover.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -107,6 +112,7 @@ jobs:
           MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
         run: python3 -I -S -B tools/may_release/renders.py seal --source-sha "$MAY_SOURCE_SHA"
       - name: Hand over only the encrypted renders
+        id: handover
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: may-ios-renders-${{ github.run_attempt }}
@@ -152,13 +158,14 @@ jobs:
         # Nothing to download (the key still a placeholder, or the render job stopped first) is reported by the next step.
         continue-on-error: true
         with:
-          name: may-ios-renders-${{ github.run_attempt }}
+          name: may-ios-renders-${{ needs.render.outputs.attempt }}
           path: ${{ runner.temp }}/may-renders-download
       - name: Decrypt and check the renders
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
           MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
+          MAY_RENDERS_HANDED: ${{ needs.render.outputs.handed }}
         run: python3 -I -S -B tools/may_release/publish.py open --source-sha "$MAY_SOURCE_SHA"
       - name: Push the run folder to may-renders
         env:
@@ -171,6 +178,7 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
           MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
+          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}
         run: python3 -I -S -B tools/may_release/publish.py comment --source-sha "$MAY_SOURCE_SHA" ${MAY_PR_NUMBER:+--pr-number "$MAY_PR_NUMBER"}
       - name: Remove the decrypted renders and the branch checkout
         if: always()

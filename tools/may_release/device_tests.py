@@ -86,13 +86,15 @@ TRUTH_PATHS = ("/v1/approvals", "/v1/inbox", "/v1/commitments", "/v1/routines")
 QUESTION_STATES = ("answered", "closed")
 # Server truth a row can ask for besides those reads (coordinator, 25 Oct): {"delivery": "succeeded"}, every tagged
 # message's reply run succeeded (chat); {"get": NOTE_PATH, "task": "{tag} task", "note": "{tag} ..."}, the Agenda task
-# titled exactly "task" has those words in its notes, which the server keeps as the commitment's description, and no
-# task of that title is left open (CLOSED: the goal deletes it at its end), so a note typed into another task never
-# passes (coordinator, 26 Oct: run 40243708096's notes left lines in an older task). A row's plain "server" reads
-# expect one of EXPECTS: 401 is a session the app signed out (sign-out).
+# titled exactly "task" has those words in its notes, which the server keeps as the commitment's description, so a
+# note typed into another task never passes (coordinator, 26 Oct: run 40243708096's notes left lines in an older task).
+# The goal ends on that task showing its note (NOTE_END), never deleting it: the judge reads the screen at done, and
+# after a delete it showed no note (run 40687078761 failed notes on the app that passed it on 25 Oct; coordinator,
+# 28 Oct). The run's tag cleanup cancels the task afterwards. A row's plain "server" reads expect one of EXPECTS: 401
+# is a session the app signed out (sign-out).
 DELIVERY_TRUTH, NOTE_PATH, EXPECTS, MAX_NOTE = {"delivery": "succeeded"}, "/v1/commitments", (200, 401), 200
-CLOSED = ("completed", "cancelled")
 NOTE_GOAL = "Do not open any existing task; create a new one."
+NOTE_END = "check that the note is shown on it."
 # A row with "chat": true talks to May in a chat of its own, made for it before its agent starts (make_chat: POST
 # /v1/agents, named CHAT_NAME with its tag, removed by the test session's cleanup with the tag), never in the shared
 # May chat that every earlier run wrote to (coordinator, 26 Oct). Its goal opens that chat by name.
@@ -102,6 +104,20 @@ CHAT_NAME, CHAT_GOAL = "{tag} chat", "open the chat named {tag} chat"
 # so no truth, delivery code or question card ever counts it or May's reply to it (run_messages starts at the tag).
 FIRST_MESSAGE = "This chat is for an automated device test. Reply with the word ready."
 AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
+# N, 30 Oct (Samuel's "May chat is blank until I scroll", iOS): a row with "card": true opens May's chat from a For you
+# card. Before its app starts, staging gets a line from it in May's own chat (CARD_LINE, so the chat has a message to
+# show) and a For you card linked to that chat (POST /v1/auth/test-session/for-you, a suggestion: fresh accounts alone).
+# Its device server counts the messages the chat shows at each read (device_mcp MAY_DEVICE_LOOK) and the first read
+# decides: a message on screen passes; none, and one only after the agent's small scroll, is LOOK_SCROLLED; none at all
+# is LOOK_EMPTY; no read of the chat is LOOK_UNREAD, never a pass. Its goal says CARD_GOAL.
+CARD_LINE = "{tag} line for the device test. Reply with the word ready."
+CARD_GOAL = "Tap the card titled Book the dentist {tag}"
+CARD_PATH = "/v1/auth/test-session/for-you"
+NO_LINE = "skipped: staging did not take the scenario's line in May's chat"
+NO_CARD = "skipped: staging did not seed the scenario's For you card"
+LOOK_SCROLLED = "the chat showed no message when it opened, and showed them once scrolled"
+LOOK_EMPTY = "the chat showed no message when it opened"
+LOOK_UNREAD = "the chat was not read on screen (unverified, never a pass)"
 MAX_CHATS = 10
 MAX_GOAL = 1500
 # The least a row may give its agent (its own "seconds"): enough to launch, look and act a few times.
@@ -183,13 +199,13 @@ SERIAL = "emulator-5554"
 RATE_LIMITED = "Claude is rate limited (skipped, never a pass)"
 UNFINISHED = "the agent did not finish"
 BLOCKED = "the agent reported it was blocked"
-WEDGED = f"the device refused {device_mcp.FAIL_FAST} acts in a row, so the agent was stopped (iOS)"
+WEDGED = "the device stopped taking acts, so the agent was stopped (iOS)"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
 DELIVERY_FAILED = "May's server did not record a succeeded reply"
 UNCONFIGURED = "server checks not configured"
 UNVERIFIED = "unverified"
-NOT_REACHED = "the agenda's first page on the server did not reach the tagged task (unverified, never a pass)"
+NOT_REACHED = "the agenda's pages on the server ran out before the tagged task (unverified, never a pass)"
 SMOKE_MAESTRO = "Maestro did not drive the app"
 SMOKE, SMOKE_PASS = "smoke", "smoke-pass"
 # The smoke scenario's flow: this repository's own, written to the private folder at run time.
@@ -307,12 +323,14 @@ def scenarios(selection="all", platform="android"):
                                                  c == DELIVERY_TRUTH and "Send this message" in row["goal"] or
                                                  set(c) == {"get", "task", "note"} and c["get"] == NOTE_PATH and
                                                  c["task"] == "{tag} task" and NOTE_GOAL in row["goal"] and
-                                                 row["goal"].endswith(f"then delete the {c['task']}.") and
+                                                 row["goal"].endswith(NOTE_END) and "delete" not in row["goal"].lower() and
                                                  isinstance(c["note"], str) and c["note"].startswith("{tag} ") and
                                                  len(c["note"]) <= MAX_NOTE and c["note"][6:] in row["goal"])
                         for c in row["truth"]) and
                     ("Send this message" in row["goal"]) == (row.get("chat") is True) and
-                    ("chat" not in row or CHAT_GOAL in row["goal"]) or
+                    ("chat" not in row or CHAT_GOAL in row["goal"]) and
+                    ("card" not in row or row["card"] is True and row.get("fresh") is True and "chat" not in row and
+                     row["truth"] == [] and row.get("platforms") == ["ios"] and CARD_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
                     isinstance(row.get("goal"), str) and len(row["goal"]) <= MAX_GOAL and row.get("server") == [])
                 and isinstance(row.get("title"), str) and
@@ -516,23 +534,26 @@ MAX_DELIVERY = 10
 
 
 def commitment_note(base, token, title, note, get=urllib.request.urlopen):
-    """The Agenda's first page (GET NOTE_PATH, without a cursor: up to the server's 200 items) read for the tasks titled
-    exactly title (case and outer spaces aside; a deleted task is still listed, closed): (HTTP status, "found" when
-    one's notes, the commitment's description, hold note and none is left open; "open" when the note is there but a
-    task of that title is still open; "absent" when no such task is there, or none's notes hold it; "beyond" when none
-    is there and the page has more after it, so the run cannot tell). Only the title and the note are looked for;
-    nothing read is kept or printed."""
-    status, data = read_json(base, token, NOTE_PATH, get)
-    if status != 200:
-        return status, "absent"
-    tasks = [task for task in listed(data, "commitments")
-             if isinstance(task.get("title"), str) and task["title"].strip().lower() == title.lower()]
-    if not tasks:
-        more = isinstance(data, dict) and isinstance(data.get("next_cursor"), str) and data["next_cursor"] != ""
-        return status, "beyond" if more else "absent"
-    if not any(isinstance(task.get("description"), str) and note in task["description"] for task in tasks):
-        return status, "absent"
-    return status, "open" if any(task.get("status") not in CLOSED for task in tasks) else "found"
+    """The Agenda read page by page (GET NOTE_PATH, then each next_cursor, at most MAX_AGENDA_PAGES) for the tasks
+    titled exactly title (case and outer spaces aside), open or closed: the reads come before the run's tag cleanup
+    cancels it, and a cancelled task stays listed. (HTTP status, "found" when one's notes, the commitment's
+    description, hold note; "absent" when every page was read and none does; "beyond" when the pages ran out first, so
+    the run cannot tell.) The Agenda puts undated tasks last, oldest first, so a new task is on the last page once the
+    shared account holds more than a page. Only the title and the note are looked for; nothing read is kept or printed."""
+    cursor, status = None, 0
+    for _ in range(MAX_AGENDA_PAGES):
+        status, data = read_json(base, token, NOTE_PATH + (f"?cursor={urllib.parse.quote(cursor)}" if cursor else ""),
+                                 get)
+        if status != 200:
+            return status, "absent"
+        if any(isinstance(task.get("title"), str) and task["title"].strip().lower() == title.lower() and
+               isinstance(task.get("description"), str) and note in task["description"]
+               for task in listed(data, "commitments")):
+            return status, "found"
+        cursor = data.get("next_cursor") if isinstance(data, dict) else None
+        if not (isinstance(cursor, str) and cursor):
+            return status, "absent"
+    return status, "beyond"
 
 
 # A one-off (coordinator, 26 Oct): earlier notes runs typed their note into the shared account's "file taxes" task
@@ -736,6 +757,63 @@ def open_chat(base, token, tag, post=urllib.request.urlopen):
     if chat is None:
         return NO_CHAT
     return True if first_message(base, token, chat, tag, post) else NO_FIRST
+
+
+def may_chat(base, token, get=urllib.request.urlopen):
+    """May's own chat on the account (GET /v1/agents, the one is_primary): its id, or None. Nothing is printed."""
+    status, data = read_json(base, token, "/v1/agents", get)
+    found = [row["id"] for row in listed(data, "agents") if status == 200 and row.get("is_primary") is True and
+             isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
+    return found[0] if len(found) == 1 else None
+
+
+def open_card(base, token, tag, post=urllib.request.urlopen):
+    """A card row's staging: CARD_LINE in May's chat (keyed by the tag), then one For you suggestion with the tag
+    (CARD_PATH, 201). True, or the reason it could not start (NO_LINE or NO_CARD); nothing of a reply is kept."""
+    may = may_chat(base, token, post)
+    if may is None:
+        return NO_LINE
+    request = urllib.request.Request(
+        base + f"/v1/conversations/{may}/messages", method="POST",
+        data=json.dumps({"client_message_id": tag + "-line", "body": CARD_LINE.replace("{tag}", tag)}).encode(),
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            if reply.status not in (200, 202):
+                return NO_LINE
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return NO_LINE
+    request = urllib.request.Request(base + CARD_PATH, method="POST",
+                                     data=json.dumps({"tag": tag, "kinds": ["suggestion"]}).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            items = json.loads(reply.read(1024 * 1024)).get("items")
+            return True if reply.status == 201 and isinstance(items, list) and len(items) == 1 else NO_CARD
+    except (urllib.error.URLError, TimeoutError, ValueError, AttributeError):
+        return NO_CARD
+
+
+def own_card(row, entry, base, token, own, carded):
+    """Whether a scenario may start: True, or, for a row with "card" whose staging failed (carded: open_card), False
+    with entry's reason NO_LINE or NO_CARD."""
+    if not row.get("card"):
+        return True
+    at(f"{row['id']}: staging its card")
+    staged = carded(base, token, own)
+    if staged is True:
+        return True
+    entry["reason"] = NO_CARD if staged == NO_CARD else NO_LINE
+    return False
+
+
+def look_verdict(looks):
+    """A card row's verdict from its chat looks (device_agent.looks): the first decides."""
+    if not looks:
+        return {"verdict": UNVERIFIED, "reason": LOOK_UNREAD}
+    if looks[0]["shown"] > 0:
+        return {"verdict": "pass", "reason": None}
+    return {"verdict": "fail", "reason": LOOK_SCROLLED if any(look["shown"] > 0 for look in looks[1:]) else LOOK_EMPTY}
 
 
 def tag_cleanup(accounts, base, secret, since, tag, minted, cleaned):
@@ -966,9 +1044,13 @@ def launch(adb, env, token, log):
     try:
         with log.open("rb") as output:
             output.seek(mark)
-            said = output.read(MAX_DIAG // 8)
+            said = output.read(MAX_DIAG // 8 + 1)
     except OSError:
         said = b""
+    # Cut at a line's end, never inside one: launch_diagnostics redacts line by line, and a token cut short would no
+    # longer match its pattern or the session (review of may-releases #136).
+    if len(said) > MAX_DIAG // 8:
+        said = said[:said.rfind(b"\n", 0, MAX_DIAG // 8) + 1]
     raise LaunchFailed(said)
 
 
@@ -1132,10 +1214,10 @@ class Diagnostics:
 LAUNCH_LOG_LINES = 1000
 
 
-def launch_diagnostics(adb, env, folder, scenario, token, said):
+def launch_diagnostics(adb, env, folder, scenario, token, said, emulator=b""):
     """Writes <scenario>.diag.txt for a launch that failed; the lines it dropped, or None when nothing was written.
-    Never an error."""
-    sections = ((b"am start", said or b""),
+    Never an error. emulator: emulator_section's text, first and at most MAX_DIAG // 16."""
+    sections = (*(((b"emulator", emulator[:MAX_DIAG // 16]),) if emulator else ()), (b"am start", said or b""),
                 (b"logcat crash,main", adb_output(adb, env, ["logcat", "-d", "-t", str(LAUNCH_LOG_LINES), "-b",
                                                              "crash,main"]) or b""),
                 (b"dumpsys activity top", adb_output(adb, env, ["shell", "dumpsys", "activity", "top"]) or b""))
@@ -1170,6 +1252,76 @@ ANIMATION_SETTINGS = ("window_animation_scale", "transition_animation_scale", "a
 ANIMATION_SCALE = "1"
 
 
+# Coordinator, 28 Oct (run 40666988126, both attempts): the emulator was gone after chat (poll's diag holds adb's "no
+# devices/emulators found"), and nothing said why: its own output went to the private run log, which is never sealed,
+# and its exit, the host's memory and the kernel's OOM kills were never read. The emulator and its system image are
+# installed unpinned (flows.install_sdk), so the log names their versions, digits and dots alone. The emulator's output
+# goes to EMULATOR_LOG; on a launch failure the scenario's sealed .diag.txt starts with emulator_section (its exit
+# status, adb's state, the host's available memory and OOM kills since boot, its output's last EMULATOR_LINES lines and
+# the kernel's last KERNEL_LINES, through kept_lines), and the public log gives the state and counts alone.
+EMULATOR_LOG, EMULATOR_LINES, KERNEL_LINES = "emulator.log", 200, 50
+MEMINFO, VMSTAT = Path("/proc/meminfo"), Path("/proc/vmstat")
+EMULATOR_VERSION = re.compile(rb"version ([0-9]{1,3}(?:\.[0-9]{1,6}){1,3})")
+IMAGE_REVISION = re.compile(rb"^Pkg\.Revision=([0-9]{1,4}(?:\.[0-9]{1,4}){0,2})[ \t\r]*$", re.MULTILINE)
+ADB_STATES = ("device", "offline", "unauthorized", "bootloader", "recovery")
+
+
+def emulator_versions(home, env):
+    """(the emulator's version, its system image's revision), each digits and dots alone, or "unknown"."""
+    try:
+        done = bounded_output([flows.sdk_tool(home, "emulator/emulator"), "-version"], env)
+    except flows.FlowsError:
+        done = None
+    found = EMULATOR_VERSION.search(done[1]) if done is not None and done[0] == 0 else None
+    try:
+        image = home.joinpath(*flows.SYSTEM_IMAGE.split(";"), "source.properties").read_bytes()[:65536]
+    except OSError:
+        image = b""
+    revision = IMAGE_REVISION.search(image)
+    return (found[1].decode() if found else "unknown"), (revision[1].decode() if revision else "unknown")
+
+
+def host_number(path, key):
+    """One whole number from a /proc file's "key value" line (meminfo's in kB), or None."""
+    try:
+        text = path.read_text(errors="replace")[:65536]
+    except OSError:
+        return None
+    found = re.search(rf"^{re.escape(key)}:?[ \t]+([0-9]{{1,15}})\b", text, re.MULTILINE)
+    return int(found[1]) if found else None
+
+
+def emulator_state(adb, env, emulator, kills_at_boot):
+    """(exit status or None while it runs, adb's state word or "none", MB available on the host or None, OOM kills
+    since boot or None): numbers and fixed words alone, for the public log."""
+    said = adb_output(adb, env, ["-s", SERIAL, "get-state"]) or b""
+    state = said.strip().decode("ascii", "replace")
+    kills = host_number(VMSTAT, "oom_kill")
+    available = host_number(MEMINFO, "MemAvailable")
+    return (emulator.poll(), state if state in ADB_STATES else "none", None if available is None else available // 1024,
+            None if kills is None or kills_at_boot is None else kills - kills_at_boot)
+
+
+def emulator_section(state, log):
+    """The sealed section of a launch failure: emulator_state's values, then the emulator's last output lines and the
+    kernel's (dmesg, when the runner lets it be read)."""
+    exited, adb_state, available, kills = state
+    try:
+        with (log.parent / EMULATOR_LOG).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - MAX_DIAG // 16))
+            output = b"".join(stream.read().splitlines(keepends=True)[-EMULATOR_LINES:])
+    except OSError:
+        output = b"(no emulator output)\n"
+    kernel = bounded_output(["dmesg"], child_env())
+    kernel = b"".join(kernel[1].splitlines(keepends=True)[-KERNEL_LINES:]) if kernel is not None and kernel[0] == 0 \
+        else b"(the kernel's messages could not be read)\n"
+    return (f"exit status: {'running' if exited is None else exited}\nadb state: {adb_state}\n"
+            f"host memory available: {'unknown' if available is None else available} MB\n"
+            f"host OOM kills since boot: {'unknown' if kills is None else kills}\n").encode() + \
+        b"-- emulator output --\n" + output + b"-- kernel --\n" + kernel
+
+
 def boot(root, log):
     """The emulator, as flows.run starts it (API 35 image, KVM, no window), with animations at ANIMATION_SCALE: (adb,
     process, env)."""
@@ -1182,6 +1334,7 @@ def boot(root, log):
                            "-n", AVD, "-k", flows.SYSTEM_IMAGE, "-d", flows.DEVICE], input=b"no\n", stdout=output,
                           stderr=output, env=env).returncode:
             raise DeviceTestsError("The emulator's virtual device could not be created; no scenario ran")
+    with (log.parent / EMULATOR_LOG).open("ab") as output:
         emulator = subprocess.Popen([flows.sdk_tool(home, "emulator/emulator"), "-avd", AVD, "-no-window", "-no-audio",
                                      "-no-boot-anim", "-no-snapshot", "-gpu", "swiftshader_indirect"],
                                     stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=env)
@@ -1553,6 +1706,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     tag, since = run_tag("android"), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     at("booting the emulator")
     adb, emulator, env = boot(root, log)
+    kills_at_boot = host_number(VMSTAT, "oom_kill")
+    version, revision = emulator_versions(flows.sdk(), env)
+    print(f"May device tests (android): emulator {version}, system image revision {revision}")
     results, records, cleaned_count = [], {}, None
     try:
         at("installing the app")
@@ -1615,7 +1771,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 launch(adb, env, token, log)
             except LaunchFailed as failed:
                 # The report and the diagnostics are kept and sealed; the scenarios after it are not started.
-                dropped = launch_diagnostics(adb, env, folder, row["id"], token, failed.said)
+                state = emulator_state(adb, env, emulator, kills_at_boot)
+                dropped = launch_diagnostics(adb, env, folder, row["id"], token, failed.said,
+                                             emulator_section(state, log))
                 if dropped is not None:
                     diagnostics.kept += 1
                     diagnostics.dropped[row["id"]] = dropped
@@ -1625,6 +1783,11 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 halted = True
                 print("May device tests (android): May Playground did not start on the emulator after one retry; the "
                       "run stopped there, and its diagnostics are sealed")
+                exited, adb_state, available, kills = (("running" if state[0] is None else state[0]), state[1],
+                                                       "unknown" if state[2] is None else state[2],
+                                                       "unknown" if state[3] is None else state[3])
+                print(f"May device tests (android): the emulator then: exit status {exited}, adb {adb_state}, "
+                      f"{available} MB available on the host, {kills} OOM kills since boot")
                 continue
             recorder = Recorder(adb, env, row["id"], log)
             recorder.start()
@@ -1693,7 +1856,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     accounts.report("android")
 
 
-def combined(entry, record, judged, sends=False):
+def combined(entry, record, judged, sends=False, look=False):
     """An agent scenario's verdict from its run, the judge and the server truth; the smoke scenario's from Maestro, its
     agent run and the judge, never "pass". For one that sends May a message (sends), the server's delivery codes
     outrank the screen: every code must be succeeded, and chats that could not be read leave it not judged."""
@@ -1719,6 +1882,8 @@ def combined(entry, record, judged, sends=False):
         return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
     if "maestro" in entry:
         return {"verdict": SMOKE_PASS, "reason": None}
+    if look:
+        return look_verdict(record.get("looks"))
     if not entry["server"]:
         return {"verdict": "ui-pass", "reason": UNCONFIGURED}
     # A pass needs the screen and every server read; a read that failed is a fail, one that could not tell is
@@ -1780,6 +1945,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
     goals = {row["id"]: row["goal"] for row in scenarios("all", platform) if row["driver"] == "agent"}
     rows = {row["id"]: row for row in scenarios("all", platform)}
     sending = {row["id"] for row in scenarios("all", platform) if sends_messages(row)}
+    looking = {row["id"] for row in scenarios("all", platform) if row.get("card")}
     goals.update((row["id"], row["goal"]) for row in smoke_rows(platform))
     pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
     token = model = None
@@ -1800,7 +1966,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
                                    private / "judge" / entry["id"], token, model)
             except (OSError, subprocess.SubprocessError, KeyError):
                 judged = ("error", "")
-        verdict_reason = combined(entry, record, judged, entry["id"] in sending)
+        verdict_reason = combined(entry, record, judged, entry["id"] in sending, entry["id"] in looking)
         entry["agent"] = sealed_agent(record)
         entry["verdict"] = verdict_reason["verdict"]
         entry.pop("reason", None)

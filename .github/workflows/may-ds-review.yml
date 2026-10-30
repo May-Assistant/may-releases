@@ -1,0 +1,88 @@
+name: Claude code review of a may-design-system pull request (posted on the pull request, never in this log)
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open, ready-for-review May-Assistant/may-design-system pull request against main or claude/may-integration (not from a fork)
+        required: true
+        type: string
+  # Every 15 minutes: the fetch step picks at most one design-system pull request waiting for a review (review.py pick).
+  schedule:
+    - cron: "*/15 * * * *"
+permissions:
+  contents: read
+concurrency:
+  group: may-ds-review
+  cancel-in-progress: false
+jobs:
+  admission:
+    # The design system's pull requests get the same independent review as may-app's (coordinator, 30 Oct: tests alone
+    # are not the merge rule), from here and in the same shape as may-app-review.yml: may-design-system is private and
+    # this repository public, so nothing from it (code, diff, file names, transcript or model output) is printed,
+    # summarised, uploaded or cached; the review's output stays in files under $RUNNER_TEMP/may-review, removed at the
+    # end, and this log carries only fixed lines, numbers and logins (review.py --target ds). The model has no shell,
+    # no gh and no token: it reads the pull request as files under /tmp/may-review-view and comments through
+    # review_mcp.py. Admission checks the input and may-claude-review's policy, as for may-app. One run at a time.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 -I -S -B tools/may_release/review.py admit --pr-number "$MAY_PR_NUMBER" --target ds
+  review:
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 60
+    # Only admission reads the environment's policy (actions: read); this job needs no API scope of its own.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_DS_REVIEW_TOKEN, before any pull request code
+        id: ci-ds-review
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-design-system
+          permission-contents: read
+          permission-pull-requests: write
+      # The code-review command, from the same pinned commit as claude-code-review.yml (2026-09-29).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anthropics/claude-code
+          ref: 0d7f14dd352fa67affd4e172eb1b6f524dbd709e
+          path: .claude-marketplace/claude-code
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check the pull request and fetch its head quietly
+        env:
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_DS_REVIEW_TOKEN: ${{ steps.ci-ds-review.outputs.token || secrets.MAY_DS_REVIEW_TOKEN }}
+          MAY_REVIEW_APP_SLUG: ${{ steps.ci-ds-review.outputs.app-slug }}
+        run: python3 -I -S -B tools/may_release/review.py fetch --pr-number "$MAY_PR_NUMBER" --target ds
+      - name: Install the pinned Claude Code release, checked against its sha512
+        run: python3 -I -S -B tools/may_release/review.py install --target ds
+      - name: Review and post on the pull request, with nothing from the review in this log
+        env:
+          MAY_PR_NUMBER: ${{ inputs.pr_number }}
+          MAY_DS_REVIEW_TOKEN: ${{ steps.ci-ds-review.outputs.token || secrets.MAY_DS_REVIEW_TOKEN }}
+          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}
+        run: python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER" --target ds
+      - name: Remove private source, transcripts and the review's output
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-review" /tmp/may-review-view

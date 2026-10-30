@@ -22,7 +22,7 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
                   "DsCompileError", "CompilePrError", "RehearsalError", "UnitTestsError", "UnitPostError",
-                  "BackendTestsError", "BackendPostError", "FeedbackError"}
+                  "BackendTestsError", "BackendPostError", "FeedbackError", "DsTestsError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -238,10 +238,14 @@ CI_MINTS = {
     "ci-comment": ("MAY_APP_PR_COMMENT_TOKEN", "may-app", (("pull-requests", "write"),)),
     "ci-ds-read": ("MAY_DS_PR_READ_TOKEN", "may-design-system", (("pull-requests", "read"),)),
     "ci-ds-comment": ("MAY_DS_PR_COMMENT_TOKEN", "may-design-system", (("pull-requests", "write"),)),
+    # ds_tests.py status sets the may-ds-tests commit status on the tested design-system head (statuses).
+    "ci-ds-status": ("MAY_DS_STATUS_TOKEN", "may-design-system", (("statuses", "write"),)),
     # review.py fetches the head over HTTPS (contents) and posts its review and STARTED marker (pull requests).
     "ci-review": ("MAY_APP_REVIEW_TOKEN", "may-app", (("contents", "read"), ("pull-requests", "write"))),
     # testflight_feedback.py lists may-app's testflight-feedback issues and files new ones (issues).
     "ci-issues": ("MAY_APP_ISSUES_TOKEN", "may-app", (("issues", "write"),)),
+    # The same for a may-design-system pull request (may-ds-review.yml, review.py --target ds).
+    "ci-ds-review": ("MAY_DS_REVIEW_TOKEN", "may-design-system", (("contents", "read"), ("pull-requests", "write"))),
     # publish.py device-release creates the run's may-renders release and uploads its assets (contents).
     "renders-release": ("MAY_RENDERS_RELEASE_TOKEN", "may-renders", (("contents", "write"),)),
 }
@@ -249,7 +253,8 @@ CI_MINTS = {
 WORKFLOW_MINTS = {
     # native runs the pull request's build code as the runner, so it mints nothing and the App key is never referenced
     # there: the read token is minted in pull, the comment token in post (reviews of #130 and #133).
-    "native-compile-pr.yml": {"pull": ("ci-read",), "swift-checks": ("ci-read", "ci-comment"), "post": ("ci-comment",)},
+    "native-compile-pr.yml": {"pull": ("ci-read",), "swift-checks": ("ci-read", "ci-comment"),
+                              "core": ("ci-read", "ci-comment"), "post": ("ci-comment",)},
     "android-unit-pr.yml": {"unit": ("ci-read", "ci-comment")},
     "ios-archive-rehearsal.yml": {"rehearsal": ("ci-read",)},
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
@@ -259,13 +264,36 @@ WORKFLOW_MINTS = {
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
     "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
     "may-app-review.yml": {"review": ("ci-review",)},
+    "may-ds-review.yml": {"review": ("ci-ds-review",)},
     "device-tests.yml": {"publish": ("renders-release",)},
     "testflight-feedback.yml": {"feedback": ("ci-issues",)},
+    # ds-tests-pr.yml splits like native-compile-pr.yml: swift and android run the design system's code and mint
+    # nothing; the read token is minted in pull, the comment token in post.
+    "ds-tests-pr.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment", "ci-ds-status")},
+    "ds-tests-schedule.yml": {"pick": ("ci-ds-read",)},
 }
 FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          persist-credentials: false\n"
 # review.py's schedule passes over heads whose STARTED marker is the token's own user's; an installation token has no
 # user (GET /user), so the fetch step, where the schedule picks, is told the app's slug: the marker is the app bot's.
-REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n"
+REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{{{ steps.{}.outputs.app-slug }}}}\n"
+# Each review mint: the fetch step's run line, which the slug sits right above.
+REVIEW_FETCHES = {"ci-review": 'review.py fetch --pr-number "$MAY_PR_NUMBER"\n',
+                  "ci-ds-review": 'review.py fetch --pr-number "$MAY_PR_NUMBER" --target ds\n'}
+# Each post is told its comment app's slug, so only that bot's own comments are edited or count as this head's
+# earlier post (review of may-releases #137): {(workflow, job): (the comment mint, the post step's run line it sits
+# right above)}.
+COMMENT_SLUG_POSTS = {
+    ("native-compile-pr.yml", "post"): ("ci-comment", "compile_pr_errors.py post "),
+    ("native-compile-pr.yml", "swift-checks"): ("ci-comment", "swift_checks.py post "),
+    ("ios-core-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
+    ("native-compile-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
+    ("ios-renders.yml", "publish"): ("ci-comment", "publish.py comment "),
+    ("ds-swift-compile.yml", "native"): ("ci-ds-comment", "ds_compile.py post "),
+}
+
+
+def comment_slug(step_id):
+    return f"          MAY_CI_APP_SLUG: ${{{{ steps.{step_id}.outputs.app-slug }}}}\n"
 APP_TOKEN_TRACES = ("create-github-app-token", CI_APP_ID, CI_APP_KEY, RENDERS_APP_ID, RENDERS_APP_KEY, "steps.ci-",
                     "steps.renders-", "MAY_REVIEW_APP_SLUG")
 
@@ -317,12 +345,17 @@ def unminted(workflow_name, text):
             if f": {either}\n" not in body:
                 found.append(name + f"job {job} mints {step_id} but never hands its token on in place of {secret}")
             body = body.replace(f": {either}\n", f": ${{{{ secrets.{secret} }}}}\n")
-            if step_id == "ci-review":
-                fetch_step = 'review.py fetch --pr-number "$MAY_PR_NUMBER"\n'
-                if body.count(REVIEW_SLUG) != 1 or REVIEW_SLUG + "        run: python3 -I -S -B tools/may_release/" + \
-                        fetch_step not in body:
+            if step_id in REVIEW_FETCHES:
+                slug = REVIEW_SLUG.format(step_id)
+                if body.count(slug) != 1 or slug + "        run: python3 -I -S -B tools/may_release/" + \
+                        REVIEW_FETCHES[step_id] not in body:
                     found.append(name + "the fetch step is not told the May CI app's slug exactly once")
-                body = body.replace(REVIEW_SLUG, "")
+                body = body.replace(slug, "")
+            if COMMENT_SLUG_POSTS.get((workflow_name, job), (None,))[0] == step_id:
+                line, run = comment_slug(step_id), COMMENT_SLUG_POSTS[(workflow_name, job)][1]
+                if body.count(line) != 1 or line + "        run: python3 -I -S -B tools/may_release/" + run not in body:
+                    found.append(name + f"job {job}'s post is not told the May CI app's slug exactly once")
+                body = body.replace(line, "")
         text = text[:span[0]] + body + text[span[1]:]
     if any(trace in text for trace in APP_TOKEN_TRACES):
         found.append(name + "a GitHub App token is minted or used other than by its pinned, narrowed step right after "
@@ -922,14 +955,31 @@ SWIFT_STEP_NAMES = ["Check the pull request head and environment before fetching
                     "Post the failing Swift checks on the may-app pull request, never in this log",
                     "Remove private source and logs"]
 PR_READ_SECRET, PR_COMMENT_SECRET = "MAY_APP_PR_READ_TOKEN", "MAY_APP_PR_COMMENT_TOKEN"
+# The native job's result, on the post alone: what it posts when no sealed record reached it (compile_pr_errors.py).
+COMPILE_PR_RESULT = ("MAY_NATIVE_RESULT", "${{ needs.native.result }}")
 COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT} | \
+                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT, COMPILE_PR_RESULT} | \
     {(name, "${{ secrets." + name + " }}")
      for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET, COMPILE_PR_DECRYPT)}
 
 
 @with_app_tokens("native-compile-pr.yml")
 def compile_pr_workflow_problems(text):
+    """compile_pr_shape_problems, after the core job: ios-core-pr.yml's own core job exactly (coordinator, 30 Oct:
+    #1493 merged with a failing MayCore test the compile alone could not see), so every compile dispatch runs MayCore's
+    swift test too, held to everything ios_core_workflow_problems holds that job to, and then taken out."""
+    name = "native-compile-pr.yml"
+    span, found = job_span(text, "core"), []
+    own = unminted("ios-core-pr.yml", (ROOT / ".github/workflows/ios-core-pr.yml").read_text())[0]
+    if span is None or job_span(own, "core") is None or \
+            text[span[0]:span[1]].strip("\n") != own[slice(*job_span(own, "core"))].strip("\n"):
+        found.append(name + ": its core job is not exactly ios-core-pr.yml's core job")
+    else:
+        text = text[:span[0]] + "\n" + text[span[1]:].lstrip("\n")
+    return found + compile_pr_shape_problems(text)
+
+
+def compile_pr_shape_problems(text):
     """The pull-request compile is exactly: dispatch with a pull request number and its head, read-only, admission, then
     pull and swift-checks, then native, then post, each but admission in the environment admission chose; the PR
     token in each recheck alone (pull's and swift-checks', never native's: native references no App key or token), the
@@ -1018,10 +1068,14 @@ def compile_pr_workflow_problems(text):
             secrets_in(opener) != {COMPILE_PR_DECRYPT} or \
             set(env_entries(opener)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), COMPILE_PR_RECIPIENT,
                                          (COMPILE_PR_DECRYPT, "${{ secrets." + COMPILE_PR_DECRYPT + " }}")} or \
-            text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or \
+            text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or text.count("needs.native.result") != 1 or \
+            set(env_entries(post)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
+                                       ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RESULT,
+                                       (PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")} or \
             any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + ": a secret or env entry other than the pull request check's PR token, the fetch step's two "
-                     "source-read keys, the seal's public key, the open's decrypt key and the post's comment token")
+                     "source-read keys, the seal's public key, the open's decrypt key and the post's comment token and "
+                     "native's result")
     if "GITHUB_ENV" in text or "GITHUB_PATH" in text or "${{ inputs." in "\n".join(runs):
         found.append(name + ": carries values to later steps or interpolates inputs into shell")
     return found
@@ -1177,13 +1231,14 @@ RENDERS_RUNS = [
     '"$RUNNER_TEMP/may-publish-git"']
 RENDERS_UPLOAD = (
     "name: Hand over only the encrypted renders\n"
+    "        id: handover\n"
     "        uses: " + UPLOAD_ARTIFACT + " # v4\n"
     "        with:\n"
     "          name: may-ios-renders-${{ github.run_attempt }}\n"
     "          path: ${{ runner.temp }}/may-renders-sealed/renders.age\n"
     "          if-no-files-found: ignore\n"
     "          retention-days: 1\n")
-RENDERS_DOWNLOAD = ("name: may-ios-renders-${{ github.run_attempt }}\n"
+RENDERS_DOWNLOAD = ("name: may-ios-renders-${{ needs.render.outputs.attempt }}\n"
                     "          path: ${{ runner.temp }}/may-renders-download\n")
 RENDERS_CONDITIONS = ["if: inputs.pr_number != ''", "if: always()",
                       "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
@@ -1192,7 +1247,12 @@ RENDERS_SECRETS = set(COMPILE_SECRETS) | {PR_READ_SECRET, PR_COMMENT_SECRET, REN
 RENDERS_INPUTS = {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
                   ("MAY_DS_SHA", "${{ inputs.ds_sha }}")}
 RENDERS_RECIPIENT = ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")
-RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}"), RENDERS_RECIPIENT} | \
+# The render job's outputs (run 41068959429): the attempt whose artifact publish downloads, and the upload's artifact id,
+# which the decrypt step is told so that renders handed over but missing fail the run instead of publishing nothing.
+RENDERS_OUTPUTS = ("    outputs:\n      attempt: ${{ github.run_attempt }}\n"
+                   "      handed: ${{ steps.handover.outputs.artifact-id }}\n    steps:\n")
+RENDERS_HANDED = ("MAY_RENDERS_HANDED", "${{ needs.render.outputs.handed }}")
+RENDERS_ENV = RENDERS_INPUTS | {("GH_TOKEN", "${{ github.token }}"), RENDERS_RECIPIENT, RENDERS_HANDED} | \
     {(name, "${{ secrets." + name + " }}") for name in RENDERS_SECRETS}
 
 
@@ -1255,6 +1315,8 @@ def renders_workflow_problems(text):
             secrets_in(post) != {PR_COMMENT_SECRET} or any(secrets_in(chunk) for chunk in others) or \
             text.count("GH_TOKEN") != 2 or "GH_TOKEN" in fetch or text.count("vars.") != 2 or \
             RENDERS_RECIPIENT not in env_entries(seal) or RENDERS_RECIPIENT not in env_entries(decrypt) or \
+            RENDERS_HANDED not in env_entries(decrypt) or text.count("MAY_RENDERS_HANDED") != 1 or \
+            RENDERS_OUTPUTS not in job_text(text, "render") or text.count("outputs:") != 2 or \
             any(e not in RENDERS_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
                      "the decrypt key, the write key, the comment token (each in its one step) and the inputs")
@@ -1363,13 +1425,19 @@ DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
 DEVICE_REDUCE_MOTION = ("MAY_IOS_REDUCE_MOTION", "${{ inputs.ios_reduce_motion }}")
 DEVICE_REDUCE_MOTION_INPUT = ("      ios_reduce_motion:\n        description: [^\n]+\n        required: false\n"
                               "        type: boolean\n        default: false\n")
-# Evidence runs alone (coordinator, 26 Oct): the iOS app's watchdog and SwiftUI change log (may-app #1338), asked for at
-# launch, in the iOS scenarios step alone.
+# The iOS app's watchdog (may-app #1338), asked for at launch, in the iOS scenarios step alone: on unless dispatched
+# false, so the nightly run (no inputs) has it too (coordinator, 26 Oct: runs 40309200520 and 40319309252 showed no
+# measurable cost). SwiftUI's change log has its own input, off unless dispatched true (may-app #1302: it brought the
+# idle hang back).
 DEVICE_DIAGNOSTICS = ("MAY_IOS_DIAGNOSTICS", "${{ inputs.ios_diagnostics }}")
 DEVICE_DIAGNOSTICS_INPUT = ("      ios_diagnostics:\n        description: [^\n]+\n        required: false\n"
+                            "        type: boolean\n        default: true\n")
+DEVICE_LOG_CHANGES = ("MAY_IOS_LOG_CHANGES", "${{ inputs.ios_log_changes }}")
+DEVICE_LOG_CHANGES_INPUT = ("      ios_log_changes:\n        description: [^\n]+\n        required: false\n"
                             "        type: boolean\n        default: false\n")
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
-              ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS} | DEVICE_VARS | \
+              ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS,
+              DEVICE_LOG_CHANGES} | DEVICE_VARS | \
     {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
 
 
@@ -1382,13 +1450,15 @@ def device_tests_workflow_problems(text):
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion",
-                                                             "ios_diagnostics", "tidy_file_taxes"] or \
-            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean"] or \
+                                                             "ios_diagnostics", "ios_log_changes", "tidy_file_taxes"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean",
+                                                                 "boolean"] or \
             not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or not re.search(DEVICE_DIAGNOSTICS_INPUT, trigger) or \
+            not re.search(DEVICE_LOG_CHANGES_INPUT, trigger) or \
             not re.search(DEVICE_TIDY_INPUT, trigger) or \
             re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
         found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion, "
-                     "ios_diagnostics and tidy_file_taxes booleans, plus one nightly schedule")
+                     "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans, plus one nightly schedule")
     if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     jobs = ("admission", "android", "ios", "publish")
@@ -1460,7 +1530,8 @@ def device_tests_workflow_problems(text):
             any(model not in env_entries(chunk) for chunk in (scenarios, judge, ios_scenarios, ios_judge)) or \
             staging not in env_entries(ios_scenarios) or DEVICE_REDUCE_MOTION not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_reduce_motion") != 1 or DEVICE_DIAGNOSTICS not in env_entries(ios_scenarios) or \
-            text.count("inputs.ios_diagnostics") != 1 or \
+            text.count("inputs.ios_diagnostics") != 1 or DEVICE_LOG_CHANGES not in env_entries(ios_scenarios) or \
+            text.count("inputs.ios_log_changes") != 1 or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
@@ -1477,7 +1548,10 @@ def device_tests_workflow_problems(text):
 DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "skipped", "ran", "cleaned_count", "platform",
                        "made", "deleted", "kept", "status",
                        "smoke_passed", "stage", "detail", "missing", "anrs", "crashes", "dropped", "revoked",
-                       "unrevoked", "waited", "network", "unverified", "tasks", "lines", "mixed", "saved"}
+                       "unrevoked", "waited", "network", "unverified", "tasks", "lines", "mixed", "saved",
+                       # The emulator's version and its image's revision (digits and dots, or "unknown"), and, after a
+                       # launch failure, its exit status, adb's state word, the host's MB available and OOM kills.
+                       "version", "revision", "exited", "adb_state", "available", "kills"}
 
 
 def device_tests_print_problems(root):
@@ -1999,7 +2073,16 @@ SCHEDULES = {
          "Dispatch the backend checks for the picked head, with no may-app credential",
          "Remove the carried numbers"],
         "May backend checks for may-app #{number} at {sha}", "actions/workflows/backend-unit-pr.yml/dispatches"),
+    "ds-tests-schedule.yml": (
+        "ds_tests_schedule.py", "may-ds-tests-schedule", "may-ds-tests-ci",
+        ["List the design-system test runs of the last 30 days, with no design-system credential",
+         "Pick the oldest may-design-system head with no run yet, with no GitHub token",
+         "Dispatch the design-system tests for the picked head, with no design-system credential",
+         "Remove the carried numbers"],
+        "May DS tests for may-design-system #{number} at {sha}", "actions/workflows/ds-tests-pr.yml/dispatches"),
 }
+# The pull-request read token each schedule's pick holds (may-app's, unless named here).
+SCHEDULE_READ_SECRETS = {"ds-tests-schedule.yml": "MAY_DS_PR_READ_TOKEN"}
 SCHEDULE = "android-ci-schedule.yml"
 SCHEDULE_TOOL = SCHEDULES[SCHEDULE][0]
 SCHEDULE_DISPATCH = SCHEDULES[SCHEDULE][5]
@@ -2054,8 +2137,9 @@ def schedule_workflow_problems(workflow, text):
     listed, picked, dispatched, clean = (by_name.get(n, "") for n in step_names)
     gate = steps["admission"][1][1] if len(steps["admission"]) > 1 else ""
     token = [("GH_TOKEN", "${{ github.token }}")]
-    if secrets_in(text) != {PR_READ_SECRET} or text.count("secrets." + PR_READ_SECRET) != 1 or \
-            env_entries(picked) != [(PR_READ_SECRET, "${{ secrets." + PR_READ_SECRET + " }}")] or \
+    read_secret = SCHEDULE_READ_SECRETS.get(workflow, PR_READ_SECRET)
+    if secrets_in(text) != {read_secret} or text.count("secrets." + read_secret) != 1 or \
+            env_entries(picked) != [(read_secret, "${{ secrets." + read_secret + " }}")] or \
             env_entries(listed) != token or env_entries(dispatched) != token or env_entries(gate) != token or \
             "env:" in clean or text.count("github.token") != 3 or re.search(r"(?m)^(    )?env:", text) or \
             "${{ inputs." in text:
@@ -2209,6 +2293,178 @@ def testflight_feedback_tool_problems(root):
     tree = ast.parse(path.read_text())
     if any(isinstance(n, ast.Constant) and n.value in ("DELETE", "PATCH", "PUT") for n in ast.walk(tree)):
         found.append(FEEDBACK_TOOL + ": it names a method that deletes or changes feedback or an issue")
+    return found
+
+
+# The design system's own suites at a may-design-system pull request head (ds-tests-pr.yml, ds_tests.py; Samuel, 28
+# Oct), dispatched by ds-tests-schedule.yml (ds_tests_schedule.py, pinned with the other schedules above).
+# may-design-system is private and this repository public, so the workflow is pinned whole, job by job and step by
+# step: dispatch with exactly pr_number and source_sha, read-only permissions, admission then pull, swift and android
+# in the environment admission chose (may-ds-renders), the read token minted in pull alone and the comment token in post
+# alone, the read key in each suite's fetch alone and nothing else secret in the suites' jobs, each suite's only upload
+# its sealed record (one day), the decrypt key in open alone, and no step summary or carried value. ds_tests.py prints
+# only fixed lines, its inputs and counts.
+DS_TESTS = "ds-tests-pr.yml"
+DS_TESTS_SCHEDULE = "ds-tests-schedule.yml"
+DS_TESTS_TOOL = "ds_tests.py"
+_DSI = {"sha": ("MAY_DS_SHA", "${{ inputs.source_sha }}"), "pr": ("MAY_DS_PR", "${{ inputs.pr_number }}")}
+_DS_GATE = 'python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
+_DS_FETCH = ("Fetch the exact design-system commit quietly", None,
+             [_DSI["sha"], _DSI["pr"], ("MAY_DS_READ_KEY", "${{ secrets.MAY_DS_READ_KEY }}")],
+             'python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"')
+_DS_AGE = ("Install pinned age, before any pull request code", None, [],
+           "python3 -I -S -B tools/may_release/toolchain.py age")
+
+
+def _ds_suite_steps(suite, title, extra, cleanup):
+    return extra + [_DS_AGE, _DS_FETCH,
+                    (f"Run the {title} suite without any credential, printing only pass or fail and counts", None,
+                     [_DSI["sha"]], f'python3 -I -S -B tools/may_release/ds_tests.py {suite} --ds-sha "$MAY_DS_SHA"'),
+                    (f"Seal the {title} record for the post job, with no secret", None,
+                     [_DSI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")],
+                     f'python3 -I -S -B tools/may_release/ds_tests.py seal --suite {suite} --ds-sha "$MAY_DS_SHA"'),
+                    (f"Hand over only the sealed {title} record", UPLOAD_ARTIFACT, [], None),
+                    (f"Fail if the {title} suite did not pass", None, [],
+                     f"python3 -I -S -B tools/may_release/ds_tests.py verdict --suite {suite}"),
+                    (cleanup[0], None, [], cleanup[1])]
+
+
+# job: (runs-on, needs, timeout, [(step name, uses, env entries, run)]) after the checkout (and, in pull and post, the
+# mint, which unminted takes out first).
+DS_TESTS_JOBS = {
+    "admission": ("ubuntu-24.04", None, None, [("", None, [("GH_TOKEN", "${{ github.token }}"), _DSI["sha"], _DSI["pr"]],
+                                                _DS_GATE)]),
+    "pull": ("ubuntu-24.04", "admission", 10, [
+        ("Check the design-system pull request head and environment before fetching", None,
+         [("GH_TOKEN", "${{ github.token }}"), ("MAY_DS_PR_READ_TOKEN", "${{ secrets.MAY_DS_PR_READ_TOKEN }}"), _DSI["sha"],
+          _DSI["pr"]], _DS_GATE + " --check-pull")]),
+    "swift": ("macos-15", "[admission, pull]", 75, _ds_suite_steps("swift", "Swift", [], (
+        "Remove the design-system checkout, logs and products",
+        'rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-derived" '
+        '"$RUNNER_TEMP/may-ds-packages" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"'))),
+    "android": ("ubuntu-24.04", "[admission, pull]", 75, _ds_suite_steps("android", "Android", [
+        ("Install the pinned, checksum-verified JDK", None, [], "python3 -I -S -B tools/may_release/toolchain.py jdk")], (
+        "Remove the design-system checkout, logs, Gradle home and the pinned JDK",
+        'rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-gradle" '
+        '"$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"'))),
+    "post": ("ubuntu-24.04", "[admission, swift, android]", 10, [
+        ("Install pinned age", None, [], "python3 -I -S -B tools/may_release/toolchain.py age"),
+        ("", DOWNLOAD_ARTIFACT, [], None), ("", DOWNLOAD_ARTIFACT, [], None),
+        ("Decrypt and check the suite records", None,
+         [_DSI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}"),
+          ("MAY_RENDERS_DECRYPT_KEY", "${{ secrets.MAY_RENDERS_DECRYPT_KEY }}")],
+         'python3 -I -S -B tools/may_release/ds_tests.py open --ds-sha "$MAY_DS_SHA"'),
+        ("Set the may-ds-tests commit status on the design-system head, with counts alone", None,
+         [_DSI["sha"], ("MAY_DS_STATUS_TOKEN", "${{ secrets.MAY_DS_STATUS_TOKEN }}"),
+          ("MAY_SWIFT_RESULT", "${{ needs.swift.result }}"), ("MAY_ANDROID_RESULT", "${{ needs.android.result }}")],
+         'python3 -I -S -B tools/may_release/ds_tests.py status --ds-sha "$MAY_DS_SHA"'),
+        ("Post both suites' results on the design-system pull request, never in this log", None,
+         [_DSI["sha"], _DSI["pr"], ("MAY_DS_PR_COMMENT_TOKEN", "${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}"),
+          ("MAY_SWIFT_RESULT", "${{ needs.swift.result }}"), ("MAY_ANDROID_RESULT", "${{ needs.android.result }}")],
+         'python3 -I -S -B tools/may_release/ds_tests.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'),
+        ("Remove the decrypted records", None, [],
+         'rm -rf -- "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-download" "$RUNNER_TEMP/may-tools"')]),
+}
+DS_TESTS_PRINT_VALUES = {"suite", "verdict", "total", "failed", "skipped", "len(found)", "number", "state",
+                         "'passed' if passed else 'failed'"}
+DS_TESTS_EXIT_CLASSES = {"GateDenial", "DsTestsError", "DsCompileError", "StoreError"}
+
+
+@with_app_tokens(DS_TESTS)
+def ds_tests_workflow_problems(text):
+    name, found = DS_TESTS + ": ", []
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or "--export" in text:
+        found.append(name + "writes a step summary or carries an environment")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"] or \
+            "\nrun-name: 'May DS tests for may-design-system #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\n" \
+            not in text:
+        found.append(name + "top-level keys or run-name are not exactly as ds_tests_schedule.py reads them")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly pr_number and source_sha")
+    if "\nconcurrency:\n  group: may-ds-tests\n  cancel-in-progress: false\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group, never cancelling a run")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r"(?m)^\s+[\w-]+:\s*write\b", text) or \
+            any(job_text(text, job).count(JOB_PERMISSIONS) != 1 for job in DS_TESTS_JOBS):
+        found.append(name + "permissions are not read-only everywhere")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(DS_TESTS_JOBS):
+        found.append(name + "jobs are not exactly admission, pull, swift, android and post")
+    for job, (runner, needs, timeout, expected) in DS_TESTS_JOBS.items():
+        header, steps = job_steps(text, job)
+        body = job_text(text, job)
+        if f"    runs-on: {runner}\n" not in header or \
+                (needs is None) != ("    needs:" not in header) or (needs and f"    needs: {needs}\n" not in header) or \
+                (timeout is None) != ("timeout-minutes:" not in header) or \
+                (timeout and f"    timeout-minutes: {timeout}\n" not in header) or \
+                (job != "admission") != ("    environment: ${{ needs.admission.outputs.environment }}\n" in header) or \
+                (job == "admission" and re.search(r"(?m)^    environment:", header)):
+            found.append(name + f"job {job}'s runner, needs, timeout or environment is not as pinned")
+        condition = "    if: ${{ !cancelled() && needs.admission.result == 'success' }}\n"
+        if (job == "post") != (condition in header) or re.search(r"(?m)^    if:", header.replace(condition, "")):
+            found.append(name + f"job {job} runs on a condition other than post's (every suite finished)")
+        if not steps or uses_in(steps[0][1]) != [CHECKOUT] or "persist-credentials: false" not in steps[0][1]:
+            found.append(name + f"job {job} does not start with the pinned checkout, without credentials")
+            continue
+        actual = [(step, (uses_in(chunk) or [None])[0], env_entries(chunk), (run_commands(chunk) or [None])[0])
+                  for step, chunk in steps[1:]]
+        if actual != expected:
+            found.append(name + f"job {job}'s steps, their environments or commands are not exactly as pinned")
+        for step, chunk in steps[1:]:
+            cond = step_condition(chunk)
+            if cond not in (None, "always()") or (cond == "always()") != step.startswith("Remove "):
+                found.append(name + f"job {job} has a step condition other than the cleanup's always()")
+            if "continue-on-error" in chunk and DOWNLOAD_ARTIFACT not in chunk:
+                found.append(name + f"job {job} lets a step other than a download fail quietly")
+    for suite in ("swift", "android"):
+        upload = next((c for s, c in job_steps(text, suite)[1] if UPLOAD_ARTIFACT in c), "")
+        if f"          name: may-ds-tests-{suite}-${{{{ github.run_attempt }}}}\n" not in upload or \
+                f"          path: ${{{{ runner.temp }}}}/may-ds-tests-sealed/{suite}.age\n" not in upload or \
+                "          retention-days: 1\n" not in upload or "          if-no-files-found: ignore\n" not in upload:
+            found.append(name + f"{suite}'s upload is not its sealed record alone, kept one day")
+    downloads = [c for s, c in job_steps(text, "post")[1] if DOWNLOAD_ARTIFACT in c]
+    if [bool(re.search(rf"name: may-ds-tests-{s}-\$\{{\{{ github.run_attempt \}}\}}\n.*may-ds-tests-download/{s}\n",
+                       c, re.S)) for s, c in zip(("swift", "android"), downloads)] != [True, True] or \
+            text.count(UPLOAD_ARTIFACT) != 2 or text.count(DOWNLOAD_ARTIFACT) != 2:
+        found.append(name + "post does not download exactly the two sealed records")
+    if secrets_in(text) != {"MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_RENDERS_DECRYPT_KEY", "MAY_DS_PR_COMMENT_TOKEN",
+                            "MAY_DS_STATUS_TOKEN"} \
+            or text.count("secrets.MAY_DS_READ_KEY") != 2 or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret is held outside its one step")
+    return found
+
+
+@with_app_tokens(DS_TESTS_SCHEDULE)
+def ds_tests_schedule_workflow_problems(text):
+    return schedule_workflow_problems(DS_TESTS_SCHEDULE, text)
+
+
+def ds_tests_schedule_tool_problems(root):
+    found = schedule_tool_problems(root, DS_TESTS_SCHEDULE)
+    path = root / "tools/may_release" / SCHEDULES[DS_TESTS_SCHEDULE][0]
+    tree = ast.parse(path.read_text())
+    reader = function_source(tree, "ds_get")
+    if reader is None or "APP_REPO" in ast.unparse(tree) or "DS_REPO}/{path}" not in ast.unparse(reader) or \
+            not ast.unparse(reader.body[1]).startswith("if not re.fullmatch("):
+        found.append(SCHEDULES[DS_TESTS_SCHEDULE][0] + ": reads something other than may-design-system's open pull "
+                     "requests, through ds_get")
+    return found
+
+
+def ds_tests_print_problems(root):
+    found = quiet_tool_problems(root, DS_TESTS_TOOL, DS_TESTS_PRINT_VALUES, DS_TESTS_EXIT_CLASSES)
+    path = root / "tools/may_release" / DS_TESTS_TOOL
+    if assigned_literal(path, "MARKER") != "may-ds-tests" or assigned_literal(path, "MAX_RECORD") != 262144:
+        found.append(DS_TESTS_TOOL + ": its marker or sealed record size is not as pinned")
+    tree = ast.parse(path.read_text())
+    post = function_source(tree, "post")
+    if post is None or "post_once(call_api, DS_REPO" not in ast.unparse(post) or \
+            "validate_ds_pull_request" not in ast.unparse(post):
+        found.append(DS_TESTS_TOOL + ": post does not read the pull request again before posting once on it")
+    if assigned_literal(path, "STATUS_CALL") != r"/repos/May-Assistant/may-design-system/statuses/[0-9a-f]{40}" or \
+            assigned_literal(path, "CONTEXT") != "may-ds-tests":
+        found.append(DS_TESTS_TOOL + ": its status call or context is not as pinned")
     return found
 
 
@@ -2477,6 +2733,9 @@ REVIEW_INSTALL = "python3 -I -S -B tools/may_release/review.py install"
 REVIEW_RUN = 'python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER"'
 REVIEW_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-review" /tmp/may-review-view'
 REVIEW_RUNS = [REVIEW_GATE, REVIEW_FETCH, REVIEW_INSTALL, REVIEW_RUN, REVIEW_CLEANUP]
+# may-ds-review.yml (coordinator, 30 Oct) is the same workflow for a may-design-system pull request: its own
+# concurrency group and review token, and each of review.py's steps with --target ds.
+DS_REVIEW_RUNS = [run + " --target ds" for run in REVIEW_RUNS[:-1]] + [REVIEW_CLEANUP]
 REVIEW_SCHEDULE = '  schedule:\n    - cron: "*/15 * * * *"'
 REVIEW_STEP_NAMES = ["Check the pull request and fetch its head quietly",
                      "Install the pinned Claude Code release, checked against its sha512",
@@ -2486,13 +2745,26 @@ REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN = "MAY_APP_REVIEW_TOKEN", "MAY_REVIEW_CLAUDE_T
 REVIEW_PLUGIN_CHECKOUT = ("        with:\n          repository: anthropics/claude-code\n"
                           "          ref: 0d7f14dd352fa67affd4e172eb1b6f524dbd709e\n          path: .claude-marketplace/claude-code\n"
                           "          fetch-depth: 1\n          persist-credentials: false\n")
-REVIEW_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
-              (REVIEW_TOKEN, "${{ secrets." + REVIEW_TOKEN + " }}"), (REVIEW_CLAUDE_TOKEN, "${{ secrets." + REVIEW_CLAUDE_TOKEN + " }}")}
+# Each review workflow: (its concurrency group, its review token, its run lines).
+REVIEW_FLAVOURS = {"may-app-review.yml": ("may-app-review", REVIEW_TOKEN, REVIEW_RUNS),
+                   "may-ds-review.yml": ("may-ds-review", "MAY_DS_REVIEW_TOKEN", DS_REVIEW_RUNS)}
 
 
 @with_app_tokens("may-app-review.yml")
 def review_workflow_problems(text):
-    name = "may-app-review.yml"
+    return review_shape_problems(text, "may-app-review.yml")
+
+
+@with_app_tokens("may-ds-review.yml")
+def ds_review_workflow_problems(text):
+    return review_shape_problems(text, "may-ds-review.yml")
+
+
+def review_shape_problems(text, name):
+    group, review_token, review_runs = REVIEW_FLAVOURS[name]
+    review_env = {("GH_TOKEN", "${{ github.token }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
+                  (review_token, "${{ secrets." + review_token + " }}"),
+                  (REVIEW_CLAUDE_TOKEN, "${{ secrets." + REVIEW_CLAUDE_TOKEN + " }}")}
     found = []
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
@@ -2501,7 +2773,7 @@ def review_workflow_problems(text):
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number"] or \
             not re.search(r"(?m)^        type: string$", trigger) or REVIEW_SCHEDULE not in trigger or trigger.count("cron:") != 1:
         found.append(name + ": is not dispatched with exactly a pr_number, and scheduled every 15 minutes, only")
-    if "\nconcurrency:\n  group: may-app-review\n  cancel-in-progress: false\n" not in text:
+    if f"\nconcurrency:\n  group: {group}\n  cancel-in-progress: false\n" not in text:
         found.append(name + ": does not run one at a time in its own concurrency group, never cancelling a run")
     # Only admission reads the environment's policy (actions: read); review has contents: read alone (review of #21, M3).
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
@@ -2513,7 +2785,7 @@ def review_workflow_problems(text):
     if "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "review"):
         found.append(name + ": a job runs somewhere other than ubuntu-24.04")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
-    if runs != REVIEW_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+    if runs != review_runs or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
         found.append(name + ": runs something other than review.py's admit, fetch, install and review, and the cleanup")
     steps = {job: job_steps(text, job)[1] for job in ("admission", "review")}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
@@ -2535,10 +2807,10 @@ def review_workflow_problems(text):
     by_name = dict(steps["review"])
     fetch, install = by_name.get(REVIEW_STEP_NAMES[0], ""), by_name.get(REVIEW_STEP_NAMES[1], "")
     run, cleanup = by_name.get(REVIEW_STEP_NAMES[2], ""), by_name.get(REVIEW_STEP_NAMES[3], "")
-    if secrets_in(text) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or text.count("secrets." + REVIEW_TOKEN) != 2 or \
-            text.count("secrets." + REVIEW_CLAUDE_TOKEN) != 1 or secrets_in(fetch) != {REVIEW_TOKEN} or \
-            secrets_in(run) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or "env:" in install or "env:" in cleanup or \
-            any(e not in REVIEW_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text) or \
+    if secrets_in(text) != {review_token, REVIEW_CLAUDE_TOKEN} or text.count("secrets." + review_token) != 2 or \
+            text.count("secrets." + REVIEW_CLAUDE_TOKEN) != 1 or secrets_in(fetch) != {review_token} or \
+            secrets_in(run) != {review_token, REVIEW_CLAUDE_TOKEN} or "env:" in install or "env:" in cleanup or \
+            any(e not in review_env for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text) or \
             "GH_TOKEN" in job:
         found.append(name + ": a secret or env entry other than the review token in fetch and review and the Claude token in review")
     if "claude-code-action" in text or "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or \
@@ -2613,6 +2885,7 @@ def control_problems(root):
     found += compile_workflow_problems(compile_workflow)
     found += compile_pr_workflow_problems((flows / "native-compile-pr.yml").read_text())
     found += review_workflow_problems((flows / "may-app-review.yml").read_text())
+    found += ds_review_workflow_problems((flows / "may-ds-review.yml").read_text())
     found += review_tool_problems(root)
     found += ds_compile_workflow_problems((flows / DS_COMPILE).read_text())
     found += ds_compile_print_problems(root)
@@ -2637,6 +2910,10 @@ def control_problems(root):
     found += device_tests_print_problems(root)
     found += testflight_feedback_workflow_problems((flows / FEEDBACK).read_text())
     found += testflight_feedback_tool_problems(root)
+    found += ds_tests_workflow_problems((flows / DS_TESTS).read_text())
+    found += ds_tests_print_problems(root)
+    found += ds_tests_schedule_workflow_problems((flows / DS_TESTS_SCHEDULE).read_text())
+    found += ds_tests_schedule_tool_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

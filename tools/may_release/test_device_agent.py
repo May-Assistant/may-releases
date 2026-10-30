@@ -205,6 +205,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
                          [["succeeded"], None, ["succeeded"]])
         self.assertEqual(run_out.splitlines(), [
+            "May device tests (android): emulator unknown, system image revision unknown",
             "May device tests (android): network ready after 4 s",
             # This may-app fixture has no onboarding subflow, so each agent starts from launch and the log says so.
             *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"
@@ -650,41 +651,48 @@ class ServerTruthTests(unittest.TestCase):
         tag, note = "qa-39557415738-notes task", "qa-39557415738-notes note from the device test"
         asked = []
 
-        def get(body, status=200):
+        def get(pages, status=200):
+            """pages: the Agenda's pages by cursor (None for the first)."""
             def reply(request, timeout):
                 asked.append(request.full_url)
                 if status != 200:
                     raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
-                return FakeReply(json.dumps(body).encode())
+                cursor = request.full_url.partition("?cursor=")[2] or None
+                return FakeReply(json.dumps(pages[cursor]).encode())
             return reply
 
-        mine = {"title": "qa-39557415738-notes task", "description": note, "status": "cancelled"}
+        mine = {"title": "qa-39557415738-notes task", "description": note, "status": "accepted"}
         other = {"title": "qa-39557415738-notes-old task", "description": note, "status": "cancelled"}
         taxes = {"title": "file taxes", "description": "keep receipts\n" + note, "status": "accepted"}
-        cases = (({"commitments": [{"title": "file taxes", "description": None}, mine], "next_cursor": None},
-                  200, (200, "found")),
-                 ({"commitments": [dict(mine, status="completed")], "next_cursor": None}, 200, (200, "found")),
-                 ({"commitments": [dict(mine, title=" QA-39557415738-notes Task ")], "next_cursor": None},
-                  200, (200, "found")),
-                 ({"commitments": [dict(mine, status="accepted")], "next_cursor": None}, 200, (200, "open")),
-                 ({"commitments": [mine, dict(mine, description=None, status="accepted")], "next_cursor": None},
-                  200, (200, "open")),
-                 ({"commitments": [dict(mine, description="qa-39557415738-notes note from the d")], "next_cursor": None},
-                  200, (200, "absent")),
-                 ({"commitments": [taxes], "next_cursor": None}, 200, (200, "absent")),
-                 ({"commitments": [dict(mine, title="qa-39557415738-notes task copy")], "next_cursor": None},
-                  200, (200, "absent")),
-                 ({"commitments": [dict(mine, description=None)], "next_cursor": "c2"}, 200, (200, "absent")),
-                 ({"commitments": [other, taxes], "next_cursor": "c2"}, 200, (200, "beyond")),
-                 ({"commitments": [other], "next_cursor": None}, 200, (200, "absent")),
-                 ({"commitments": [], "next_cursor": ""}, 200, (200, "absent")),
-                 ({"commitments": [mine]}, 401, (401, "absent")),
-                 ([mine], 200, (200, "found")))
-        for body, status, expected in cases:
-            with self.subTest(body=body, status=status):
-                self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(body, status)),
+        one = lambda *tasks: {None: {"commitments": list(tasks), "next_cursor": None}}
+        cases = ((one({"title": "file taxes", "description": None}, mine), 200, (200, "found")),
+                 # Open (the reads come before the tag cleanup) or closed alike.
+                 (one(dict(mine, status="cancelled")), 200, (200, "found")),
+                 (one(dict(mine, status="completed")), 200, (200, "found")),
+                 (one(dict(mine, title=" QA-39557415738-notes Task ")), 200, (200, "found")),
+                 (one(dict(mine, description="qa-39557415738-notes note from the d")), 200, (200, "absent")),
+                 (one(taxes), 200, (200, "absent")),
+                 (one(dict(mine, title="qa-39557415738-notes task copy")), 200, (200, "absent")),
+                 (one(other), 200, (200, "absent")),
+                 ({None: {"commitments": [], "next_cursor": ""}}, 200, (200, "absent")),
+                 (one(mine), 401, (401, "absent")),
+                 ({None: [mine]}, 200, (200, "found")),
+                 # The new task on a later page: the Agenda puts undated tasks last, oldest first.
+                 ({None: {"commitments": [other, taxes], "next_cursor": "c2"},
+                   "c2": {"commitments": [taxes], "next_cursor": "c3"},
+                   "c3": {"commitments": [mine], "next_cursor": None}}, 200, (200, "found")),
+                 ({None: {"commitments": [other], "next_cursor": "c2"},
+                   "c2": {"commitments": [taxes], "next_cursor": None}}, 200, (200, "absent")))
+        for pages, status, expected in cases:
+            with self.subTest(pages=pages, status=status):
+                self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(pages, status)),
                                  expected)
-        self.assertEqual(set(asked), {"https://s/v1/commitments"}, "the first page alone, no cursor")
+        asked.clear()
+        endless = {None: {"commitments": [other], "next_cursor": "c"}, "c": {"commitments": [other], "next_cursor": "c"}}
+        self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(endless)), (200, "beyond"),
+                         "pages that never end are unverified, never a pass or a fail")
+        self.assertEqual(len(asked), device_tests.MAX_AGENDA_PAGES)
+        self.assertEqual(asked[:2], ["https://s/v1/commitments", "https://s/v1/commitments?cursor=c"])
 
     def test_make_chat_posts_the_tagged_name_with_the_session_and_reads_its_id(self):
         seen = []
@@ -762,6 +770,92 @@ class ServerTruthTests(unittest.TestCase):
                 self.assertFalse(device_tests.own_chat({"chat": True, "id": "poll"}, entry, "https://s", TOKEN, "qa-1",
                                                        lambda base, token, tag: opened))
                 self.assertEqual(entry["reason"], reason)
+
+    def test_a_card_row_seeds_a_line_in_mays_chat_then_one_for_you_card(self):
+        """N, 30 Oct: the blank-chat test opens May's chat from a For you card, so staging gives that chat a message and
+        seeds the card (a suggestion, fresh accounts alone) before the app starts."""
+        seen = []
+
+        def post(answers):
+            def answer(request, timeout):
+                seen.append((request.full_url, request.get_method(), request.data and json.loads(request.data),
+                             request.headers.get("Authorization")))
+                status, body = answers.pop(0)
+                if status >= 400:
+                    raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+                reply = FakeReply(json.dumps(body).encode())
+                reply.status = status
+                return reply
+            return answer
+
+        tag, may = "qa-39557415738-i-chat-open-from-card", "0f0e0d0c-0b0a-4908-8706-050403020100"
+        agents = {"agents": [{"id": "a-other", "is_primary": False}, {"id": may, "is_primary": True}]}
+        self.assertIs(device_tests.open_card("https://s", TOKEN, tag, post([(200, agents), (202, {}),
+                                                                             (201, {"items": [{"id": "i1"}]})])), True)
+        self.assertEqual(seen, [
+            ("https://s/v1/agents", "GET", None, "Bearer " + TOKEN),
+            (f"https://s/v1/conversations/{may}/messages", "POST",
+             {"client_message_id": tag + "-line", "body": device_tests.CARD_LINE.replace("{tag}", tag)}, "Bearer " + TOKEN),
+            ("https://s/v1/auth/test-session/for-you", "POST", {"tag": tag, "kinds": ["suggestion"]}, "Bearer " + TOKEN)])
+        two = {"agents": [{"id": may, "is_primary": True}, {"id": "b", "is_primary": True}]}
+        # Each case carries the answers a wrongly taken later step would get, so taking it fails on the reason.
+        later = [(202, {}), (201, {"items": [{"id": "i1"}]})]
+        for answers, reason in (([(200, {"agents": [{"id": may}]}), *later], device_tests.NO_LINE),
+                                ([(200, two), *later], device_tests.NO_LINE),
+                                ([(401, {}), *later], device_tests.NO_LINE),
+                                ([(200, agents), (429, {})], device_tests.NO_LINE),
+                                ([(200, agents), (202, {}), (403, {"error": "fresh_only"})], device_tests.NO_CARD),
+                                ([(200, agents), (202, {}), (201, {"items": []})], device_tests.NO_CARD),
+                                ([(200, agents), (202, {}), (200, {"items": [{"id": "i1"}]})], device_tests.NO_CARD)):
+            with self.subTest(answers=answers):
+                self.assertEqual(device_tests.open_card("https://s", TOKEN, tag, post(list(answers))), reason)
+        for entry_reason in (device_tests.NO_LINE, device_tests.NO_CARD):
+            with self.subTest(reason=entry_reason), patch("sys.stdout", io.StringIO()):
+                entry = {}
+                self.assertFalse(device_tests.own_card({"card": True, "id": "c"}, entry, "https://s", TOKEN, "qa-1",
+                                                       lambda base, token, tag: entry_reason))
+                self.assertEqual(entry["reason"], entry_reason)
+                self.assertIn(entry_reason, publish.REASONS)
+        self.assertTrue(device_tests.own_card({"id": "chat"}, {}, "https://s", TOKEN, "qa-1", None),
+                        "a row without a card stages none")
+        self.assertIs(inspect.signature(device_ios.run_scenarios).parameters["carded"].default, device_tests.open_card)
+
+    def test_the_first_look_at_the_chat_decides_a_card_rows_verdict(self):
+        """N, 30 Oct: a message on screen when the chat opens passes; none then but some once scrolled is the bug."""
+        record, judged = {"state": "ok", "outcome": "completed"}, ("pass", "")
+        cases = (([{"shown": 3, "shot": None}], ("pass", None)),
+                 ([{"shown": 2, "shot": None}, {"shown": 0, "shot": None}], ("pass", None)),
+                 ([{"shown": 0, "shot": None}, {"shown": 4, "shot": None}], ("fail", device_tests.LOOK_SCROLLED)),
+                 ([{"shown": 0, "shot": None}, {"shown": 0, "shot": None}], ("fail", device_tests.LOOK_EMPTY)),
+                 ([{"shown": 0, "shot": None}], ("fail", device_tests.LOOK_EMPTY)),
+                 ([], (device_tests.UNVERIFIED, device_tests.LOOK_UNREAD)),
+                 (None, (device_tests.UNVERIFIED, device_tests.LOOK_UNREAD)))
+        for looks, expected in cases:
+            with self.subTest(looks=looks):
+                found = device_tests.combined({"server": []}, dict(record, looks=looks), judged, look=True)
+                self.assertEqual((found["verdict"], found["reason"]), expected)
+        self.assertEqual(device_tests.combined({"server": []}, dict(record, looks=[]), judged)["verdict"], "ui-pass",
+                         "a row without a card is judged as before")
+        self.assertEqual(device_tests.combined({"server": []}, dict(record, looks=[{"shown": 3}]), ("fail", ""),
+                                               look=True)["verdict"], "fail", "the judge still has to pass it")
+        for reason in (device_tests.LOOK_SCROLLED, device_tests.LOOK_EMPTY, device_tests.LOOK_UNREAD):
+            self.assertIn(reason, publish.REASONS)
+
+    def test_the_card_row_is_fresh_ios_only_and_opens_the_seeded_card(self):
+        rows = {row["id"]: row for row in device_tests.scenarios("all", "ios")}
+        card = rows["chat-open-from-card"]
+        self.assertEqual((card["card"], card["fresh"], card["platforms"], card["truth"]), (True, True, ["ios"], []))
+        self.assertIn(device_tests.CARD_GOAL, card["goal"])
+        self.assertNotIn("chat-open-from-card", [row["id"] for row in device_tests.scenarios("all", "android")])
+        self.assertEqual(list(rows)[-2:], ["chat-open-from-card", "onboarding"], "onboarding still runs last")
+        listed = json.loads(device_tests.SCENARIOS.read_text())
+        for change in ({"fresh": False}, {"platforms": ["android", "ios"]}, {"truth": [{"get": "/v1/inbox"}]},
+                       {"card": "yes"}, {"chat": True}, {"goal": card["goal"].replace("Book the dentist", "Pay")}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "scenarios.json"
+                path.write_text(json.dumps([dict(row, **change) if row["id"] == card["id"] else row for row in listed]))
+                with patch("device_tests.SCENARIOS", path), self.assertRaises(device_tests.DeviceTestsError):
+                    device_tests.scenarios("all", "ios")
 
     def test_tidy_removes_only_whole_leftover_note_lines_from_file_taxes(self):
         """Coordinator, 26 Oct: earlier notes runs left their lines in the shared account's "file taxes" task."""
@@ -1664,19 +1758,22 @@ class IosDeviceServerTests(unittest.TestCase):
             failing = self.failing.get("act" if argv[-1].endswith("act.yaml") else argv[-1])
             if failing is not None:
                 return subprocess.CompletedProcess(argv, 1, b"", failing)
-            out = json.dumps(IOS_TREE).encode() if argv[-1] == "hierarchy" else b""
+            out = json.dumps(getattr(self, "tree", IOS_TREE)).encode() if argv[-1] == "hierarchy" else b""
             return subprocess.CompletedProcess(argv, 0, out, b"")
 
         with patch("device_mcp.subprocess.run", side_effect=run):
             return device_mcp.call(name, args, self.config)
 
-    def test_three_refused_acts_in_a_row_stop_the_agent_blocked(self):
-        """Run 40203481816: every iOS act after the first refusal was refused too, 90 s each (coordinator, 25 Oct)."""
-        with patch("device_mcp.flow", side_effect=[1, 1, 0, 1, 1, 1]) as flow:
-            answers = [self.call("tap", x=180, y=120) for _ in range(5)]
-            self.assertEqual([failed for failed, _ in answers], [True, True, False, True, True],
+    def test_two_refused_acts_in_a_row_stop_the_agent_blocked(self):
+        """Run 40203481816: every iOS act after the first refusal was refused too, 90 s each (coordinator, 25 Oct). Run
+        40309200520: three still cost 9 minutes a scenario, so two in a row now stop it (coordinator, 26 Oct)."""
+        with patch("device_mcp.flow", side_effect=[1, 0, 1, 0, 1, 1]) as flow:
+            answers = [self.call("tap", x=180, y=120) for _ in range(4)]
+            self.assertEqual([failed for failed, _ in answers], [True, False, True, False],
                              "a taken act starts the count again")
             self.assertFalse(self.config["wedged"])
+            self.assertTrue(self.call("tap", x=180, y=120)[0])
+            self.assertFalse(self.config["wedged"], "one refusal alone does not stop it")
             failed, content = self.call("tap", x=180, y=120)
         self.assertTrue(failed)
         self.assertEqual(content[0]["text"], device_mcp.WEDGED_TEXT)
@@ -1695,6 +1792,63 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertEqual(verdict, {"verdict": "fail", "reason": device_tests.WEDGED},
                          "a stopped agent is never a pass, and the report says why")
         self.assertIn(device_tests.WEDGED, publish.REASONS)
+
+    def test_a_snapshot_timeout_after_a_read_that_timed_out_stops_the_agent_at_once(self):
+        """Run 40309200520: the chat's snapshot never came back; one more refusal there only spends another minute. Its
+        diagnostics: in poll-skip and onboarding the tap was COMPLETED and the screen never settled (a settle timeout),
+        which counts toward the two in a row and never stops it alone (independent review of #139)."""
+        def refused_with(cause):
+            def flow(config, command):
+                config["refusal_cause"] = cause
+                return 1
+            return flow
+
+        for read, act, wedged in (("snapshot timeout", "snapshot timeout", True), (None, "snapshot timeout", False),
+                                  (None, "settle timeout", False), ("snapshot timeout", "settle timeout", False),
+                                  ("snapshot timeout", "lost connection", False), ("not idle", "snapshot timeout", False)):
+            with self.subTest(read=read, act=act):
+                self.config.update(refusals=0, wedged=False, dump_cause=read)
+                with patch("device_mcp.flow", side_effect=refused_with(act)):
+                    failed, content = self.call("tap", x=180, y=120)
+                self.assertTrue(failed)
+                self.assertEqual(self.config["wedged"], wedged)
+                self.assertEqual(content[0]["text"] == device_mcp.WEDGED_TEXT, wedged)
+
+    def test_a_settle_timeout_counts_toward_two_in_a_row(self):
+        def refused(config, command):
+            config["refusal_cause"] = "settle timeout"
+            return 1
+
+        with patch("device_mcp.flow", side_effect=refused):
+            self.call("tap", x=180, y=120)
+            self.assertFalse(self.config["wedged"], "one slow settle while a reply streams does not end the scenario")
+            failed, content = self.call("tap", x=180, y=120)
+        self.assertEqual((failed, content[0]["text"], self.config["wedged"]), (True, device_mcp.WEDGED_TEXT, True))
+
+    def test_a_taken_act_clears_an_earlier_reads_time_out(self):
+        """Independent review of #139: a read that timed out before an act that was taken says nothing of the screen
+        after it, so a later snapshot timeout alone does not stop the agent."""
+        def refused(config, command):
+            config["refusal_cause"] = "snapshot timeout"
+            return 1
+
+        self.config.update(dump_cause="snapshot timeout")
+        with patch("device_mcp.flow", return_value=0):
+            self.assertFalse(self.call("tap", x=180, y=120)[0])
+        self.assertIsNone(self.config["dump_cause"])
+        with patch("device_mcp.flow", side_effect=refused):
+            failed, content = self.call("tap", x=180, y=120)
+        self.assertTrue(failed)
+        self.assertFalse(self.config["wedged"])
+        self.assertNotEqual(content[0]["text"], device_mcp.WEDGED_TEXT)
+
+    def test_each_act_is_held_act_seconds_at_most(self):
+        seen = []
+        with patch("device_mcp.tool", side_effect=lambda config, argv, timeout=90, both=False: seen.append(timeout) or
+                   (0, b"")):
+            device_mcp.flow(self.config, "- back")
+        self.assertEqual(seen, [device_mcp.ACT_SECONDS])
+        self.assertLessEqual(device_mcp.ACT_SECONDS, 60)
 
     def test_each_act_is_one_fixed_maestro_command_in_points(self):
         self.call("tap", x=180, y=120)
@@ -1792,7 +1946,10 @@ class IosDeviceServerTests(unittest.TestCase):
     def test_a_failed_hierarchy_or_refused_act_keeps_the_drivers_cause_in_fixed_words(self):
         """Run 40290647340: "iOS hierarchy failed" said nothing of why; the driver's output is sorted into
         DRIVER_CAUSES and only the word is kept (coordinator, 26 Oct)."""
-        cases = {b"Timed out waiting for the snapshot of the accessibility hierarchy": "snapshot timeout",
+        cases = {b"Tap on point (189,250)... COMPLETED\nWARNING: GL pipe is running in software mode\n\n(timed out)\n":
+                 "settle timeout",
+                 b"Tap on point (133,577)...\n(timed out)\n": "snapshot timeout",
+                 b"Timed out waiting for the snapshot of the accessibility hierarchy": "snapshot timeout",
                  b"Failed to wait for app to idle (quiescence)": "not idle",
                  b"io.grpc.StatusRuntimeException: UNAVAILABLE: Connection refused": "lost connection",
                  b"Application io.github.mayassistant.may.playground is not running": "app not running",
@@ -1800,7 +1957,7 @@ class IosDeviceServerTests(unittest.TestCase):
         for said, cause in cases.items():
             with self.subTest(cause=cause):
                 self.failing = {"hierarchy": said, "act": said}
-                self.config.update(actions=0, refusals=0, done=False, hierarchy="")
+                self.config.update(actions=0, refusals=0, done=False, hierarchy="", wedged=False)
                 self.assertTrue(self.call("tap", x=180, y=120)[0])
                 self.assertFalse(self.call("done", outcome="blocked", summary="stuck")[0])
                 stored = json.loads(Path(self.config["result"]).read_text())
@@ -1813,8 +1970,16 @@ class IosDeviceServerTests(unittest.TestCase):
         stored = json.loads(Path(self.config["result"]).read_text())
         self.assertEqual((stored["hierarchy_failure"], stored["hierarchy_cause"]), (None, None),
                          "a read that worked keeps no cause")
-        self.assertEqual(device_mcp.DRIVER_CAUSES, ("not idle", "snapshot timeout", "lost connection", "app not running",
-                                                    "scale unknown", "other"))
+        self.assertEqual(device_mcp.DRIVER_CAUSES, ("settle timeout", "not idle", "snapshot timeout", "lost connection", "app not running",
+                                                    "scale unknown", "typed nothing", "other"))
+        self.assertEqual(device_mcp.driver_cause(b"Tap on point (201,803)... COMPLETED\nidle\n"), "not idle",
+                         "COMPLETED alone, with no act that ran out of time, is no settle timeout")
+        for typed in (b"Input text COMPLETED...\n(timed out)\n", b"Input text a COMPLETED b...\n(timed out)\n"):
+            with self.subTest(typed=typed):
+                self.assertEqual(device_mcp.driver_cause(typed), "snapshot timeout",
+                                 "typed text holding COMPLETED is not Maestro's status line (independent review of #139)")
+        self.assertEqual(device_mcp.driver_cause(b"Swipe from (1,2) to (3,4)... COMPLETED\n(timed out)\n"),
+                         "settle timeout")
 
     def test_the_hierarchy_is_in_screenshot_pixels(self):
         failed, content = self.call("hierarchy")
@@ -1824,11 +1989,105 @@ class IosDeviceServerTests(unittest.TestCase):
         failed, content = self.call("screenshot")
         self.assertEqual((failed, content[0]["type"]), (False, "image"))
 
+    def test_a_card_rows_reads_count_the_messages_the_chat_shows_and_keep_a_screenshot(self):
+        """N, 30 Oct: a blank chat has no message laid out between its header and its composer; each read that shows
+        the chat keeps how many it shows (never their words) and a screenshot taken at once."""
+        self.config["look"] = True
+        header = {"resource-id": "chat.header", "text": "May", "bounds": "[0,50][393,110]"}
+        composer = {"resource-id": "chat.composer", "bounds": "[0,760][393,840]"}
+        line = {"text": "qa-1 line for the device test", "bounds": "[20,600][380,660]"}
+        reply = {"text": "ready", "bounds": "[20,680][200,720]"}
+        above = {"text": "an older message", "bounds": "[20,0][380,40]"}
+        chrome = {"resource-id": "chat.starter", "text": "Plan my day", "bounds": "[20,500][380,540]"}
+        tree = lambda *nodes: {"attributes": {"bounds": "[0,0][393,852]"},
+                               "children": [{"attributes": node} for node in nodes]}
+        for nodes in ((header, composer, line, reply, above, chrome), (header, composer, above, chrome),
+                      (header, line), (composer, line, reply)):
+            with self.subTest(nodes=[n.get("resource-id") or n.get("text") for n in nodes]), \
+                    patch(__name__ + ".IOS_TREE", tree(*nodes)):
+                self.assertFalse(self.call("hierarchy")[0])
+        looks = json.loads(Path(self.config["result"]).read_text()).get("looks")
+        self.assertEqual(looks, [{"shown": 2, "shot": "look-1.png"}, {"shown": 0, "shot": "look-2.png"}],
+                         "a read without the header or the composer is not a look at the chat")
+        self.assertTrue((self.work / "look-1.png").read_bytes().startswith(b"\x89PNG"))
+        self.assertNotIn("line for the device test", json.dumps(looks))
+        with patch(__name__ + ".IOS_TREE", tree(header, composer, line)):
+            for _ in range(device_mcp.MAX_LOOKS + 2):
+                self.call("hierarchy")
+        self.assertEqual(len(self.config["looks"]), device_mcp.MAX_LOOKS)
+        self.assertEqual(device_agent.looks(self.config["looks"] + [{"shown": "3"}, {"shown": 1, "shot": "../x.png"}]),
+                         self.config["looks"][:device_mcp.MAX_LOOKS])
+        self.assertEqual(device_agent.looks([{"shown": 1, "shot": "../x.png"}]), [{"shown": 1, "shot": None}])
+
+    def test_a_row_without_a_card_counts_no_looks(self):
+        with patch(__name__ + ".IOS_TREE", {"attributes": {}, "children": [
+                {"attributes": {"resource-id": "chat.header", "bounds": "[0,50][393,110]"}},
+                {"attributes": {"resource-id": "chat.composer", "bounds": "[0,760][393,840]"}}]}):
+            self.call("hierarchy")
+        self.assertNotIn("looks", json.loads(Path(self.config["result"]).read_text()))
+        self.assertFalse(list(self.work.glob("look-*.png")))
+        self.assertTrue(device_mcp.settings({"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID,
+                                             "MAY_DEVICE_MAESTRO": "/m", "MAY_DEVICE_LOOK": "chat",
+                                             "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground",
+                                             "MAY_DEVICE_AGENT_RESULT": "/r"})["look"])
+
     def test_no_yaml_or_odd_text_reaches_maestro(self):
         for text in ('a"\n- runScript: x', "a\\b", "x: y\n- openLink: z", "it's"):
             with self.subTest(text=text):
                 self.assertTrue(self.call("type", text=text)[0])
         self.assertEqual(self.flows, [])
+
+    def typed(self, value, text="This is device test qa-123", focused="true"):
+        """One iOS type act whose next hierarchy has a field (focused or not) holding value: (failed, the answer)."""
+        self.tree = {"attributes": {"bounds": "[0,0][393,852]"}, "children": [
+            {"attributes": {"text": "Ask May", "focused": "false", "bounds": "[0,700][393,740]"}},
+            {"attributes": {"value": value, "hintText": "Add notes", "focused": focused, "bounds": "[0,760][393,800]"}}]}
+        failed, content = self.call("type", text=text)
+        return failed, content[0]["text"]
+
+    def test_a_type_says_what_the_focused_field_now_holds(self):
+        """Coordinator, 28 Oct: iOS inputText came back COMPLETED with no text in the field, and the agent heard Done."""
+        self.assertEqual(self.typed("This is device test qa-123"),
+                         (False, "Done. The focused field now reads: 'This is device test qa-123'"))
+        reads = [argv for argv, _ in self.calls if argv[-1] == "hierarchy"]
+        self.assertEqual(len(reads), 1, "one read after the act")
+        self.assertEqual((self.config["refusals"], self.config.get("refusal_cause")), (0, None))
+        self.assertEqual(self.typed("This is device text qa-123.", text="This is device test qa-123")[0], False,
+                         "a word autocorrect changed still leaves the act taken")
+        self.assertEqual(self.typed("write to sam@example.com", text="write to sam@example.com"),
+                         (False, "Done. The focused field now reads: 'write to ***@example.com'"))
+        self.assertEqual(self.typed("token=abc test"), (False, "Done. The focused field now reads: '(hidden)'"))
+
+    def test_a_type_that_left_the_field_without_its_words_is_a_refused_act(self):
+        # An empty field's value can be its placeholder, and the notes goal types "... note ...": neither counts.
+        for value, shown in (("", ""), ("Add notes", ""), ("Notes", "Notes")):
+            with self.subTest(value=value):
+                (self.work / device_mcp.DRIVER_FILE).unlink(missing_ok=True)
+                self.config.update(refusals=0, refusal_cause=None)
+                failed, said = self.typed(value, text="qa-123 note from the device test")
+                self.assertEqual((failed, said),
+                                 (True, f"The device did not take it: the focused field reads {shown!r}"))
+                self.assertEqual((self.config["refusals"], self.config["refusal_cause"]), (1, "typed nothing"))
+                kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
+                self.assertTrue(kept.startswith(b"== refused: - inputText:"), kept[:60])
+                self.assertIn(device_mcp.TYPED_NOTHING_LINE, kept)
+        stored = json.loads(Path(self.config["result"]).read_text())
+        self.assertEqual(stored["refusal_cause"], "typed nothing", "the cause reaches the agent's record")
+        self.assertEqual(device_tests.sealed_agent(stored)["refusal_cause"], "typed nothing")
+        self.assertTrue(publish.agent_ok(device_tests.sealed_agent(stored)), "publish takes the new word")
+        self.typed("")
+        self.assertEqual(self.typed("")[1], device_mcp.WEDGED_TEXT, "typed nothing counts toward the fail-fast")
+
+    def test_a_field_that_cannot_be_read_is_said_and_the_act_stays_taken(self):
+        self.assertEqual(self.typed("", focused="false"),
+                         (False, "Done; the focused field could not be read, so take a hierarchy"))
+        self.failing = {"hierarchy": b"Failed to wait for app to idle (quiescence)"}
+        self.assertEqual(self.typed("")[0], False)
+        self.assertEqual((self.config["refusals"], self.config.get("refusal_cause")), (0, None))
+        self.failing = {"act": b"Timed out"}
+        before = len([argv for argv, _ in self.calls if argv[-1] == "hierarchy"])
+        self.assertEqual(self.typed("")[1], "The device did not take it", "a refused type is not read back")
+        self.assertEqual(len([argv for argv, _ in self.calls if argv[-1] == "hierarchy"]), before)
 
     def test_settings_refuse_an_odd_simulator_or_bundle(self):
         good = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID, "MAY_DEVICE_MAESTRO": "/m",

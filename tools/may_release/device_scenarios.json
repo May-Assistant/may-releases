@@ -74,7 +74,7 @@
     "id": "notes",
     "title": "Add a note to a new agenda task",
     "driver": "agent",
-    "goal": "In May Playground, tap the Agenda tab in the bottom bar (not a chat). Do not open any existing task; create a new one. Add a new task titled {tag} task, then open that task. On its Details tab, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on it, then delete the {tag} task.",
+    "goal": "In May Playground, tap the Agenda tab in the bottom bar (not a chat). Do not open any existing task; create a new one. Add a new task titled {tag} task, then open that task. On its Details tab, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on it.",
     "platforms": [
       "android",
       "ios"
@@ -149,10 +149,24 @@
     ]
   },
   {
+    "id": "chat-open-from-card",
+    "title": "Open May's chat from a For you card and see its messages at once",
+    "driver": "agent",
+    "goal": "In May Playground, tap the For you tab in the bottom bar. Tap the card titled Book the dentist {tag} on its title text, never on its buttons (not Add to Agenda, not Not now). If that opens a thread instead of the May chat, tap Open in May. As soon as the May chat shows, call hierarchy at once: no wait, swipe or screenshot before it. Then swipe up by 10 pixels in the middle of the chat (from y=1200 to y=1190), and call hierarchy again. Then call done: completed once the May chat has opened, whatever it showed.",
+    "card": true,
+    "platforms": [
+      "ios"
+    ],
+    "outward": false,
+    "fresh": true,
+    "server": [],
+    "truth": []
+  },
+  {
     "id": "onboarding",
     "title": "Go through onboarding on a new account",
     "driver": "agent",
-    "goal": "May Playground has just signed in to a new account for device test {tag} and shows its first-run onboarding. Go through it: on Hi, I'm May tap Accept and continue; on the email step and on the phone step tap Not now, never making an address or getting a number; on I have my own computer tap Continue; on Connect your apps tap Not now, never connecting an app; on Make me yours tap Purple, then Continue; on Let me reach you tap Not now, never turning on notifications. Do not type anything or change a setting. You are done, and must stop at once and report success, as soon as you have tapped Not now on Let me reach you, or as soon as the app's main tabs (Chats, Agenda) show, whichever comes first.",
+    "goal": "May Playground has just signed in to a new account for device test {tag} and shows its first-run onboarding. Go through it: on Hi, I'm May tap Accept and continue; on the email step and on the phone step tap Not now, never making an address or getting a number; on I have my own computer tap Continue; on Connect your apps tap Not now, never connecting an app; on Make me yours tap Purple, then Continue; on Let me reach you tap Not now, never turning on notifications; on I'm all set, tap Start chatting. Do not type anything or change a setting. You are done, and must stop at once and report success, as soon as you have tapped Not now on Let me reach you, or as soon as the app's main tabs (Chats, Agenda) show, whichever comes first.",
     "platforms": [
       "android",
       "ios"

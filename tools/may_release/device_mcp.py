@@ -15,7 +15,8 @@ read or write a file, or reach the network itself.
 
 - type takes plain text only (letters, digits, spaces and . , ! : - _ @; never ? or *, a glob in the device shell), so nothing reaches adb's shell as a
   command.
-- On iOS, after FAIL_FAST refused acts in a row, every call but done answers that the agent must stop, blocked.
+- On iOS, after FAIL_FAST refused acts in a row (or one refused on a snapshot timeout right after a screen read that
+  timed out), every call but done answers that the agent must stop, blocked.
 - At most MAX_ACTIONS look or act calls, or a scenario's own steps (MAY_DEVICE_STEPS, up to MOST_ACTIONS); after
   that every call but done answers that the limit is reached.
 - Every call but done rewrites MAY_DEVICE_AGENT_RESULT as unfinished, with the steps so far and the last hierarchy.
@@ -44,10 +45,15 @@ MAX_ACTIONS = 80
 MOST_ACTIONS = 200
 # Run 40203481816: on iOS, every act after the first refusal was refused too, each holding the agent 90 s, so a wedged
 # scenario spent its whole 20 minutes. After FAIL_FAST refused acts in a row the server stops every call but done, and
-# the agent's result says so (coordinator, 25 Oct). iOS alone.
-FAIL_FAST = 3
+# the agent's result says so (coordinator, 25 Oct). iOS alone. Run 40309200520: three refusals, each a 90 s snapshot
+# timeout, still cost poll and poll-skip 9 minutes apiece and chat its budget; the stop now comes at the second refusal
+# in a row, or at once when a refusal's snapshot timeout follows a screen read that timed out too (the screen is not
+# coming back), and each act's Maestro call is held ACT_SECONDS at most (coordinator, 26 Oct). A settle timeout (the
+# act was taken and its screen never settled) counts toward the two in a row like any refusal, so one slow settle while
+# a reply streams does not end the scenario (independent review of #139).
+FAIL_FAST, ACT_SECONDS = 2, 60
 UNFINISHED = "unfinished"  # the result's outcome until done replaces it
-WEDGED_TEXT = f"The device refused {FAIL_FAST} acts in a row: call done now with outcome blocked"
+WEDGED_TEXT = "The device stopped taking acts: call done now with outcome blocked"
 MAX_HIERARCHY = 40_000
 MAX_SUMMARY = 1000
 MAX_FIELD = 300
@@ -140,7 +146,7 @@ def settings(environ):
     env.update(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED="true")
     return dict(base, platform="ios", udid=udid, maestro=maestro, bundle=bundle, env=env, scale=None,
-                flows=os.path.dirname(result))
+                flows=os.path.dirname(result), look=environ.get(LOOK_ENV) == "chat", looks=[])
 
 
 def adb(config, *args, timeout=60):
@@ -178,7 +184,8 @@ def flow(config, command):
     with open(path, "w", encoding="utf-8") as output:
         output.write(f"appId: {config['bundle']}\n---\n{command}\n")
     started = utc_now()
-    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], both=True)
+    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], timeout=ACT_SECONDS,
+                        both=True)
     if status:
         refused(config, command, said, started, utc_now())
         config["refusal_cause"] = driver_cause(said)
@@ -233,12 +240,8 @@ def ios_nodes(node, depth=0):
         yield from ios_nodes(child, depth + 1)
 
 
-def ios_hierarchy(config):
-    """The hierarchy in the screenshot's pixels (the same lines as Android's); "" when the screen's scale is unknown."""
-    scale = screen_scale(config)
-    if not scale:
-        config["dump_cause"] = "scale unknown"
-        return ""
+def ios_tree(config):
+    """`maestro hierarchy`'s JSON tree, or None (and the driver's cause in config["dump_cause"])."""
     status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy"], both=True)
     try:
         # The output holds stderr after stdout (for driver_cause); the tree is the first JSON value in it.
@@ -246,8 +249,30 @@ def ios_hierarchy(config):
     except ValueError:
         tree = None
     config["dump_cause"] = None if isinstance(tree, dict) else driver_cause(data)
-    nodes = list(ios_nodes(tree))
+    return tree if isinstance(tree, dict) else None
+
+
+def ios_focused_value(config):
+    """The focused element's value (its text when it has none) as the simulator holds it, unredacted, for the check
+    alone: "" when it shows only its placeholder (an empty field's value can be its placeholder); None when the
+    hierarchy could not be read or no element has focus."""
+    field = next((node for node in ios_nodes(ios_tree(config)) if node.get("focused") in (True, "true")), None)
+    if field is None:
+        return None
+    value = str(field.get("value") or field.get("text") or "")
+    return "" if value == str(field.get("hintText") or "") else value
+
+
+def ios_hierarchy(config):
+    """The hierarchy in the screenshot's pixels (the same lines as Android's); "" when the screen's scale is unknown."""
+    scale = screen_scale(config)
+    if not scale:
+        config["dump_cause"] = "scale unknown"
+        return ""
+    nodes = list(ios_nodes(ios_tree(config)))
     boxes = [re.fullmatch(r"\[(-?\d+),(-?\d+)\]\[(\d+),(\d+)\]", str(n.get("bounds", ""))) for n in nodes]
+    if config.get("look"):
+        chat_look(config, nodes, boxes)
     lines = []
     for attributes, box in zip(nodes, boxes):
         text = str(attributes.get("text") or "")
@@ -261,6 +286,52 @@ def ios_hierarchy(config):
                  "clickable" if clickable else "", centre]
         lines.append(" | ".join(part for part in parts if part))
     return "\n".join(lines)[:MAX_HIERARCHY]
+
+
+# N, 30 Oct (Samuel's "May chat is blank until I scroll"): the chat is a lazy stack anchored at its bottom, and after
+# it opens from a For you card the viewport can be left past its content, so no message row is laid out where the
+# screen shows. A row's MAY_DEVICE_LOOK=chat has every iOS hierarchy read that shows the chat (its header and its
+# composer both listed) counted: the text elements between the header's bottom and the composer's top, within the
+# header's width, that are not the chat's own chrome (an id starting "chat."). Each such look keeps that count and a
+# screenshot taken at once (look-<n>.png in the agent's folder, for people to see whether the screen agrees), at most
+# MAX_LOOKS of them; the count alone reaches the record, never a word of the text.
+LOOK_ENV, MAX_LOOKS = "MAY_DEVICE_LOOK", 4
+
+
+def chat_shown(nodes, boxes):
+    """How many message texts the chat shows on screen, or None when the read does not show the chat."""
+    marks = {}
+    for attributes, box in zip(nodes, boxes):
+        rid = str(attributes.get("resource-id") or "")
+        if box and rid in ("chat.header", "chat.composer") and rid not in marks:
+            marks[rid] = [int(value) for value in box.groups()]
+    if len(marks) < 2:
+        return None
+    left, _, right, top = marks["chat.header"]
+    bottom = marks["chat.composer"][1]
+    if bottom <= top:
+        return None
+    shown = 0
+    for attributes, box in zip(nodes, boxes):
+        if not box or str(attributes.get("resource-id") or "").startswith("chat.") or \
+                not str(attributes.get("text") or "").strip():
+            continue
+        x, y = (int(box[1]) + int(box[3])) / 2, (int(box[2]) + int(box[4])) / 2
+        shown += left <= x <= right and top < y < bottom
+    return shown
+
+
+def chat_look(config, nodes, boxes):
+    """One look at the chat (chat_shown) into config["looks"], with its screenshot, while fewer than MAX_LOOKS."""
+    shown = chat_shown(nodes, boxes)
+    if shown is None or len(config["looks"]) >= MAX_LOOKS:
+        return
+    data = ios_screenshot(config)
+    name = f"look-{len(config['looks']) + 1}.png"
+    if data is not None:
+        with open(os.path.join(config["flows"], name), "wb") as output:
+            output.write(data)
+    config["looks"].append({"shown": shown, "shot": name if data is not None else None})
 
 
 # Run 40155638626: the scale was the screenshot's width over the hierarchy's widest box, which was about 322 points on
@@ -337,13 +408,21 @@ DUMP_FAILURES = ("adb failed", "no idle state", "unreadable", "iOS hierarchy fai
 # Coordinator, 26 Oct (run 40290647340): "iOS hierarchy failed" never said why. The driver's own output for a failed
 # iOS hierarchy read, and for the last refused act, is sorted into DRIVER_CAUSES' fixed words (first match in
 # CAUSE_PATTERNS' order, else "other"); only the word is kept in the agent's record and the sealed report.
-CAUSE_PATTERNS = (("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
+# Run 40309200520's diagnostics (coordinator, 26 Oct): a tap printed COMPLETED and then the act ran out of time, so
+# Maestro was waiting for the screen to settle after it ("settle timeout": Maestro's own status line for the command
+# ending "... COMPLETED", then tool's "(timed out)"). Anchored to that line's end, so typed text holding the word is
+# not one (independent review of #139).
+CAUSE_PATTERNS = (("settle timeout", re.compile(rb"(?m)(?:Tap|Input text|Swip|Press)[^\n]*\.\.\. COMPLETED[ \t\r]*$"
+                                                rb"(?s:.*)\n\(timed out\)\n\Z")),
+                  ("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
                   ("snapshot timeout", re.compile(rb"timed? ?out|timeout|snapshot", re.IGNORECASE)),
                   ("lost connection", re.compile(rb"connection (?:refused|reset|lost|closed)|broken pipe|unavailable|"
                                                  rb"failed to connect|lost connection|xctestdriver|end of stream",
                                                  re.IGNORECASE)),
                   ("app not running", re.compile(rb"not running|terminated|crash", re.IGNORECASE)))
-DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "other")
+# "typed nothing": an iOS type act Maestro took, after which the focused field holds none of the typed words
+# (coordinator, 28 Oct: inputText COMPLETED and no text appeared).
+DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "typed nothing", "other")
 
 
 def driver_cause(output):
@@ -419,7 +498,8 @@ def record(config, outcome, summary):
                    "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
                    "hierarchy_failure": config.get("hierarchy_failure"),
                    "hierarchy_cause": config.get("hierarchy_cause"), "refusal_cause": config.get("refusal_cause"),
-                   **({"wedged": True} if config.get("wedged") else {})}, output)
+                   **({"wedged": True} if config.get("wedged") else {}),
+                   **({"looks": config["looks"]} if config.get("look") else {})}, output)
 
 
 def call(name, args, config):
@@ -519,8 +599,13 @@ def focused_text(xml):
     field = next((node for node in root.iter("node") if node.get("focused") == "true"), None)
     if field is None:
         return None
-    text = field.get("text", "").replace("\n", " ").replace("\r", " ")
-    kept, dropped = kept_lines(text.encode(), "")
+    return shown_field(field.get("text", ""))
+
+
+def shown_field(text):
+    """A field's text through kept_lines (a field that could hold a credential is "(hidden)", an email address keeps
+    its domain alone), on one line and at most MAX_FIELD characters."""
+    kept, dropped = kept_lines(text.replace("\n", " ").replace("\r", " ").encode(), "")
     return "(hidden)" if dropped else kept.decode("utf-8", "replace")[:MAX_FIELD]
 
 
@@ -528,6 +613,12 @@ def focused_text(xml):
 # COMPLETED and then never returned, and the driver took nothing after it. Each act's settle wait is capped (Maestro
 # calls the cap best effort), so a screen that keeps redrawing cannot hold the act.
 SETTLE_MS = 3000
+# Coordinator, 28 Oct (runs 40478288501 and 40666988126): iOS inputText into a focused field came back COMPLETED and
+# no text appeared, and the agent was told "Done". After a type Maestro took, the hierarchy is read once and the agent
+# is told what the focused field holds, as on Android. A field holding none of the typed words is a refused act
+# (refusal_cause "typed nothing", counted toward FAIL_FAST, kept in DRIVER_FILE); a field that cannot be read is said
+# so and counts as taken.
+TYPED_NOTHING_LINE = b"typed nothing: Maestro took the act, and the focused field holds none of the typed words\n"
 
 
 def ios_act(name, args, ints, config):
@@ -547,14 +638,42 @@ def ios_act(name, args, ints, config):
         command = f'- swipe:\n    start: "1%,50%"\n    end: "80%,50%"\n    duration: 300{settle}'
     else:
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
+    started = utc_now() if name == "type" else None
     status = flow(config, command)
+    landed = None
+    if name == "type" and not status:
+        landed = ios_focused_value(config)
+        if landed is not None and not typed_landed(args["text"], landed):
+            status = 1
+            refused(config, command, TYPED_NOTHING_LINE, started, utc_now())
+            config["refusal_cause"] = "typed nothing"
     config["refusals"] = config["refusals"] + 1 if status else 0
-    if config["refusals"] >= FAIL_FAST:
+    stuck = bool(status) and config.get("refusal_cause") == "snapshot timeout" == config.get("dump_cause")
+    if not status:
+        # A taken act changes the screen, so an earlier read's time-out no longer says it is stuck (independent review
+        # of #139).
+        config["dump_cause"] = None
+    if config["refusals"] >= FAIL_FAST or stuck:
         config["wedged"] = True
         # Recorded now, so a stopped agent that never calls done still leaves its reason; a later done replaces it.
         record(config, "blocked", WEDGED_TEXT)
         return True, [{"type": "text", "text": WEDGED_TEXT}]
+    if name == "type" and landed is not None:
+        said = "Done. The focused field now reads:" if not status else "The device did not take it: the focused field reads"
+        return bool(status), [{"type": "text", "text": f"{said} {shown_field(landed)!r}"}]
+    if name == "type" and not status:
+        return False, [{"type": "text", "text": "Done; the focused field could not be read, so take a hierarchy"}]
     return bool(status), [{"type": "text", "text": "Done" if not status else "The device did not take it"}]
+
+
+WORD = re.compile(r"[\w@.:-]+")
+
+
+def typed_landed(text, value):
+    """Whether any whole word of the typed text is a word of the field after the act (autocorrect may change some of
+    them; a part of a word never counts, so "note" is not in "Add notes")."""
+    held = set(WORD.findall(value.casefold()))
+    return any(word in held for word in WORD.findall(text.casefold()))
 
 
 def answer(message, config):

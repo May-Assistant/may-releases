@@ -126,6 +126,8 @@ SECRET_NAMES = (
     # ds-swift-compile.yml: the may-design-system pull-request read token (gate.py --check-pull alone) and the token
     # that comments on that pull request (ds_compile.py post alone). No other step may hold either.
     "MAY_DS_PR_READ_TOKEN", "MAY_DS_PR_COMMENT_TOKEN",
+    # ds-tests-pr.yml: the token that sets the may-ds-tests commit status (ds_tests.py status alone).
+    "MAY_DS_STATUS_TOKEN",
     # native-compile-pr.yml: the token that comments a compile's errors on the may-app pull request
     # (compile_pr_errors.py alone). No other step may hold it.
     "MAY_APP_PR_COMMENT_TOKEN",

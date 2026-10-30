@@ -42,7 +42,7 @@ import urllib.request
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from ds_compile import API, DsCompileError, MAX_BODY, post_once, request, run_url
+from ds_compile import API, DsCompileError, MAX_BODY, comment_author, post_once, request, run_url
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import GITHUB_HOST_KEY
 import board
@@ -69,7 +69,7 @@ DEVICES = ("android", "ios")
 # may-app's flows and board notes, sealed by each device job and set aside by device-open for the flow board
 # (board.py), never committed.
 BOARD_INPUTS, BOARD, DROPPED = ("flows.json", "board-notes.json"), "may-device-board", ".dropped"
-DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.preview\.mp4|\.xml|"
+DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|-look-[1-4]\.png|\.mp4|-part[0-9]{1,2}\.mp4|\.preview\.mp4|\.xml|"
                          r"\.diag\.txt)|report\.json|"
                          + "|".join(re.escape(name) for name in BOARD_INPUTS) + "|" + board.PATH_FILE.pattern + "|" +
                          board.SHOT_FILE.pattern)
@@ -81,7 +81,8 @@ REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no
            device_tests.BUDGET, *device_tests.UNTAGGED.values(), device_tests.FRESH_EXHAUSTED, device_tests.NOT_FRESH,
            device_tests.MODEL_CAP, device_tests.MINT_FAILED, device_tests.FLOW_IDS, device_tests.DELIVERY_FAILED,
            device_tests.NOT_REACHED, device_tests.WEDGED, device_tests.NO_CHAT,
-           device_tests.NO_FIRST, device_tests.NOT_STARTED, device_tests.HALTED)
+           device_tests.NO_FIRST, device_tests.NOT_STARTED, device_tests.HALTED, device_tests.NO_LINE,
+           device_tests.NO_CARD, device_tests.LOOK_SCROLLED, device_tests.LOOK_EMPTY, device_tests.LOOK_UNREAD)
 MAX_NOTES = 600
 # A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
 DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)
@@ -106,6 +107,8 @@ MAX_FILES = 2000
 MAX_FILE = 40 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
 DOWNLOAD, TREE = "may-renders-download/renders.age", "may-publish-tree"
+# The render job's upload's artifact id, set when it handed sealed renders over (ios-renders.yml, run 41068959429).
+HANDED = "MAY_RENDERS_HANDED"
 MARKER = "may-ios-renders"
 AUTHOR = ("-c", "user.name=May renders", "-c", "user.email=renders@may-releases.invalid")
 README = ("# May parity renders and device tests\n\nWritten by may-releases, never by hand.\n\n"
@@ -242,6 +245,12 @@ def open_renders(sha):
     root = runner_root()
     sealed = root / DOWNLOAD
     if not sealed.is_file() or sealed.is_symlink():
+        # Run 41068959429: publish alone re-run as attempt 2 looked for attempt 2's renders, found none, and the run
+        # went green with nothing published. Renders the render job handed over (its upload's artifact id) that never
+        # arrived fail the run.
+        if os.environ.get(HANDED, "").strip():
+            raise PublishError("The render job handed over sealed renders, but they did not reach this job; nothing "
+                               "was published")
         print("May iOS renders: no sealed renders from this run attempt; nothing will be published")
         return
     recipient = os.environ.get(RECIPIENT, "").strip()
@@ -287,18 +296,39 @@ def decrypt(sealed, plain, identity, recipient, private):
         key.unlink(missing_ok=True)
 
 
+# Run 41068959429 (N, 30 Oct): a push failed with nothing said, and its git output went with the job's private log. A
+# failed git step now names its class in the public log, from git's own words, which never leave the private log:
+# rejected (may-renders moved after the fetch), auth, network, or other. A rejected push is tried once more from
+# may-renders' new head (PUSH_ATTEMPTS), never by force.
+GIT_CAUSES = (("rejected", re.compile(rb"\[rejected\]|non-fast-forward|\(fetch first\)")),
+              ("auth", re.compile(rb"Permission denied|publickey|Host key verification failed|Authentication failed|"
+                                  rb"Repository not found", re.IGNORECASE)),
+              ("network", re.compile(rb"Could not resolve host|timed out|Connection (?:reset|refused|closed)|"
+                                     rb"Network is unreachable|hung up|early EOF|unable to access", re.IGNORECASE)))
+PUSH_ATTEMPTS = 2
+
+
+class GitFailed(PublishError):
+    """A git step that failed, with its class (git_cause) alone."""
+
+    def __init__(self, cause):
+        super().__init__(f"may-renders could not be updated ({cause}); inspect protected runner diagnostics")
+        self.cause = cause
+
+
+def git_cause(output):
+    """A failed git step's class from its output: the first GIT_CAUSES word whose pattern it holds, else "other"."""
+    return next((word for word, pattern in GIT_CAUSES if pattern.search(output)), "other")
+
+
 def git(argv, log, env, cwd, capture=False):
     """One git command with its output in the private log (or its stdout captured, its stderr logged)."""
     argv = ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "core.fsmonitor=false", *argv]
-    if capture:
-        result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True)
-        with log.open("ab") as output:
-            output.write(result.stderr)
-    else:
-        with log.open("ab") as output:
-            result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output)
+    result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True)
+    with log.open("ab") as output:
+        output.write(result.stderr if capture else result.stdout + result.stderr)
     if result.returncode:
-        raise PublishError("may-renders could not be updated; inspect protected runner diagnostics")
+        raise GitFailed(git_cause(result.stdout + result.stderr))
     return result.stdout
 
 
@@ -330,38 +360,66 @@ def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git, ex
     try:
         write_private(key, (key_text + "\n").encode())
         write_private(known, (GITHUB_HOST_KEY + "\n").encode())
-        run_git(["init", "-q", str(work)], log, env, root)
-        run_git(["remote", "add", "origin", REMOTE], log, env, work)
-        heads = run_git(["ls-remote", "--heads", "origin", "refs/heads/" + BRANCH], log, env, work, capture=True)
-        if heads.strip():
-            run_git(["fetch", "--quiet", "--no-tags", "--depth", "1", "origin",
-                     f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"], log, env, work)
-            run_git(["checkout", "-q", "-B", "renders", "refs/remotes/origin/" + BRANCH], log, env, work)
-        else:
-            run_git(["checkout", "-q", "--orphan", "renders"], log, env, work)
-        base = work / prefix if prefix else work
-        base.mkdir(parents=True, exist_ok=True)
-        index = base / "runs.json"
-        try:
-            existing = json.loads(index.read_text()) if index.is_file() and not index.is_symlink() else []
-        except (OSError, ValueError):
-            existing = []
-        kept, removed = runs_after(existing if isinstance(existing, list) else [], entry, keep)
-        for old in removed + [folder]:
-            if (base / old).exists():
-                run_git(["rm", "-r", "-q", "--ignore-unmatch", "--", prefix + old], log, env, work)
-                shutil.rmtree(base / old, ignore_errors=True)
-        shutil.copytree(tree, base / folder, symlinks=False)
-        index.write_text(json.dumps(kept, indent=2) + "\n")
-        added = extra(base) if extra else None
-        (work / "README.md").write_text(README)
-        run_git(["add", "-A", "--", "."], log, env, work)
-        run_git([*AUTHOR, "commit", "-q", "-m", message], log, env, work)
-        run_git(["push", "--quiet", "origin", "HEAD:refs/heads/" + BRANCH], log, env, work)
+        for attempt in range(1, PUSH_ATTEMPTS + 1):
+            try:
+                return commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, root, work, keep)
+            except GitFailed as failed:
+                if failed.cause != "rejected" or attempt == PUSH_ATTEMPTS:
+                    raise
+                print("May renders publish: may-renders moved during the push; trying once more from its new head")
     finally:
         key.unlink(missing_ok=True)
         known.unlink(missing_ok=True)
+
+
+def commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, root, work, keep=KEEP):
+    """One attempt of publish_tree, in a fresh clone of may-renders' main at work: (kept, removed, extra's result)."""
+    shutil.rmtree(work, ignore_errors=True)
+    run_git(["init", "-q", str(work)], log, env, root)
+    run_git(["remote", "add", "origin", REMOTE], log, env, work)
+    heads = run_git(["ls-remote", "--heads", "origin", "refs/heads/" + BRANCH], log, env, work, capture=True)
+    if heads.strip():
+        run_git(["fetch", "--quiet", "--no-tags", "--depth", "1", "origin",
+                 f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"], log, env, work)
+        run_git(["checkout", "-q", "-B", "renders", "refs/remotes/origin/" + BRANCH], log, env, work)
+    else:
+        run_git(["checkout", "-q", "--orphan", "renders"], log, env, work)
+    base = work / prefix if prefix else work
+    base.mkdir(parents=True, exist_ok=True)
+    index = base / "runs.json"
+    try:
+        existing = json.loads(index.read_text()) if index.is_file() and not index.is_symlink() else []
+    except (OSError, ValueError):
+        existing = []
+    kept, removed = runs_after(existing if isinstance(existing, list) else [], entry, keep)
+    for old in removed + [folder]:
+        if (base / old).exists():
+            run_git(["rm", "-r", "-q", "--ignore-unmatch", "--", prefix + old], log, env, work)
+            shutil.rmtree(base / old, ignore_errors=True)
+    shutil.copytree(tree, base / folder, symlinks=False)
+    index.write_text(json.dumps(kept, indent=2) + "\n")
+    added = extra(base) if extra else None
+    (work / "README.md").write_text(README)
+    run_git(["add", "-A", "--", "."], log, env, work)
+    run_git([*AUTHOR, "commit", "-q", "-m", message], log, env, work)
+    run_git(["push", "--quiet", "origin", "HEAD:refs/heads/" + BRANCH], log, env, work)
+    landed(prefix, folder, run_git, log, env, work)
     return kept, removed, added
+
+
+def landed(prefix, folder, run_git, log, env, work):
+    """After a push git called a success: may-renders' main, fetched again, holds the run folder and lists it first in
+    runs.json (N, 30 Oct: check it rather than trust a green step), else the publish fails."""
+    try:
+        run_git(["fetch", "--quiet", "--no-tags", "--depth", "1", "origin",
+                 f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"], log, env, work)
+        run_git(["cat-file", "-e", f"refs/remotes/origin/{BRANCH}:{prefix}{folder}"], log, env, work)
+        listed = json.loads(run_git(["show", f"refs/remotes/origin/{BRANCH}:{prefix}runs.json"], log, env, work,
+                                    capture=True))
+    except (GitFailed, ValueError):
+        listed = None
+    if not (isinstance(listed, list) and any(isinstance(run, dict) and run.get("folder") == folder for run in listed)):
+        raise PublishError("may-renders main does not hold the run folder after the push; check may-renders")
 
 
 def write_key():
@@ -797,7 +855,7 @@ def comment(sha, pr, call_api=github):
         validate_pull_request(pull, number, sha)
     except GateDenial:
         raise PublishError("The pull request is no longer open at the rendered head; nothing was posted") from None
-    if post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
+    if post_once(call_api, APP_REPO, number, sha, body, token, MARKER, comment_author(os.environ)):
         print(f"May iOS renders linked on may-app #{number}")
     else:
         print(f"May iOS renders already linked for this head on may-app #{number}; nothing posted again")

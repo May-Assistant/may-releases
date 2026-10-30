@@ -145,6 +145,42 @@ class RunTests(unittest.TestCase):
                                    "tests": [2705, 8, 0], "problems": 0})
         self.assertEqual(failures, {"failures": [], "total": 0})
 
+    def test_the_tests_read_project_yml_as_committed_not_as_prepare_rewrote_it(self):
+        """N, 30 Oct: prepare --platform ios points MayDesignSystem at the local checkout, so MayCore's pin test, which
+        reads project.yml for `revision: <the lock's sha>`, failed on every pull request; the head's own blob goes back."""
+        pinned = "packages:\n  MayDesignSystem:\n    url: x\n    revision: " + "3" * 40 + "\n"
+        sha = self.commit(extra={"ios/project.yml": pinned})
+        (self.source / "ios/project.yml").write_text("packages:\n  MayDesignSystem:\n    path: /tmp/ds\n")
+        seen = []
+
+        def ran(source, swift_top, private, log):
+            seen.append((source / "ios/project.yml").read_text())
+            tool.record(private, "passed", {"build": "passed", "tests": "passed"}, None, [], 0)
+
+        with patch.object(tool, "run_sandboxed", side_effect=ran):
+            self.run_it(sha)
+        self.assertEqual(seen, [pinned], "the build and tests see project.yml exactly as the head has it")
+
+    def test_a_project_yml_that_cannot_be_read_back_or_is_a_link_runs_nothing(self):
+        sha = self.commit()
+        (self.source / "ios/project.yml").write_text("rewritten, but not in the head\n")
+        with patch.object(tool, "run_sandboxed", side_effect=AssertionError("ran")), \
+                self.assertRaises(tool.IosCoreError):
+            self.run_it(sha)
+        sha = self.commit(extra={"ios/project.yml": "revision: x\n"})
+        (self.source / "ios/project.yml").unlink()
+        (self.source / "ios/project.yml").symlink_to(self.root / "elsewhere.yml")
+        with patch.object(tool, "run_sandboxed", side_effect=AssertionError("ran")), \
+                self.assertRaises(tool.IosCoreError):
+            self.run_it(sha)
+        self.assertFalse((self.root / "elsewhere.yml").exists(), "nothing is written through the link")
+        sha = self.commit()
+        ran = []
+        with patch.object(tool, "run_sandboxed", side_effect=lambda source, swift_top, private, log: ran.append(1) or
+                          tool.record(private, "passed", {"build": "passed", "tests": "passed"}, None, [], 0)):
+            self.run_it(sha)
+        self.assertEqual(ran, [1], "a head with no project.yml runs as before")
+
     def test_build_then_tests_in_the_package_with_no_fetch_no_secret_and_private_folders(self):
         self.run_it(self.commit(), extra={"MAY_APP_PR_TOKEN_UNRELATED": "x"})
         scratch = ["--scratch-path", str(sandbox.ROOT / "build")]
@@ -434,7 +470,8 @@ class PostTests(unittest.TestCase):
         return call
 
     def post(self, call, token=TOKEN):
-        environ = {"RUNNER_TEMP": str(self.root), "PATH": os.environ.get("PATH", ""), "GITHUB_RUN_ID": "9"}
+        environ = {"RUNNER_TEMP": str(self.root), "PATH": os.environ.get("PATH", ""), "GITHUB_RUN_ID": "9",
+                   "MAY_CI_APP_SLUG": "may-ci"}
         if token is not None:
             environ["MAY_APP_PR_COMMENT_TOKEN"] = token
         out = io.StringIO()
@@ -501,11 +538,17 @@ class PostTests(unittest.TestCase):
             self.post(self.api(pull(head__sha="b" * 40)))
         self.assertEqual(self.posted(), [])
         self.calls = []
-        earlier = [{"body": f"x <!-- {tool.MARKER} head={SHA} -->", "user": {"login": "x"}}]
+        earlier = [{"body": f"x <!-- {tool.MARKER} head={SHA} -->", "user": {"type": "Bot", "login": "may-ci[bot]"}}]
         code, out = self.post(self.api(comments=earlier))
         self.assertEqual(code, 1)
         self.assertIn("already posted", out)
         self.assertEqual(self.posted(), [])
+        # Review of may-releases #137: a person's or another app's comment quoting the marker is not this post.
+        for user in ({"type": "User", "login": "may-ci[bot]"}, {"type": "Bot", "login": "x[bot]"}, {"login": "x"}):
+            with self.subTest(user=user):
+                self.calls = []
+                self.post(self.api(comments=[dict(earlier[0], user=user)]))
+                self.assertEqual(len(self.posted()), 1)
 
     def test_a_malformed_record_is_refused(self):
         good_outcome, good_failed = recorded()
@@ -639,3 +682,35 @@ class WorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompileGateTests(unittest.TestCase):
+    """Coordinator, 30 Oct: may-app #1493 merged with a failing MayCore test that the iOS compile alone could not see.
+    native-compile-pr.yml, which the coordinator's queue dispatches for every pull request, runs ios-core-pr.yml's core
+    job exactly, so its build and tests run on every compile and a failing test fails the run (post exits 1)."""
+
+    COMPILE = ".github/workflows/native-compile-pr.yml"
+
+    def test_the_compile_runs_the_core_job_exactly_as_ios_core_pr_does(self):
+        compile_text = (static_check.ROOT / self.COMPILE).read_text()
+        own = (static_check.ROOT / WORKFLOW).read_text()
+        self.assertEqual(static_check.compile_pr_workflow_problems(compile_text), [])
+        core = compile_text[slice(*static_check.job_span(compile_text, "core"))]
+        self.assertEqual(core.strip("\n"), own[slice(*static_check.job_span(own, "core"))].strip("\n"))
+        self.assertIn('ios_core.py run --source-sha "$MAY_SOURCE_SHA"', core)
+        self.assertIn('ios_core.py post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"', core)
+
+    def test_a_core_job_that_differs_from_ios_core_prs_or_is_missing_is_refused(self):
+        text = (static_check.ROOT / self.COMPILE).read_text()
+        span = static_check.job_span(text, "core")
+        for label, changed in (
+                ("dropped", text[:span[0]] + text[span[1]:]),
+                ("no post", text.replace("      - name: Post the MayCore failures on the may-app pull request, never in "
+                                         "this log\n", "      - name: Skipped\n", 1)),
+                ("no tests", text.replace('ios_core.py run --source-sha "$MAY_SOURCE_SHA"', 'ios_core.py post --source-sha "$MAY_SOURCE_SHA"', 1)),
+                ("longer", text.replace("    timeout-minutes: 35\n", "    timeout-minutes: 90\n", 1))):
+            with self.subTest(label=label):
+                self.assertNotEqual(changed, text)
+                self.assertTrue(any("core job" in problem
+                                    for problem in static_check.compile_pr_workflow_problems(changed)),
+                                static_check.compile_pr_workflow_problems(changed))

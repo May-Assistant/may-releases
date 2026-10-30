@@ -104,6 +104,7 @@ jobs:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
           MAY_APP_PR_COMMENT_TOKEN: ${{ steps.ci-comment.outputs.token || secrets.MAY_APP_PR_COMMENT_TOKEN }}
+          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}
         run: python3 -I -S -B tools/may_release/ios_core.py post --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
       - name: Remove private source, logs, build outputs and the pinned Swift
         if: always()

@@ -19,8 +19,11 @@ CHECKERS = {
     "ios-renders.yml": static_check.renders_workflow_problems,
     "ds-swift-compile.yml": static_check.ds_compile_workflow_problems,
     "may-app-review.yml": static_check.review_workflow_problems,
+    "may-ds-review.yml": static_check.ds_review_workflow_problems,
     "device-tests.yml": static_check.device_tests_workflow_problems,
     "testflight-feedback.yml": static_check.testflight_feedback_workflow_problems,
+    "ds-tests-pr.yml": static_check.ds_tests_workflow_problems,
+    "ds-tests-schedule.yml": static_check.ds_tests_schedule_workflow_problems,
 }
 SCHEDULE = "android-ci-schedule.yml"
 REVIEW = "may-app-review.yml"
@@ -142,14 +145,35 @@ class MintMutationTests(unittest.TestCase):
         self.assert_refused(DEVICE, release, "MAY_RENDERS_RELEASE_TOKEN: ${{ steps.renders-release.outputs.token }}\n")
 
     def test_the_review_slug_goes_to_the_fetch_step_alone(self):
-        slug = static_check.REVIEW_SLUG
-        text = workflow(REVIEW)
-        self.assertEqual(text.count(slug), 1)
-        review_env = "          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}\n"
-        self.assert_refused(REVIEW, slug, "")
-        self.assert_refused(REVIEW, review_env, review_env + slug)
-        self.assertTrue(static_check.review_workflow_problems(text.replace(slug, "").replace(review_env,
-                                                                                              review_env + slug)))
+        for name, step_id, check in ((REVIEW, "ci-review", static_check.review_workflow_problems),
+                                     ("may-ds-review.yml", "ci-ds-review", static_check.ds_review_workflow_problems)):
+            with self.subTest(workflow=name):
+                slug = static_check.REVIEW_SLUG.format(step_id)
+                text = workflow(name)
+                self.assertEqual(text.count(slug), 1)
+                review_env = "          MAY_REVIEW_CLAUDE_TOKEN: ${{ secrets.MAY_REVIEW_CLAUDE_TOKEN }}\n"
+                self.assert_refused(name, slug, "")
+                self.assert_refused(name, review_env, review_env + slug)
+                self.assertTrue(check(text.replace(slug, "").replace(review_env, review_env + slug)))
+
+
+    def test_each_post_alone_is_told_its_comment_apps_slug(self):
+        """Review of may-releases #137: each post counts only its own app's bot comments, so it is told the slug."""
+        self.assertEqual(set(static_check.COMMENT_SLUG_POSTS),
+                         {("native-compile-pr.yml", "post"), ("native-compile-pr.yml", "swift-checks"),
+                          ("ios-core-pr.yml", "core"), ("native-compile-pr.yml", "core"), ("ios-renders.yml", "publish"),
+                          ("ds-swift-compile.yml", "native")},
+                         "every post that dedupes on its head's marker")
+        for (name, job), (step_id, run) in static_check.COMMENT_SLUG_POSTS.items():
+            with self.subTest(workflow=name, job=job):
+                slug = static_check.comment_slug(step_id)
+                anchor = slug + "        run: python3 -I -S -B tools/may_release/" + run
+                text = workflow(name)
+                self.assertEqual(text.count(anchor), 1)
+                self.assert_refused(name, anchor, anchor.replace(slug, ""))
+                self.assert_refused(name, anchor, slug + anchor)
+                other = slug.replace("app-slug", "token")
+                self.assert_refused(name, anchor, anchor.replace(slug, other))
 
 
 if __name__ == "__main__":

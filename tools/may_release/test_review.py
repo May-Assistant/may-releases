@@ -577,7 +577,9 @@ class CommentServerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.posted = Path(self.temp.name) / "posted"
-        self.config = {"number": 42, "head": SHA, "token": TOKEN, "posted": str(self.posted)}
+        repo, bases, marker = review_mcp.TARGETS["app"]
+        self.config = {"number": 42, "head": SHA, "token": TOKEN, "posted": str(self.posted), "repo": repo,
+                       "bases": bases, "marker": marker}
         self.posts = []
         self.pull = pull()
 
@@ -985,7 +987,7 @@ class ScheduledFetchTests(unittest.TestCase):
             root = Path(temp) / "may-review"
             self.assertEqual(((root / "number").read_text(), (root / "head").read_text()), ("42\n", SHA + "\n"))
             self.assertEqual((root / "poster").read_text(), POSTER + "\n", "the review step's already-reviewed check")
-        read.assert_called_once_with(42, TOKEN)
+        read.assert_called_once_with(42, TOKEN, "May-Assistant/may-app")
         fetched.assert_called_once()
         self.assertEqual(printed.getvalue(), f"May app review: may-app #42 is open and ready for review; its head "
                                              f"{SHA} is fetched (picked by the schedule)\n")
@@ -1018,3 +1020,140 @@ class ScheduleCheckTests(unittest.TestCase):
             with self.subTest(change=name):
                 self.assertNotEqual(changed, text)
                 self.assertTrue(static_check.review_workflow_problems(changed))
+
+
+DS = "May-Assistant/may-design-system"
+
+
+def ds_side(ref="claude/may-integration"):
+    return {"base": {"ref": ref, "repo": {"full_name": DS}}, "head": {"sha": SHA, "ref": "feature", "repo": {"full_name": DS}}}
+
+
+class DesignSystemTargetTests(unittest.TestCase):
+    """Coordinator, 30 Oct: may-design-system pull requests get the same independent review (may-ds-review.yml),
+    from review.py --target ds; may-app's review is unchanged."""
+
+    def setUp(self):
+        review.use("ds")
+        self.addCleanup(review.use, "app")
+
+    def test_a_design_system_pull_request_into_either_base_is_reviewed_and_a_may_app_one_is_refused(self):
+        for ref in ("claude/may-integration", "main"):
+            with self.subTest(ref=ref):
+                try:
+                    head = review.review_pull(pull(**ds_side(ref)), 42)
+                except GateDenial as denial:
+                    self.fail("a design-system pull request was refused: " + denial.args[0])
+                self.assertEqual(head, SHA)
+        for refused in (pull(), pull(**ds_side("develop")),
+                        pull(**{**ds_side(), "head": {"sha": SHA, "repo": {"full_name": "someone/may-design-system"}}})):
+            with self.subTest(refused=refused["base"]), self.assertRaises(GateDenial):
+                review.review_pull(refused, 42)
+
+    def test_the_schedule_picks_only_the_design_systems_own_pull_requests_into_its_bases(self):
+        side = ds_side()
+        get, asked = pick_answers([candidate(40), candidate(41, base=side["base"], head={"sha": OTHER, "repo": {"full_name": "x/y"}}),
+                                   candidate(42, base={"ref": "develop", "repo": {"full_name": DS}}, head=side["head"]),
+                                   candidate(43, **side)])
+        self.assertEqual(review.pick(TOKEN, get, POSTER), 43)
+        self.assertEqual(asked[0], "pulls?state=open&sort=created&direction=asc&per_page=100&page=1",
+                         "both bases are listed, so no base filter")
+
+    def test_everything_the_review_reaches_names_the_design_system(self):
+        root = Path("/tmp/x")
+        command = review.claude_command(Path("/c"), 42, SHA, Path("/m.json"), Path("/p"), Path("/v"), root)
+        self.assertIn(f"/code-review:code-review --comment {DS}/pull/42", command)
+        prompt = command[command.index("--append-system-prompt") + 1]
+        self.assertIn(f"code-review command for {DS} pull request #42", prompt)
+        self.assertIn(f"https://github.com/{DS}/blob/{SHA}/PATH", prompt)
+        self.assertNotIn("may-app", prompt)
+        env = review.mcp_config(42, SHA, Path("/posted"), Path("/token"))["mcpServers"]["github_inline_comment"]["env"]
+        self.assertEqual(env["MAY_REVIEW_REPO"], "ds")
+        self.assertEqual(review.REVIEWED.format(marker=review.TARGET["marker"], head=SHA), f"<!-- may-ds-review head={SHA} -->")
+        self.assertEqual(review.REVIEW_TOKEN, "MAY_DS_REVIEW_TOKEN")
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(GateDenial) as missing:
+            review.read_pull(42)
+        self.assertEqual(missing.exception.args[0], "Review token unavailable (MAY_DS_REVIEW_TOKEN in may-claude-review)")
+        with patch.object(review.urllib.request, "urlopen", side_effect=review.urllib.error.URLError("x")) as opened:
+            review.app_get("pulls/42", TOKEN)
+        self.assertEqual(opened.call_args[0][0].full_url, f"https://api.github.com/repos/{DS}/pulls/42")
+
+    def test_the_head_is_fetched_from_the_design_system(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"RUNNER_TEMP": temp}), \
+                patch.object(review.subprocess, "run", side_effect=run), self.assertRaises(review.ReviewError):
+            review.fetch_head(TOKEN, SHA, Path(temp) / "source")
+        self.assertEqual(calls[0][-2:], ["init", "-q"])
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"RUNNER_TEMP": temp}), \
+                patch.object(review.subprocess, "run",
+                             side_effect=lambda argv, **k: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")), \
+                self.assertRaises(review.ReviewError):
+            review.fetch_head(TOKEN, SHA, Path(temp) / "source")
+        self.assertIn(f"https://github.com/{DS}.git", [arg for argv in calls for arg in argv])
+
+    def test_the_comment_server_posts_on_the_design_system_pull_request(self):
+        with tempfile.TemporaryDirectory() as temp:
+            token = Path(temp) / "token"
+            token.write_text(TOKEN)
+            environ = {"MAY_PR_NUMBER": "42", "MAY_REVIEW_HEAD": SHA, "MAY_REVIEW_TOKEN_FILE": str(token),
+                       "MAY_REVIEW_POSTED": str(Path(temp) / "posted")}
+            config = review_mcp.settings({**environ, "MAY_REVIEW_REPO": "ds"})
+            self.assertEqual((config["repo"], config["bases"], config["marker"]),
+                             (DS, ("claude/may-integration", "main"), "may-ds-review"))
+            self.assertEqual(review_mcp.settings(environ)["repo"], "May-Assistant/may-app", "may-app unless told")
+            self.assertIsNone(review_mcp.settings({**environ, "MAY_REVIEW_REPO": "elsewhere"}))
+            calls = []
+
+            def call_api(method, path, payload, token):
+                calls.append((method, path))
+                return (200, pull(**ds_side())) if method == "GET" else (201, {})
+
+            failed, _ = review_mcp.call("create_summary_comment", {"body": "Fine."}, config, call_api)
+            self.assertFalse(failed)
+            self.assertEqual(calls, [("GET", f"/repos/{DS}/pulls/42"), ("POST", f"/repos/{DS}/issues/42/comments")])
+            self.assertIn(f"<!-- may-ds-review head={SHA} -->", review_mcp.body_of({"body": "Fine."}, config))
+            calls.clear()
+            failed, _ = review_mcp.call("create_inline_comment", {"path": "a.swift", "line": 3, "body": "x",
+                                                                  "confirmed": True}, config, call_api)
+            self.assertEqual((failed, calls[-1]), (False, ("POST", f"/repos/{DS}/pulls/42/comments")))
+            calls.clear()
+            moved = lambda method, path, payload, token: (calls.append((method, path)) or
+                                                          ((200, pull(**ds_side("develop"))) if method == "GET" else (201, {})))
+            self.assertTrue(review_mcp.call("create_summary_comment", {"body": "Fine."}, config, moved)[0],
+                            "retargeted away from the design system's bases: nothing posts")
+            self.assertEqual(calls, [("GET", f"/repos/{DS}/pulls/42")])
+
+    def test_the_command_line_takes_the_target_and_may_app_stays_the_default(self):
+        review.use("app")
+        self.assertEqual((review.TARGET["repo"], review.REVIEW_TOKEN), ("May-Assistant/may-app", "MAY_APP_REVIEW_TOKEN"))
+        with patch.object(sys, "argv", ["review.py", "install", "--target", "ds"]), \
+                patch.object(review, "install") as installed:
+            review.main()
+        installed.assert_called_once()
+        self.assertEqual(review.TARGET["repo"], DS)
+        with patch.object(sys, "argv", ["review.py", "install"]), patch.object(review, "install"):
+            review.main()
+        self.assertEqual(review.TARGET["repo"], "May-Assistant/may-app")
+
+
+class DesignSystemWorkflowTests(unittest.TestCase):
+    NAME = ".github/workflows/may-ds-review.yml"
+
+    def test_the_design_system_review_workflow_is_pinned_whole_and_changes_fail(self):
+        text = (HERE.parent.parent / self.NAME).read_text()
+        self.assertEqual(static_check.ds_review_workflow_problems(text), [])
+        app = (HERE.parent.parent / ".github/workflows/may-app-review.yml").read_text()
+        for change in (("group: may-ds-review", "group: may-app-review"),
+                       ('fetch --pr-number "$MAY_PR_NUMBER" --target ds', 'fetch --pr-number "$MAY_PR_NUMBER"'),
+                       ("          repositories: may-design-system\n", "          repositories: may-app\n"),
+                       ("secrets.MAY_DS_REVIEW_TOKEN }}\n          MAY_REVIEW_CLAUDE", "secrets.MAY_APP_REVIEW_TOKEN }}\n          MAY_REVIEW_CLAUDE")):
+            with self.subTest(change=change[1]):
+                self.assertEqual(text.count(change[0]), 1, change[0])
+                self.assertNotEqual(static_check.ds_review_workflow_problems(text.replace(*change)), [])
+        self.assertNotEqual(static_check.ds_review_workflow_problems(app), [], "may-app's workflow is not the DS one")
+        self.assertNotEqual(static_check.review_workflow_problems(text), [], "nor the other way round")

@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -61,10 +62,14 @@ REDUCE_MOTION = "MAY_IOS_REDUCE_MOTION"
 REDUCE_MOTION_ON = ("defaults", "write", "com.apple.Accessibility", "ReduceMotionEnabled", "-bool", "true")
 # may-app #1338 (N, 26 Oct): the debug Playground's main-thread watchdog and SwiftUI's change log run only when the
 # launch environment asks (MAY_DIAG_WATCHDOG=1, MAY_DIAG_LOG_CHANGES=1); the watchdog's 10 Hz ping was the suspected cause
-# of the idle hangs. With ios_diagnostics dispatched true, every launch asks (evidence runs alone); otherwise no stall,
-# span or stall-after line exists to read, and the public log says the stalls were not collected, never 0.
-DIAGNOSTICS = "MAY_IOS_DIAGNOSTICS"
-DIAGNOSTICS_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG": "1", "SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES": "1"}
+# of the idle hangs. The two are asked for apart (coordinator, 26 Oct). The watchdog (spans, steps and stalls): every
+# launch asks unless ios_diagnostics is dispatched false, so the nightly run, which has no inputs, asks too (the
+# scripted rows of runs 40309200520 and 40319309252 took no longer with diagnostics on). Off, no stall, span or
+# stall-after line exists to read, and the public log says the stalls were not collected, never 0. SwiftUI's change
+# log: only when ios_log_changes is dispatched true, since it brought the idle hang back itself (may-app #1302).
+DIAGNOSTICS, LOG_CHANGES = "MAY_IOS_DIAGNOSTICS", "MAY_IOS_LOG_CHANGES"
+WATCHDOG_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG": "1"}
+LOG_CHANGES_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES": "1"}
 SWIFTUI_PERSIST = ("log", "config", "--subsystem", "com.apple.SwiftUI", "--mode", "level:info,persist:info")
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
@@ -557,20 +562,39 @@ def boot(log, env):
 
 
 def diagnostics_wanted():
-    return os.environ.get(DIAGNOSTICS, "").strip() == "true"
+    return os.environ.get(DIAGNOSTICS, "").strip() != "false"
+
+
+def log_changes_wanted():
+    return os.environ.get(LOG_CHANGES, "").strip() == "true"
 
 
 def launch(udid, env, token, log):
     """The app, stopped and started again with a fresh test session in its launch environment (never an argument);
     signed out, with no token (the smoke scenario). SHOW_TOUCHES draws each tap in the app (may-app #1194, May
     Playground alone), as Android's show_touches does, since the simulator's recording never shows touches. The
-    watchdog and SwiftUI's change log are asked for only on a diagnostics run (DIAGNOSTICS_LAUNCH)."""
+    watchdog is asked for unless the run turned it off (WATCHDOG_LAUNCH), SwiftUI's change log only when the run
+    turned it on (LOG_CHANGES_LAUNCH)."""
     renders.quiet(["xcrun", "simctl", "terminate", udid, BUNDLE], log, env=env)
-    env = dict(env, **DIAGNOSTICS_LAUNCH) if diagnostics_wanted() else env
+    env = dict(env, **WATCHDOG_LAUNCH) if diagnostics_wanted() else env
+    env = dict(env, **LOG_CHANGES_LAUNCH) if log_changes_wanted() else env
     launched = renders.quiet(["xcrun", "simctl", "launch", udid, BUNDLE, *SHOW_TOUCHES], log,
                              env=dict(env, SIMCTL_CHILD_MAY_TEST_SESSION=token) if token else env)
     if launched.returncode:
         raise DeviceTestsError("May Playground did not launch on the simulator")
+
+
+def look_shots(scenario, record, private, folder):
+    """A card row's look screenshots (device_agent.looks), copied from its agent's folder into the run's folder as
+    <scenario>-look-<n>.png, in order; the names that were copied."""
+    names = []
+    for look in (record or {}).get("looks", []):
+        source = private / "agent" / scenario / str(look.get("shot"))
+        if look.get("shot") in device_agent.LOOK_SHOTS and source.is_file() and not source.is_symlink():
+            name = f"{scenario}-{look['shot']}"
+            shutil.copyfile(source, folder / name)
+            names.append(name)
+    return names
 
 
 def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check, truth=device_tests.tagged,
@@ -578,7 +602,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                   install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
                   revoked_by=device_tests.revoke, diagnosed=None, noted=device_tests.commitment_note,
-                  made=device_tests.open_chat):
+                  made=device_tests.open_chat, carded=device_tests.open_card):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -617,7 +641,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         else:
             print("May device tests (ios): Reduce Motion is on for this run")
     if diagnostics_wanted():
-        print("May device tests (ios): the main-thread watchdog and SwiftUI's change log are on for this run")
+        print("May device tests (ios): the main-thread watchdog is on for this run")
+    if log_changes_wanted():
+        print("May device tests (ios): SwiftUI's change log is on for this run")
     # Run 40232904242: SwiftUI's info lines stayed in the simulator's memory alone, so a scenario's later read kept
     # only its last minutes of body changes. They are persisted for that subsystem alone, before the app starts; the
     # read and its rules are unchanged (private diag alone).
@@ -662,7 +688,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 token = ""
                 continue
             own = device_tests.scenario_tag(tag, row)  # the scenario's own tag
-            if not device_tests.own_chat(row, entry, base, token, own, made):
+            if not (device_tests.own_chat(row, entry, base, token, own, made) and
+                    device_tests.own_card(row, entry, base, token, own, carded)):
                 accounts.finish(row, base, token)
                 token = ""
                 continue
@@ -693,13 +720,15 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {}),
-                          **device_tests.steps(row)}
+                          **device_tests.steps(row),
+                          **({device_tests.device_mcp.LOOK_ENV: "chat"} if row.get("card") else {})}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"], claude[0],
                                            claude[1], seconds=device_tests.agent_seconds(row, device_agent.IOS_AGENT_SECONDS))
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)
-            entry["screenshots"] = [shot] if shot else []
+            entry["screenshots"] = look_shots(row["id"], records.get(row["id"]), private, folder) + \
+                ([shot] if shot else [])
             recorder.halt()
             # Run 40181517145: poll's server read came after the conversion, half an hour past its session's mint,
             # and got 401. The server reads and the diagnostics come first; the conversion, however long, after.
@@ -738,7 +767,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
               f"{longest} ms; {crashes} with a crash; {drivers} with refused device acts)")
     elif kept:
         print(f"May device tests (ios): diagnostics kept for {kept} scenarios (main-thread stalls not collected: "
-              f"dispatch with ios_diagnostics for them; {crashes} with a crash; {drivers} with refused device acts)")
+              f"dispatched with ios_diagnostics off; {crashes} with a crash; {drivers} with refused device acts)")
     for name in SPAN_NAMES:
         if name in diagnostics.spans:
             count, longest = diagnostics.spans[name]
@@ -749,7 +778,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             print(f"May device tests (ios): main-thread stall-after {name}: {count}")
     wedged = sum(1 for record in records.values() if isinstance(record, dict) and record.get("wedged") is True)
     if wedged:
-        print(f"May device tests (ios): {wedged} scenarios stopped after refused device acts in a row (fail-fast)")
+        print(f"May device tests (ios): {wedged} scenarios stopped after the device stopped taking acts (fail-fast)")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:
