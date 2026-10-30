@@ -20,6 +20,8 @@ CHECKERS = {
     "ds-swift-compile.yml": static_check.ds_compile_workflow_problems,
     "may-app-review.yml": static_check.review_workflow_problems,
     "device-tests.yml": static_check.device_tests_workflow_problems,
+    "ds-tests-pr.yml": static_check.ds_tests_workflow_problems,
+    "ds-tests-schedule.yml": static_check.ds_tests_schedule_workflow_problems,
 }
 SCHEDULE = "android-ci-schedule.yml"
 REVIEW = "may-app-review.yml"

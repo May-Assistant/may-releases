@@ -183,7 +183,7 @@ SERIAL = "emulator-5554"
 RATE_LIMITED = "Claude is rate limited (skipped, never a pass)"
 UNFINISHED = "the agent did not finish"
 BLOCKED = "the agent reported it was blocked"
-WEDGED = f"the device refused {device_mcp.FAIL_FAST} acts in a row, so the agent was stopped (iOS)"
+WEDGED = "the device stopped taking acts, so the agent was stopped (iOS)"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
 DELIVERY_FAILED = "May's server did not record a succeeded reply"
@@ -1079,9 +1079,13 @@ def launch(adb, env, token, log):
     try:
         with log.open("rb") as output:
             output.seek(mark)
-            said = output.read(MAX_DIAG // 8)
+            said = output.read(MAX_DIAG // 8 + 1)
     except OSError:
         said = b""
+    # Cut at a line's end, never inside one: launch_diagnostics redacts line by line, and a token cut short would no
+    # longer match its pattern or the session (review of may-releases #136).
+    if len(said) > MAX_DIAG // 8:
+        said = said[:said.rfind(b"\n", 0, MAX_DIAG // 8) + 1]
     raise LaunchFailed(said)
 
 
@@ -1245,10 +1249,10 @@ class Diagnostics:
 LAUNCH_LOG_LINES = 1000
 
 
-def launch_diagnostics(adb, env, folder, scenario, token, said):
+def launch_diagnostics(adb, env, folder, scenario, token, said, emulator=b""):
     """Writes <scenario>.diag.txt for a launch that failed; the lines it dropped, or None when nothing was written.
-    Never an error."""
-    sections = ((b"am start", said or b""),
+    Never an error. emulator: emulator_section's text, first and at most MAX_DIAG // 16."""
+    sections = (*(((b"emulator", emulator[:MAX_DIAG // 16]),) if emulator else ()), (b"am start", said or b""),
                 (b"logcat crash,main", adb_output(adb, env, ["logcat", "-d", "-t", str(LAUNCH_LOG_LINES), "-b",
                                                              "crash,main"]) or b""),
                 (b"dumpsys activity top", adb_output(adb, env, ["shell", "dumpsys", "activity", "top"]) or b""))
@@ -1283,6 +1287,76 @@ ANIMATION_SETTINGS = ("window_animation_scale", "transition_animation_scale", "a
 ANIMATION_SCALE = "1"
 
 
+# Coordinator, 28 Oct (run 40666988126, both attempts): the emulator was gone after chat (poll's diag holds adb's "no
+# devices/emulators found"), and nothing said why: its own output went to the private run log, which is never sealed,
+# and its exit, the host's memory and the kernel's OOM kills were never read. The emulator and its system image are
+# installed unpinned (flows.install_sdk), so the log names their versions, digits and dots alone. The emulator's output
+# goes to EMULATOR_LOG; on a launch failure the scenario's sealed .diag.txt starts with emulator_section (its exit
+# status, adb's state, the host's available memory and OOM kills since boot, its output's last EMULATOR_LINES lines and
+# the kernel's last KERNEL_LINES, through kept_lines), and the public log gives the state and counts alone.
+EMULATOR_LOG, EMULATOR_LINES, KERNEL_LINES = "emulator.log", 200, 50
+MEMINFO, VMSTAT = Path("/proc/meminfo"), Path("/proc/vmstat")
+EMULATOR_VERSION = re.compile(rb"version ([0-9]{1,3}(?:\.[0-9]{1,6}){1,3})")
+IMAGE_REVISION = re.compile(rb"^Pkg\.Revision=([0-9]{1,4}(?:\.[0-9]{1,4}){0,2})[ \t\r]*$", re.MULTILINE)
+ADB_STATES = ("device", "offline", "unauthorized", "bootloader", "recovery")
+
+
+def emulator_versions(home, env):
+    """(the emulator's version, its system image's revision), each digits and dots alone, or "unknown"."""
+    try:
+        done = bounded_output([flows.sdk_tool(home, "emulator/emulator"), "-version"], env)
+    except flows.FlowsError:
+        done = None
+    found = EMULATOR_VERSION.search(done[1]) if done is not None and done[0] == 0 else None
+    try:
+        image = home.joinpath(*flows.SYSTEM_IMAGE.split(";"), "source.properties").read_bytes()[:65536]
+    except OSError:
+        image = b""
+    revision = IMAGE_REVISION.search(image)
+    return (found[1].decode() if found else "unknown"), (revision[1].decode() if revision else "unknown")
+
+
+def host_number(path, key):
+    """One whole number from a /proc file's "key value" line (meminfo's in kB), or None."""
+    try:
+        text = path.read_text(errors="replace")[:65536]
+    except OSError:
+        return None
+    found = re.search(rf"^{re.escape(key)}:?[ \t]+([0-9]{{1,15}})\b", text, re.MULTILINE)
+    return int(found[1]) if found else None
+
+
+def emulator_state(adb, env, emulator, kills_at_boot):
+    """(exit status or None while it runs, adb's state word or "none", MB available on the host or None, OOM kills
+    since boot or None): numbers and fixed words alone, for the public log."""
+    said = adb_output(adb, env, ["-s", SERIAL, "get-state"]) or b""
+    state = said.strip().decode("ascii", "replace")
+    kills = host_number(VMSTAT, "oom_kill")
+    available = host_number(MEMINFO, "MemAvailable")
+    return (emulator.poll(), state if state in ADB_STATES else "none", None if available is None else available // 1024,
+            None if kills is None or kills_at_boot is None else kills - kills_at_boot)
+
+
+def emulator_section(state, log):
+    """The sealed section of a launch failure: emulator_state's values, then the emulator's last output lines and the
+    kernel's (dmesg, when the runner lets it be read)."""
+    exited, adb_state, available, kills = state
+    try:
+        with (log.parent / EMULATOR_LOG).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - MAX_DIAG // 16))
+            output = b"".join(stream.read().splitlines(keepends=True)[-EMULATOR_LINES:])
+    except OSError:
+        output = b"(no emulator output)\n"
+    kernel = bounded_output(["dmesg"], child_env())
+    kernel = b"".join(kernel[1].splitlines(keepends=True)[-KERNEL_LINES:]) if kernel is not None and kernel[0] == 0 \
+        else b"(the kernel's messages could not be read)\n"
+    return (f"exit status: {'running' if exited is None else exited}\nadb state: {adb_state}\n"
+            f"host memory available: {'unknown' if available is None else available} MB\n"
+            f"host OOM kills since boot: {'unknown' if kills is None else kills}\n").encode() + \
+        b"-- emulator output --\n" + output + b"-- kernel --\n" + kernel
+
+
 def boot(root, log):
     """The emulator, as flows.run starts it (API 35 image, KVM, no window), with animations at ANIMATION_SCALE: (adb,
     process, env)."""
@@ -1295,6 +1369,7 @@ def boot(root, log):
                            "-n", AVD, "-k", flows.SYSTEM_IMAGE, "-d", flows.DEVICE], input=b"no\n", stdout=output,
                           stderr=output, env=env).returncode:
             raise DeviceTestsError("The emulator's virtual device could not be created; no scenario ran")
+    with (log.parent / EMULATOR_LOG).open("ab") as output:
         emulator = subprocess.Popen([flows.sdk_tool(home, "emulator/emulator"), "-avd", AVD, "-no-window", "-no-audio",
                                      "-no-boot-anim", "-no-snapshot", "-gpu", "swiftshader_indirect"],
                                     stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=env)
@@ -1666,6 +1741,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     tag, since = run_tag("android"), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     at("booting the emulator")
     adb, emulator, env = boot(root, log)
+    kills_at_boot = host_number(VMSTAT, "oom_kill")
+    version, revision = emulator_versions(flows.sdk(), env)
+    print(f"May device tests (android): emulator {version}, system image revision {revision}")
     results, records, cleaned_count = [], {}, None
     try:
         at("installing the app")
@@ -1728,7 +1806,9 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 launch(adb, env, token, log)
             except LaunchFailed as failed:
                 # The report and the diagnostics are kept and sealed; the scenarios after it are not started.
-                dropped = launch_diagnostics(adb, env, folder, row["id"], token, failed.said)
+                state = emulator_state(adb, env, emulator, kills_at_boot)
+                dropped = launch_diagnostics(adb, env, folder, row["id"], token, failed.said,
+                                             emulator_section(state, log))
                 if dropped is not None:
                     diagnostics.kept += 1
                     diagnostics.dropped[row["id"]] = dropped
@@ -1738,6 +1818,11 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                 halted = True
                 print("May device tests (android): May Playground did not start on the emulator after one retry; the "
                       "run stopped there, and its diagnostics are sealed")
+                exited, adb_state, available, kills = (("running" if state[0] is None else state[0]), state[1],
+                                                       "unknown" if state[2] is None else state[2],
+                                                       "unknown" if state[3] is None else state[3])
+                print(f"May device tests (android): the emulator then: exit status {exited}, adb {adb_state}, "
+                      f"{available} MB available on the host, {kills} OOM kills since boot")
                 continue
             recorder = Recorder(adb, env, row["id"], log)
             recorder.start()

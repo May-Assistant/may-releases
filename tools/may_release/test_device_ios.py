@@ -227,26 +227,32 @@ class RunTests(Workspace):
                                  "May device tests (ios): main-thread span recognizer: 2, the longest 410 ms"],
                          "per name across the scenarios, in the agreed order, only the names seen")
 
-    def test_the_watchdog_and_change_log_are_asked_for_at_launch_only_when_dispatched(self):
-        """may-app #1338: both are opt-in at launch; ios_diagnostics asks for them on evidence runs alone."""
+    def test_the_watchdog_is_asked_for_at_launch_unless_dispatched_off_and_the_change_log_only_when_on(self):
+        """may-app #1338: the watchdog is asked for on every run, the nightly one (no inputs, so empty values) included,
+        unless ios_diagnostics is dispatched false; SwiftUI's change log only when ios_log_changes is dispatched true,
+        since it brought the idle hang back itself (may-app #1302; coordinator, 26 Oct)."""
         def launches(calls):
             return [env for argv, env in calls if argv[:3] == ["xcrun", "simctl", "launch"]]
 
-        calls, minted, report, out, run = self.run_it(env={device_ios.DIAGNOSTICS: "true"})
-        self.assertTrue(launches(calls))
-        for env in launches(calls):
-            self.assertEqual((env.get("SIMCTL_CHILD_MAY_DIAG_WATCHDOG"), env.get("SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES")),
-                             ("1", "1"))
-        self.assertIn("May device tests (ios): the main-thread watchdog and SwiftUI's change log are on for this run",
-                      out.splitlines())
-        for value in (None, "false", "", "TRUE "):
-            with self.subTest(value=value):
+        watchdog_line = "May device tests (ios): the main-thread watchdog is on for this run"
+        change_log_line = "May device tests (ios): SwiftUI's change log is on for this run"
+        for diagnostics, log_changes, asked in (
+                ("true", "false", {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG"}), ("", "", {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG"}),
+                (None, None, {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG"}), ("TRUE ", "TRUE ", {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG"}),
+                ("true", "true", {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG", "SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES"}),
+                ("false", "true", {"SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES"}), ("false", None, set()),
+                (" false\n", "", set())):
+            with self.subTest(diagnostics=diagnostics, log_changes=log_changes):
                 (self.private / device_tests.AGENTS).unlink(missing_ok=True)
-                calls, minted, report, out, run = self.run_it(env={device_ios.DIAGNOSTICS: value})
+                calls, minted, report, out, run = self.run_it(env={device_ios.DIAGNOSTICS: diagnostics,
+                                                                   device_ios.LOG_CHANGES: log_changes})
                 self.assertTrue(launches(calls))
                 for env in launches(calls):
-                    self.assertFalse([k for k in env if k.startswith("SIMCTL_CHILD_MAY_DIAG_")])
-                self.assertNotIn("watchdog", out)
+                    self.assertEqual({k for k in env if k.startswith("SIMCTL_CHILD_MAY_DIAG_")}, asked)
+                    self.assertTrue(all(env[k] == "1" for k in asked))
+                lines = out.splitlines()
+                self.assertEqual((watchdog_line in lines, change_log_line in lines),
+                                 ("SIMCTL_CHILD_MAY_DIAG_WATCHDOG" in asked, "SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES" in asked))
 
     def test_a_plain_run_says_its_stalls_were_not_collected_never_zero(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
@@ -259,9 +265,9 @@ class RunTests(Workspace):
             def keep(self, folder, scenario, token, driver=None, onboarding=b""):
                 super().keep(folder, scenario, token, driver, b"onboarding line\n")
 
-        calls, minted, report, out, run = self.run_it(diagnosed=Keeping)
+        calls, minted, report, out, run = self.run_it(diagnosed=Keeping, env={device_ios.DIAGNOSTICS: "false"})
         self.assertIn("May device tests (ios): diagnostics kept for 2 scenarios (main-thread stalls not collected: "
-                      "dispatch with ios_diagnostics for them; 0 with a crash; 0 with refused device acts)",
+                      "dispatched with ios_diagnostics off; 0 with a crash; 0 with refused device acts)",
                       out.splitlines())
         self.assertNotIn("0 main-thread stalls", out)
 
@@ -294,7 +300,7 @@ class RunTests(Workspace):
                                                           str(self.root / device_ios.APP)]),
                         "before the app is installed and first started")
         self.assertEqual([argv for argv in argvs if "config" in argv], [persist], "that subsystem alone")
-        self.assertNotIn("SwiftUI", out, "a config that took says nothing")
+        self.assertNotIn("body changes", out, "a config that took says nothing")
 
     def test_a_log_config_that_fails_is_said_and_never_stops_the_run(self):
         calls, _, report, out, _ = self.run_it(log_config_fails=True)
@@ -325,6 +331,7 @@ class RunTests(Workspace):
                          [("ui-pass", ["sign-in.mp4"], ["sign-in-end.png"]),
                           ("ui-pass", ["connections.mp4"], ["connections-end.png"])])
         self.assertEqual(out.splitlines(), [
+            "May device tests (ios): the main-thread watchdog is on for this run",
             "May device tests (ios): 2 scenarios ran; verdicts follow the judge step",
             "May device tests (ios): 2 test sessions were signed out at their end",
             "May device tests (ios): sign-in: ui-pass", "May device tests (ios): connections: ui-pass",
@@ -450,7 +457,7 @@ class RunTests(Workspace):
         _, _, _, out, _ = self.run_it(
             selection="chat,poll", agent=agent,
             env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
-        self.assertIn("May device tests (ios): 2 scenarios stopped after refused device acts in a row (fail-fast)", out)
+        self.assertIn("May device tests (ios): 2 scenarios stopped after the device stopped taking acts (fail-fast)", out)
 
     def test_the_server_reads_and_diagnostics_come_before_the_conversion(self):
         """Run 40181517145: poll's read came after a long conversion and got 401 (coordinator, 25 Oct)."""
