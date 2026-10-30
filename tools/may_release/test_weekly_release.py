@@ -153,7 +153,8 @@ class DispatchTests(unittest.TestCase):
             tool.pick_step(pulls_get([merged(8, CUT, THURSDAY)]), now=THURSDAY + datetime.timedelta(hours=2))
             self.assertNotIn(tool.READ_TOKEN, os.environ, "the read token is popped")
             posted = []
-            tool.dispatch_step(lambda path, token, payload: posted.append(payload) or 204)
+            tool.dispatch_step(lambda path, token, payload: posted.append(payload) or 204,
+                               now=THURSDAY + datetime.timedelta(hours=2))
             carried = {p.name: json.loads(p.read_text()) for p in (Path(temp) / tool.STATE).iterdir()}
         self.assertEqual(posted[0]["inputs"]["platform"], "ios")
         self.assertEqual(posted[0]["inputs"]["build_number"], "15")
@@ -170,8 +171,30 @@ class DispatchTests(unittest.TestCase):
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             tool.runs_step(runs_get([store_run("iOS", 14, CUT, status="waiting", conclusion=None)]))
             tool.pick_step(pulls_get([merged(8, CUT, THURSDAY)]), now=THURSDAY)
-            tool.dispatch_step(lambda *a: self.fail("dispatched"))
+            tool.dispatch_step(lambda *a: self.fail("dispatched"), now=THURSDAY)
         self.assertIn("a store run is queued, waiting for approval or running; nothing dispatched", out.getvalue())
+
+
+    def test_only_thursday_1507_to_friday_2307_outside_the_device_window_dispatches(self):
+        for now, reason in ((THURSDAY, None), (THURSDAY - datetime.timedelta(minutes=1), "outside"),
+                            (at(5, 23, 7), None), (at(6, 9, 59), None), (at(6, 10, 0), "device window"),
+                            (at(6, 10, 7), "device window"), (at(6, 11, 7), "device window"), (at(6, 11, 30), None),
+                            (at(6, 23, 7), None), (at(6, 23, 8), "outside"), (at(7, 12, 7), "outside"),
+                            (at(4, 16, 7), "outside")):
+            with self.subTest(now=now):
+                self.assertEqual(tool.quiet(now), reason)
+
+    def test_a_quiet_firing_sends_nothing_even_when_a_build_is_due(self):
+        for now, line in ((at(6, 10, 7), "inside the 10:00 to 11:30 UTC device-test window; nothing dispatched"),
+                          (at(7, 15, 7), "outside Thursday 15:07 to Friday 23:07 UTC; nothing dispatched")):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as temp, \
+                    patch.dict(os.environ, {**RUN, "RUNNER_TEMP": temp, "GH_TOKEN": "t", tool.READ_TOKEN: "t"},
+                               clear=True), \
+                    patch("sys.stdout", new_callable=io.StringIO) as out:
+                tool.runs_step(runs_get([store_run("iOS", 14, OLD)]))
+                tool.pick_step(pulls_get([merged(8, CUT, THURSDAY)]), now=now)
+                tool.dispatch_step(lambda *a: self.fail("dispatched"), now=now)
+                self.assertEqual(out.getvalue().splitlines()[-1], "May weekly release: " + line)
 
 
 class WorkflowTests(unittest.TestCase):

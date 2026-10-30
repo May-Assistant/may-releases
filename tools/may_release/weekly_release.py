@@ -8,6 +8,7 @@ the platform, the build number and, from now on, the source SHA) say everything 
 - The cut is may-app main as of the week's CUT (Thursday 15:07 UTC; the day is the coordinator's placeholder until
   Samuel confirms it): the merge commit of the last pull request merged into main at or before then. Later merges that
   day wait for next week, so the hourly firings never make a second build of the week.
+- A firing after Friday 23:07 UTC, or between 10:00 and 11:30 UTC (the device-test window): nothing is dispatched.
 - A store run queued, waiting for its approval or running: nothing is dispatched.
 - No iOS run for the cut: iOS is dispatched. This is also "no run if main hasn't changed": a cut already built is
   never dispatched again.
@@ -55,6 +56,10 @@ RUNS_PATH = "actions/workflows/store-release-draft.yml/runs"
 DISPATCH_PATH = "actions/workflows/store-release-draft.yml/dispatches"
 # The week's cut: Thursday (weekday 3) at 15:07 UTC, off the round minutes and outside the 10:00-11:30 device window.
 CUT_WEEKDAY, CUT_HOUR, CUT_MINUTE = 3, 15, 7
+# Firings dispatch only from the cut to Friday 23:07 UTC (coordinator, 30 Oct), and never in the device-test window,
+# 10:00 to 11:30 UTC, so a release never overlaps it.
+WINDOW = datetime.timedelta(hours=32)
+DEVICE_WINDOW = (datetime.time(10, 0), datetime.time(11, 30))
 PLATFORMS = ("ios", "android")
 LABELS = {"ios": "iOS", "android": "Android"}
 STORE_PAGES = 5
@@ -94,6 +99,15 @@ def cut_time(now):
     day = now.replace(hour=CUT_HOUR, minute=CUT_MINUTE, second=0, microsecond=0)
     day -= datetime.timedelta(days=(now.weekday() - CUT_WEEKDAY) % 7)
     return day if day <= now else day - datetime.timedelta(days=7)
+
+
+def quiet(now):
+    """The fixed reason this firing dispatches nothing whatever the runs say, or None."""
+    if now - cut_time(now) > WINDOW:
+        return "outside"
+    if DEVICE_WINDOW[0] <= now.time() < DEVICE_WINDOW[1]:
+        return "device window"
+    return None
 
 
 def admit(get=get_json):
@@ -269,7 +283,7 @@ def pick_step(get=app_get, now=None):
         print(f"May weekly release: this week's cut of may-app main is {sha}")
 
 
-def dispatch_step(post=control_dispatch):
+def dispatch_step(post=control_dispatch, now=None):
     check_run()
     token = os.environ.get("GH_TOKEN")
     if not token:
@@ -278,8 +292,13 @@ def dispatch_step(post=control_dispatch):
     if not isinstance(runs, dict) or not isinstance(runs.get("busy"), bool) or not isinstance(runs.get("runs"), list) or \
             not isinstance(cut, dict) or set(cut) != {"cut"}:
         raise ScheduleError("The store runs or the cut were not recorded; nothing was dispatched")
-    platform, number = decide(runs["busy"], runs["runs"], cut["cut"])
-    if number == "busy":
+    reason = quiet(now or datetime.datetime.now(datetime.timezone.utc))
+    platform, number = (None, reason) if reason else decide(runs["busy"], runs["runs"], cut["cut"])
+    if number == "outside":
+        print("May weekly release: outside Thursday 15:07 to Friday 23:07 UTC; nothing dispatched")
+    elif number == "device window":
+        print("May weekly release: inside the 10:00 to 11:30 UTC device-test window; nothing dispatched")
+    elif number == "busy":
         print("May weekly release: a store run is queued, waiting for approval or running; nothing dispatched")
     elif number == "no cut":
         print("May weekly release: there is no cut this week; nothing dispatched")
