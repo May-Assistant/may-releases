@@ -450,7 +450,7 @@ class RunTests(Workspace):
         _, _, _, out, _ = self.run_it(
             selection="chat,poll", agent=agent,
             env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
-        self.assertIn("May device tests (ios): 2 scenarios stopped after refused device acts in a row (fail-fast)", out)
+        self.assertIn("May device tests (ios): 2 scenarios stopped after the device stopped taking acts (fail-fast)", out)
 
     def test_the_server_reads_and_diagnostics_come_before_the_conversion(self):
         """Run 40181517145: poll's read came after a long conversion and got 401 (coordinator, 25 Oct)."""

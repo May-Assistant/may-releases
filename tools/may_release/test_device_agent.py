@@ -1670,13 +1670,16 @@ class IosDeviceServerTests(unittest.TestCase):
         with patch("device_mcp.subprocess.run", side_effect=run):
             return device_mcp.call(name, args, self.config)
 
-    def test_three_refused_acts_in_a_row_stop_the_agent_blocked(self):
-        """Run 40203481816: every iOS act after the first refusal was refused too, 90 s each (coordinator, 25 Oct)."""
-        with patch("device_mcp.flow", side_effect=[1, 1, 0, 1, 1, 1]) as flow:
-            answers = [self.call("tap", x=180, y=120) for _ in range(5)]
-            self.assertEqual([failed for failed, _ in answers], [True, True, False, True, True],
+    def test_two_refused_acts_in_a_row_stop_the_agent_blocked(self):
+        """Run 40203481816: every iOS act after the first refusal was refused too, 90 s each (coordinator, 25 Oct). Run
+        40309200520: three still cost 9 minutes a scenario, so two in a row now stop it (coordinator, 26 Oct)."""
+        with patch("device_mcp.flow", side_effect=[1, 0, 1, 0, 1, 1]) as flow:
+            answers = [self.call("tap", x=180, y=120) for _ in range(4)]
+            self.assertEqual([failed for failed, _ in answers], [True, False, True, False],
                              "a taken act starts the count again")
             self.assertFalse(self.config["wedged"])
+            self.assertTrue(self.call("tap", x=180, y=120)[0])
+            self.assertFalse(self.config["wedged"], "one refusal alone does not stop it")
             failed, content = self.call("tap", x=180, y=120)
         self.assertTrue(failed)
         self.assertEqual(content[0]["text"], device_mcp.WEDGED_TEXT)
@@ -1695,6 +1698,63 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertEqual(verdict, {"verdict": "fail", "reason": device_tests.WEDGED},
                          "a stopped agent is never a pass, and the report says why")
         self.assertIn(device_tests.WEDGED, publish.REASONS)
+
+    def test_a_snapshot_timeout_after_a_read_that_timed_out_stops_the_agent_at_once(self):
+        """Run 40309200520: the chat's snapshot never came back; one more refusal there only spends another minute. Its
+        diagnostics: in poll-skip and onboarding the tap was COMPLETED and the screen never settled (a settle timeout),
+        which counts toward the two in a row and never stops it alone (independent review of #139)."""
+        def refused_with(cause):
+            def flow(config, command):
+                config["refusal_cause"] = cause
+                return 1
+            return flow
+
+        for read, act, wedged in (("snapshot timeout", "snapshot timeout", True), (None, "snapshot timeout", False),
+                                  (None, "settle timeout", False), ("snapshot timeout", "settle timeout", False),
+                                  ("snapshot timeout", "lost connection", False), ("not idle", "snapshot timeout", False)):
+            with self.subTest(read=read, act=act):
+                self.config.update(refusals=0, wedged=False, dump_cause=read)
+                with patch("device_mcp.flow", side_effect=refused_with(act)):
+                    failed, content = self.call("tap", x=180, y=120)
+                self.assertTrue(failed)
+                self.assertEqual(self.config["wedged"], wedged)
+                self.assertEqual(content[0]["text"] == device_mcp.WEDGED_TEXT, wedged)
+
+    def test_a_settle_timeout_counts_toward_two_in_a_row(self):
+        def refused(config, command):
+            config["refusal_cause"] = "settle timeout"
+            return 1
+
+        with patch("device_mcp.flow", side_effect=refused):
+            self.call("tap", x=180, y=120)
+            self.assertFalse(self.config["wedged"], "one slow settle while a reply streams does not end the scenario")
+            failed, content = self.call("tap", x=180, y=120)
+        self.assertEqual((failed, content[0]["text"], self.config["wedged"]), (True, device_mcp.WEDGED_TEXT, True))
+
+    def test_a_taken_act_clears_an_earlier_reads_time_out(self):
+        """Independent review of #139: a read that timed out before an act that was taken says nothing of the screen
+        after it, so a later snapshot timeout alone does not stop the agent."""
+        def refused(config, command):
+            config["refusal_cause"] = "snapshot timeout"
+            return 1
+
+        self.config.update(dump_cause="snapshot timeout")
+        with patch("device_mcp.flow", return_value=0):
+            self.assertFalse(self.call("tap", x=180, y=120)[0])
+        self.assertIsNone(self.config["dump_cause"])
+        with patch("device_mcp.flow", side_effect=refused):
+            failed, content = self.call("tap", x=180, y=120)
+        self.assertTrue(failed)
+        self.assertFalse(self.config["wedged"])
+        self.assertNotEqual(content[0]["text"], device_mcp.WEDGED_TEXT)
+
+    def test_each_act_is_held_act_seconds_at_most(self):
+        seen = []
+        with patch("device_mcp.tool", side_effect=lambda config, argv, timeout=90, both=False: seen.append(timeout) or
+                   (0, b"")):
+            device_mcp.flow(self.config, "- back")
+        self.assertEqual(seen, [device_mcp.ACT_SECONDS])
+        self.assertLessEqual(device_mcp.ACT_SECONDS, 60)
 
     def test_each_act_is_one_fixed_maestro_command_in_points(self):
         self.call("tap", x=180, y=120)
@@ -1792,7 +1852,10 @@ class IosDeviceServerTests(unittest.TestCase):
     def test_a_failed_hierarchy_or_refused_act_keeps_the_drivers_cause_in_fixed_words(self):
         """Run 40290647340: "iOS hierarchy failed" said nothing of why; the driver's output is sorted into
         DRIVER_CAUSES and only the word is kept (coordinator, 26 Oct)."""
-        cases = {b"Timed out waiting for the snapshot of the accessibility hierarchy": "snapshot timeout",
+        cases = {b"Tap on point (189,250)... COMPLETED\nWARNING: GL pipe is running in software mode\n\n(timed out)\n":
+                 "settle timeout",
+                 b"Tap on point (133,577)...\n(timed out)\n": "snapshot timeout",
+                 b"Timed out waiting for the snapshot of the accessibility hierarchy": "snapshot timeout",
                  b"Failed to wait for app to idle (quiescence)": "not idle",
                  b"io.grpc.StatusRuntimeException: UNAVAILABLE: Connection refused": "lost connection",
                  b"Application io.github.mayassistant.may.playground is not running": "app not running",
@@ -1800,7 +1863,7 @@ class IosDeviceServerTests(unittest.TestCase):
         for said, cause in cases.items():
             with self.subTest(cause=cause):
                 self.failing = {"hierarchy": said, "act": said}
-                self.config.update(actions=0, refusals=0, done=False, hierarchy="")
+                self.config.update(actions=0, refusals=0, done=False, hierarchy="", wedged=False)
                 self.assertTrue(self.call("tap", x=180, y=120)[0])
                 self.assertFalse(self.call("done", outcome="blocked", summary="stuck")[0])
                 stored = json.loads(Path(self.config["result"]).read_text())
@@ -1813,8 +1876,16 @@ class IosDeviceServerTests(unittest.TestCase):
         stored = json.loads(Path(self.config["result"]).read_text())
         self.assertEqual((stored["hierarchy_failure"], stored["hierarchy_cause"]), (None, None),
                          "a read that worked keeps no cause")
-        self.assertEqual(device_mcp.DRIVER_CAUSES, ("not idle", "snapshot timeout", "lost connection", "app not running",
+        self.assertEqual(device_mcp.DRIVER_CAUSES, ("settle timeout", "not idle", "snapshot timeout", "lost connection", "app not running",
                                                     "scale unknown", "other"))
+        self.assertEqual(device_mcp.driver_cause(b"Tap on point (201,803)... COMPLETED\nidle\n"), "not idle",
+                         "COMPLETED alone, with no act that ran out of time, is no settle timeout")
+        for typed in (b"Input text COMPLETED...\n(timed out)\n", b"Input text a COMPLETED b...\n(timed out)\n"):
+            with self.subTest(typed=typed):
+                self.assertEqual(device_mcp.driver_cause(typed), "snapshot timeout",
+                                 "typed text holding COMPLETED is not Maestro's status line (independent review of #139)")
+        self.assertEqual(device_mcp.driver_cause(b"Swipe from (1,2) to (3,4)... COMPLETED\n(timed out)\n"),
+                         "settle timeout")
 
     def test_the_hierarchy_is_in_screenshot_pixels(self):
         failed, content = self.call("hierarchy")
