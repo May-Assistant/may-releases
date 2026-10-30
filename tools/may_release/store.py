@@ -142,6 +142,9 @@ SECRET_NAMES = (
     # device-tests.yml: the repository's Claude token, for the device agent (device_tests.py run) and its judge
     # (device_tests.py judge) alone.
     "CLAUDE_CODE_OAUTH_TOKEN",
+    # testflight-feedback.yml: the dedicated feedback key (testflight_feedback.py read alone, with MAY_ASC_ISSUER_ID)
+    # and the token that lists and files may-app's testflight-feedback issues (known and file alone).
+    "MAY_ASC_FEEDBACK_KEY_BASE64", "MAY_APP_ISSUES_TOKEN",
 )
 SOURCE_READ_SECRETS = ("MAY_APP_READ_KEY", "MAY_DS_READ_KEY")
 # Crash reports (PostHog): each platform's build step alone may hold its project key, and

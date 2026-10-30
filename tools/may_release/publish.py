@@ -332,15 +332,18 @@ def git(argv, log, env, cwd, capture=False):
     return result.stdout
 
 
-def runs_after(existing, entry):
-    """runs.json after adding entry first: (the list kept, the folders to remove)."""
+def runs_after(existing, entry, keep=KEEP):
+    """runs.json after adding entry first: (the list kept, the folders to remove). keep None keeps every folder
+    (testflight_feedback.py: its issues link each one)."""
     runs = [run for run in existing if isinstance(run, dict) and isinstance(run.get("folder"), str) and
             RUN_FOLDER.fullmatch(run["folder"]) and run["folder"] != entry["folder"]]
     runs.insert(0, entry)
-    return runs[:KEEP], [run["folder"] for run in runs[KEEP:]]
+    if keep is None:
+        return runs, []
+    return runs[:keep], [run["folder"] for run in runs[keep:]]
 
 
-def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git, extra=None):
+def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git, extra=None, keep=KEEP):
     """Add tree as prefix + folder in may-renders' main, record entry first in prefix + runs.json, remove the run
     folders beyond the newest KEEP there, let extra(base) add to the commit, and push main (never by force; the first
     push creates it). Returns (kept, removed, extra's result)."""
@@ -359,7 +362,7 @@ def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git, ex
         write_private(known, (GITHUB_HOST_KEY + "\n").encode())
         for attempt in range(1, PUSH_ATTEMPTS + 1):
             try:
-                return commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, root, work)
+                return commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, root, work, keep)
             except GitFailed as failed:
                 if failed.cause != "rejected" or attempt == PUSH_ATTEMPTS:
                     raise
@@ -369,7 +372,7 @@ def publish_tree(tree, prefix, folder, entry, message, key_text, run_git=git, ex
         known.unlink(missing_ok=True)
 
 
-def commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, root, work):
+def commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, root, work, keep=KEEP):
     """One attempt of publish_tree, in a fresh clone of may-renders' main at work: (kept, removed, extra's result)."""
     shutil.rmtree(work, ignore_errors=True)
     run_git(["init", "-q", str(work)], log, env, root)
@@ -388,7 +391,7 @@ def commit_tree(tree, prefix, folder, entry, message, run_git, extra, log, env, 
         existing = json.loads(index.read_text()) if index.is_file() and not index.is_symlink() else []
     except (OSError, ValueError):
         existing = []
-    kept, removed = runs_after(existing if isinstance(existing, list) else [], entry)
+    kept, removed = runs_after(existing if isinstance(existing, list) else [], entry, keep)
     for old in removed + [folder]:
         if (base / old).exists():
             run_git(["rm", "-r", "-q", "--ignore-unmatch", "--", prefix + old], log, env, work)

@@ -193,10 +193,11 @@ def der_to_jose(signature):
     return r + s
 
 
-def asc_token(key_path, issuer, now=None):
-    """An App Store Connect API token signed with the upload key (ES256, via the system openssl)."""
+def asc_token(key_path, issuer, now=None, kid=APPLE_KEY_ID):
+    """An App Store Connect API token signed with the upload key (ES256, via the system openssl); testflight_feedback.py
+    signs with its own key's ID (kid)."""
     issued = int(now if now is not None else time.time())
-    header = {"alg": "ES256", "kid": APPLE_KEY_ID, "typ": "JWT"}
+    header = {"alg": "ES256", "kid": kid, "typ": "JWT"}
     claims = {"iss": issuer, "iat": issued, "exp": issued + TOKEN_LIFETIME, "aud": "appstoreconnect-v1"}
     signing_input = b64url(json.dumps(header).encode()) + b"." + b64url(json.dumps(claims).encode())
     try:

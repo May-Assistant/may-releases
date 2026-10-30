@@ -1,0 +1,76 @@
+name: May TestFlight feedback (filed as private may-app issues; counts only in this log)
+on:
+  # Hourly, and by hand: testflight_feedback.py files each new TestFlight screenshot or crash submission once.
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: may-testflight-feedback
+  cancel-in-progress: false
+jobs:
+  admission:
+    # Admission has no environment, so a missing one is denied on its 404 and never auto-created; it checks the run
+    # (schedule or dispatch, main only) and may-testflight-feedback's policy (no required reviewer, administrator
+    # bypass off, main only).
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/testflight_feedback.py admit
+  feedback:
+    # No pull request code runs here. Each credential is in its own step alone: the issues token where the filed
+    # submissions are listed and where new ones are filed, the dedicated App Store Connect key (Developer role, never
+    # the release key) where the feedback is read, and the may-renders deploy key where the screenshots are stored.
+    # Feedback stays in the runner's private folder and goes only to may-app's issues and may-renders.
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_ISSUES_TOKEN, before any pull request code
+        id: ci-issues
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-issues: write
+      - name: List the submissions already filed, with no App Store Connect key
+        env:
+          MAY_APP_ISSUES_TOKEN: ${{ steps.ci-issues.outputs.token || secrets.MAY_APP_ISSUES_TOKEN }}
+        run: python3 -I -S -B tools/may_release/testflight_feedback.py known
+      - name: Read new feedback from App Store Connect, with no GitHub token
+        env:
+          MAY_ASC_FEEDBACK_KEY_BASE64: ${{ secrets.MAY_ASC_FEEDBACK_KEY_BASE64 }}
+          MAY_ASC_FEEDBACK_KEY_ID: ${{ vars.MAY_ASC_FEEDBACK_KEY_ID }}
+          MAY_ASC_ISSUER_ID: ${{ secrets.MAY_ASC_ISSUER_ID }}
+        run: python3 -I -S -B tools/may_release/testflight_feedback.py read
+      - name: Store the screenshots in may-renders, with its deploy key alone
+        env:
+          MAY_APP_RENDERS_WRITE_KEY: ${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}
+        run: python3 -I -S -B tools/may_release/testflight_feedback.py store
+      - name: File each new submission as a may-app issue, never in this log
+        env:
+          MAY_APP_ISSUES_TOKEN: ${{ steps.ci-issues.outputs.token || secrets.MAY_APP_ISSUES_TOKEN }}
+        run: python3 -I -S -B tools/may_release/testflight_feedback.py file
+      - name: Remove the feedback
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-testflight" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-publish-git"
