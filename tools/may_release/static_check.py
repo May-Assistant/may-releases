@@ -275,11 +275,20 @@ REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{{{ steps.{}.outputs.app-slug }}
 # Each review mint: the fetch step's run line, which the slug sits right above.
 REVIEW_FETCHES = {"ci-review": 'review.py fetch --pr-number "$MAY_PR_NUMBER"\n',
                   "ci-ds-review": 'review.py fetch --pr-number "$MAY_PR_NUMBER" --target ds\n'}
-# A post that edits its head's own comment in place is told the comment app's slug, so it edits only that bot's
-# comments (review of may-releases #137): {(workflow, job): the post step's run line it sits right above}.
-COMMENT_SLUG = "          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}\n"
-COMMENT_SLUG_POSTS = {("native-compile-pr.yml", "post"): "        run: python3 -I -S -B tools/may_release/"
-                                                           "compile_pr_errors.py post "}
+# Each post is told its comment app's slug, so only that bot's own comments are edited or count as this head's
+# earlier post (review of may-releases #137): {(workflow, job): (the comment mint, the post step's run line it sits
+# right above)}.
+COMMENT_SLUG_POSTS = {
+    ("native-compile-pr.yml", "post"): ("ci-comment", "compile_pr_errors.py post "),
+    ("native-compile-pr.yml", "swift-checks"): ("ci-comment", "swift_checks.py post "),
+    ("ios-core-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
+    ("ios-renders.yml", "publish"): ("ci-comment", "publish.py comment "),
+    ("ds-swift-compile.yml", "native"): ("ci-ds-comment", "ds_compile.py post "),
+}
+
+
+def comment_slug(step_id):
+    return f"          MAY_CI_APP_SLUG: ${{{{ steps.{step_id}.outputs.app-slug }}}}\n"
 APP_TOKEN_TRACES = ("create-github-app-token", CI_APP_ID, CI_APP_KEY, RENDERS_APP_ID, RENDERS_APP_KEY, "steps.ci-",
                     "steps.renders-", "MAY_REVIEW_APP_SLUG")
 
@@ -337,11 +346,11 @@ def unminted(workflow_name, text):
                         REVIEW_FETCHES[step_id] not in body:
                     found.append(name + "the fetch step is not told the May CI app's slug exactly once")
                 body = body.replace(slug, "")
-            if step_id == "ci-comment" and (workflow_name, job) in COMMENT_SLUG_POSTS:
-                if body.count(COMMENT_SLUG) != 1 or \
-                        COMMENT_SLUG + COMMENT_SLUG_POSTS[(workflow_name, job)] not in body:
+            if COMMENT_SLUG_POSTS.get((workflow_name, job), (None,))[0] == step_id:
+                line, run = comment_slug(step_id), COMMENT_SLUG_POSTS[(workflow_name, job)][1]
+                if body.count(line) != 1 or line + "        run: python3 -I -S -B tools/may_release/" + run not in body:
                     found.append(name + f"job {job}'s post is not told the May CI app's slug exactly once")
-                body = body.replace(COMMENT_SLUG, "")
+                body = body.replace(line, "")
         text = text[:span[0]] + body + text[span[1]:]
     if any(trace in text for trace in APP_TOKEN_TRACES):
         found.append(name + "a GitHub App token is minted or used other than by its pinned, narrowed step right after "

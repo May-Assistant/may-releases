@@ -233,7 +233,8 @@ class PostTests(unittest.TestCase):
         return call
 
     def post(self, call, token=TOKEN):
-        environ = {"RUNNER_TEMP": str(self.root), "PATH": os.environ.get("PATH", ""), "GITHUB_RUN_ID": "9"}
+        environ = {"RUNNER_TEMP": str(self.root), "PATH": os.environ.get("PATH", ""), "GITHUB_RUN_ID": "9",
+                   "MAY_CI_APP_SLUG": "may-ci"}
         if token is not None:
             environ["MAY_APP_PR_COMMENT_TOKEN"] = token
         out = io.StringIO()
@@ -283,11 +284,17 @@ class PostTests(unittest.TestCase):
             self.post(self.api(pull(head__sha="b" * 40)))
         self.assertEqual(self.posted(), [])
         self.calls = []
-        earlier = [{"body": f"x <!-- {tool.MARKER} head={SHA} -->", "user": {"login": "x"}}]
+        earlier = [{"body": f"x <!-- {tool.MARKER} head={SHA} -->", "user": {"type": "Bot", "login": "may-ci[bot]"}}]
         code, out = self.post(self.api(comments=earlier))
         self.assertEqual(code, 1)
         self.assertIn("already posted", out)
         self.assertEqual(self.posted(), [])
+        # Review of may-releases #137: a person's or another app's comment quoting the marker is not this post.
+        for user in ({"type": "User", "login": "may-ci[bot]"}, {"type": "Bot", "login": "x[bot]"}, {"login": "x"}):
+            with self.subTest(user=user):
+                self.calls = []
+                self.post(self.api(comments=[dict(earlier[0], user=user)]))
+                self.assertEqual(len(self.posted()), 1)
 
     def test_a_malformed_record_is_refused(self):
         for outcome, failed in (({"result": "maybe", "problems": 0}, {"failures": [], "total": 0}),

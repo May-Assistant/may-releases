@@ -832,6 +832,7 @@ class PublishCommentTests(unittest.TestCase):
             return 201, {}
 
         with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "MAY_APP_PR_COMMENT_TOKEN": "c" * 30,
+                                     "MAY_CI_APP_SLUG": "may-ci",
                                      "GITHUB_RUN_ID": "77"}, clear=True), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             try:
@@ -863,9 +864,16 @@ class PublishCommentTests(unittest.TestCase):
         calls, _, error = self.comment(head="b" * 40)
         self.assertEqual(error, "The pull request is no longer open at the rendered head; nothing was posted")
         self.assertFalse(any(method == "POST" for method, _, _ in calls))
-        calls, out, _ = self.comment(comments=[{"body": f"<!-- may-ios-renders head={SHA} -->"}])
+        bot = {"type": "Bot", "login": "may-ci[bot]"}
+        calls, out, _ = self.comment(comments=[{"body": f"<!-- may-ios-renders head={SHA} -->", "user": bot}])
         self.assertFalse(any(method == "POST" for method, _, _ in calls))
         self.assertIn("already linked", out)
+        # Review of may-releases #137: a person's or another app's comment quoting the marker is not this link.
+        for user in ({"type": "User", "login": "may-ci[bot]"}, {"type": "Bot", "login": "x[bot]"}, None):
+            with self.subTest(user=user):
+                stranger = {"body": f"<!-- may-ios-renders head={SHA} -->", **({"user": user} if user else {})}
+                calls, out, _ = self.comment(comments=[stranger])
+                self.assertTrue(any(method == "POST" for method, _, _ in calls))
 
     def test_without_the_comment_token_the_comment_is_skipped_and_nothing_fails(self):
         calls = []

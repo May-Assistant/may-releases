@@ -261,6 +261,10 @@ ALLOWED_CALLS = (("GET", _PR.format("pulls")),
                  ("POST", _PR.format("issues") + r"/comments"))
 # Pages of existing comments read for the marker before posting (100 each).
 MAX_COMMENT_PAGES = 10
+# The comment mint's app-slug, in each post step (static_check pins it): its bot's own comments alone count as this
+# head's earlier post (review of may-releases #137).
+APP_SLUG = "MAY_CI_APP_SLUG"
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,38}")
 
 
 def post_or_update(call_api, repo, number, sha, body, token, name=MARKER, author=None):
@@ -342,15 +346,23 @@ def request_once(method, path, payload, token):
         return 0, None
 
 
-def post_once(call_api, repo, number, sha, body, token, name=MARKER):
+def comment_author(environ):
+    """The comment app's own bot login, "<slug>[bot]", from the mint's app-slug output in APP_SLUG; "" (no comment's
+    author) when it is unset or odd, as with the PAT fallback, whose user is not known here (review of #137)."""
+    slug = environ.get(APP_SLUG, "")
+    return slug + "[bot]" if SLUG.fullmatch(slug) else ""
+
+
+def post_once(call_api, repo, number, sha, body, token, name=MARKER, author=None):
     """Post body on the pull request unless a comment already carries this head's marker: True when posted, False
     when it was already there. One comment per head: a re-run (or a second dispatch) for a head already reported
-    posts nothing again. Shared with compile_pr_errors.py; every message is repository-neutral."""
+    posts nothing again. With author (comment_author), only that bot's own comments count, so a person's or another
+    app's comment quoting the marker never stops the post; "" counts none. Every message is repository-neutral."""
     for page in range(1, MAX_COMMENT_PAGES + 1):
         status, comments = call_api("GET", f"/repos/{repo}/issues/{number}/comments?per_page=100&page={page}", None, token)
         if status != 200 or not isinstance(comments, list):
             raise DsCompileError("The pull request's comments could not be read; nothing was posted")
-        if already_posted(comments, sha, name):
+        if already_posted(comments, sha, name, author):
             return False
         if len(comments) < 100:
             break
@@ -396,7 +408,7 @@ def post(sha, pr, call_api=github):
         validate_ds_pull_request(pull, number, sha)
     except GateDenial:
         raise DsCompileError("The pull request is no longer open at the compiled head; nothing was posted") from None
-    if not post_once(call_api, DS_REPO, number, sha, body, token):
+    if not post_once(call_api, DS_REPO, number, sha, body, token, author=comment_author(os.environ)):
         print(f"DS Swift compile result already posted for this head on may-design-system #{number}; nothing posted again")
         return 0 if passed else 1
     if passed:
