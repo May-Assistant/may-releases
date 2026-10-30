@@ -660,6 +660,8 @@ gh workflow run ios-core-pr.yml -f pr_number=<may-app PR number> -f source_sha=<
 - **Concurrency:** one run at a time per pull request (`may-ios-core-pr-<number>`), so a queued run of another pull request is never dropped.
 - **Residual risk:** the pull request's own Swift runs on a runner whose earlier steps held the deploy keys and the pull-request read token, though as `may-sandbox` it reads none of the runner user's files; only same-repository heads are admitted.
 - `tools/ios`'s Python checks are not run here: `test_swift_*.py` and `test_parity_*.py` already run in the iOS compile's `swift-checks` job.
+- **It also runs inside every iOS compile** (coordinator, 30 Oct: may-app #1493 merged with a failing MayCore test that the compile alone could not see). `native-compile-pr.yml` has a `core` job that is this workflow's `core` job exactly, which `static_check.py` holds equal, so every compile dispatch builds and tests MayCore beside `swift-checks` and `native`, and a failing test fails the compile run. This workflow stays for a run on its own.
+- **`ios/project.yml` as the pull request has it** (N, 30 Oct). The fetch points project.yml's MayDesignSystem at the local checkout for the Xcode build, and MayCore's own pin test, which reads `revision: <the lock's sha>` there, then failed on every pull request. MayCore never reads the design system, so `ios_core.py run` first puts project.yml back exactly as the head's own blob (`git show HEAD:ios/project.yml`). A head without one runs as before. A project.yml that can't be read back, or that is a link, stops the run before anything is built.
 
 ### Design-system Swift compile of a pull request head
 
