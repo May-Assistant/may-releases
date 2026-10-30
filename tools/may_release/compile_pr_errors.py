@@ -40,8 +40,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from compile import OUTCOME
-from ds_compile import (DsCompileError, MAX_BODY, MAX_ERRORS, SHA, XCODE, diagnostics, fence_for, post_or_update,
-                        request, run_url)
+from ds_compile import (APP_SLUG, DsCompileError, MAX_BODY, MAX_ERRORS, SHA, XCODE, comment_author, diagnostics,
+                        fence_for, post_or_update, request, run_url)
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
@@ -66,10 +66,6 @@ MARKER = "may-ios-compile-pr"
 # with the key pair unset, #133's post was silent and the may-app merge gate had no result to read). Only success and
 # failure are posted, as the result line alone: no detail, still head-marked.
 NATIVE_RESULT, RESULTS = "MAY_NATIVE_RESULT", {"success": True, "failure": False}
-# The May CI App's slug (the comment mint's app-slug output): the post edits or counts as posted only its own bot's
-# comments, "<slug>[bot]" (review of may-releases #137). Unset with the PAT fallback: then it posts anew each run.
-APP_SLUG = "MAY_CI_APP_SLUG"
-SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,38}")
 
 
 class CompilePrError(ValueError):
@@ -321,8 +317,8 @@ def post(sha, pr, call_api=github):
         validate_pull_request(pull, number, sha)
     except GateDenial:
         raise CompilePrError("The pull request is no longer open at the compiled head; nothing was posted") from None
-    slug = os.environ.get(APP_SLUG, "")
-    author = slug + "[bot]" if SLUG.fullmatch(slug) else None
+    # Only the comment app's own comments are edited or count as posted; without its slug (the PAT fallback), none.
+    author = comment_author(os.environ)
     done = post_or_update(listed_only(call_api), APP_REPO, number, sha, body, token, MARKER, author)
     if done == "same":
         print(f"May iOS compile result already posted for this head on may-app #{number}; nothing posted again")

@@ -156,5 +156,23 @@ class MintMutationTests(unittest.TestCase):
                 self.assertTrue(check(text.replace(slug, "").replace(review_env, review_env + slug)))
 
 
+    def test_each_post_alone_is_told_its_comment_apps_slug(self):
+        """Review of may-releases #137: each post counts only its own app's bot comments, so it is told the slug."""
+        self.assertEqual(set(static_check.COMMENT_SLUG_POSTS),
+                         {("native-compile-pr.yml", "post"), ("native-compile-pr.yml", "swift-checks"),
+                          ("ios-core-pr.yml", "core"), ("ios-renders.yml", "publish"), ("ds-swift-compile.yml", "native")},
+                         "every post that dedupes on its head's marker")
+        for (name, job), (step_id, run) in static_check.COMMENT_SLUG_POSTS.items():
+            with self.subTest(workflow=name, job=job):
+                slug = static_check.comment_slug(step_id)
+                anchor = slug + "        run: python3 -I -S -B tools/may_release/" + run
+                text = workflow(name)
+                self.assertEqual(text.count(anchor), 1)
+                self.assert_refused(name, anchor, anchor.replace(slug, ""))
+                self.assert_refused(name, anchor, slug + anchor)
+                other = slug.replace("app-slug", "token")
+                self.assert_refused(name, anchor, anchor.replace(slug, other))
+
+
 if __name__ == "__main__":
     unittest.main()

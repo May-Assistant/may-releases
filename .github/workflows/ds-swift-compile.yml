@@ -92,6 +92,7 @@ jobs:
           MAY_DS_SHA: ${{ inputs.ds_sha }}
           MAY_DS_PR: ${{ inputs.ds_pr }}
           MAY_DS_PR_COMMENT_TOKEN: ${{ steps.ci-ds-comment.outputs.token || secrets.MAY_DS_PR_COMMENT_TOKEN }}
+          MAY_CI_APP_SLUG: ${{ steps.ci-ds-comment.outputs.app-slug }}
         run: python3 -I -S -B tools/may_release/ds_compile.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
       - name: Remove the design-system checkout, logs and products
         if: always()
