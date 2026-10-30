@@ -721,6 +721,51 @@ class GitHubCallTests(unittest.TestCase):
         with patch("urllib.request.urlopen", urlopen):
             self.assertEqual(ds_compile.github("GET", "/repos/May-Assistant/may-design-system/pulls/40", None, TOKEN), (422, None))
 
+    def test_a_read_that_gets_no_answer_or_a_server_error_is_tried_again(self):
+        """Run 40468630357: the post's read of the pull request failed once and two failing tests were never posted."""
+        pull = "/repos/May-Assistant/may-design-system/pulls/40"
+        for failures, then in (([502, 503], 200), ([0], 200), ([429, 500, 504], 200), ([0, 0, 0, 0], None),
+                               ([502, 502, 502, 502], None)):
+            with self.subTest(failures=failures):
+                answers, calls, slept = list(failures), [], []
+
+                def urlopen(request, timeout):
+                    calls.append(request.get_method())
+                    status = answers.pop(0) if answers else then
+                    if status == 0:
+                        raise urllib.error.URLError("no answer")
+                    if status != 200:
+                        raise urllib.error.HTTPError(request.full_url, status, MARKER, {}, io.BytesIO(MARKER.encode()))
+                    return FakeResponse(b"{}", 200)
+
+                with patch("urllib.request.urlopen", urlopen), patch("time.sleep", slept.append):
+                    status, data = ds_compile.github("GET", pull, None, TOKEN)
+                tries = min(len(failures) + 1, len(ds_compile.RETRY_SECONDS) + 1)
+                self.assertEqual(len(calls), tries)
+                self.assertEqual(slept, list(ds_compile.RETRY_SECONDS[:tries - 1]))
+                self.assertEqual(status, 200 if then == 200 else failures[-1])
+                self.assertEqual(data, {} if then == 200 else None)
+
+    def test_a_post_or_a_refusal_is_never_tried_again(self):
+        for method, path, status in (("POST", "/repos/May-Assistant/may-design-system/issues/40/comments", 502),
+                                     ("POST", "/repos/May-Assistant/may-design-system/issues/40/comments", 0),
+                                     ("GET", "/repos/May-Assistant/may-design-system/pulls/40", 404),
+                                     ("GET", "/repos/May-Assistant/may-design-system/pulls/40", 403),
+                                     ("GET", "/repos/May-Assistant/may-design-system/pulls/40", 401)):
+            with self.subTest(method=method, status=status):
+                calls, slept = [], []
+
+                def urlopen(request, timeout):
+                    calls.append(request.get_method())
+                    if status == 0:
+                        raise urllib.error.URLError("no answer")
+                    raise urllib.error.HTTPError(request.full_url, status, MARKER, {}, io.BytesIO(MARKER.encode()))
+
+                with patch("urllib.request.urlopen", urlopen), patch("time.sleep", slept.append):
+                    self.assertEqual(ds_compile.github(method, path, {"body": "b"} if method == "POST" else None, TOKEN),
+                                     (status, None))
+                self.assertEqual((calls, slept), ([method], []))
+
 
 class CommandLineTests(RunnerCase):
     def test_the_cli_prints_fixed_lines_and_exits_non_zero_on_a_failed_compile(self):

@@ -30,6 +30,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -262,10 +263,43 @@ ALLOWED_CALLS = (("GET", _PR.format("pulls")),
 MAX_COMMENT_PAGES = 10
 
 
-def already_posted(comments, sha, name=MARKER):
-    """Whether a comment in one page of the pull request's comments already carries this head's marker."""
+def post_or_update(call_api, repo, number, sha, body, token, name=MARKER, author=None):
+    """Post body on the pull request, or, when a comment of author's already carries this head's marker, edit that
+    comment in place: "posted", "updated", or "same" when it already reads body. The newest result for a head wins: a
+    re-run's pass replaces an earlier run's failure, and a detailed comment replaces a result-only one (review of
+    may-releases #137). Only author's own comments count (a bot login, "<app slug>[bot]"): a person's or another app's
+    comment quoting the marker is never edited or taken as posted. Without author (the PAT fallback, whose user is not
+    known here) nothing is edited and body is posted anew. A marked comment GitHub will not let the token edit is left,
+    and body is posted anew."""
+    found = None
+    for page in range(1, MAX_COMMENT_PAGES + 1) if author else ():
+        status, comments = call_api("GET", f"/repos/{repo}/issues/{number}/comments?per_page=100&page={page}", None, token)
+        if status != 200 or not isinstance(comments, list):
+            raise DsCompileError("The pull request's comments could not be read; nothing was posted")
+        marked = [c for c in comments if already_posted([c], sha, name, author) and type(c.get("id")) is int and
+                  c["id"] > 0]
+        found = marked[-1] if marked else found
+        if len(comments) < 100:
+            break
+    if found is not None and found.get("body") == body:
+        return "same"
+    if found is not None:
+        status, _ = call_api("PATCH", f"/repos/{repo}/issues/comments/{found['id']}", {"body": body}, token)
+        if status == 200:
+            return "updated"
+    status, _ = call_api("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body}, token)
+    if status != 201:
+        raise DsCompileError("GitHub did not accept the comment; nothing from the compile is shown here")
+    return "posted"
+
+
+def already_posted(comments, sha, name=MARKER, author=None):
+    """Whether a comment in one page of the pull request's comments already carries this head's marker; with author, a
+    comment by that bot login alone counts."""
     marker = f"<!-- {name} head={sha} -->"
-    return any(isinstance(c, dict) and isinstance(c.get("body"), str) and marker in c["body"] for c in comments)
+    return any(isinstance(c, dict) and isinstance(c.get("body"), str) and marker in c["body"] and
+               (author is None or isinstance(c.get("user"), dict) and c["user"].get("type") == "Bot" and
+                c["user"].get("login") == author) for c in comments)
 
 
 def github(method, path, payload, token):
@@ -276,8 +310,25 @@ def github(method, path, payload, token):
     return request(method, path, payload, token)
 
 
+# Run 40468630357 (coordinator, 27 Oct): the post's read of the may-app pull request failed once, and two failing tests
+# were never posted; a review run that started at the same moment failed too. A read (GET alone, which changes nothing)
+# that gets no answer, a rate limit or a server error is tried again after each of RETRY_SECONDS; a post or an edit is
+# never repeated.
+RETRY_STATUSES, RETRY_SECONDS = frozenset((0, 429, 500, 502, 503, 504)), (2, 5, 15)
+
+
 def request(method, path, payload, token):
-    """The HTTP call behind github() and compile_pr_errors.github(), each of which checks its own allowlist first."""
+    """The HTTP call behind github() and compile_pr_errors.github(), each of which checks its own allowlist first. A GET
+    whose status is in RETRY_STATUSES is tried again after each of RETRY_SECONDS; the last status is returned."""
+    for wait in RETRY_SECONDS:
+        status, data = request_once(method, path, payload, token)
+        if method != "GET" or status not in RETRY_STATUSES:
+            return status, data
+        time.sleep(wait)
+    return request_once(method, path, payload, token)
+
+
+def request_once(method, path, payload, token):
     call = urllib.request.Request(API + path, data=None if payload is None else json.dumps(payload).encode(),
                                      method=method, headers={
         "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",

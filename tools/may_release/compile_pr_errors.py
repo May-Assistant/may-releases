@@ -40,8 +40,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from compile import OUTCOME
-from ds_compile import (DsCompileError, MAX_BODY, MAX_ERRORS, SHA, XCODE, diagnostics, fence_for, post_once, request,
-                        run_url)
+from ds_compile import (DsCompileError, MAX_BODY, MAX_ERRORS, SHA, XCODE, diagnostics, fence_for, post_or_update,
+                        request, run_url)
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
@@ -62,10 +62,31 @@ SCHEME, DESTINATION = "MayPlayground", "generic/platform=iOS Simulator"
 # The design system prepare.py checks out inside the may-app checkout: not may-app's own files.
 EXCLUDED = ("android/build-deps/",)
 MARKER = "may-ios-compile-pr"
+# The native job's own result (needs.native.result), for the post job when no record reached it (coordinator, 26 Oct:
+# with the key pair unset, #133's post was silent and the may-app merge gate had no result to read). Only success and
+# failure are posted, as the result line alone: no detail, still head-marked.
+NATIVE_RESULT, RESULTS = "MAY_NATIVE_RESULT", {"success": True, "failure": False}
+# The May CI App's slug (the comment mint's app-slug output): the post edits or counts as posted only its own bot's
+# comments, "<slug>[bot]" (review of may-releases #137). Unset with the PAT fallback: then it posts anew each run.
+APP_SLUG = "MAY_CI_APP_SLUG"
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,38}")
 
 
 class CompilePrError(ValueError):
     pass
+
+
+def result_body(sha, url, passed):
+    """The comment when no record reached the post job: the native job's pass or fail, and why there is no detail."""
+    if not SHA.fullmatch(sha or ""):
+        raise CompilePrError("The compiled commit is not an exact SHA")
+    lines = [f"### May iOS compile: {'passed' if passed else 'failed'}", "",
+             f"`{sha}`: the native job {'passed' if passed else 'failed'}. Its details are not posted: no sealed record "
+             "reached the post job (`MAY_RENDERS_RECIPIENT` or `MAY_RENDERS_DECRYPT_KEY` may be unset in "
+             "may-native-compile-pr, or the job stopped before its seal)."]
+    if url:
+        lines += ["", f"Run: {url}"]
+    return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
 
 
 def comment_body(sha, url, passed, errors, total):
@@ -98,12 +119,30 @@ def comment_body(sha, url, passed, errors, total):
 _PR = r"/repos/" + re.escape(APP_REPO) + r"/{}/[1-9][0-9]{{0,6}}"
 ALLOWED_CALLS = (("GET", _PR.format("pulls")),
                  ("GET", _PR.format("issues") + r"/comments\?per_page=100&page=(?:[1-9]|10)"),
-                 ("POST", _PR.format("issues") + r"/comments"))
+                 ("POST", _PR.format("issues") + r"/comments"),
+                 # The head's own marked comment, edited in place (ds_compile.post_or_update).
+                 ("PATCH", r"/repos/" + re.escape(APP_REPO) + r"/issues/comments/[1-9][0-9]{0,19}"))
+
+
+def listed_only(call_api):
+    """call_api, refusing an edit of any comment the pull request's own comment pages did not list (review of
+    may-releases #137): ALLOWED_CALLS takes any may-app comment id, so the id is checked against this pull request's."""
+    listed = set()
+
+    def call(method, path, payload, token):
+        if method == "PATCH" and path.rsplit("/", 1)[-1] not in listed:
+            raise CompilePrError("Only this pull request's own comments can be edited")
+        status, data = call_api(method, path, payload, token)
+        if method == "GET" and "/comments?" in path and isinstance(data, list):
+            listed.update(str(c["id"]) for c in data if isinstance(c, dict) and type(c.get("id")) is int)
+        return status, data
+    return call
 
 
 def github(method, path, payload, token):
     """One may-app API call: (status, parsed JSON or None). Only ALLOWED_CALLS are made: the pull request read, a page
-    of its comments, and its comment post. Nothing from the call is printed."""
+    of its comments, its comment post, and the edit of this head's own marked comment. Nothing from the call is
+    printed."""
     if not any(method == allowed and re.fullmatch(pattern, path) for allowed, pattern in ALLOWED_CALLS):
         raise CompilePrError("Only the may-app pull request and its comments are reachable")
     return request(method, path, payload, token)
@@ -254,21 +293,25 @@ def post(sha, pr, call_api=github):
         raise CompilePrError("Source SHA is not an exact lowercase commit SHA")
     number = pull_number(pr)
     path = private_root() / PRIVATE / RECORD
-    if not path.is_file() or path.is_symlink():
-        print("May iOS compile: no record to post (MAY_RENDERS_RECIPIENT or MAY_RENDERS_DECRYPT_KEY may be unset in "
-              "may-native-compile-pr); the native job's verdict stands")
-        return 0
-    try:
-        record = checked_record(json.loads(path.read_text()), sha)
-    except (OSError, ValueError, RecursionError):
-        raise CompilePrError("The compile record is malformed or for another commit; nothing was posted") from None
-    passed, errors, total = record["passed"], record["errors"], record["total"]
+    sealed = path.is_file() and not path.is_symlink()
+    if sealed:
+        try:
+            record = checked_record(json.loads(path.read_text()), sha)
+        except (OSError, ValueError, RecursionError):
+            raise CompilePrError("The compile record is malformed or for another commit; nothing was posted") from None
+        passed, errors, total = record["passed"], record["errors"], record["total"]
+    else:
+        passed = RESULTS.get(os.environ.get(NATIVE_RESULT, ""))
+        if passed is None:
+            print("May iOS compile: no record and no native result to post; nothing posted")
+            return 0
     if not token:
         print("May iOS compile: MAY_APP_PR_COMMENT_TOKEN is not set in may-native-compile-pr; no comment posted")
         return 0 if passed else 1
     if len(token) < 20:
         raise CompilePrError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")
-    body = comment_body(sha, run_url(os.environ), passed, errors, total)
+    url = run_url(os.environ)
+    body = comment_body(sha, url, passed, errors, total) if sealed else result_body(sha, url, passed)
     if holds(body, token):
         raise CompilePrError("The comment holds a credential; nothing was posted")
     status, pull = call_api("GET", f"/repos/{APP_REPO}/pulls/{number}", None, token)
@@ -278,9 +321,20 @@ def post(sha, pr, call_api=github):
         validate_pull_request(pull, number, sha)
     except GateDenial:
         raise CompilePrError("The pull request is no longer open at the compiled head; nothing was posted") from None
-    if not post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
+    slug = os.environ.get(APP_SLUG, "")
+    author = slug + "[bot]" if SLUG.fullmatch(slug) else None
+    done = post_or_update(listed_only(call_api), APP_REPO, number, sha, body, token, MARKER, author)
+    if done == "same":
         print(f"May iOS compile result already posted for this head on may-app #{number}; nothing posted again")
         return 0 if passed else 1
+    if done == "updated":
+        print(f"May iOS compile: this head's comment on may-app #{number} is updated with this run's result")
+    if not sealed and passed:
+        print(f"May iOS compile passed; the result alone posted to may-app #{number} (no sealed record: no details)")
+        return 0
+    if not sealed:
+        print(f"May iOS compile failed; the result alone posted to may-app #{number} (no sealed record: no details)")
+        return 1
     if passed:
         print(f"May iOS compile passed with Xcode {XCODE}; result posted to may-app #{number}")
         return 0
