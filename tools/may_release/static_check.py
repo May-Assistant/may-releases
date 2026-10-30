@@ -283,6 +283,7 @@ COMMENT_SLUG_POSTS = {
     ("native-compile-pr.yml", "post"): ("ci-comment", "compile_pr_errors.py post "),
     ("native-compile-pr.yml", "swift-checks"): ("ci-comment", "swift_checks.py post "),
     ("ios-core-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
+    ("native-compile-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
     ("ios-renders.yml", "publish"): ("ci-comment", "publish.py comment "),
     ("ds-swift-compile.yml", "native"): ("ci-ds-comment", "ds_compile.py post "),
 }

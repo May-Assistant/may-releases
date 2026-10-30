@@ -160,7 +160,8 @@ class MintMutationTests(unittest.TestCase):
         """Review of may-releases #137: each post counts only its own app's bot comments, so it is told the slug."""
         self.assertEqual(set(static_check.COMMENT_SLUG_POSTS),
                          {("native-compile-pr.yml", "post"), ("native-compile-pr.yml", "swift-checks"),
-                          ("ios-core-pr.yml", "core"), ("ios-renders.yml", "publish"), ("ds-swift-compile.yml", "native")},
+                          ("ios-core-pr.yml", "core"), ("native-compile-pr.yml", "core"), ("ios-renders.yml", "publish"),
+                          ("ds-swift-compile.yml", "native")},
                          "every post that dedupes on its head's marker")
         for (name, job), (step_id, run) in static_check.COMMENT_SLUG_POSTS.items():
             with self.subTest(workflow=name, job=job):
