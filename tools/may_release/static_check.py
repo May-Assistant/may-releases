@@ -2228,6 +2228,16 @@ def _ds_suite_steps(suite, title, extra, cleanup):
                     (cleanup[0], None, [], cleanup[1])]
 
 
+# The suites, each in its own job with its sealed record (tokens and web: coordinator, 30 Oct, with the pinned Node), and
+# each job's result as the post job reads it.
+_DS_SUITES = ("swift", "android", "tokens", "web")
+_DS_RESULTS = [(f"MAY_{suite.upper()}_RESULT", f"${{{{ needs.{suite}.result }}}}") for suite in _DS_SUITES]
+_DS_NODE = ("Install the pinned, checksum-verified Node", None, [], "python3 -I -S -B tools/may_release/toolchain.py node")
+_DS_NODE_CLEANUP = ("Remove the design-system checkout, logs, npm cache and the pinned Node",
+                    'rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-npm" '
+                    '"$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"')
+
+
 # job: (runs-on, needs, timeout, [(step name, uses, env entries, run)]) after the checkout (and, in pull and post, the
 # mint, which unminted takes out first).
 DS_TESTS_JOBS = {
@@ -2246,20 +2256,20 @@ DS_TESTS_JOBS = {
         "Remove the design-system checkout, logs, Gradle home and the pinned JDK",
         'rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-gradle" '
         '"$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"'))),
-    "post": ("ubuntu-24.04", "[admission, swift, android]", 10, [
+    "tokens": ("ubuntu-24.04", "[admission, pull]", 20, _ds_suite_steps("tokens", "tokens", [_DS_NODE], _DS_NODE_CLEANUP)),
+    "web": ("ubuntu-24.04", "[admission, pull]", 30, _ds_suite_steps("web", "web", [_DS_NODE], _DS_NODE_CLEANUP)),
+    "post": ("ubuntu-24.04", "[admission, swift, android, tokens, web]", 10, [
         ("Install pinned age", None, [], "python3 -I -S -B tools/may_release/toolchain.py age"),
-        ("", DOWNLOAD_ARTIFACT, [], None), ("", DOWNLOAD_ARTIFACT, [], None),
+        *[("", DOWNLOAD_ARTIFACT, [], None)] * len(_DS_SUITES),
         ("Decrypt and check the suite records", None,
          [_DSI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}"),
           ("MAY_RENDERS_DECRYPT_KEY", "${{ secrets.MAY_RENDERS_DECRYPT_KEY }}")],
          'python3 -I -S -B tools/may_release/ds_tests.py open --ds-sha "$MAY_DS_SHA"'),
         ("Set the may-ds-tests commit status on the design-system head, with counts alone", None,
-         [_DSI["sha"], ("MAY_DS_STATUS_TOKEN", "${{ secrets.MAY_DS_STATUS_TOKEN }}"),
-          ("MAY_SWIFT_RESULT", "${{ needs.swift.result }}"), ("MAY_ANDROID_RESULT", "${{ needs.android.result }}")],
+         [_DSI["sha"], ("MAY_DS_STATUS_TOKEN", "${{ secrets.MAY_DS_STATUS_TOKEN }}"), *_DS_RESULTS],
          'python3 -I -S -B tools/may_release/ds_tests.py status --ds-sha "$MAY_DS_SHA"'),
-        ("Post both suites' results on the design-system pull request, never in this log", None,
-         [_DSI["sha"], _DSI["pr"], ("MAY_DS_PR_COMMENT_TOKEN", "${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}"),
-          ("MAY_SWIFT_RESULT", "${{ needs.swift.result }}"), ("MAY_ANDROID_RESULT", "${{ needs.android.result }}")],
+        ("Post every suite's result on the design-system pull request, never in this log", None,
+         [_DSI["sha"], _DSI["pr"], ("MAY_DS_PR_COMMENT_TOKEN", "${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}"), *_DS_RESULTS],
          'python3 -I -S -B tools/may_release/ds_tests.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'),
         ("Remove the decrypted records", None, [],
          'rm -rf -- "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-tests-download" "$RUNNER_TEMP/may-tools"')]),
@@ -2289,7 +2299,7 @@ def ds_tests_workflow_problems(text):
             any(job_text(text, job).count(JOB_PERMISSIONS) != 1 for job in DS_TESTS_JOBS):
         found.append(name + "permissions are not read-only everywhere")
     if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(DS_TESTS_JOBS):
-        found.append(name + "jobs are not exactly admission, pull, swift, android and post")
+        found.append(name + "jobs are not exactly admission, pull, swift, android, tokens, web and post")
     for job, (runner, needs, timeout, expected) in DS_TESTS_JOBS.items():
         header, steps = job_steps(text, job)
         body = job_text(text, job)
@@ -2316,7 +2326,7 @@ def ds_tests_workflow_problems(text):
                 found.append(name + f"job {job} has a step condition other than the cleanup's always()")
             if "continue-on-error" in chunk and DOWNLOAD_ARTIFACT not in chunk:
                 found.append(name + f"job {job} lets a step other than a download fail quietly")
-    for suite in ("swift", "android"):
+    for suite in _DS_SUITES:
         upload = next((c for s, c in job_steps(text, suite)[1] if UPLOAD_ARTIFACT in c), "")
         if f"          name: may-ds-tests-{suite}-${{{{ github.run_attempt }}}}\n" not in upload or \
                 f"          path: ${{{{ runner.temp }}}}/may-ds-tests-sealed/{suite}.age\n" not in upload or \
@@ -2324,12 +2334,12 @@ def ds_tests_workflow_problems(text):
             found.append(name + f"{suite}'s upload is not its sealed record alone, kept one day")
     downloads = [c for s, c in job_steps(text, "post")[1] if DOWNLOAD_ARTIFACT in c]
     if [bool(re.search(rf"name: may-ds-tests-{s}-\$\{{\{{ github.run_attempt \}}\}}\n.*may-ds-tests-download/{s}\n",
-                       c, re.S)) for s, c in zip(("swift", "android"), downloads)] != [True, True] or \
-            text.count(UPLOAD_ARTIFACT) != 2 or text.count(DOWNLOAD_ARTIFACT) != 2:
-        found.append(name + "post does not download exactly the two sealed records")
+                       c, re.S)) for s, c in zip(_DS_SUITES, downloads)] != [True] * len(_DS_SUITES) or \
+            text.count(UPLOAD_ARTIFACT) != len(_DS_SUITES) or text.count(DOWNLOAD_ARTIFACT) != len(_DS_SUITES):
+        found.append(name + "post does not download exactly the suites' sealed records")
     if secrets_in(text) != {"MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_RENDERS_DECRYPT_KEY", "MAY_DS_PR_COMMENT_TOKEN",
                             "MAY_DS_STATUS_TOKEN"} \
-            or text.count("secrets.MAY_DS_READ_KEY") != 2 or re.search(r"(?m)^(    )?env:", text):
+            or text.count("secrets.MAY_DS_READ_KEY") != len(_DS_SUITES) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret is held outside its one step")
     return found
 
@@ -2356,6 +2366,14 @@ def ds_tests_print_problems(root):
     path = root / "tools/may_release" / DS_TESTS_TOOL
     if assigned_literal(path, "MARKER") != "may-ds-tests" or assigned_literal(path, "MAX_RECORD") != 262144:
         found.append(DS_TESTS_TOOL + ": its marker or sealed record size is not as pinned")
+    if assigned_literal(path, "SUITES") != _DS_SUITES or \
+            assigned_literal(path, "TOKEN_CHECKS") != (("tools/generate-tokens.mjs", "--check"),
+                                                       ("tools/generate-agent-marks.mjs", "--check")) or \
+            assigned_literal(path, "WEB_STEPS") != (("npm ci", ("npm", "ci", "--no-audit", "--no-fund")),
+                                                    ("npm test", ("npm", "test")),
+                                                    ("npm run typecheck", ("npm", "run", "typecheck")),
+                                                    ("npm run build", ("npm", "run", "build"))):
+        found.append(DS_TESTS_TOOL + ": its suites, or the tokens and web commands, are not the ones the workflow runs")
     tree = ast.parse(path.read_text())
     post = function_source(tree, "post")
     if post is None or "post_once(call_api, DS_REPO" not in ast.unparse(post) or \
