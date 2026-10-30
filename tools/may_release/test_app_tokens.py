@@ -19,8 +19,10 @@ CHECKERS = {
     "ios-renders.yml": static_check.renders_workflow_problems,
     "ds-swift-compile.yml": static_check.ds_compile_workflow_problems,
     "may-app-review.yml": static_check.review_workflow_problems,
+    "weekly-release.yml": static_check.weekly_release_workflow_problems,
     "may-ds-review.yml": static_check.ds_review_workflow_problems,
     "device-tests.yml": static_check.device_tests_workflow_problems,
+    "testflight-feedback.yml": static_check.testflight_feedback_workflow_problems,
     "ds-tests-pr.yml": static_check.ds_tests_workflow_problems,
     "ds-tests-schedule.yml": static_check.ds_tests_schedule_workflow_problems,
 }

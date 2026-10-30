@@ -22,7 +22,7 @@ PINNED_USES = re.compile(r"(\./\S+|[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}|dock
 # each must be one string literal: never formatted, never from provider or file data.
 PRINTED_ERRORS = {"StoreError", "PlayRefusal", "GateDenial", "VerifyError", "FlowsError", "ReviewError",
                   "DsCompileError", "CompilePrError", "RehearsalError", "UnitTestsError", "UnitPostError",
-                  "BackendTestsError", "BackendPostError", "DsTestsError"}
+                  "BackendTestsError", "BackendPostError", "FeedbackError", "DsTestsError"}
 # The one printed error whose message is not a single literal: it adds Play's
 # numeric HTTP status, so that a 403 can be told from a 401 or a 404 in the public
 # log. What is enforced (message_problems):
@@ -242,6 +242,8 @@ CI_MINTS = {
     "ci-ds-status": ("MAY_DS_STATUS_TOKEN", "may-design-system", (("statuses", "write"),)),
     # review.py fetches the head over HTTPS (contents) and posts its review and STARTED marker (pull requests).
     "ci-review": ("MAY_APP_REVIEW_TOKEN", "may-app", (("contents", "read"), ("pull-requests", "write"))),
+    # testflight_feedback.py lists may-app's testflight-feedback issues and files new ones (issues).
+    "ci-issues": ("MAY_APP_ISSUES_TOKEN", "may-app", (("issues", "write"),)),
     # The same for a may-design-system pull request (may-ds-review.yml, review.py --target ds).
     "ci-ds-review": ("MAY_DS_REVIEW_TOKEN", "may-design-system", (("contents", "read"), ("pull-requests", "write"))),
     # publish.py device-release creates the run's may-renders release and uploads its assets (contents).
@@ -256,6 +258,7 @@ WORKFLOW_MINTS = {
     "android-unit-pr.yml": {"unit": ("ci-read", "ci-comment")},
     "ios-archive-rehearsal.yml": {"rehearsal": ("ci-read",)},
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
+    "weekly-release.yml": {"pick": ("ci-read",)},
     "backend-unit-pr.yml": {"backend": ("ci-read", "ci-comment")},
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
@@ -264,6 +267,7 @@ WORKFLOW_MINTS = {
     "may-app-review.yml": {"review": ("ci-review",)},
     "may-ds-review.yml": {"review": ("ci-ds-review",)},
     "device-tests.yml": {"publish": ("renders-release",)},
+    "testflight-feedback.yml": {"feedback": ("ci-issues",)},
     # ds-tests-pr.yml splits like native-compile-pr.yml: swift and android run the design system's code and mint
     # nothing; the read token is minted in pull, the comment token in post.
     "ds-tests-pr.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment", "ci-ds-status")},
@@ -421,7 +425,7 @@ def stage_problems(store):
 # spaced or explicit (`?`) keys, no anchors, aliases, tags or merge keys, no tabs,
 # no multi-line quoted, plain or flow values (block scalars only after `key: |`).
 # The store run's name: the app, platform and build number, plus "(dry run)" or "(sign only)", from its inputs alone.
-STORE_RUN_NAME = ("run-name: ${{ inputs.target == 'playground' && 'May Playground' || 'May' }} · ${{ inputs.platform == 'ios' && 'iOS' || 'Android' }} · build ${{ inputs.build_number }}${{ inputs.dry_run && ' (dry run)' || '' }}${{ inputs.sign_only && ' (sign only)' || '' }}")
+STORE_RUN_NAME = ("run-name: ${{ inputs.target == 'playground' && 'May Playground' || 'May' }} · ${{ inputs.platform == 'ios' && 'iOS' || 'Android' }} · build ${{ inputs.build_number }} at ${{ inputs.source_sha }}${{ inputs.dry_run && ' (dry run)' || '' }}${{ inputs.sign_only && ' (sign only)' || '' }}")
 LAYOUT_LINE = re.compile(r"( *)(- )?([A-Za-z][\w-]*):(?: (.*))?")
 LAYOUT_VALUE = re.compile(r"""[^\s&*!{}?|>%@`'"\[\]#,][^#]*|'(?:[^']|'')*'|\[[^\[\]{}'"#]*\]|[|>]-?""")
 ADMISSION_ENV = [("GH_TOKEN", "${{ github.token }}"), ("MAY_PLATFORM", "${{ inputs.platform }}"),
@@ -451,7 +455,8 @@ def layout_problems(store):
     if re.findall(r"(?m)^([\w-]+):", store) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
         found.append("store-release-draft.yml: top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
     if store.count("\nrun-name: ") != 1 or "\n" + STORE_RUN_NAME + "\n" not in store:
-        found.append("store-release-draft.yml: run-name is not exactly the app, platform, build number and mode from its inputs")
+        found.append("store-release-draft.yml: run-name is not exactly the app, platform, build number, source SHA and mode "
+                     "from its inputs")
     if re.findall(r"(?m)^  ([\w-]+):", store.partition("\non:\n")[2].partition("\npermissions:")[0]) != ["workflow_dispatch"]:
         found.append("store-release-draft.yml: is triggered by something other than workflow_dispatch")
     if re.findall(r"(?m)^  ([\w-]+):", store.partition("\njobs:\n")[2]) != list(STORE_JOB_IF):
@@ -2050,6 +2055,8 @@ def backend_unit_silence_problems(root):
 # holding both credentials: GITHUB_TOKEN in runs and dispatch, the PR read token in pick alone, nothing in the cleanup.
 # Each tool's one write is control_dispatch, which refuses any path but its lane's dispatches before it sends anything.
 SCHEDULE_CRON = '  schedule:\n    - cron: "*/15 * * * *"\n  workflow_dispatch:\npermissions:'
+# The weekly release fires hourly on Thursday and Friday (weekly_release.py decides each time), not every 15 minutes.
+SCHEDULE_CRONS = {"weekly-release.yml": '  schedule:\n    - cron: "7 * * * 4,5"\n  workflow_dispatch:\npermissions:'}
 SCHEDULE_PICK_PERMISSIONS = "    permissions:\n      contents: read\n      actions: write\n    steps:\n"
 SCHEDULE_PRINT_VALUES = {"int(count)", "int(looked)", "int(number)", "sha"}
 SCHEDULE_EXIT_CLASSES = {"GateDenial", "ScheduleError"}
@@ -2077,6 +2084,14 @@ SCHEDULES = {
          "Dispatch the design-system tests for the picked head, with no design-system credential",
          "Remove the carried numbers"],
         "May DS tests for may-design-system #{number} at {sha}", "actions/workflows/ds-tests-pr.yml/dispatches"),
+    # 30 Oct: May Playground's weekly store release, iOS then Android, each still approved by hand.
+    "weekly-release.yml": (
+        "weekly_release.py", "may-weekly-release", "may-weekly-release",
+        ["List the store runs, with no may-app credential",
+         "Find this week's cut of may-app main, with no GitHub token",
+         "Dispatch the next store build for the cut, with no may-app credential",
+         "Remove the carried numbers"],
+        "May Playground · {platform} · build {number} at {sha}", "actions/workflows/store-release-draft.yml/dispatches"),
 }
 # The pull-request read token each schedule's pick holds (may-app's, unless named here).
 SCHEDULE_READ_SECRETS = {"ds-tests-schedule.yml": "MAY_DS_PR_READ_TOKEN"}
@@ -2084,6 +2099,7 @@ SCHEDULE = "android-ci-schedule.yml"
 SCHEDULE_TOOL = SCHEDULES[SCHEDULE][0]
 SCHEDULE_DISPATCH = SCHEDULES[SCHEDULE][5]
 BACKEND_SCHEDULE = "backend-ci-schedule.yml"
+WEEKLY_RELEASE = "weekly-release.yml"
 
 
 def schedule_workflow_problems(workflow, text):
@@ -2098,9 +2114,11 @@ def schedule_workflow_problems(workflow, text):
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
-    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["schedule", "workflow_dispatch"] or SCHEDULE_CRON not in text or \
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["schedule", "workflow_dispatch"] or \
+            SCHEDULE_CRONS.get(workflow, SCHEDULE_CRON) not in text or \
             text.count("cron:") != 1 or re.search(r"(?m)^    (inputs|types|branches):", trigger):
-        found.append(name + "is not scheduled every 15 minutes and dispatched with no input, only")
+        found.append(name + ("is not scheduled hourly on Thursday and Friday" if workflow in SCHEDULE_CRONS else
+                             "is not scheduled every 15 minutes") + " and dispatched with no input, only")
     if f"\nconcurrency:\n  group: {group}\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group, never cancelling a run")
     writes = re.findall(r"(?m)^\s+[\w-]+:\s*write\b", text)
@@ -2192,6 +2210,104 @@ def backend_ci_schedule_tool_problems(root):
     tree = ast.parse((root / "tools/may_release" / SCHEDULES[BACKEND_SCHEDULE][0]).read_text())
     if function_source(tree, "app_get") is not None or "APP_REPO}/" in ast.unparse(tree):
         found.append(SCHEDULES[BACKEND_SCHEDULE][0] + ": reads may-app other than through android_ci_schedule.app_get")
+    return found
+
+
+# TestFlight beta feedback (testflight-feedback.yml, testflight_feedback.py; coordinator, 27 Oct). Each submission's
+# content goes to a private may-app issue and its screenshots to private may-renders, never to this public log, so
+# the workflow is pinned whole: hourly and by a bare dispatch alone, one run at a time, read-only permissions,
+# admission with no environment then feedback in the one admission chose, no pull request code, and each credential
+# in its own step alone: the issues token in known and file, the dedicated App Store Connect key (its ID a variable)
+# with the issuer in read, the may-renders deploy key in store, nothing in the cleanup.
+FEEDBACK = "testflight-feedback.yml"
+FEEDBACK_TOOL = "testflight_feedback.py"
+FEEDBACK_CRON = '  schedule:\n    - cron: "41 * * * *"\n  workflow_dispatch:\npermissions:'
+FEEDBACK_JOB_PERMISSIONS = "    permissions:\n      contents: read\n    steps:\n"
+FEEDBACK_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-testflight" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-publish-git"'
+FEEDBACK_STEPS = ["List the submissions already filed, with no App Store Connect key",
+                  "Read new feedback from App Store Connect, with no GitHub token",
+                  "Store the screenshots in may-renders, with its deploy key alone",
+                  "File each new submission as a may-app issue, never in this log",
+                  "Remove the feedback"]
+FEEDBACK_ENV = {
+    FEEDBACK_STEPS[0]: [("MAY_APP_ISSUES_TOKEN", "${{ secrets.MAY_APP_ISSUES_TOKEN }}")],
+    FEEDBACK_STEPS[1]: [("MAY_ASC_FEEDBACK_KEY_BASE64", "${{ secrets.MAY_ASC_FEEDBACK_KEY_BASE64 }}"),
+                        ("MAY_ASC_FEEDBACK_KEY_ID", "${{ vars.MAY_ASC_FEEDBACK_KEY_ID }}"),
+                        ("MAY_ASC_ISSUER_ID", "${{ secrets.MAY_ASC_ISSUER_ID }}")],
+    FEEDBACK_STEPS[2]: [("MAY_APP_RENDERS_WRITE_KEY", "${{ secrets.MAY_APP_RENDERS_WRITE_KEY }}")],
+    FEEDBACK_STEPS[3]: [("MAY_APP_ISSUES_TOKEN", "${{ secrets.MAY_APP_ISSUES_TOKEN }}")],
+    FEEDBACK_STEPS[4]: [],
+}
+FEEDBACK_PRINT_VALUES = {"len(ids)", "len(found)", "len(records)", "len(found) - len(records)", "skipped_images", "count",
+                         "filed"}
+FEEDBACK_EXIT_CLASSES = {"GateDenial", "FeedbackError", "DsCompileError", "PublishError", "StoreError"}
+FEEDBACK_CALLS = (("GET", r"/repos/May-Assistant/may-app/issues\?labels=testflight-feedback&state=all&per_page=100"
+                          r"&page=(?:[1-9]|10)"),
+                  ("POST", r"/repos/May-Assistant/may-app/issues"))
+
+
+@with_app_tokens(FEEDBACK)
+def testflight_feedback_workflow_problems(text):
+    name, found = FEEDBACK + ": ", []
+    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or \
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "feedback")] != [1, 1] or \
+            text.count("runs-on:") != 2:
+        found.append(name + "is not the Linux feedback lane with no artifact, step summary or carried environment")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["schedule", "workflow_dispatch"] or FEEDBACK_CRON not in text or \
+            text.count("cron:") != 1 or re.search(r"(?m)^    (inputs|types|branches):", trigger) or "${{ inputs." in text:
+        found.append(name + "is not hourly at :41 and dispatched with no input, only")
+    if "\nconcurrency:\n  group: may-testflight-feedback\n  cancel-in-progress: false\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group, never cancelling a run")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or text.count("permissions:") != 3 or \
+            job_text(text, "admission").count(JOB_PERMISSIONS) != 1 or \
+            FEEDBACK_JOB_PERMISSIONS not in job_text(text, "feedback") or re.search(r"(?m)^\s+[\w-]+:\s*write\b", text):
+        found.append(name + "permissions are not read-only everywhere")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "feedback"]:
+        found.append(name + "jobs are not exactly admission and feedback")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    expected = [f"python3 -I -S -B tools/may_release/{FEEDBACK_TOOL} {step}"
+                for step in ("admit", "known", "read", "store", "file")] + [FEEDBACK_CLEANUP]
+    if runs != expected or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + f"runs something other than {FEEDBACK_TOOL}'s admit, known, read, store and file, and the "
+                     "cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "feedback")}
+    names = [step for step, _ in steps["feedback"]]
+    cleanup = steps["feedback"][-1][1] if steps["feedback"] else ""
+    if names != [""] + FEEDBACK_STEPS or "\n        if: always()\n" not in cleanup or uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + "feedback's steps are not exactly known, read, store, file and an always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 15\n" not in job_text(text, "feedback"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than feedback's 15 minutes")
+    job = job_text(text, "feedback")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or "    needs: admission\n" not in job or \
+            re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "feedback's environment is not the one admission chose, after admission")
+    by_name = dict(steps["feedback"])
+    gate = steps["admission"][1][1] if len(steps["admission"]) > 1 else ""
+    if any(env_entries(by_name.get(step, "")) != entries for step, entries in FEEDBACK_ENV.items()) or \
+            env_entries(gate) != [("GH_TOKEN", "${{ github.token }}")] or text.count("github.token") != 1 or \
+            secrets_in(text) != {"MAY_APP_ISSUES_TOKEN", "MAY_ASC_FEEDBACK_KEY_BASE64", "MAY_ASC_ISSUER_ID",
+                                 "MAY_APP_RENDERS_WRITE_KEY"} or text.count("vars.") != 1 or \
+            re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a step holds a credential other than its own: the issues token in known and file, the "
+                     "feedback key and issuer in read, the may-renders write key in store")
+    return found
+
+
+def testflight_feedback_tool_problems(root):
+    path = root / "tools/may_release" / FEEDBACK_TOOL
+    found = quiet_tool_problems(root, FEEDBACK_TOOL, FEEDBACK_PRINT_VALUES, FEEDBACK_EXIT_CLASSES, {"GITHUB_OUTPUT": "admit"})
+    if assigned_literal(path, "ALLOWED_CALLS") != FEEDBACK_CALLS:
+        found.append(FEEDBACK_TOOL + ": its GitHub calls are not exactly the label's issues and a new issue")
+    if assigned_literal(path, "RELEASE_KEY_ID") != "23VX669FGY" or \
+            "key_id == RELEASE_KEY_ID" not in ast.unparse(function_source(ast.parse(path.read_text()), "asc_key") or ast.Pass()):
+        found.append(FEEDBACK_TOOL + ": it does not refuse the release key (23VX669FGY) as its feedback key")
+    tree = ast.parse(path.read_text())
+    if any(isinstance(n, ast.Constant) and n.value in ("DELETE", "PATCH", "PUT") for n in ast.walk(tree)):
+        found.append(FEEDBACK_TOOL + ": it names a method that deletes or changes feedback or an issue")
     return found
 
 
@@ -2341,6 +2457,25 @@ def ds_tests_workflow_problems(text):
                             "MAY_DS_STATUS_TOKEN"} \
             or text.count("secrets.MAY_DS_READ_KEY") != len(_DS_SUITES) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret is held outside its one step")
+    return found
+
+
+@with_app_tokens("weekly-release.yml")
+def weekly_release_workflow_problems(text):
+    return schedule_workflow_problems(WEEKLY_RELEASE, text)
+
+
+def weekly_release_tool_problems(root):
+    found = schedule_tool_problems(root, WEEKLY_RELEASE)
+    # Its may-app reads go through android_ci_schedule.app_get, never a reader of its own, and its one dispatch is for
+    # TARGET alone, never a dry run's opposite or another app (the inputs are checked again in control_dispatch).
+    path = root / "tools/may_release" / SCHEDULES[WEEKLY_RELEASE][0]
+    tree = ast.parse(path.read_text())
+    if function_source(tree, "app_get") is not None or "APP_REPO}/" in ast.unparse(tree):
+        found.append(SCHEDULES[WEEKLY_RELEASE][0] + ": reads may-app other than through android_ci_schedule.app_get")
+    if assigned_literal(path, "TARGET") != "playground" or \
+            assigned_literal(path, "RUNS_PATH") != "actions/workflows/store-release-draft.yml/runs":
+        found.append(SCHEDULES[WEEKLY_RELEASE][0] + ": TARGET is not May Playground, or it reads other runs")
     return found
 
 
@@ -2825,10 +2960,14 @@ def control_problems(root):
     found += renders_print_problems(root)
     found += device_tests_workflow_problems((flows / DEVICE_TESTS).read_text())
     found += device_tests_print_problems(root)
+    found += testflight_feedback_workflow_problems((flows / FEEDBACK).read_text())
+    found += testflight_feedback_tool_problems(root)
     found += ds_tests_workflow_problems((flows / DS_TESTS).read_text())
     found += ds_tests_print_problems(root)
     found += ds_tests_schedule_workflow_problems((flows / DS_TESTS_SCHEDULE).read_text())
     found += ds_tests_schedule_tool_problems(root)
+    found += weekly_release_workflow_problems((flows / WEEKLY_RELEASE).read_text())
+    found += weekly_release_tool_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

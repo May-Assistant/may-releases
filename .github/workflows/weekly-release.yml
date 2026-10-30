@@ -1,0 +1,73 @@
+name: May weekly release on a schedule (dispatches store-release-draft.yml for May Playground, iOS then Android)
+on:
+  # Every hour on Thursday and Friday (UTC), and by hand: weekly_release.py dispatches store-release-draft.yml for this
+  # week's cut, iOS first and Android once iOS has succeeded, each still waiting for its approval.
+  schedule:
+    - cron: "7 * * * 4,5"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: may-weekly-release
+  cancel-in-progress: false
+jobs:
+  admission:
+    # Chooses whether this week's May Playground cut is dispatched next, nothing else: the dispatched
+    # store-release-draft.yml admits and checks it again, and still waits for its required reviewer's approval. Admission has
+    # no environment, so a missing one is denied on its 404 and never auto-created; it checks the run (schedule or
+    # dispatch, main only) and may-native-compile-pr's policy. pick holds two credentials, never in the same step:
+    # GITHUB_TOKEN (actions: write, used for one dispatch alone) in runs and dispatch, MAY_APP_PR_READ_TOKEN in pick
+    # alone. Only counts, build numbers and the cut's SHA are printed.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/weekly_release.py admit
+  pick:
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    # actions: write is for store-release-draft.yml's dispatch alone (weekly_release.control_dispatch refuses any
+    # other write); actions: read, which it includes, lists that workflow's runs.
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code
+        id: ci-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: read
+      - name: List the store runs, with no may-app credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/weekly_release.py runs
+      - name: Find this week's cut of may-app main, with no GitHub token
+        env:
+          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
+        run: python3 -I -S -B tools/may_release/weekly_release.py pick
+      - name: Dispatch the next store build for the cut, with no may-app credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/weekly_release.py dispatch
+      - name: Remove the carried numbers
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-weekly-release"
