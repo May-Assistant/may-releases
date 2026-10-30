@@ -1806,6 +1806,8 @@ class PublishDeviceTests(unittest.TestCase):
         calls, work = [], self.root / "may-publish-git"
 
         def git(argv, log, env, cwd, capture=False):
+            if argv[0] == "show":  # publish.landed's read of main after the push: what was committed
+                return (work / argv[-1].split(":", 1)[1]).read_bytes()
             calls.append(argv)
             if argv[0] == "init":
                 Path(argv[-1]).mkdir()
@@ -1849,6 +1851,8 @@ class PublishDeviceTests(unittest.TestCase):
         work = self.root / "may-publish-git"
 
         def git(argv, log, env, cwd, capture=False):
+            if argv[0] == "show":  # publish.landed's read of main after the push: what was committed
+                return (work / argv[-1].split(":", 1)[1]).read_bytes()
             if argv[0] == "init":
                 Path(argv[-1]).mkdir()
             return b""
@@ -1901,6 +1905,8 @@ class PublishDeviceTests(unittest.TestCase):
         work = self.root / "may-publish-git"
 
         def git(argv, log, env, cwd, capture=False):
+            if argv[0] == "show":  # publish.landed's read of main after the push: what was committed
+                return (work / argv[-1].split(":", 1)[1]).read_bytes()
             if argv[0] == "init":
                 Path(argv[-1]).mkdir()
             return b""
