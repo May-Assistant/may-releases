@@ -651,41 +651,48 @@ class ServerTruthTests(unittest.TestCase):
         tag, note = "qa-39557415738-notes task", "qa-39557415738-notes note from the device test"
         asked = []
 
-        def get(body, status=200):
+        def get(pages, status=200):
+            """pages: the Agenda's pages by cursor (None for the first)."""
             def reply(request, timeout):
                 asked.append(request.full_url)
                 if status != 200:
                     raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
-                return FakeReply(json.dumps(body).encode())
+                cursor = request.full_url.partition("?cursor=")[2] or None
+                return FakeReply(json.dumps(pages[cursor]).encode())
             return reply
 
-        mine = {"title": "qa-39557415738-notes task", "description": note, "status": "cancelled"}
+        mine = {"title": "qa-39557415738-notes task", "description": note, "status": "accepted"}
         other = {"title": "qa-39557415738-notes-old task", "description": note, "status": "cancelled"}
         taxes = {"title": "file taxes", "description": "keep receipts\n" + note, "status": "accepted"}
-        cases = (({"commitments": [{"title": "file taxes", "description": None}, mine], "next_cursor": None},
-                  200, (200, "found")),
-                 ({"commitments": [dict(mine, status="completed")], "next_cursor": None}, 200, (200, "found")),
-                 ({"commitments": [dict(mine, title=" QA-39557415738-notes Task ")], "next_cursor": None},
-                  200, (200, "found")),
-                 ({"commitments": [dict(mine, status="accepted")], "next_cursor": None}, 200, (200, "open")),
-                 ({"commitments": [mine, dict(mine, description=None, status="accepted")], "next_cursor": None},
-                  200, (200, "open")),
-                 ({"commitments": [dict(mine, description="qa-39557415738-notes note from the d")], "next_cursor": None},
-                  200, (200, "absent")),
-                 ({"commitments": [taxes], "next_cursor": None}, 200, (200, "absent")),
-                 ({"commitments": [dict(mine, title="qa-39557415738-notes task copy")], "next_cursor": None},
-                  200, (200, "absent")),
-                 ({"commitments": [dict(mine, description=None)], "next_cursor": "c2"}, 200, (200, "absent")),
-                 ({"commitments": [other, taxes], "next_cursor": "c2"}, 200, (200, "beyond")),
-                 ({"commitments": [other], "next_cursor": None}, 200, (200, "absent")),
-                 ({"commitments": [], "next_cursor": ""}, 200, (200, "absent")),
-                 ({"commitments": [mine]}, 401, (401, "absent")),
-                 ([mine], 200, (200, "found")))
-        for body, status, expected in cases:
-            with self.subTest(body=body, status=status):
-                self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(body, status)),
+        one = lambda *tasks: {None: {"commitments": list(tasks), "next_cursor": None}}
+        cases = ((one({"title": "file taxes", "description": None}, mine), 200, (200, "found")),
+                 # Open (the reads come before the tag cleanup) or closed alike.
+                 (one(dict(mine, status="cancelled")), 200, (200, "found")),
+                 (one(dict(mine, status="completed")), 200, (200, "found")),
+                 (one(dict(mine, title=" QA-39557415738-notes Task ")), 200, (200, "found")),
+                 (one(dict(mine, description="qa-39557415738-notes note from the d")), 200, (200, "absent")),
+                 (one(taxes), 200, (200, "absent")),
+                 (one(dict(mine, title="qa-39557415738-notes task copy")), 200, (200, "absent")),
+                 (one(other), 200, (200, "absent")),
+                 ({None: {"commitments": [], "next_cursor": ""}}, 200, (200, "absent")),
+                 (one(mine), 401, (401, "absent")),
+                 ({None: [mine]}, 200, (200, "found")),
+                 # The new task on a later page: the Agenda puts undated tasks last, oldest first.
+                 ({None: {"commitments": [other, taxes], "next_cursor": "c2"},
+                   "c2": {"commitments": [taxes], "next_cursor": "c3"},
+                   "c3": {"commitments": [mine], "next_cursor": None}}, 200, (200, "found")),
+                 ({None: {"commitments": [other], "next_cursor": "c2"},
+                   "c2": {"commitments": [taxes], "next_cursor": None}}, 200, (200, "absent")))
+        for pages, status, expected in cases:
+            with self.subTest(pages=pages, status=status):
+                self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(pages, status)),
                                  expected)
-        self.assertEqual(set(asked), {"https://s/v1/commitments"}, "the first page alone, no cursor")
+        asked.clear()
+        endless = {None: {"commitments": [other], "next_cursor": "c"}, "c": {"commitments": [other], "next_cursor": "c"}}
+        self.assertEqual(device_tests.commitment_note("https://s", TOKEN, tag, note, get=get(endless)), (200, "beyond"),
+                         "pages that never end are unverified, never a pass or a fail")
+        self.assertEqual(len(asked), device_tests.MAX_AGENDA_PAGES)
+        self.assertEqual(asked[:2], ["https://s/v1/commitments", "https://s/v1/commitments?cursor=c"])
 
     def test_make_chat_posts_the_tagged_name_with_the_session_and_reads_its_id(self):
         seen = []

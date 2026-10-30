@@ -191,13 +191,15 @@ class ScenarioTests(unittest.TestCase):
         device_tests.settle(entry, row, False)
         self.assertEqual(entry["verdict"], "fail", "a flow that failed is a fail whatever the server says")
 
-    def test_the_notes_scenario_writes_into_its_own_new_task_and_deletes_it(self):
+    def test_the_notes_scenario_writes_into_its_own_new_task_and_ends_on_it(self):
         """Run 40063426822: "the first item you see" was the shared account's, so the note joined the previous run's.
-        Coordinator, 26 Oct: run 40243708096 still tapped "file taxes", so the goal forbids opening any existing task
-        and ends by deleting its own, which the truth then finds closed."""
+        Coordinator, 26 Oct: run 40243708096 still tapped "file taxes", so the goal forbids opening any existing task.
+        Coordinator, 28 Oct: run 40687078761 failed notes on the app that passed it on 25 Oct, because the goal deleted
+        the task and the judge's screen at done showed no note; the goal ends on the task showing it."""
         goal = device_tests.scenarios("notes")[0]["goal"]
         self.assertIn("Do not open any existing task; create a new one. Add a new task titled {tag} task", goal)
-        self.assertTrue(goal.endswith("then delete the {tag} task."))
+        self.assertTrue(goal.endswith("open the {tag} task again and check that the note is shown on it."))
+        self.assertNotIn("delete", goal.lower())
         self.assertNotIn("first item", goal)
 
     def test_the_notes_scenario_uses_the_details_notes_field(self):
@@ -305,9 +307,11 @@ class ScenarioTests(unittest.TestCase):
                                    "note": "{tag} note from the device test"}]},
                        {"truth": [{"get": "/v1/commitments", "task": "file taxes",
                                    "note": "{tag} note from the device test"}]},
-                       # The note's task is new and deleted at the goal's end (coordinator, 26 Oct).
+                       # The note's task is new (coordinator, 26 Oct), and the goal ends on it, never deleting it
+                       # (coordinator, 28 Oct).
                        {"goal": agent["goal"].replace("Do not open any existing task; create a new one. ", "")},
-                       {"goal": agent["goal"].replace(" then delete the {tag} task.", " then stop.")},
+                       {"goal": agent["goal"].replace(" shown on it.", " shown on it, then delete the {tag} task.")},
+                       {"goal": agent["goal"].replace(" shown on it.", " shown on it, then stop.")},
                        # A chat of its own: an agent row that sends May a message and opens it by name.
                        {"chat": True}, {"chat": False}, {"chat": "yes"},
                        # Delivery truth: only for a goal that sends May a message, and only "succeeded".
