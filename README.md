@@ -40,7 +40,7 @@ The [iOS core suite workflow](.github/workflows/ios-core-pr.yml) builds and test
 
 The [design-system Swift compile workflow](.github/workflows/ds-swift-compile.yml) compiles may-design-system's Swift package at the head of an open may-design-system pull request and posts its compile errors on that pull request, never in this log, in its own environment `may-ds-renders`. It needs no approval, and it is not usable until Samuel creates that environment's secrets (see [Design-system Swift compile of a pull request head](#design-system-swift-compile-of-a-pull-request-head)).
 
-The [may-app review workflow](.github/workflows/may-app-review.yml) runs Claude's code review of an open may-app pull request and posts it on that pull request, because may-app's own Actions are blocked. It runs in its own environment `may-claude-review`, and nothing from may-app reaches this public repository's log. It is not usable until Samuel creates that environment and its secrets (see [Claude code review of a may-app pull request](#claude-code-review-of-a-may-app-pull-request)).
+The [may-app review workflow](.github/workflows/may-app-review.yml) runs Claude's code review of an open may-app pull request and posts it on that pull request, because may-app's own Actions are blocked. It runs in its own environment `may-claude-review`, and nothing from may-app reaches this public repository's log. It is not usable until Samuel creates that environment and its secrets (see [Claude code review of a may-app pull request](#claude-code-review-of-a-may-app-pull-request)). The [design-system review workflow](.github/workflows/may-ds-review.yml) does the same for an open may-design-system pull request.
 
 The [native compile workflow](.github/workflows/native-compile-draft.yml) is **active for iOS only**: each build, the coordinator dispatches it to check that **May Playground** compiles. It runs on `macos-15` with the pinned Xcode 26.3 and XcodeGen 2.46.0, makes a simulator Release build with `CODE_SIGNING_ALLOWED=NO`, and has no signing, store call or artifact (see [iOS compile each build](#ios-compile-each-build)). The pull-request check runs only dependency-free control tests and static checks with a read-only token.
 
@@ -751,6 +751,19 @@ Its secrets, and nothing else:
 - `MAY_REVIEW_CLAUDE_TOKEN`: a Claude Code OAuth token from `claude setup-token`, the same kind as the repository's `CLAUDE_CODE_OAUTH_TOKEN`. A separate token is better, so either can be revoked alone.
 
 No repository secret is needed.
+
+### Claude code review of a may-design-system pull request
+
+`may-ds-review.yml` is the same review for **may-design-system**, whose merges wait on an independent review as may-app's do (coordinator, 30 Oct: tests alone are not the merge rule). It is `may-app-review.yml` step for step, with `review.py --target ds` in each step: everything above holds for it, with may-design-system in place of may-app. The differences:
+
+- the pull request must be open, ready for review, from may-design-system itself, and against its `main` or `claude/may-integration` (the branches `ds-swift-compile.yml` and the DS tests take); the schedule lists every open one, oldest first, and takes the first against either branch;
+- the review token is `MAY_DS_REVIEW_TOKEN`, minted by the May CI App for may-design-system alone (contents: read, pull-requests: write), with the PAT of that name as the fallback while `MAY_CI_APP_ID` is unset;
+- the log says "May DS review" and names may-design-system, and the comments carry the marker `may-ds-review`; review_mcp.py posts to may-design-system alone, and only while the pull request still targets one of those two branches;
+- it has its own concurrency group, `may-ds-review`, so a design-system review never waits behind a may-app one, or the other way round. The environment (`may-claude-review`), the Claude token, the pinned CLI and plugin, and the model's tools are the same.
+
+```
+gh workflow run may-ds-review.yml -f pr_number=<may-design-system PR number> --repo May-Assistant/may-releases --ref main
+```
 
 ### iOS renders of May Playground (parity with Android)
 
