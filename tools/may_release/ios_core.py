@@ -49,6 +49,11 @@ import toolchain
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
 PACKAGE = "ios/MayCore"
+# N, 30 Oct: the fetch (prepare.py --platform ios) points project.yml's MayDesignSystem at the local checkout for the
+# Xcode build, so MayCore's own pin test (it reads project.yml for `revision: <the lock's sha>`) failed on every pull
+# request. MayCore is Foundation only and never reads the design system: project.yml goes back to the head's own blob
+# before the build, so the tests read what the pull request has.
+PROJECT = "ios/project.yml"
 SWIFT_VERSION = "6.2.4"
 BUILD = ["swift", "build", "--build-tests", "--disable-automatic-resolution"]
 TEST = ["swift", "test", "--skip-build", "--disable-automatic-resolution"]
@@ -182,6 +187,7 @@ def run_suite(source_sha):
         return
     if DEPENDENCY.search(manifest.read_text(errors="replace")) or (package / "Package.resolved").exists():
         raise IosCoreError("ios/MayCore declares a package dependency, which this job does not fetch; nothing ran")
+    restore_project(source)
     swift_top = pinned_swift_bin().parent.parent
     log = private / LOG
     log.write_bytes(b"")
@@ -190,6 +196,21 @@ def run_suite(source_sha):
     finally:
         if not sandbox.teardown(log):
             print("May iOS core suite: some files of the build user could not be removed")
+
+
+def restore_project(source, run=subprocess.run):
+    """PROJECT exactly as the checked-out head has it (git show HEAD:PROJECT), over prepare's rewrite; nothing when the
+    head has none. Nothing from git is printed."""
+    path = source / PROJECT
+    done = run(["git", "-C", str(source), "show", "HEAD:" + PROJECT], stdin=subprocess.DEVNULL, capture_output=True,
+               timeout=60)
+    if done.returncode:
+        if path.exists() or path.is_symlink():
+            raise IosCoreError("ios/project.yml could not be read back from the checked head; nothing ran")
+        return
+    if path.is_symlink() or not path.parent.is_dir() or path.parent.is_symlink():
+        raise IosCoreError("ios/project.yml is not a plain file in the checkout; nothing ran")
+    path.write_bytes(done.stdout)
 
 
 def run_sandboxed(source, swift_top, private, log):

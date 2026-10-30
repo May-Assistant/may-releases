@@ -251,7 +251,8 @@ CI_MINTS = {
 WORKFLOW_MINTS = {
     # native runs the pull request's build code as the runner, so it mints nothing and the App key is never referenced
     # there: the read token is minted in pull, the comment token in post (reviews of #130 and #133).
-    "native-compile-pr.yml": {"pull": ("ci-read",), "swift-checks": ("ci-read", "ci-comment"), "post": ("ci-comment",)},
+    "native-compile-pr.yml": {"pull": ("ci-read",), "swift-checks": ("ci-read", "ci-comment"),
+                              "core": ("ci-read", "ci-comment"), "post": ("ci-comment",)},
     "android-unit-pr.yml": {"unit": ("ci-read", "ci-comment")},
     "ios-archive-rehearsal.yml": {"rehearsal": ("ci-read",)},
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
@@ -951,6 +952,21 @@ COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ i
 
 @with_app_tokens("native-compile-pr.yml")
 def compile_pr_workflow_problems(text):
+    """compile_pr_shape_problems, after the core job: ios-core-pr.yml's own core job exactly (coordinator, 30 Oct:
+    #1493 merged with a failing MayCore test the compile alone could not see), so every compile dispatch runs MayCore's
+    swift test too, held to everything ios_core_workflow_problems holds that job to, and then taken out."""
+    name = "native-compile-pr.yml"
+    span, found = job_span(text, "core"), []
+    own = unminted("ios-core-pr.yml", (ROOT / ".github/workflows/ios-core-pr.yml").read_text())[0]
+    if span is None or job_span(own, "core") is None or \
+            text[span[0]:span[1]].strip("\n") != own[slice(*job_span(own, "core"))].strip("\n"):
+        found.append(name + ": its core job is not exactly ios-core-pr.yml's core job")
+    else:
+        text = text[:span[0]] + "\n" + text[span[1]:].lstrip("\n")
+    return found + compile_pr_shape_problems(text)
+
+
+def compile_pr_shape_problems(text):
     """The pull-request compile is exactly: dispatch with a pull request number and its head, read-only, admission, then
     pull and swift-checks, then native, then post, each but admission in the environment admission chose; the PR
     token in each recheck alone (pull's and swift-checks', never native's: native references no App key or token), the
