@@ -1,6 +1,6 @@
 name: May protected store release (stage 4, Android internal and internal TestFlight uploads)
 # The run's own name, from its inputs only (not admission's verdict), so two runs read apart in the list.
-run-name: ${{ inputs.target == 'playground' && 'May Playground' || 'May' }} · ${{ inputs.platform == 'ios' && 'iOS' || 'Android' }} · build ${{ inputs.build_number }}${{ inputs.dry_run && ' (dry run)' || '' }}${{ inputs.sign_only && ' (sign only)' || '' }}
+run-name: ${{ inputs.target == 'playground' && 'May Playground' || 'May' }} · ${{ inputs.platform == 'ios' && 'iOS' || 'Android' }} · build ${{ inputs.build_number }} at ${{ inputs.source_sha }}${{ inputs.dry_run && ' (dry run)' || '' }}${{ inputs.sign_only && ' (sign only)' || '' }}
 # Activation stage 4: an Android dispatch can dry-run or, with dry_run: false,
 # upload May or May Playground to its Play internal track, and an iOS dispatch
 # can dry-run or upload May or May Playground to internal TestFlight only. May production can
