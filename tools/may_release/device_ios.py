@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -583,12 +584,25 @@ def launch(udid, env, token, log):
         raise DeviceTestsError("May Playground did not launch on the simulator")
 
 
+def look_shots(scenario, record, private, folder):
+    """A card row's look screenshots (device_agent.looks), copied from its agent's folder into the run's folder as
+    <scenario>-look-<n>.png, in order; the names that were copied."""
+    names = []
+    for look in (record or {}).get("looks", []):
+        source = private / "agent" / scenario / str(look.get("shot"))
+        if look.get("shot") in device_agent.LOOK_SHOTS and source.is_file() and not source.is_symlink():
+            name = f"{scenario}-{look['shot']}"
+            shutil.copyfile(source, folder / name)
+            names.append(name)
+    return names
+
+
 def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.server_check, truth=device_tests.tagged,
                   asked=device_tests.question_truth, cleaned=device_tests.cleanup, agent=device_agent.run_agent,
                   install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
                   revoked_by=device_tests.revoke, diagnosed=None, noted=device_tests.commitment_note,
-                  made=device_tests.open_chat):
+                  made=device_tests.open_chat, carded=device_tests.open_card):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -674,7 +688,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 token = ""
                 continue
             own = device_tests.scenario_tag(tag, row)  # the scenario's own tag
-            if not device_tests.own_chat(row, entry, base, token, own, made):
+            if not (device_tests.own_chat(row, entry, base, token, own, made) and
+                    device_tests.own_card(row, entry, base, token, own, carded)):
                 accounts.finish(row, base, token)
                 token = ""
                 continue
@@ -705,13 +720,15 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {}),
-                          **device_tests.steps(row)}
+                          **device_tests.steps(row),
+                          **({device_tests.device_mcp.LOOK_ENV: "chat"} if row.get("card") else {})}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"], claude[0],
                                            claude[1], seconds=device_tests.agent_seconds(row, device_agent.IOS_AGENT_SECONDS))
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)
-            entry["screenshots"] = [shot] if shot else []
+            entry["screenshots"] = look_shots(row["id"], records.get(row["id"]), private, folder) + \
+                ([shot] if shot else [])
             recorder.halt()
             # Run 40181517145: poll's server read came after the conversion, half an hour past its session's mint,
             # and got 401. The server reads and the diagnostics come first; the conversion, however long, after.
