@@ -155,7 +155,7 @@ class RunTests(Workspace):
             minted.append("fresh" if fresh else secret)
             return TOKEN + str(len(minted))
 
-        self.deleted, self.cleaned_tags, self.chats = [], [], []
+        self.deleted, self.cleaned_tags, self.chats, self.cards = [], [], [], []
 
         environ = {"RUNNER_TEMP": str(self.root), "MAY_TEST_SIGNIN_SECRET": "s" * 32,
                    "MAY_STAGING_API_URL": "https://staging-api.usemay.co", "PATH": "/usr/bin", **(env or {})}
@@ -171,6 +171,7 @@ class RunTests(Workspace):
                                      truth=lambda base, token, path, tag: (200, True),
                                      noted=lambda base, token, tag, note: (200, "found"),
                                      made=lambda base, token, tag: self.chats.append(tag) or True,
+                                     carded=lambda base, token, tag: self.cards.append(tag) or True,
                                      asked=lambda base, token, state, tag: (200, True),
                                      cleaned=lambda base, token, since, tag: self.cleaned_tags.append(tag) or 2,
                                      agent=agent or (lambda *a, **k: self.fail("an agent ran")),
@@ -515,6 +516,60 @@ class RunTests(Workspace):
         assert set(devices) == {"poll", "poll-skip"}, devices
         self.assertEqual((devices["poll"].get("MAY_DEVICE_STEPS"), devices["poll-skip"].get("MAY_DEVICE_STEPS")),
                          ("120", "120"), "both type slowly (run 40232904242: poll ran out at 80)")
+
+    def test_the_card_row_stages_its_card_counts_its_looks_and_keeps_their_screenshots(self):
+        """N, 30 Oct: the card row's device server counts what the chat shows (MAY_DEVICE_LOOK); its screenshots join
+        the report, and the first look decides."""
+        devices = {}
+
+        def agent(looks):
+            def run(cli, goal, tag, device, work, token, model, seconds):
+                devices[tag.rsplit("-i-", 1)[1]] = device
+                Path(work).mkdir(parents=True, exist_ok=True)
+                for look in looks:
+                    (Path(work) / look["shot"]).write_bytes(png())
+                return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3,
+                        "looks": looks}
+            return run
+
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5",
+               "GITHUB_RUN_ID": "39557415738"}
+        for looks, verdict, reason in (
+                ([{"shown": 2, "shot": "look-1.png"}, {"shown": 2, "shot": "look-2.png"}], "pass", None),
+                ([{"shown": 0, "shot": "look-1.png"}, {"shown": 3, "shot": "look-2.png"}], "fail",
+                 device_tests.LOOK_SCROLLED)):
+            with self.subTest(verdict=verdict):
+                devices.clear()
+                (self.private / device_tests.AGENTS).unlink(missing_ok=True)
+                _, minted, report, _, run = self.run_it(selection="chat-open-from-card,poll", agent=agent(looks),
+                                                        env=env)
+                rows = {row["id"]: row for row in report["scenarios"]}
+                card = rows["chat-open-from-card"]
+                self.assertEqual((card["verdict"], card.get("reason")), (verdict, reason))
+                self.assertEqual(card["screenshots"][:2], ["chat-open-from-card-look-1.png",
+                                                           "chat-open-from-card-look-2.png"])
+                for name in card["screenshots"]:
+                    self.assertTrue((run / "ios" / name).is_file(), name)
+                self.assertEqual(self.cards, ["qa-39557415738-i-chat-open-from-card"])
+                self.assertEqual(minted.count("fresh"), 1, "the card row is seeded on a fresh account alone")
+                self.assertEqual(devices["chat-open-from-card"].get(device_tests.device_mcp.LOOK_ENV), "chat")
+                self.assertNotIn(device_tests.device_mcp.LOOK_ENV, devices["poll"])
+                self.cards.clear()
+
+    def test_only_a_card_rows_own_look_screenshots_are_copied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private, folder = Path(directory) / "private", Path(directory) / "run"
+            (private / "agent" / "c").mkdir(parents=True)
+            folder.mkdir()
+            (private / "agent" / "c" / "look-1.png").write_bytes(png())
+            (private / "agent" / "c" / "look-2.png").symlink_to(private / "agent" / "c" / "look-1.png")
+            record = {"looks": [{"shown": 0, "shot": "look-1.png"}, {"shown": 1, "shot": "look-2.png"},
+                                {"shown": 1, "shot": "../x.png"}, {"shown": 1, "shot": None}]}
+            self.assertEqual(device_ios.look_shots("c", record, private, folder), ["c-look-1.png"],
+                             "a link or an odd name is never copied")
+            self.assertEqual(device_ios.look_shots("c", None, private, folder), [])
+        self.assertTrue(publish.DEVICE_FILE.fullmatch("chat-open-from-card-look-1.png"))
+        self.assertFalse(publish.DEVICE_FILE.fullmatch("chat-open-from-card-look-9.png"))
 
     def test_an_agent_scenario_runs_the_onboarding_subflow_before_the_agent(self):
         """Run 40046272749: the shared account lands in onboarding, not Chats; may-app's subflow taps through it."""
