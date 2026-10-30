@@ -269,6 +269,11 @@ FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          
 # review.py's schedule passes over heads whose STARTED marker is the token's own user's; an installation token has no
 # user (GET /user), so the fetch step, where the schedule picks, is told the app's slug: the marker is the app bot's.
 REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n"
+# A post that edits its head's own comment in place is told the comment app's slug, so it edits only that bot's
+# comments (review of may-releases #137): {(workflow, job): the post step's run line it sits right above}.
+COMMENT_SLUG = "          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}\n"
+COMMENT_SLUG_POSTS = {("native-compile-pr.yml", "post"): "        run: python3 -I -S -B tools/may_release/"
+                                                           "compile_pr_errors.py post "}
 APP_TOKEN_TRACES = ("create-github-app-token", CI_APP_ID, CI_APP_KEY, RENDERS_APP_ID, RENDERS_APP_KEY, "steps.ci-",
                     "steps.renders-", "MAY_REVIEW_APP_SLUG")
 
@@ -326,6 +331,11 @@ def unminted(workflow_name, text):
                         fetch_step not in body:
                     found.append(name + "the fetch step is not told the May CI app's slug exactly once")
                 body = body.replace(REVIEW_SLUG, "")
+            if step_id == "ci-comment" and (workflow_name, job) in COMMENT_SLUG_POSTS:
+                if body.count(COMMENT_SLUG) != 1 or \
+                        COMMENT_SLUG + COMMENT_SLUG_POSTS[(workflow_name, job)] not in body:
+                    found.append(name + f"job {job}'s post is not told the May CI app's slug exactly once")
+                body = body.replace(COMMENT_SLUG, "")
         text = text[:span[0]] + body + text[span[1]:]
     if any(trace in text for trace in APP_TOKEN_TRACES):
         found.append(name + "a GitHub App token is minted or used other than by its pinned, narrowed step right after "
@@ -925,8 +935,10 @@ SWIFT_STEP_NAMES = ["Check the pull request head and environment before fetching
                     "Post the failing Swift checks on the may-app pull request, never in this log",
                     "Remove private source and logs"]
 PR_READ_SECRET, PR_COMMENT_SECRET = "MAY_APP_PR_READ_TOKEN", "MAY_APP_PR_COMMENT_TOKEN"
+# The native job's result, on the post alone: what it posts when no sealed record reached it (compile_pr_errors.py).
+COMPILE_PR_RESULT = ("MAY_NATIVE_RESULT", "${{ needs.native.result }}")
 COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT} | \
+                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT, COMPILE_PR_RESULT} | \
     {(name, "${{ secrets." + name + " }}")
      for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET, COMPILE_PR_DECRYPT)}
 
@@ -1021,10 +1033,14 @@ def compile_pr_workflow_problems(text):
             secrets_in(opener) != {COMPILE_PR_DECRYPT} or \
             set(env_entries(opener)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), COMPILE_PR_RECIPIENT,
                                          (COMPILE_PR_DECRYPT, "${{ secrets." + COMPILE_PR_DECRYPT + " }}")} or \
-            text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or \
+            text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or text.count("needs.native.result") != 1 or \
+            set(env_entries(post)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
+                                       ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RESULT,
+                                       (PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")} or \
             any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + ": a secret or env entry other than the pull request check's PR token, the fetch step's two "
-                     "source-read keys, the seal's public key, the open's decrypt key and the post's comment token")
+                     "source-read keys, the seal's public key, the open's decrypt key and the post's comment token and "
+                     "native's result")
     if "GITHUB_ENV" in text or "GITHUB_PATH" in text or "${{ inputs." in "\n".join(runs):
         found.append(name + ": carries values to later steps or interpolates inputs into shell")
     return found
