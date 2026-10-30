@@ -146,7 +146,7 @@ def settings(environ):
     env.update(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED="true")
     return dict(base, platform="ios", udid=udid, maestro=maestro, bundle=bundle, env=env, scale=None,
-                flows=os.path.dirname(result))
+                flows=os.path.dirname(result), look=environ.get(LOOK_ENV) == "chat", looks=[])
 
 
 def adb(config, *args, timeout=60):
@@ -271,6 +271,8 @@ def ios_hierarchy(config):
         return ""
     nodes = list(ios_nodes(ios_tree(config)))
     boxes = [re.fullmatch(r"\[(-?\d+),(-?\d+)\]\[(\d+),(\d+)\]", str(n.get("bounds", ""))) for n in nodes]
+    if config.get("look"):
+        chat_look(config, nodes, boxes)
     lines = []
     for attributes, box in zip(nodes, boxes):
         text = str(attributes.get("text") or "")
@@ -284,6 +286,52 @@ def ios_hierarchy(config):
                  "clickable" if clickable else "", centre]
         lines.append(" | ".join(part for part in parts if part))
     return "\n".join(lines)[:MAX_HIERARCHY]
+
+
+# N, 30 Oct (Samuel's "May chat is blank until I scroll"): the chat is a lazy stack anchored at its bottom, and after
+# it opens from a For you card the viewport can be left past its content, so no message row is laid out where the
+# screen shows. A row's MAY_DEVICE_LOOK=chat has every iOS hierarchy read that shows the chat (its header and its
+# composer both listed) counted: the text elements between the header's bottom and the composer's top, within the
+# header's width, that are not the chat's own chrome (an id starting "chat."). Each such look keeps that count and a
+# screenshot taken at once (look-<n>.png in the agent's folder, for people to see whether the screen agrees), at most
+# MAX_LOOKS of them; the count alone reaches the record, never a word of the text.
+LOOK_ENV, MAX_LOOKS = "MAY_DEVICE_LOOK", 4
+
+
+def chat_shown(nodes, boxes):
+    """How many message texts the chat shows on screen, or None when the read does not show the chat."""
+    marks = {}
+    for attributes, box in zip(nodes, boxes):
+        rid = str(attributes.get("resource-id") or "")
+        if box and rid in ("chat.header", "chat.composer") and rid not in marks:
+            marks[rid] = [int(value) for value in box.groups()]
+    if len(marks) < 2:
+        return None
+    left, _, right, top = marks["chat.header"]
+    bottom = marks["chat.composer"][1]
+    if bottom <= top:
+        return None
+    shown = 0
+    for attributes, box in zip(nodes, boxes):
+        if not box or str(attributes.get("resource-id") or "").startswith("chat.") or \
+                not str(attributes.get("text") or "").strip():
+            continue
+        x, y = (int(box[1]) + int(box[3])) / 2, (int(box[2]) + int(box[4])) / 2
+        shown += left <= x <= right and top < y < bottom
+    return shown
+
+
+def chat_look(config, nodes, boxes):
+    """One look at the chat (chat_shown) into config["looks"], with its screenshot, while fewer than MAX_LOOKS."""
+    shown = chat_shown(nodes, boxes)
+    if shown is None or len(config["looks"]) >= MAX_LOOKS:
+        return
+    data = ios_screenshot(config)
+    name = f"look-{len(config['looks']) + 1}.png"
+    if data is not None:
+        with open(os.path.join(config["flows"], name), "wb") as output:
+            output.write(data)
+    config["looks"].append({"shown": shown, "shot": name if data is not None else None})
 
 
 # Run 40155638626: the scale was the screenshot's width over the hierarchy's widest box, which was about 322 points on
@@ -450,7 +498,8 @@ def record(config, outcome, summary):
                    "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
                    "hierarchy_failure": config.get("hierarchy_failure"),
                    "hierarchy_cause": config.get("hierarchy_cause"), "refusal_cause": config.get("refusal_cause"),
-                   **({"wedged": True} if config.get("wedged") else {})}, output)
+                   **({"wedged": True} if config.get("wedged") else {}),
+                   **({"looks": config["looks"]} if config.get("look") else {})}, output)
 
 
 def call(name, args, config):
