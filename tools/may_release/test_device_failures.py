@@ -187,6 +187,35 @@ class AndroidLaunchTests(unittest.TestCase):
         self.assertEqual((code, seen), (3, {"argv": ["/sdk/adb", "shell"], "input": b"am start x --es k secret\n",
                                              "stdin": None}))
 
+    def test_a_session_straddling_the_output_cap_never_reaches_the_diagnostics(self):
+        """Review of may-releases #136: the failed start's output was cut at MAX_DIAG // 8 before its redaction, so a
+        session cut short no longer matched and stayed in the sealed file. It is now cut at a line's end."""
+        token = "token-" + "x" * 30
+        cap = device_tests.MAX_DIAG // 8
+        with tempfile.TemporaryDirectory() as directory:
+            log, folder = Path(directory) / "log", Path(directory)
+            log.write_bytes(b"earlier lines\n")
+
+            def shell(adb, env, log_, line):
+                with log_.open("ab") as output:
+                    filler = b"Starting: Intent { cmp=io.github.mayassistant.may.playground/.MainActivity }\n"
+                    lines = filler * ((cap - 20) // len(filler))
+                    output.write(lines + b"." * (cap - len(lines) - 10) + b"\nsession " + token.encode() + b"\nError\n")
+                return 1
+
+            with patch("device_tests.flows.run_private", return_value=0), \
+                    patch("device_tests.adb_shell", side_effect=shell), patch("device_tests.flows.sleep"):
+                with self.assertRaises(device_tests.LaunchFailed) as caught:
+                    device_tests.launch("/sdk/adb", {}, token, log)
+            said = caught.exception.said
+            self.assertLessEqual(len(said), cap)
+            self.assertTrue(said.endswith(b"\n"), "cut at a line's end")
+            with patch("device_tests.adb_output", return_value=None):
+                device_tests.launch_diagnostics("/sdk/adb", {}, folder, "sign-in", token, said)
+            diag = (folder / ("sign-in" + device_tests.DIAG)).read_bytes()
+        self.assertNotIn(token[:12].encode(), diag, "no part of the session")
+        self.assertIn(b"== am start ==\nStarting: Intent", diag)
+
     def test_one_retry_then_a_readable_stop(self):
         starts, slept, raised = self.launch("", [1, 0])
         self.assertEqual((len(starts), slept, raised), (2, [10], None))

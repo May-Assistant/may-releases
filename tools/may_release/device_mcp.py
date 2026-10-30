@@ -15,7 +15,8 @@ read or write a file, or reach the network itself.
 
 - type takes plain text only (letters, digits, spaces and . , ! : - _ @; never ? or *, a glob in the device shell), so nothing reaches adb's shell as a
   command.
-- On iOS, after FAIL_FAST refused acts in a row, every call but done answers that the agent must stop, blocked.
+- On iOS, after FAIL_FAST refused acts in a row (or one refused on a snapshot timeout right after a screen read that
+  timed out), every call but done answers that the agent must stop, blocked.
 - At most MAX_ACTIONS look or act calls, or a scenario's own steps (MAY_DEVICE_STEPS, up to MOST_ACTIONS); after
   that every call but done answers that the limit is reached.
 - Every call but done rewrites MAY_DEVICE_AGENT_RESULT as unfinished, with the steps so far and the last hierarchy.
@@ -44,10 +45,15 @@ MAX_ACTIONS = 80
 MOST_ACTIONS = 200
 # Run 40203481816: on iOS, every act after the first refusal was refused too, each holding the agent 90 s, so a wedged
 # scenario spent its whole 20 minutes. After FAIL_FAST refused acts in a row the server stops every call but done, and
-# the agent's result says so (coordinator, 25 Oct). iOS alone.
-FAIL_FAST = 3
+# the agent's result says so (coordinator, 25 Oct). iOS alone. Run 40309200520: three refusals, each a 90 s snapshot
+# timeout, still cost poll and poll-skip 9 minutes apiece and chat its budget; the stop now comes at the second refusal
+# in a row, or at once when a refusal's snapshot timeout follows a screen read that timed out too (the screen is not
+# coming back), and each act's Maestro call is held ACT_SECONDS at most (coordinator, 26 Oct). A settle timeout (the
+# act was taken and its screen never settled) counts toward the two in a row like any refusal, so one slow settle while
+# a reply streams does not end the scenario (independent review of #139).
+FAIL_FAST, ACT_SECONDS = 2, 60
 UNFINISHED = "unfinished"  # the result's outcome until done replaces it
-WEDGED_TEXT = f"The device refused {FAIL_FAST} acts in a row: call done now with outcome blocked"
+WEDGED_TEXT = "The device stopped taking acts: call done now with outcome blocked"
 MAX_HIERARCHY = 40_000
 MAX_SUMMARY = 1000
 MAX_FIELD = 300
@@ -178,7 +184,8 @@ def flow(config, command):
     with open(path, "w", encoding="utf-8") as output:
         output.write(f"appId: {config['bundle']}\n---\n{command}\n")
     started = utc_now()
-    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], both=True)
+    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], timeout=ACT_SECONDS,
+                        both=True)
     if status:
         refused(config, command, said, started, utc_now())
         config["refusal_cause"] = driver_cause(said)
@@ -353,7 +360,13 @@ DUMP_FAILURES = ("adb failed", "no idle state", "unreadable", "iOS hierarchy fai
 # Coordinator, 26 Oct (run 40290647340): "iOS hierarchy failed" never said why. The driver's own output for a failed
 # iOS hierarchy read, and for the last refused act, is sorted into DRIVER_CAUSES' fixed words (first match in
 # CAUSE_PATTERNS' order, else "other"); only the word is kept in the agent's record and the sealed report.
-CAUSE_PATTERNS = (("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
+# Run 40309200520's diagnostics (coordinator, 26 Oct): a tap printed COMPLETED and then the act ran out of time, so
+# Maestro was waiting for the screen to settle after it ("settle timeout": Maestro's own status line for the command
+# ending "... COMPLETED", then tool's "(timed out)"). Anchored to that line's end, so typed text holding the word is
+# not one (independent review of #139).
+CAUSE_PATTERNS = (("settle timeout", re.compile(rb"(?m)(?:Tap|Input text|Swip|Press)[^\n]*\.\.\. COMPLETED[ \t\r]*$"
+                                                rb"(?s:.*)\n\(timed out\)\n\Z")),
+                  ("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
                   ("snapshot timeout", re.compile(rb"timed? ?out|timeout|snapshot", re.IGNORECASE)),
                   ("lost connection", re.compile(rb"connection (?:refused|reset|lost|closed)|broken pipe|unavailable|"
                                                  rb"failed to connect|lost connection|xctestdriver|end of stream",
@@ -586,7 +599,12 @@ def ios_act(name, args, ints, config):
             refused(config, command, TYPED_NOTHING_LINE, started, utc_now())
             config["refusal_cause"] = "typed nothing"
     config["refusals"] = config["refusals"] + 1 if status else 0
-    if config["refusals"] >= FAIL_FAST:
+    stuck = bool(status) and config.get("refusal_cause") == "snapshot timeout" == config.get("dump_cause")
+    if not status:
+        # A taken act changes the screen, so an earlier read's time-out no longer says it is stuck (independent review
+        # of #139).
+        config["dump_cause"] = None
+    if config["refusals"] >= FAIL_FAST or stuck:
         config["wedged"] = True
         # Recorded now, so a stopped agent that never calls done still leaves its reason; a later done replaces it.
         record(config, "blocked", WEDGED_TEXT)

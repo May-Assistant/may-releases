@@ -183,7 +183,7 @@ SERIAL = "emulator-5554"
 RATE_LIMITED = "Claude is rate limited (skipped, never a pass)"
 UNFINISHED = "the agent did not finish"
 BLOCKED = "the agent reported it was blocked"
-WEDGED = f"the device refused {device_mcp.FAIL_FAST} acts in a row, so the agent was stopped (iOS)"
+WEDGED = "the device stopped taking acts, so the agent was stopped (iOS)"
 NO_TRUTH = "the server did not show the tagged item"
 NOT_JUDGED = "not judged"
 DELIVERY_FAILED = "May's server did not record a succeeded reply"
@@ -966,9 +966,13 @@ def launch(adb, env, token, log):
     try:
         with log.open("rb") as output:
             output.seek(mark)
-            said = output.read(MAX_DIAG // 8)
+            said = output.read(MAX_DIAG // 8 + 1)
     except OSError:
         said = b""
+    # Cut at a line's end, never inside one: launch_diagnostics redacts line by line, and a token cut short would no
+    # longer match its pattern or the session (review of may-releases #136).
+    if len(said) > MAX_DIAG // 8:
+        said = said[:said.rfind(b"\n", 0, MAX_DIAG // 8) + 1]
     raise LaunchFailed(said)
 
 

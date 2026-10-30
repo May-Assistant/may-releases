@@ -253,7 +253,9 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("on Let me reach you tap Not now", goal)
         self.assertIn("You are done, and must stop at once and report success, as soon as you have tapped Not now on Let "
                       "me reach you, or as soon as the app's main tabs (Chats, Agenda) show", goal)
-        self.assertNotIn("Start chatting", goal)
+        # may-app #1430 (M, 27 Oct): with notifications already allowed (the Android emulator), Let me reach you is
+        # skipped, and only Start chatting on I'm all set leaves onboarding for the main tabs.
+        self.assertIn("on I'm all set, tap Start chatting", goal)
 
     def test_every_agent_scenario_fits_inside_one_test_session(self):
         """Run 40063426822: an iOS session ended mid-scenario; a session lasts SESSION_SECONDS and has no refresh, so
@@ -2453,9 +2455,9 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, line + line.replace("MAY_IOS", "MAY_ALSO")), "a secret, variable")
         self.flagged(self.text.replace("        type: boolean\n        default: false\n", "        type: string\n"
-                                       "        default: \"\"\n"), "optional ios_reduce_motion, ios_diagnostics and tidy_file_taxes booleans")
+                                       "        default: \"\"\n"), "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans")
         self.flagged(self.text.replace("      ios_reduce_motion:\n", "      reduce_motion:\n"),
-                     "optional ios_reduce_motion, ios_diagnostics and tidy_file_taxes booleans")
+                     "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans")
 
     def test_diagnostics_is_an_optional_boolean_read_by_the_ios_scenarios_step_alone(self):
         line = "          MAY_IOS_DIAGNOSTICS: ${{ inputs.ios_diagnostics }}\n"
@@ -2464,10 +2466,28 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
         self.flagged(self.text.replace("      ios_diagnostics:\n", "      diagnostics:\n"),
-                     "optional ios_reduce_motion, ios_diagnostics and tidy_file_taxes booleans")
-        block = self.text[self.text.index("      ios_diagnostics:\n"):self.text.index("  schedule:\n")]
+                     "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans")
+        block = self.text[self.text.index("      ios_diagnostics:\n"):self.text.index("      ios_log_changes:\n")]
+        self.assertTrue(block.endswith("        type: boolean\n        default: true\n"), "on unless dispatched off")
         self.flagged(self.text.replace(block, block.replace("type: boolean", "type: string").replace(
-            "default: false", 'default: ""')), "optional ios_reduce_motion, ios_diagnostics and tidy_file_taxes booleans")
+            "default: true", 'default: ""')), "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans")
+        self.flagged(self.text.replace(block, block.replace("default: true", "default: false")),
+                     "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans")
+
+    def test_the_change_log_is_its_own_boolean_off_unless_dispatched_read_by_the_ios_scenarios_step_alone(self):
+        """may-app #1302: SwiftUI's change log brought the idle hang back, so it is apart from the watchdog and off
+        unless dispatched true (coordinator, 26 Oct)."""
+        message = "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans"
+        line = "          MAY_IOS_LOG_CHANGES: ${{ inputs.ios_log_changes }}\n"
+        self.assertEqual(self.text.count(line), 1)
+        android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
+        self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, line.replace("ios_log_changes", "ios_diagnostics")), "a secret, variable")
+        block = self.text[self.text.index("      ios_log_changes:\n"):self.text.index("      tidy_file_taxes:\n")]
+        self.assertTrue(block.endswith("        type: boolean\n        default: false\n"), "off unless dispatched on")
+        self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
+        self.flagged(self.text.replace(block, ""), message)
 
     def test_the_sign_in_secret_stays_in_the_scenarios_step(self):
         line = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"
