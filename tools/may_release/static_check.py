@@ -242,6 +242,8 @@ CI_MINTS = {
     "ci-ds-status": ("MAY_DS_STATUS_TOKEN", "may-design-system", (("statuses", "write"),)),
     # review.py fetches the head over HTTPS (contents) and posts its review and STARTED marker (pull requests).
     "ci-review": ("MAY_APP_REVIEW_TOKEN", "may-app", (("contents", "read"), ("pull-requests", "write"))),
+    # The same for a may-design-system pull request (may-ds-review.yml, review.py --target ds).
+    "ci-ds-review": ("MAY_DS_REVIEW_TOKEN", "may-design-system", (("contents", "read"), ("pull-requests", "write"))),
     # publish.py device-release creates the run's may-renders release and uploads its assets (contents).
     "renders-release": ("MAY_RENDERS_RELEASE_TOKEN", "may-renders", (("contents", "write"),)),
 }
@@ -259,6 +261,7 @@ WORKFLOW_MINTS = {
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
     "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
     "may-app-review.yml": {"review": ("ci-review",)},
+    "may-ds-review.yml": {"review": ("ci-ds-review",)},
     "device-tests.yml": {"publish": ("renders-release",)},
     # ds-tests-pr.yml splits like native-compile-pr.yml: swift and android run the design system's code and mint
     # nothing; the read token is minted in pull, the comment token in post.
@@ -268,7 +271,10 @@ WORKFLOW_MINTS = {
 FIRST_CHECKOUT = "      - uses: " + CHECKOUT + " # v4\n        with:\n          persist-credentials: false\n"
 # review.py's schedule passes over heads whose STARTED marker is the token's own user's; an installation token has no
 # user (GET /user), so the fetch step, where the schedule picks, is told the app's slug: the marker is the app bot's.
-REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{ steps.ci-review.outputs.app-slug }}\n"
+REVIEW_SLUG = "          MAY_REVIEW_APP_SLUG: ${{{{ steps.{}.outputs.app-slug }}}}\n"
+# Each review mint: the fetch step's run line, which the slug sits right above.
+REVIEW_FETCHES = {"ci-review": 'review.py fetch --pr-number "$MAY_PR_NUMBER"\n',
+                  "ci-ds-review": 'review.py fetch --pr-number "$MAY_PR_NUMBER" --target ds\n'}
 # A post that edits its head's own comment in place is told the comment app's slug, so it edits only that bot's
 # comments (review of may-releases #137): {(workflow, job): the post step's run line it sits right above}.
 COMMENT_SLUG = "          MAY_CI_APP_SLUG: ${{ steps.ci-comment.outputs.app-slug }}\n"
@@ -325,12 +331,12 @@ def unminted(workflow_name, text):
             if f": {either}\n" not in body:
                 found.append(name + f"job {job} mints {step_id} but never hands its token on in place of {secret}")
             body = body.replace(f": {either}\n", f": ${{{{ secrets.{secret} }}}}\n")
-            if step_id == "ci-review":
-                fetch_step = 'review.py fetch --pr-number "$MAY_PR_NUMBER"\n'
-                if body.count(REVIEW_SLUG) != 1 or REVIEW_SLUG + "        run: python3 -I -S -B tools/may_release/" + \
-                        fetch_step not in body:
+            if step_id in REVIEW_FETCHES:
+                slug = REVIEW_SLUG.format(step_id)
+                if body.count(slug) != 1 or slug + "        run: python3 -I -S -B tools/may_release/" + \
+                        REVIEW_FETCHES[step_id] not in body:
                     found.append(name + "the fetch step is not told the May CI app's slug exactly once")
-                body = body.replace(REVIEW_SLUG, "")
+                body = body.replace(slug, "")
             if step_id == "ci-comment" and (workflow_name, job) in COMMENT_SLUG_POSTS:
                 if body.count(COMMENT_SLUG) != 1 or \
                         COMMENT_SLUG + COMMENT_SLUG_POSTS[(workflow_name, job)] not in body:
@@ -2592,6 +2598,9 @@ REVIEW_INSTALL = "python3 -I -S -B tools/may_release/review.py install"
 REVIEW_RUN = 'python3 -I -S -B tools/may_release/review.py review --pr-number "$MAY_PR_NUMBER"'
 REVIEW_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-review" /tmp/may-review-view'
 REVIEW_RUNS = [REVIEW_GATE, REVIEW_FETCH, REVIEW_INSTALL, REVIEW_RUN, REVIEW_CLEANUP]
+# may-ds-review.yml (coordinator, 30 Oct) is the same workflow for a may-design-system pull request: its own
+# concurrency group and review token, and each of review.py's steps with --target ds.
+DS_REVIEW_RUNS = [run + " --target ds" for run in REVIEW_RUNS[:-1]] + [REVIEW_CLEANUP]
 REVIEW_SCHEDULE = '  schedule:\n    - cron: "*/15 * * * *"'
 REVIEW_STEP_NAMES = ["Check the pull request and fetch its head quietly",
                      "Install the pinned Claude Code release, checked against its sha512",
@@ -2601,13 +2610,26 @@ REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN = "MAY_APP_REVIEW_TOKEN", "MAY_REVIEW_CLAUDE_T
 REVIEW_PLUGIN_CHECKOUT = ("        with:\n          repository: anthropics/claude-code\n"
                           "          ref: 0d7f14dd352fa67affd4e172eb1b6f524dbd709e\n          path: .claude-marketplace/claude-code\n"
                           "          fetch-depth: 1\n          persist-credentials: false\n")
-REVIEW_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
-              (REVIEW_TOKEN, "${{ secrets." + REVIEW_TOKEN + " }}"), (REVIEW_CLAUDE_TOKEN, "${{ secrets." + REVIEW_CLAUDE_TOKEN + " }}")}
+# Each review workflow: (its concurrency group, its review token, its run lines).
+REVIEW_FLAVOURS = {"may-app-review.yml": ("may-app-review", REVIEW_TOKEN, REVIEW_RUNS),
+                   "may-ds-review.yml": ("may-ds-review", "MAY_DS_REVIEW_TOKEN", DS_REVIEW_RUNS)}
 
 
 @with_app_tokens("may-app-review.yml")
 def review_workflow_problems(text):
-    name = "may-app-review.yml"
+    return review_shape_problems(text, "may-app-review.yml")
+
+
+@with_app_tokens("may-ds-review.yml")
+def ds_review_workflow_problems(text):
+    return review_shape_problems(text, "may-ds-review.yml")
+
+
+def review_shape_problems(text, name):
+    group, review_token, review_runs = REVIEW_FLAVOURS[name]
+    review_env = {("GH_TOKEN", "${{ github.token }}"), ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"),
+                  (review_token, "${{ secrets." + review_token + " }}"),
+                  (REVIEW_CLAUDE_TOKEN, "${{ secrets." + REVIEW_CLAUDE_TOKEN + " }}")}
     found = []
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
@@ -2616,7 +2638,7 @@ def review_workflow_problems(text):
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number"] or \
             not re.search(r"(?m)^        type: string$", trigger) or REVIEW_SCHEDULE not in trigger or trigger.count("cron:") != 1:
         found.append(name + ": is not dispatched with exactly a pr_number, and scheduled every 15 minutes, only")
-    if "\nconcurrency:\n  group: may-app-review\n  cancel-in-progress: false\n" not in text:
+    if f"\nconcurrency:\n  group: {group}\n  cancel-in-progress: false\n" not in text:
         found.append(name + ": does not run one at a time in its own concurrency group, never cancelling a run")
     # Only admission reads the environment's policy (actions: read); review has contents: read alone (review of #21, M3).
     if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
@@ -2628,7 +2650,7 @@ def review_workflow_problems(text):
     if "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "review"):
         found.append(name + ": a job runs somewhere other than ubuntu-24.04")
     runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
-    if runs != REVIEW_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+    if runs != review_runs or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
         found.append(name + ": runs something other than review.py's admit, fetch, install and review, and the cleanup")
     steps = {job: job_steps(text, job)[1] for job in ("admission", "review")}
     leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
@@ -2650,10 +2672,10 @@ def review_workflow_problems(text):
     by_name = dict(steps["review"])
     fetch, install = by_name.get(REVIEW_STEP_NAMES[0], ""), by_name.get(REVIEW_STEP_NAMES[1], "")
     run, cleanup = by_name.get(REVIEW_STEP_NAMES[2], ""), by_name.get(REVIEW_STEP_NAMES[3], "")
-    if secrets_in(text) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or text.count("secrets." + REVIEW_TOKEN) != 2 or \
-            text.count("secrets." + REVIEW_CLAUDE_TOKEN) != 1 or secrets_in(fetch) != {REVIEW_TOKEN} or \
-            secrets_in(run) != {REVIEW_TOKEN, REVIEW_CLAUDE_TOKEN} or "env:" in install or "env:" in cleanup or \
-            any(e not in REVIEW_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text) or \
+    if secrets_in(text) != {review_token, REVIEW_CLAUDE_TOKEN} or text.count("secrets." + review_token) != 2 or \
+            text.count("secrets." + REVIEW_CLAUDE_TOKEN) != 1 or secrets_in(fetch) != {review_token} or \
+            secrets_in(run) != {review_token, REVIEW_CLAUDE_TOKEN} or "env:" in install or "env:" in cleanup or \
+            any(e not in review_env for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text) or \
             "GH_TOKEN" in job:
         found.append(name + ": a secret or env entry other than the review token in fetch and review and the Claude token in review")
     if "claude-code-action" in text or "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or \
@@ -2728,6 +2750,7 @@ def control_problems(root):
     found += compile_workflow_problems(compile_workflow)
     found += compile_pr_workflow_problems((flows / "native-compile-pr.yml").read_text())
     found += review_workflow_problems((flows / "may-app-review.yml").read_text())
+    found += ds_review_workflow_problems((flows / "may-ds-review.yml").read_text())
     found += review_tool_problems(root)
     found += ds_compile_workflow_problems((flows / DS_COMPILE).read_text())
     found += ds_compile_print_problems(root)
