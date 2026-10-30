@@ -301,6 +301,38 @@ class WebTests(NodeCase):
         self.assertNotIn(MARKER, out)
 
 
+class PrototypeTests(NodeCase):
+    def run_prototype(self, codes=None, summary=" Tests  5 passed (5)\n"):
+        def write(argv, log):
+            with log.open("a") as stream:
+                stream.write(summary)
+        try:
+            _, out = self.quiet(tool.run_prototype, SHA, self.fake(codes or {}, {"npm --prefix prototype test": write}))
+        except DsTestsError as error:
+            self.fail("the prototype suite's record was refused: " + error.args[0])
+        return out, json.loads((self.private / "prototype.json").read_text())
+
+    def test_no_prototype_folder_is_skipped_and_passes(self):
+        out, record = self.run_prototype()
+        self.assertEqual(out, "May DS tests prototype: skipped: no prototype/\n")
+        self.assertEqual((record["ran"], record["passed"], self.calls), (False, True, []))
+        self.assertEqual(self.quiet(tool.verdict, "prototype"), (0, ""))
+
+    def test_install_and_test_run_from_the_checkout_and_vitest_counts(self):
+        (self.checkout / "prototype").mkdir()
+        (self.checkout / "prototype" / "package.json").write_text("{}")
+        out, record = self.run_prototype()
+        self.assertEqual([c[0] for c in self.calls], [["npm", "--prefix", "prototype", "ci", "--no-audit", "--no-fund"],
+                                                      ["npm", "--prefix", "prototype", "test"]])
+        self.assertTrue(all(c[1] == self.checkout for c in self.calls), "run from the checkout, so its pretest finds web/")
+        self.assertEqual((record["passed"], record["total"]), (True, 6))
+        self.assertEqual(out, "May DS tests prototype: passed, 6 tests, 0 failed, 0 skipped\n")
+        self.calls.clear()
+        out, record = self.run_prototype({"npm --prefix prototype test": 1}, summary="pretest failed\n")
+        self.assertEqual((record["passed"], record["failures"]), (False, [{"name": "npm --prefix prototype test",
+                                                                           "message": "failed"}]))
+
+
 class VerdictTests(Case):
     def test_the_suite_job_fails_unless_its_suite_passed(self):
         self.record("swift")
@@ -332,7 +364,7 @@ class StatusTests(Case):
         self.assertEqual(payload, {"state": "success", "context": "may-ds-tests", "target_url":
                                    "https://github.com/May-Assistant/may-releases/actions/runs/88",
                                    "description": "swift 283 tests, 0 failed; android 1533 tests, 0 failed; tokens 12 "
-                                                  "tests, 0 failed; web 12 tests, 0 failed"})
+                                                  "tests, 0 failed; web 12 tests, 0 failed; prototype 12 tests, 0 failed"})
         self.record("android", passed=False, failed=2, failures=[{"name": MARKER, "message": MARKER}])
         _, out, sent = self.status()
         self.assertEqual(sent[0][2]["state"], "failure")
@@ -340,11 +372,11 @@ class StatusTests(Case):
 
     def test_a_suite_with_no_record_counts_by_its_job_and_none_finished_is_an_error(self):
         _, _, sent = self.status(MAY_SWIFT_RESULT="success", MAY_ANDROID_RESULT="failure", MAY_TOKENS_RESULT="success",
-                                 MAY_WEB_RESULT="success")
+                                 MAY_WEB_RESULT="success", MAY_PROTOTYPE_RESULT="success")
         self.assertEqual((sent[0][2]["state"], sent[0][2]["description"]),
-                         ("failure", "swift passed; android failed; tokens passed; web passed"))
+                         ("failure", "swift passed; android failed; tokens passed; web passed; prototype passed"))
         _, _, sent = self.status(MAY_SWIFT_RESULT="cancelled", MAY_ANDROID_RESULT="skipped", MAY_TOKENS_RESULT="skipped",
-                                 MAY_WEB_RESULT="cancelled")
+                                 MAY_WEB_RESULT="cancelled", MAY_PROTOTYPE_RESULT="skipped")
         self.assertEqual((sent[0][2]["state"], sent[0][2]["description"]), ("error", "neither suite finished"))
 
     def test_no_token_sets_nothing_and_only_a_status_is_writable(self):
@@ -399,6 +431,7 @@ class SealOpenPostTests(Case):
         self.record("tokens", passed=False, failed=1, failures=[{"name": "tools/generate-tokens.mjs --check",
                                                                  "message": "failed"}])
         self.record("web", ran=False, total=0)
+        self.record("prototype", ran=False, total=0)
         os.environ[tool.RECIPIENT] = self.public
         for suite in tool.SUITES:
             try:
@@ -417,11 +450,12 @@ class SealOpenPostTests(Case):
         self.seal_and_hand_over()
         os.environ[tool.DECRYPT_KEY] = self.secret
         _, out = self.quiet(tool.open_records, SHA)
-        self.assertEqual(out, "May DS tests: 4 suite records decrypted and checked\n")
+        self.assertEqual(out, "May DS tests: 5 suite records decrypted and checked\n")
         self.assertNotIn(tool.DECRYPT_KEY, os.environ)
         del os.environ[tool.RECIPIENT]
         os.environ.update({tool.COMMENT_TOKEN: TOKEN, "MAY_SWIFT_RESULT": "failure", "MAY_ANDROID_RESULT": "success",
-                           "MAY_TOKENS_RESULT": "failure", "MAY_WEB_RESULT": "success", "GITHUB_RUN_ID": "77"})
+                           "MAY_TOKENS_RESULT": "failure", "MAY_WEB_RESULT": "success", "MAY_PROTOTYPE_RESULT": "success",
+                           "GITHUB_RUN_ID": "77"})
         call, calls = self.api()
         code, out = self.quiet(tool.post, SHA, "40", call)
         self.assertEqual((code, out), (1, "May DS tests failed; result posted to may-design-system #40\n"))
@@ -435,19 +469,20 @@ class SealOpenPostTests(Case):
         self.assertIn("**Warning:** android ran 1000 tests, fewer than the 1533 at `b0e9c28`.", body)
         self.assertIn("tools/generate-tokens.mjs --check: failed", body)
         self.assertIn("| skipped (no `web/` yet) |", body)
+        self.assertIn("| skipped (no `prototype/` yet) |", body)
         self.assertNotIn("tokens ran", body, "the new suites have no baseline")
         self.assertIn(f"<!-- may-ds-tests head={SHA} -->", body)
         self.assertNotIn(MARKER, out)
 
     def test_a_suite_with_no_record_is_posted_from_its_jobs_result(self):
         os.environ.update({tool.COMMENT_TOKEN: TOKEN, "MAY_SWIFT_RESULT": "success", "MAY_ANDROID_RESULT": "success",
-                           "MAY_TOKENS_RESULT": "success", "MAY_WEB_RESULT": "success"})
+                           "MAY_TOKENS_RESULT": "success", "MAY_WEB_RESULT": "success", "MAY_PROTOTYPE_RESULT": "success"})
         call, calls = self.api()
         code, _ = self.quiet(tool.post, SHA, "40", call)
         self.assertEqual(code, 0)
         self.assertIn("| passed (no detail reached the post job) |", calls[-1][2]["body"])
         os.environ.update({tool.COMMENT_TOKEN: TOKEN, "MAY_SWIFT_RESULT": "cancelled", "MAY_ANDROID_RESULT": "skipped",
-                           "MAY_TOKENS_RESULT": "skipped", "MAY_WEB_RESULT": "skipped"})
+                           "MAY_TOKENS_RESULT": "skipped", "MAY_WEB_RESULT": "skipped", "MAY_PROTOTYPE_RESULT": "skipped"})
         code, out = self.quiet(tool.post, SHA, "40", self.api()[0])
         self.assertEqual((code, out), (1, "May DS tests: neither suite finished (cancelled or skipped); nothing posted\n"))
 
@@ -558,7 +593,10 @@ class ShapeTests(unittest.TestCase):
                          ("    if: ${{ !cancelled() && needs.admission.result == 'success' }}\n", "    if: always()\n"),
                          ("      contents: read\n      actions: read\n    steps:", "      contents: write\n      actions: read\n    steps:"),
                          ("ds_tests.py verdict --suite android", "ds_tests.py verdict --suite swift"),
-                         ("    needs: [admission, swift, android, tokens, web]\n", "    needs: [admission, swift, android]\n"),
+                         ("    needs: [admission, swift, android, tokens, web, prototype]\n",
+                          "    needs: [admission, swift, android, tokens, web]\n"),
+                         ("          MAY_PROTOTYPE_RESULT: ${{ needs.prototype.result }}\n", ""),
+                         ('ds_tests.py prototype --ds-sha "$MAY_DS_SHA"', 'ds_tests.py web --ds-sha "$MAY_DS_SHA"'),
                          ("          MAY_WEB_RESULT: ${{ needs.web.result }}\n", ""),
                          ("ds_tests.py verdict --suite web", "ds_tests.py verdict --suite tokens"),
                          ("may-ds-tests-sealed/tokens.age", "may-ds-private/tokens.json"),

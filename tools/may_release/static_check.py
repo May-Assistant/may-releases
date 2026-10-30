@@ -2346,7 +2346,7 @@ def _ds_suite_steps(suite, title, extra, cleanup):
 
 # The suites, each in its own job with its sealed record (tokens and web: coordinator, 30 Oct, with the pinned Node), and
 # each job's result as the post job reads it.
-_DS_SUITES = ("swift", "android", "tokens", "web")
+_DS_SUITES = ("swift", "android", "tokens", "web", "prototype")
 _DS_RESULTS = [(f"MAY_{suite.upper()}_RESULT", f"${{{{ needs.{suite}.result }}}}") for suite in _DS_SUITES]
 _DS_NODE = ("Install the pinned, checksum-verified Node", None, [], "python3 -I -S -B tools/may_release/toolchain.py node")
 _DS_NODE_CLEANUP = ("Remove the design-system checkout, logs, npm cache and the pinned Node",
@@ -2374,7 +2374,9 @@ DS_TESTS_JOBS = {
         '"$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"'))),
     "tokens": ("ubuntu-24.04", "[admission, pull]", 20, _ds_suite_steps("tokens", "tokens", [_DS_NODE], _DS_NODE_CLEANUP)),
     "web": ("ubuntu-24.04", "[admission, pull]", 30, _ds_suite_steps("web", "web", [_DS_NODE], _DS_NODE_CLEANUP)),
-    "post": ("ubuntu-24.04", "[admission, swift, android, tokens, web]", 10, [
+    "prototype": ("ubuntu-24.04", "[admission, pull]", 30, _ds_suite_steps("prototype", "prototype", [_DS_NODE],
+                                                                           _DS_NODE_CLEANUP)),
+    "post": ("ubuntu-24.04", "[admission, swift, android, tokens, web, prototype]", 10, [
         ("Install pinned age", None, [], "python3 -I -S -B tools/may_release/toolchain.py age"),
         *[("", DOWNLOAD_ARTIFACT, [], None)] * len(_DS_SUITES),
         ("Decrypt and check the suite records", None,
@@ -2415,7 +2417,7 @@ def ds_tests_workflow_problems(text):
             any(job_text(text, job).count(JOB_PERMISSIONS) != 1 for job in DS_TESTS_JOBS):
         found.append(name + "permissions are not read-only everywhere")
     if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(DS_TESTS_JOBS):
-        found.append(name + "jobs are not exactly admission, pull, swift, android, tokens, web and post")
+        found.append(name + "jobs are not exactly admission, pull, swift, android, tokens, web, prototype and post")
     for job, (runner, needs, timeout, expected) in DS_TESTS_JOBS.items():
         header, steps = job_steps(text, job)
         body = job_text(text, job)
@@ -2507,8 +2509,12 @@ def ds_tests_print_problems(root):
             assigned_literal(path, "WEB_STEPS") != (("npm ci", ("npm", "ci", "--no-audit", "--no-fund")),
                                                     ("npm test", ("npm", "test")),
                                                     ("npm run typecheck", ("npm", "run", "typecheck")),
-                                                    ("npm run build", ("npm", "run", "build"))):
-        found.append(DS_TESTS_TOOL + ": its suites, or the tokens and web commands, are not the ones the workflow runs")
+                                                    ("npm run build", ("npm", "run", "build"))) or \
+            assigned_literal(path, "PROTOTYPE_STEPS") != (
+                ("npm --prefix prototype ci", ("npm", "--prefix", "prototype", "ci", "--no-audit", "--no-fund")),
+                ("npm --prefix prototype test", ("npm", "--prefix", "prototype", "test"))):
+        found.append(DS_TESTS_TOOL + ": its suites, or the tokens, web and prototype commands, are not the ones the "
+                     "workflow runs")
     tree = ast.parse(path.read_text())
     post = function_source(tree, "post")
     if post is None or "post_once(call_api, DS_REPO" not in ast.unparse(post) or \

@@ -23,6 +23,8 @@ hands over only that; a fresh post job opens both and posts (the split of may-re
            `node --test tools/*.test.mjs` with its JUnit report: each check is one test, node's own tests one each.
   web      (ubuntu-24.04, no secret, the pinned Node) npm ci, npm test, npm run typecheck and npm run build in web/: each
            step is one test, vitest's own tests one each when it reports them. With no web/ yet: skipped, and a pass.
+  prototype (ubuntu-24.04, no secret, the pinned Node) `npm --prefix prototype ci` and `npm --prefix prototype test`
+           from the checkout (its pretest builds web/ first), counted as web. With no prototype/ yet: skipped, a pass.
   seal     (the same job, no secret) that suite's record ({sha, suite, ran, passed, total, failed, skipped, failures})
            padded to MAX_RECORD and age-encrypted to MAY_RENDERS_RECIPIENT; without the recipient nothing is sealed.
   verdict  (the same job, no secret) fails the job when the suite did not pass, whether or not the post job can post.
@@ -34,7 +36,8 @@ hands over only that; a fresh post job opens both and posts (the split of may-re
   post     (post job, MAY_DS_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts one comment for every
            suite on the pull request, after it is read again and is still open at that head, unless a comment already
            carries this head's marker. A suite whose record never arrived is reported from its job's result alone
-           (MAY_SWIFT_RESULT, MAY_ANDROID_RESULT, MAY_TOKENS_RESULT, MAY_WEB_RESULT: success, failure). It fails when a suite did not pass.
+           (MAY_SWIFT_RESULT, MAY_ANDROID_RESULT, MAY_TOKENS_RESULT, MAY_WEB_RESULT,
+           MAY_PROTOTYPE_RESULT: success, failure). It fails when a suite did not pass.
 """
 
 import argparse
@@ -68,9 +71,9 @@ CONTEXT = "may-ds-tests"
 RECIPIENT, DECRYPT_KEY = "MAY_RENDERS_RECIPIENT", "MAY_RENDERS_DECRYPT_KEY"
 AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
 SHA = re.compile(r"[0-9a-f]{40}")
-SUITES = ("swift", "android", "tokens", "web")
+SUITES = ("swift", "android", "tokens", "web", "prototype")
 RESULT_ENV = {"swift": "MAY_SWIFT_RESULT", "android": "MAY_ANDROID_RESULT", "tokens": "MAY_TOKENS_RESULT",
-              "web": "MAY_WEB_RESULT"}
+              "web": "MAY_WEB_RESULT", "prototype": "MAY_PROTOTYPE_RESULT"}
 DERIVED = "may-ds-tests-derived"
 SEALED, DOWNLOAD = "may-ds-tests-sealed", "may-ds-tests-download"
 # Every sealed record is padded to MAX_RECORD bytes, so its size says nothing about how many tests failed.
@@ -93,6 +96,12 @@ TOKEN_TESTS = "tools"
 WEB = "web"
 WEB_STEPS = (("npm ci", ("npm", "ci", "--no-audit", "--no-fund")), ("npm test", ("npm", "test")),
              ("npm run typecheck", ("npm", "run", "typecheck")), ("npm run build", ("npm", "run", "build")))
+# The prototype's tests (coordinator, 30 Oct), run from the checkout as given: its pretest builds the web package first.
+PROTOTYPE = "prototype"
+PROTOTYPE_STEPS = (("npm --prefix prototype ci", ("npm", "--prefix", "prototype", "ci", "--no-audit", "--no-fund")),
+                   ("npm --prefix prototype test", ("npm", "--prefix", "prototype", "test")))
+# A suite whose folder is not there yet: skipped, and a pass (web/ until DS #223, prototype/ until DS #235).
+OPTIONAL = {"web": WEB, "prototype": PROTOTYPE}
 NODE_SECONDS = 20 * 60
 VITEST_TOTAL = re.compile(r"\s*Tests\s+(.*?)\s*\((\d+)\)\s*")
 VITEST_PART = re.compile(r"(\d+) (passed|failed|skipped|todo)")
@@ -100,7 +109,8 @@ TITLES = {"swift": f"Swift (`xcodebuild test`, Xcode {XCODE}, {DEVICE} simulator
           "android": f"Android (`{GRADLE_TASK}`, JDK 21)",
           "tokens": "Tokens (`generate-tokens.mjs --check`, `generate-agent-marks.mjs --check`, "
                     "`node --test tools/*.test.mjs`, Node 22.22.0)",
-          "web": "Web (`npm ci`, `npm test`, `npm run typecheck`, `npm run build` in `web/`, Node 22.22.0)"}
+          "web": "Web (`npm ci`, `npm test`, `npm run typecheck`, `npm run build` in `web/`, Node 22.22.0)",
+          "prototype": "Prototype (`npm --prefix prototype ci`, `npm --prefix prototype test`, Node 22.22.0)"}
 
 
 class DsTestsError(ValueError):
@@ -131,8 +141,9 @@ def checked_record(data, sha, suite):
 
 
 def absent(record):
-    """The web suite's record when the design system has no web/ yet: not run, and a pass (coordinator, 30 Oct)."""
-    return record["suite"] == "web" and not record["ran"] and record["passed"] and record["total"] == 0 and \
+    """An optional suite's record when the design system does not have its folder yet: not run, and a pass
+    (coordinator, 30 Oct)."""
+    return record["suite"] in OPTIONAL and not record["ran"] and record["passed"] and record["total"] == 0 and \
         not record["failures"]
 
 
@@ -359,48 +370,64 @@ def vitest_counts(text):
     return found
 
 
-def run_web(sha, tool=quiet):
+def run_npm(sha, suite, steps, cwd_of, tool):
+    """An npm suite: each step in order (a failed install leaves the rest unrun and failed), vitest's own tests
+    counted in place of the test step when it reports them. With no package.json in the suite's folder: skipped."""
     require_step_secrets(())
     exact(sha)
     root, checkout, private = prepared()
     if head_revision(checkout) != sha:
         raise DsTestsError("The checkout is not the exact design-system commit")
-    web = checkout / WEB
-    if web.is_symlink() or not web.is_dir() or not (web / "package.json").is_file():
-        record = checked_record({"sha": sha, "suite": "web", "ran": False, "passed": True, "total": 0, "failed": 0,
-                                 "skipped": 0, "failures": []}, sha, "web")
+    folder = checkout / OPTIONAL[suite]
+    if folder.is_symlink() or not folder.is_dir() or not (folder / "package.json").is_file() or \
+            (folder / "package.json").is_symlink():
+        record = checked_record({"sha": sha, "suite": suite, "ran": False, "passed": True, "total": 0, "failed": 0,
+                                 "skipped": 0, "failures": []}, sha, suite)
         write_record(private, record)
         report(record)
         return
-    env, log, test_log = node_env(root), private / "web.log", private / "web-test.log"
-    # Counts come only from this run's own npm test output, never a log left from before.
+    cwd = cwd_of(checkout)
+    env, log, test_log = node_env(root), private / f"{suite}.log", private / f"{suite}-test.log"
+    # Counts come only from this run's own test output, never a log left from before.
     test_log.unlink(missing_ok=True)
     checks, tests = [], None
-    installed = checked_run(WEB_STEPS[0][1], log, web, env, tool)
-    checks.append((WEB_STEPS[0][0], installed))
-    for name, argv in WEB_STEPS[1:]:
+    installed = checked_run(steps[0][1], log, cwd, env, tool)
+    checks.append((steps[0][0], installed))
+    for name, argv in steps[1:]:
         if not installed:
-            checks.append((name + " (not run: npm ci failed)", False))
+            checks.append((name + f" (not run: {steps[0][0]} failed)", False))
             continue
-        done = checked_run(argv, test_log if name == "npm test" else log, web, env, tool)
-        if name == "npm test":
+        testing = argv[-1] == "test"
+        done = checked_run(argv, test_log if testing else log, cwd, env, tool)
+        if testing:
             counts = vitest_counts(test_log.read_text(errors="replace")) if test_log.is_file() else None
             if counts and (done or counts[1]):
                 tests = (counts[0], counts[1], counts[2],
-                         [{"name": "npm test", "message": f"{int(counts[1])} vitest tests failed"}] if counts[1] else [])
+                         [{"name": name, "message": f"{int(counts[1])} vitest tests failed"}] if counts[1] else [])
                 continue
         checks.append((name, done))
     total, failed, skipped, failures = counted(checks, tests)
-    record = record_of(sha, "web", True, total, failed, skipped, failures)
+    record = record_of(sha, suite, True, total, failed, skipped, failures)
     write_record(private, record)
     report(record)
+
+
+def run_web(sha, tool=quiet):
+    return run_npm(sha, "web", WEB_STEPS, lambda checkout: checkout / WEB, tool)
+
+
+def run_prototype(sha, tool=quiet):
+    return run_npm(sha, "prototype", PROTOTYPE_STEPS, lambda checkout: checkout, tool)
 
 
 def report(record):
     """One fixed line: the suite and its counts, never a name or a message."""
     suite = record["suite"]
     if absent(record):
-        print("May DS tests web: skipped: no web/")
+        if suite == "web":
+            print("May DS tests web: skipped: no web/")
+        else:
+            print("May DS tests prototype: skipped: no prototype/")
         return
     if not record["ran"]:
         print(f"May DS tests {suite}: did not run (the build or the tool stopped before a result)")
@@ -414,7 +441,7 @@ def report(record):
 
 def suite_of(suite):
     if suite not in SUITES:
-        raise DsTestsError("The suite is not swift, android, tokens or web")
+        raise DsTestsError("The suite is not swift, android, tokens, web or prototype")
     return suite
 
 
@@ -527,7 +554,7 @@ def comment_body(sha, url, records, results):
             lines.append(f"| {TITLES[suite]} | {state} (no detail reached the post job) | | | |")
             continue
         if absent(record):
-            lines.append(f"| {TITLES[suite]} | skipped (no `web/` yet) | | | |")
+            lines.append(f"| {TITLES[suite]} | skipped (no `{OPTIONAL[suite]}/` yet) | | | |")
             continue
         state = "passed" if record["passed"] else "failed" if record["ran"] else "did not run"
         lines.append(f"| {TITLES[suite]} | {state} | {int(record['total'])} | {int(record['failed'])} | "
@@ -645,8 +672,8 @@ def post(sha, pr, call_api=github):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("swift", "android", "tokens", "web", "seal", "verdict", "open", "status",
-                                            "post"))
+    parser.add_argument("command", choices=("swift", "android", "tokens", "web", "prototype", "seal", "verdict", "open",
+                                            "status", "post"))
     parser.add_argument("--ds-sha")
     parser.add_argument("--pr-number")
     parser.add_argument("--suite")
@@ -659,6 +686,8 @@ def main():
         return run_tokens(args.ds_sha)
     if args.command == "web":
         return run_web(args.ds_sha)
+    if args.command == "prototype":
+        return run_prototype(args.ds_sha)
     if args.command == "seal":
         return seal(args.ds_sha, args.suite)
     if args.command == "verdict":
