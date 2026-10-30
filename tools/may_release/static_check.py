@@ -1382,13 +1382,19 @@ DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
 DEVICE_REDUCE_MOTION = ("MAY_IOS_REDUCE_MOTION", "${{ inputs.ios_reduce_motion }}")
 DEVICE_REDUCE_MOTION_INPUT = ("      ios_reduce_motion:\n        description: [^\n]+\n        required: false\n"
                               "        type: boolean\n        default: false\n")
-# Evidence runs alone (coordinator, 26 Oct): the iOS app's watchdog and SwiftUI change log (may-app #1338), asked for at
-# launch, in the iOS scenarios step alone.
+# The iOS app's watchdog (may-app #1338), asked for at launch, in the iOS scenarios step alone: on unless dispatched
+# false, so the nightly run (no inputs) has it too (coordinator, 26 Oct: runs 40309200520 and 40319309252 showed no
+# measurable cost). SwiftUI's change log has its own input, off unless dispatched true (may-app #1302: it brought the
+# idle hang back).
 DEVICE_DIAGNOSTICS = ("MAY_IOS_DIAGNOSTICS", "${{ inputs.ios_diagnostics }}")
 DEVICE_DIAGNOSTICS_INPUT = ("      ios_diagnostics:\n        description: [^\n]+\n        required: false\n"
+                            "        type: boolean\n        default: true\n")
+DEVICE_LOG_CHANGES = ("MAY_IOS_LOG_CHANGES", "${{ inputs.ios_log_changes }}")
+DEVICE_LOG_CHANGES_INPUT = ("      ios_log_changes:\n        description: [^\n]+\n        required: false\n"
                             "        type: boolean\n        default: false\n")
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
-              ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS} | DEVICE_VARS | \
+              ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS,
+              DEVICE_LOG_CHANGES} | DEVICE_VARS | \
     {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
 
 
@@ -1401,13 +1407,15 @@ def device_tests_workflow_problems(text):
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion",
-                                                             "ios_diagnostics", "tidy_file_taxes"] or \
-            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean"] or \
+                                                             "ios_diagnostics", "ios_log_changes", "tidy_file_taxes"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean",
+                                                                 "boolean"] or \
             not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or not re.search(DEVICE_DIAGNOSTICS_INPUT, trigger) or \
+            not re.search(DEVICE_LOG_CHANGES_INPUT, trigger) or \
             not re.search(DEVICE_TIDY_INPUT, trigger) or \
             re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
         found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion, "
-                     "ios_diagnostics and tidy_file_taxes booleans, plus one nightly schedule")
+                     "ios_diagnostics, ios_log_changes and tidy_file_taxes booleans, plus one nightly schedule")
     if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     jobs = ("admission", "android", "ios", "publish")
@@ -1479,7 +1487,8 @@ def device_tests_workflow_problems(text):
             any(model not in env_entries(chunk) for chunk in (scenarios, judge, ios_scenarios, ios_judge)) or \
             staging not in env_entries(ios_scenarios) or DEVICE_REDUCE_MOTION not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_reduce_motion") != 1 or DEVICE_DIAGNOSTICS not in env_entries(ios_scenarios) or \
-            text.count("inputs.ios_diagnostics") != 1 or \
+            text.count("inputs.ios_diagnostics") != 1 or DEVICE_LOG_CHANGES not in env_entries(ios_scenarios) or \
+            text.count("inputs.ios_log_changes") != 1 or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
