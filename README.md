@@ -402,6 +402,8 @@ Only GETs are sent. Every value is printed only if it matches a fixed shape (dig
 
 If either is missing, signing fails with a fixed message naming the missing part, and the IPA is deleted before any upload. When both hold, the log says so in one fixed line. Nothing from the IPA itself is printed.
 
+**The IPA's push entitlement (30 Oct, F4).** Push needs the signed app to carry `aps-environment` set to `production`, which the export takes from the app's entitlements and its App Store profile together. After the icon check, `sign.py` unpacks the signed IPA into private scratch (`ditto -x -k`) and reads what the one app in `Payload/` was signed with (`codesign -d --entitlements - --xml`); `verify.check_push` passes only when that sets `aps-environment` to `production`. Otherwise signing fails with a fixed message saying whether the key is missing, set to something else, or unreadable, never its value or anything of the profile, and the IPA is deleted before any upload. It runs for both targets, May and May Playground, and in a dry run too (which signs and verifies but uploads nothing), so a dry run at a build's commit answers whether that target's profile carries push. The scratch is removed whatever happens.
+
 TestFlight processing (the build itself) and the internal group's testers are still checked in App Store Connect.
 
 ### What Samuel does

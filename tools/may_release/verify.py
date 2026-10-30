@@ -425,6 +425,29 @@ def ipa_identity(path, team, bundle_id, build_number):
         raise VerifyError("IPA build number differs")
 
 
+
+# Coordinator, 30 Oct (F4): May's iOS push needs the signed app to carry aps-environment=production, which the export
+# takes from the app's own entitlements and its App Store profile together. The check reads what codesign says the
+# exported app was signed with (codesign -d --entitlements - --xml), for both targets, and says pass or fail and
+# whether the key is there, never a value or anything of the profile.
+PUSH_KEY, PUSH_PRODUCTION = "aps-environment", "production"
+
+
+def check_push(xml):
+    """Require codesign's entitlements XML to set aps-environment to production; fixed messages, no values."""
+    starts = [at for at in (xml.find(b"<?xml"), xml.find(b"<plist")) if at >= 0]
+    try:
+        entitlements = plistlib.loads(xml[min(starts):]) if starts else None
+    except (plistlib.InvalidFileException, ValueError):
+        entitlements = None
+    if not isinstance(entitlements, dict):
+        raise VerifyError("IPA push check failed: the app's signed entitlements could not be read")
+    if PUSH_KEY not in entitlements:
+        raise VerifyError("IPA push check failed: the app's signed entitlements have no aps-environment")
+    if entitlements[PUSH_KEY] != PUSH_PRODUCTION:
+        raise VerifyError("IPA push check failed: the app's signed entitlements have aps-environment, not production")
+
+
 APP_ICON = "AppIcon"
 
 

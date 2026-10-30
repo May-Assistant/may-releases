@@ -42,6 +42,7 @@ import verify
 
 # Apple's tools by absolute path; xcodebuild honours DEVELOPER_DIR.
 SECURITY, XCODEBUILD = "/usr/bin/security", "/usr/bin/xcodebuild"
+CODESIGN, DITTO = "/usr/bin/codesign", "/usr/bin/ditto"
 
 
 def jarsigner():
@@ -172,11 +173,34 @@ def sign_ios(target, source_sha, build_number):
     try:
         verify.ipa_identity(ipa, APPLE_TEAM, app_id, build_number)
         verify.ipa_icon(ipa)
+        ipa_push(ipa, private, env)
     except BaseException:
         ipa.unlink(missing_ok=True)
         raise
     print("May iOS IPA signed for internal TestFlight and its profile verified")
     print("IPA app icon: Info.plist names CFBundleIconName AppIcon, and Assets.car names AppIcon")
+    print("IPA push: the app's signed entitlements have aps-environment, set to production")
+
+
+def ipa_push(ipa, private, env):
+    """The exported app's signed entitlements, as codesign reads them from the IPA unpacked into private scratch,
+    checked by verify.check_push; the scratch is removed whatever happens."""
+    unpacked = private / "ios-entitlements"
+    unpacked.mkdir(mode=0o700)
+    try:
+        if subprocess.run([DITTO, "-x", "-k", str(ipa), str(unpacked)], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env).returncode:
+            raise StoreError("IPA push check failed: the IPA could not be unpacked")
+        payload = unpacked / "Payload"
+        apps = [app for app in payload.iterdir() if app.suffix == ".app" and app.is_dir() and not app.is_symlink()] \
+            if payload.is_dir() and not payload.is_symlink() else []
+        if len(apps) != 1:
+            raise StoreError("IPA push check failed: the IPA does not hold exactly one app")
+        read = subprocess.run([CODESIGN, "-d", "--entitlements", "-", "--xml", str(apps[0])], capture_output=True,
+                              stdin=subprocess.DEVNULL, env=env)
+        verify.check_push(read.stdout if not read.returncode else b"")
+    finally:
+        shutil.rmtree(unpacked, ignore_errors=True)
 
 
 if __name__ == "__main__":
