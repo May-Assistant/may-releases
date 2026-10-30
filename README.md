@@ -461,6 +461,17 @@ gh workflow run store-release-draft.yml -f platform=android -f target=production
 
 In the Actions UI, choose **May protected store release (stage 4, Android internal and internal TestFlight uploads)**, **Run workflow** from `main`, and set the inputs above. A run that did not do what it was asked is **red**: admission refuses what it does not admit, the upload step fails on any Play refusal or error (deleting the edit), and the loud-failure checks fail the job whenever the upload, or the sign-only publication, did not succeed.
 
+### Weekly May Playground release
+
+[`weekly-release.yml`](.github/workflows/weekly-release.yml) dispatches this workflow once a week for May Playground: iOS first, then Android once iOS succeeded. It does not replace the approval: each run it starts still waits in `may-store-release` for a required reviewer, as a run dispatched by hand does.
+
+- **When and what.** It fires at minute 7 of every hour on Thursday and Friday (UTC), and can be dispatched by hand with no input. The cut is may-app `main` at Thursday 15:07 UTC: the merge commit of the last pull request merged into `main` at or before then. Later merges wait for next week, so the hourly firings never make a second build in a week. Only firings from the cut to Friday 23:07 UTC dispatch anything, and none between 10:00 and 11:30 UTC, so a release never overlaps the device-test window.
+- **Stateless.** Each firing decides again from `store-release-draft.yml`'s own run names, which carry the platform, build number and (from this change) the source SHA. A store run that is queued, waiting for approval or running: nothing is sent. No iOS run for the cut: iOS is sent. iOS succeeded and Android has no run for the cut: Android is sent. iOS failed or was cancelled: nothing more is sent, and the log says so. A cut already built (main unchanged since last week) is never sent again.
+- **Build numbers.** One above the highest May Playground build number that platform has had in any store run, dry runs included, and at least the store floor, as by hand. `gate.py` refuses it again if it is not.
+- **Steps** (as the other schedules, so no step holds two credentials): `admit` (no environment) checks the trigger, `main` and `may-native-compile-pr`'s policy; `runs` (`GITHUB_TOKEN` alone) reads the store runs; `pick` (`MAY_APP_PR_READ_TOKEN` alone) reads may-app's merged pull requests to find the cut; `dispatch` (`GITHUB_TOKEN`, `actions: write`) sends at most one `workflow_dispatch` of `store-release-draft.yml` on `main` with exactly a platform, `playground`, the cut, a build number, `dry_run=false` and `sign_only=false`.
+- **What is printed:** fixed lines, build numbers and the cut's SHA, which the store run's name carries in public anyway. No may-app title, branch or file name.
+- **Pinned by `static_check.py`:** the workflow with the other schedules (`SCHEDULES`, its own cron in `SCHEDULE_CRONS`), the token mint, `TARGET`, `RUNS_PATH` and the store run name.
+
 ### iOS compile each build
 
 `native-compile-draft.yml` checks that iOS May Playground still compiles, at the may-app commit of each build. It is a compile only: no signing, no TestFlight, no artifact. The coordinator dispatches it; Samuel approves `may-native-compile` (the same environment and read-only keys as every store build).

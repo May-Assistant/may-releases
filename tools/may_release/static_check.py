@@ -258,6 +258,7 @@ WORKFLOW_MINTS = {
     "android-unit-pr.yml": {"unit": ("ci-read", "ci-comment")},
     "ios-archive-rehearsal.yml": {"rehearsal": ("ci-read",)},
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
+    "weekly-release.yml": {"pick": ("ci-read",)},
     "backend-unit-pr.yml": {"backend": ("ci-read", "ci-comment")},
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
@@ -424,7 +425,7 @@ def stage_problems(store):
 # spaced or explicit (`?`) keys, no anchors, aliases, tags or merge keys, no tabs,
 # no multi-line quoted, plain or flow values (block scalars only after `key: |`).
 # The store run's name: the app, platform and build number, plus "(dry run)" or "(sign only)", from its inputs alone.
-STORE_RUN_NAME = ("run-name: ${{ inputs.target == 'playground' && 'May Playground' || 'May' }} · ${{ inputs.platform == 'ios' && 'iOS' || 'Android' }} · build ${{ inputs.build_number }}${{ inputs.dry_run && ' (dry run)' || '' }}${{ inputs.sign_only && ' (sign only)' || '' }}")
+STORE_RUN_NAME = ("run-name: ${{ inputs.target == 'playground' && 'May Playground' || 'May' }} · ${{ inputs.platform == 'ios' && 'iOS' || 'Android' }} · build ${{ inputs.build_number }} at ${{ inputs.source_sha }}${{ inputs.dry_run && ' (dry run)' || '' }}${{ inputs.sign_only && ' (sign only)' || '' }}")
 LAYOUT_LINE = re.compile(r"( *)(- )?([A-Za-z][\w-]*):(?: (.*))?")
 LAYOUT_VALUE = re.compile(r"""[^\s&*!{}?|>%@`'"\[\]#,][^#]*|'(?:[^']|'')*'|\[[^\[\]{}'"#]*\]|[|>]-?""")
 ADMISSION_ENV = [("GH_TOKEN", "${{ github.token }}"), ("MAY_PLATFORM", "${{ inputs.platform }}"),
@@ -454,7 +455,8 @@ def layout_problems(store):
     if re.findall(r"(?m)^([\w-]+):", store) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
         found.append("store-release-draft.yml: top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
     if store.count("\nrun-name: ") != 1 or "\n" + STORE_RUN_NAME + "\n" not in store:
-        found.append("store-release-draft.yml: run-name is not exactly the app, platform, build number and mode from its inputs")
+        found.append("store-release-draft.yml: run-name is not exactly the app, platform, build number, source SHA and mode "
+                     "from its inputs")
     if re.findall(r"(?m)^  ([\w-]+):", store.partition("\non:\n")[2].partition("\npermissions:")[0]) != ["workflow_dispatch"]:
         found.append("store-release-draft.yml: is triggered by something other than workflow_dispatch")
     if re.findall(r"(?m)^  ([\w-]+):", store.partition("\njobs:\n")[2]) != list(STORE_JOB_IF):
@@ -2053,6 +2055,8 @@ def backend_unit_silence_problems(root):
 # holding both credentials: GITHUB_TOKEN in runs and dispatch, the PR read token in pick alone, nothing in the cleanup.
 # Each tool's one write is control_dispatch, which refuses any path but its lane's dispatches before it sends anything.
 SCHEDULE_CRON = '  schedule:\n    - cron: "*/15 * * * *"\n  workflow_dispatch:\npermissions:'
+# The weekly release fires hourly on Thursday and Friday (weekly_release.py decides each time), not every 15 minutes.
+SCHEDULE_CRONS = {"weekly-release.yml": '  schedule:\n    - cron: "7 * * * 4,5"\n  workflow_dispatch:\npermissions:'}
 SCHEDULE_PICK_PERMISSIONS = "    permissions:\n      contents: read\n      actions: write\n    steps:\n"
 SCHEDULE_PRINT_VALUES = {"int(count)", "int(looked)", "int(number)", "sha"}
 SCHEDULE_EXIT_CLASSES = {"GateDenial", "ScheduleError"}
@@ -2080,6 +2084,14 @@ SCHEDULES = {
          "Dispatch the design-system tests for the picked head, with no design-system credential",
          "Remove the carried numbers"],
         "May DS tests for may-design-system #{number} at {sha}", "actions/workflows/ds-tests-pr.yml/dispatches"),
+    # 30 Oct: May Playground's weekly store release, iOS then Android, each still approved by hand.
+    "weekly-release.yml": (
+        "weekly_release.py", "may-weekly-release", "may-weekly-release",
+        ["List the store runs, with no may-app credential",
+         "Find this week's cut of may-app main, with no GitHub token",
+         "Dispatch the next store build for the cut, with no may-app credential",
+         "Remove the carried numbers"],
+        "May Playground · {platform} · build {number} at {sha}", "actions/workflows/store-release-draft.yml/dispatches"),
 }
 # The pull-request read token each schedule's pick holds (may-app's, unless named here).
 SCHEDULE_READ_SECRETS = {"ds-tests-schedule.yml": "MAY_DS_PR_READ_TOKEN"}
@@ -2087,6 +2099,7 @@ SCHEDULE = "android-ci-schedule.yml"
 SCHEDULE_TOOL = SCHEDULES[SCHEDULE][0]
 SCHEDULE_DISPATCH = SCHEDULES[SCHEDULE][5]
 BACKEND_SCHEDULE = "backend-ci-schedule.yml"
+WEEKLY_RELEASE = "weekly-release.yml"
 
 
 def schedule_workflow_problems(workflow, text):
@@ -2101,9 +2114,11 @@ def schedule_workflow_problems(workflow, text):
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
-    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["schedule", "workflow_dispatch"] or SCHEDULE_CRON not in text or \
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["schedule", "workflow_dispatch"] or \
+            SCHEDULE_CRONS.get(workflow, SCHEDULE_CRON) not in text or \
             text.count("cron:") != 1 or re.search(r"(?m)^    (inputs|types|branches):", trigger):
-        found.append(name + "is not scheduled every 15 minutes and dispatched with no input, only")
+        found.append(name + ("is not scheduled hourly on Thursday and Friday" if workflow in SCHEDULE_CRONS else
+                             "is not scheduled every 15 minutes") + " and dispatched with no input, only")
     if f"\nconcurrency:\n  group: {group}\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group, never cancelling a run")
     writes = re.findall(r"(?m)^\s+[\w-]+:\s*write\b", text)
@@ -2432,6 +2447,25 @@ def ds_tests_workflow_problems(text):
                             "MAY_DS_STATUS_TOKEN"} \
             or text.count("secrets.MAY_DS_READ_KEY") != 2 or re.search(r"(?m)^(    )?env:", text):
         found.append(name + "a secret is held outside its one step")
+    return found
+
+
+@with_app_tokens("weekly-release.yml")
+def weekly_release_workflow_problems(text):
+    return schedule_workflow_problems(WEEKLY_RELEASE, text)
+
+
+def weekly_release_tool_problems(root):
+    found = schedule_tool_problems(root, WEEKLY_RELEASE)
+    # Its may-app reads go through android_ci_schedule.app_get, never a reader of its own, and its one dispatch is for
+    # TARGET alone, never a dry run's opposite or another app (the inputs are checked again in control_dispatch).
+    path = root / "tools/may_release" / SCHEDULES[WEEKLY_RELEASE][0]
+    tree = ast.parse(path.read_text())
+    if function_source(tree, "app_get") is not None or "APP_REPO}/" in ast.unparse(tree):
+        found.append(SCHEDULES[WEEKLY_RELEASE][0] + ": reads may-app other than through android_ci_schedule.app_get")
+    if assigned_literal(path, "TARGET") != "playground" or \
+            assigned_literal(path, "RUNS_PATH") != "actions/workflows/store-release-draft.yml/runs":
+        found.append(SCHEDULES[WEEKLY_RELEASE][0] + ": TARGET is not May Playground, or it reads other runs")
     return found
 
 
@@ -2914,6 +2948,8 @@ def control_problems(root):
     found += ds_tests_print_problems(root)
     found += ds_tests_schedule_workflow_problems((flows / DS_TESTS_SCHEDULE).read_text())
     found += ds_tests_schedule_tool_problems(root)
+    found += weekly_release_workflow_problems((flows / WEEKLY_RELEASE).read_text())
+    found += weekly_release_tool_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")
