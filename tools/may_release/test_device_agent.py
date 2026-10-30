@@ -1768,7 +1768,7 @@ class IosDeviceServerTests(unittest.TestCase):
             failing = self.failing.get("act" if argv[-1].endswith("act.yaml") else argv[-1])
             if failing is not None:
                 return subprocess.CompletedProcess(argv, 1, b"", failing)
-            out = json.dumps(IOS_TREE).encode() if argv[-1] == "hierarchy" else b""
+            out = json.dumps(getattr(self, "tree", IOS_TREE)).encode() if argv[-1] == "hierarchy" else b""
             return subprocess.CompletedProcess(argv, 0, out, b"")
 
         with patch("device_mcp.subprocess.run", side_effect=run):
@@ -1981,7 +1981,7 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertEqual((stored["hierarchy_failure"], stored["hierarchy_cause"]), (None, None),
                          "a read that worked keeps no cause")
         self.assertEqual(device_mcp.DRIVER_CAUSES, ("settle timeout", "not idle", "snapshot timeout", "lost connection", "app not running",
-                                                    "scale unknown", "other"))
+                                                    "scale unknown", "typed nothing", "other"))
         self.assertEqual(device_mcp.driver_cause(b"Tap on point (201,803)... COMPLETED\nidle\n"), "not idle",
                          "COMPLETED alone, with no act that ran out of time, is no settle timeout")
         for typed in (b"Input text COMPLETED...\n(timed out)\n", b"Input text a COMPLETED b...\n(timed out)\n"):
@@ -2004,6 +2004,58 @@ class IosDeviceServerTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(self.call("type", text=text)[0])
         self.assertEqual(self.flows, [])
+
+    def typed(self, value, text="This is device test qa-123", focused="true"):
+        """One iOS type act whose next hierarchy has a field (focused or not) holding value: (failed, the answer)."""
+        self.tree = {"attributes": {"bounds": "[0,0][393,852]"}, "children": [
+            {"attributes": {"text": "Ask May", "focused": "false", "bounds": "[0,700][393,740]"}},
+            {"attributes": {"value": value, "hintText": "Add notes", "focused": focused, "bounds": "[0,760][393,800]"}}]}
+        failed, content = self.call("type", text=text)
+        return failed, content[0]["text"]
+
+    def test_a_type_says_what_the_focused_field_now_holds(self):
+        """Coordinator, 28 Oct: iOS inputText came back COMPLETED with no text in the field, and the agent heard Done."""
+        self.assertEqual(self.typed("This is device test qa-123"),
+                         (False, "Done. The focused field now reads: 'This is device test qa-123'"))
+        reads = [argv for argv, _ in self.calls if argv[-1] == "hierarchy"]
+        self.assertEqual(len(reads), 1, "one read after the act")
+        self.assertEqual((self.config["refusals"], self.config.get("refusal_cause")), (0, None))
+        self.assertEqual(self.typed("This is device text qa-123.", text="This is device test qa-123")[0], False,
+                         "a word autocorrect changed still leaves the act taken")
+        self.assertEqual(self.typed("write to sam@example.com", text="write to sam@example.com"),
+                         (False, "Done. The focused field now reads: 'write to ***@example.com'"))
+        self.assertEqual(self.typed("token=abc test"), (False, "Done. The focused field now reads: '(hidden)'"))
+
+    def test_a_type_that_left_the_field_without_its_words_is_a_refused_act(self):
+        # An empty field's value can be its placeholder, and the notes goal types "... note ...": neither counts.
+        for value, shown in (("", ""), ("Add notes", ""), ("Notes", "Notes")):
+            with self.subTest(value=value):
+                (self.work / device_mcp.DRIVER_FILE).unlink(missing_ok=True)
+                self.config.update(refusals=0, refusal_cause=None)
+                failed, said = self.typed(value, text="qa-123 note from the device test")
+                self.assertEqual((failed, said),
+                                 (True, f"The device did not take it: the focused field reads {shown!r}"))
+                self.assertEqual((self.config["refusals"], self.config["refusal_cause"]), (1, "typed nothing"))
+                kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
+                self.assertTrue(kept.startswith(b"== refused: - inputText:"), kept[:60])
+                self.assertIn(device_mcp.TYPED_NOTHING_LINE, kept)
+        stored = json.loads(Path(self.config["result"]).read_text())
+        self.assertEqual(stored["refusal_cause"], "typed nothing", "the cause reaches the agent's record")
+        self.assertEqual(device_tests.sealed_agent(stored)["refusal_cause"], "typed nothing")
+        self.assertTrue(publish.agent_ok(device_tests.sealed_agent(stored)), "publish takes the new word")
+        self.typed("")
+        self.assertEqual(self.typed("")[1], device_mcp.WEDGED_TEXT, "typed nothing counts toward the fail-fast")
+
+    def test_a_field_that_cannot_be_read_is_said_and_the_act_stays_taken(self):
+        self.assertEqual(self.typed("", focused="false"),
+                         (False, "Done; the focused field could not be read, so take a hierarchy"))
+        self.failing = {"hierarchy": b"Failed to wait for app to idle (quiescence)"}
+        self.assertEqual(self.typed("")[0], False)
+        self.assertEqual((self.config["refusals"], self.config.get("refusal_cause")), (0, None))
+        self.failing = {"act": b"Timed out"}
+        before = len([argv for argv, _ in self.calls if argv[-1] == "hierarchy"])
+        self.assertEqual(self.typed("")[1], "The device did not take it", "a refused type is not read back")
+        self.assertEqual(len([argv for argv, _ in self.calls if argv[-1] == "hierarchy"]), before)
 
     def test_settings_refuse_an_odd_simulator_or_bundle(self):
         good = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID, "MAY_DEVICE_MAESTRO": "/m",
