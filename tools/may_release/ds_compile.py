@@ -30,6 +30,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -309,8 +310,25 @@ def github(method, path, payload, token):
     return request(method, path, payload, token)
 
 
+# Run 40468630357 (coordinator, 27 Oct): the post's read of the may-app pull request failed once, and two failing tests
+# were never posted; a review run that started at the same moment failed too. A read (GET alone, which changes nothing)
+# that gets no answer, a rate limit or a server error is tried again after each of RETRY_SECONDS; a post or an edit is
+# never repeated.
+RETRY_STATUSES, RETRY_SECONDS = frozenset((0, 429, 500, 502, 503, 504)), (2, 5, 15)
+
+
 def request(method, path, payload, token):
-    """The HTTP call behind github() and compile_pr_errors.github(), each of which checks its own allowlist first."""
+    """The HTTP call behind github() and compile_pr_errors.github(), each of which checks its own allowlist first. A GET
+    whose status is in RETRY_STATUSES is tried again after each of RETRY_SECONDS; the last status is returned."""
+    for wait in RETRY_SECONDS:
+        status, data = request_once(method, path, payload, token)
+        if method != "GET" or status not in RETRY_STATUSES:
+            return status, data
+        time.sleep(wait)
+    return request_once(method, path, payload, token)
+
+
+def request_once(method, path, payload, token):
     call = urllib.request.Request(API + path, data=None if payload is None else json.dumps(payload).encode(),
                                      method=method, headers={
         "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
