@@ -748,8 +748,8 @@ class BudgetTests(unittest.TestCase):
 
     def test_the_budget_leaves_the_job_time_to_build_seal_and_publish(self):
         workflow = (Path(device_tests.__file__).parent.parent.parent / ".github/workflows/device-tests.yml").read_text()
-        # The device jobs' own timeouts, after the one-off tidy job's.
-        timeouts = re.findall(r"(?m)^    timeout-minutes: (\d+)$", workflow)[1:]
+        # The device jobs' own timeouts, after the one-off tidy and backfill jobs'.
+        timeouts = re.findall(r"(?m)^    timeout-minutes: (\d+)$", workflow)[2:]
         job = min(int(minutes) for minutes in timeouts[:2]) * 60
         previews = re.findall(r"(?m)^        continue-on-error: true\n        timeout-minutes: (\d+)\n"
                               r"        run: python3 -I -S -B tools/may_release/device_tests.py previews", workflow)
@@ -2539,6 +2539,10 @@ class BoundedOutputTests(unittest.TestCase):
         bounded.assert_called_once_with(["/sdk/adb", "logcat", "-d"], {"A": "1"})
 
 
+UNTIDY = ("    needs: admission\n    if: ${{ !inputs.tidy_file_taxes && inputs.backfill_test_items != 'dry' && "
+          "inputs.backfill_test_items != 'real' }}\n")
+
+
 class WorkflowPinTests(unittest.TestCase):
     def setUp(self):
         self.text = (ROOT / WORKFLOW).read_text()
@@ -2596,8 +2600,8 @@ class WorkflowPinTests(unittest.TestCase):
     def test_the_sign_in_secret_stays_in_the_scenarios_step(self):
         line = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"
         step = "      - name: Encrypt the report to the renders public key\n        env:\n"
-        self.assertEqual((self.text.count(step), self.text.count(line)), (2, 3),
-                         "one seal per device job; the secret in each scenarios step and the tidy step")
+        self.assertEqual((self.text.count(step), self.text.count(line)), (2, 4),
+                         "one seal per device job; the secret in each scenarios step, the tidy step and the backfill step")
         self.flagged(self.text.replace(line, "", 1).replace(step, step + line, 1), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, "", 2).replace(step, step + line), "a secret, variable or env entry")
         build = "      - name: Build May Playground for the emulator without secrets\n"
@@ -2611,12 +2615,12 @@ class WorkflowPinTests(unittest.TestCase):
         tidy = self.text[self.text.index("\n  tidy:\n"):self.text.index("\n  android:\n") + 1]
         self.assertIn("    if: ${{ inputs.tidy_file_taxes }}\n", tidy)
         self.assertIn("        run: python3 -I -S -B tools/may_release/device_tests.py tidy\n", tidy)
-        self.assertEqual(self.text.count("    needs: admission\n    if: ${{ !inputs.tidy_file_taxes }}\n"), 2,
-                         "neither device job runs with it")
+        self.assertEqual(self.text.count(UNTIDY), 2, "neither device job runs with it")
         secret = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"
         self.flagged(self.text.replace("    if: ${{ inputs.tidy_file_taxes }}\n", ""), "a condition")
-        self.flagged(self.text.replace("    if: ${{ !inputs.tidy_file_taxes }}\n", "", 1), "a condition")
-        self.flagged(self.text.replace(" && !inputs.tidy_file_taxes }}", " }}"), "a condition")
+        self.flagged(self.text.replace(UNTIDY, "    needs: admission\n", 1), "a condition")
+        self.flagged(self.text.replace(" && !inputs.tidy_file_taxes && inputs.backfill", " && inputs.backfill"),
+                     "a condition")
         self.flagged(self.text.replace(tidy, tidy.replace(secret, "")), "a secret, variable or env entry")
         self.flagged(self.text.replace(tidy, tidy.replace("    permissions:\n      contents: read\n",
                                                           "    permissions:\n      contents: read\n      actions: read\n")),
@@ -2628,6 +2632,31 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(tidy, tidy.replace(step, step + "          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets."
                                                           "CLAUDE_CODE_OAUTH_TOKEN }}\n")),
                      "a secret, variable or env entry")
+
+    def test_the_backfill_job_runs_alone_with_the_sign_in_secret_and_its_inputs_in_its_one_step(self):
+        """Coordinator, 28 Oct: the one-off backfill of the shared account's earlier test items (may-app #1467), dry
+        first, real only after approval; no device job and no publish beside it."""
+        backfill = self.text[self.text.index("\n  backfill:\n"):self.text.index("\n  android:\n") + 1]
+        self.assertIn("    if: ${{ inputs.backfill_test_items == 'dry' || inputs.backfill_test_items == 'real' }}\n",
+                      backfill)
+        self.assertIn("        run: python3 -I -S -B tools/may_release/device_tests.py backfill\n", backfill)
+        self.assertIn("&& inputs.backfill_test_items != 'dry' && inputs.backfill_test_items != 'real' }}\n",
+                      self.text.partition("\n  publish:\n")[2], "no publish beside it")
+        secret = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"
+        expect = "          MAY_BACKFILL_EXPECT: ${{ inputs.backfill_expect }}\n"
+        self.flagged(self.text.replace(" || inputs.backfill_test_items == 'real'", ""), "a condition")
+        self.flagged(self.text.replace(" && inputs.backfill_test_items != 'real' }}", " }}", 1), "a condition")
+        self.flagged(self.text.replace(backfill, backfill.replace(secret, "")), "a secret, variable or env entry")
+        self.flagged(self.text.replace(backfill, backfill.replace(expect, "")), "a secret, variable or env entry")
+        self.flagged(self.text.replace(backfill, backfill.replace(
+            expect, expect + "          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n")),
+                     "a secret, variable or env entry")
+        self.flagged(self.text.replace(backfill, backfill.replace(
+            "device_tests.py backfill", 'device_tests.py backfill "${{ inputs.backfill_expect }}"')), "runs something")
+        self.flagged(self.text.replace("          - real\n", "          - real\n          - forced\n"),
+                     "backfill_test_items choice")
+        self.flagged(self.text.replace(backfill, backfill.replace("timeout-minutes: 20", "timeout-minutes: 90")),
+                     "a timeout")
 
     def test_the_release_token_stays_in_the_release_step(self):
         line = "          MAY_RENDERS_RELEASE_TOKEN: ${{ steps.renders-release.outputs.token || secrets.MAY_RENDERS_RELEASE_TOKEN }}\n"
@@ -2659,7 +2688,7 @@ class WorkflowPinTests(unittest.TestCase):
     def test_variables_stay_in_their_steps(self):
         line = "          MAY_STAGING_API_URL: ${{ vars.MAY_STAGING_API_URL }}\n"
         build = "      - name: Build May Playground for the emulator without secrets\n"
-        self.assertEqual(self.text.count(line), 3, "each scenarios step and the tidy step")
+        self.assertEqual(self.text.count(line), 4, "each scenarios step, the tidy step and the backfill step")
         self.flagged(self.text.replace(line, "", 1).replace(build, build + "        env:\n" + line),
                      "a secret, variable or env entry")
 
