@@ -159,7 +159,8 @@ class ScenarioTests(unittest.TestCase):
         # Onboarding runs last (coordinator, 26 Oct), so its account's time never crowds out chat and notes.
         self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "notes", "poll",
                                "poll-skip", "routines", "onboarding"])
-        self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")], ids, "both devices run all")
+        self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")],
+                         ids[:-1] + ["chat-open-from-card", "onboarding"], "both devices run all, and iOS the card row")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
             device_tests.scenarios("sign-in,unknown")

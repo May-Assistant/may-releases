@@ -149,6 +149,20 @@
     ]
   },
   {
+    "id": "chat-open-from-card",
+    "title": "Open May's chat from a For you card and see its messages at once",
+    "driver": "agent",
+    "goal": "In May Playground, tap the For you tab in the bottom bar. Tap the card titled Book the dentist {tag} on its title text, never on its buttons (not Add to Agenda, not Not now). If that opens a thread instead of the May chat, tap Open in May. As soon as the May chat shows, call hierarchy at once: no wait, swipe or screenshot before it. Then swipe up by 10 pixels in the middle of the chat (from y=1200 to y=1190), and call hierarchy again. Then call done: completed once the May chat has opened, whatever it showed.",
+    "card": true,
+    "platforms": [
+      "ios"
+    ],
+    "outward": false,
+    "fresh": true,
+    "server": [],
+    "truth": []
+  },
+  {
     "id": "onboarding",
     "title": "Go through onboarding on a new account",
     "driver": "agent",

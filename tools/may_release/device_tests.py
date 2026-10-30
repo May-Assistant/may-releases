@@ -104,6 +104,20 @@ CHAT_NAME, CHAT_GOAL = "{tag} chat", "open the chat named {tag} chat"
 # so no truth, delivery code or question card ever counts it or May's reply to it (run_messages starts at the tag).
 FIRST_MESSAGE = "This chat is for an automated device test. Reply with the word ready."
 AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
+# N, 30 Oct (Samuel's "May chat is blank until I scroll", iOS): a row with "card": true opens May's chat from a For you
+# card. Before its app starts, staging gets a line from it in May's own chat (CARD_LINE, so the chat has a message to
+# show) and a For you card linked to that chat (POST /v1/auth/test-session/for-you, a suggestion: fresh accounts alone).
+# Its device server counts the messages the chat shows at each read (device_mcp MAY_DEVICE_LOOK) and the first read
+# decides: a message on screen passes; none, and one only after the agent's small scroll, is LOOK_SCROLLED; none at all
+# is LOOK_EMPTY; no read of the chat is LOOK_UNREAD, never a pass. Its goal says CARD_GOAL.
+CARD_LINE = "{tag} line for the device test. Reply with the word ready."
+CARD_GOAL = "Tap the card titled Book the dentist {tag}"
+CARD_PATH = "/v1/auth/test-session/for-you"
+NO_LINE = "skipped: staging did not take the scenario's line in May's chat"
+NO_CARD = "skipped: staging did not seed the scenario's For you card"
+LOOK_SCROLLED = "the chat showed no message when it opened, and showed them once scrolled"
+LOOK_EMPTY = "the chat showed no message when it opened"
+LOOK_UNREAD = "the chat was not read on screen (unverified, never a pass)"
 MAX_CHATS = 10
 MAX_GOAL = 1500
 # The least a row may give its agent (its own "seconds"): enough to launch, look and act a few times.
@@ -314,7 +328,9 @@ def scenarios(selection="all", platform="android"):
                                                  len(c["note"]) <= MAX_NOTE and c["note"][6:] in row["goal"])
                         for c in row["truth"]) and
                     ("Send this message" in row["goal"]) == (row.get("chat") is True) and
-                    ("chat" not in row or CHAT_GOAL in row["goal"]) or
+                    ("chat" not in row or CHAT_GOAL in row["goal"]) and
+                    ("card" not in row or row["card"] is True and row.get("fresh") is True and "chat" not in row and
+                     row["truth"] == [] and row.get("platforms") == ["ios"] and CARD_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
                     isinstance(row.get("goal"), str) and len(row["goal"]) <= MAX_GOAL and row.get("server") == [])
                 and isinstance(row.get("title"), str) and
@@ -741,6 +757,63 @@ def open_chat(base, token, tag, post=urllib.request.urlopen):
     if chat is None:
         return NO_CHAT
     return True if first_message(base, token, chat, tag, post) else NO_FIRST
+
+
+def may_chat(base, token, get=urllib.request.urlopen):
+    """May's own chat on the account (GET /v1/agents, the one is_primary): its id, or None. Nothing is printed."""
+    status, data = read_json(base, token, "/v1/agents", get)
+    found = [row["id"] for row in listed(data, "agents") if status == 200 and row.get("is_primary") is True and
+             isinstance(row.get("id"), str) and AGENT_ID.fullmatch(row["id"])]
+    return found[0] if len(found) == 1 else None
+
+
+def open_card(base, token, tag, post=urllib.request.urlopen):
+    """A card row's staging: CARD_LINE in May's chat (keyed by the tag), then one For you suggestion with the tag
+    (CARD_PATH, 201). True, or the reason it could not start (NO_LINE or NO_CARD); nothing of a reply is kept."""
+    may = may_chat(base, token, post)
+    if may is None:
+        return NO_LINE
+    request = urllib.request.Request(
+        base + f"/v1/conversations/{may}/messages", method="POST",
+        data=json.dumps({"client_message_id": tag + "-line", "body": CARD_LINE.replace("{tag}", tag)}).encode(),
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            if reply.status not in (200, 202):
+                return NO_LINE
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return NO_LINE
+    request = urllib.request.Request(base + CARD_PATH, method="POST",
+                                     data=json.dumps({"tag": tag, "kinds": ["suggestion"]}).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            items = json.loads(reply.read(1024 * 1024)).get("items")
+            return True if reply.status == 201 and isinstance(items, list) and len(items) == 1 else NO_CARD
+    except (urllib.error.URLError, TimeoutError, ValueError, AttributeError):
+        return NO_CARD
+
+
+def own_card(row, entry, base, token, own, carded):
+    """Whether a scenario may start: True, or, for a row with "card" whose staging failed (carded: open_card), False
+    with entry's reason NO_LINE or NO_CARD."""
+    if not row.get("card"):
+        return True
+    at(f"{row['id']}: staging its card")
+    staged = carded(base, token, own)
+    if staged is True:
+        return True
+    entry["reason"] = NO_CARD if staged == NO_CARD else NO_LINE
+    return False
+
+
+def look_verdict(looks):
+    """A card row's verdict from its chat looks (device_agent.looks): the first decides."""
+    if not looks:
+        return {"verdict": UNVERIFIED, "reason": LOOK_UNREAD}
+    if looks[0]["shown"] > 0:
+        return {"verdict": "pass", "reason": None}
+    return {"verdict": "fail", "reason": LOOK_SCROLLED if any(look["shown"] > 0 for look in looks[1:]) else LOOK_EMPTY}
 
 
 def tag_cleanup(accounts, base, secret, since, tag, minted, cleaned):
@@ -1783,7 +1856,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     accounts.report("android")
 
 
-def combined(entry, record, judged, sends=False):
+def combined(entry, record, judged, sends=False, look=False):
     """An agent scenario's verdict from its run, the judge and the server truth; the smoke scenario's from Maestro, its
     agent run and the judge, never "pass". For one that sends May a message (sends), the server's delivery codes
     outrank the screen: every code must be succeeded, and chats that could not be read leave it not judged."""
@@ -1809,6 +1882,8 @@ def combined(entry, record, judged, sends=False):
         return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
     if "maestro" in entry:
         return {"verdict": SMOKE_PASS, "reason": None}
+    if look:
+        return look_verdict(record.get("looks"))
     if not entry["server"]:
         return {"verdict": "ui-pass", "reason": UNCONFIGURED}
     # A pass needs the screen and every server read; a read that failed is a fail, one that could not tell is
@@ -1870,6 +1945,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
     goals = {row["id"]: row["goal"] for row in scenarios("all", platform) if row["driver"] == "agent"}
     rows = {row["id"]: row for row in scenarios("all", platform)}
     sending = {row["id"] for row in scenarios("all", platform) if sends_messages(row)}
+    looking = {row["id"] for row in scenarios("all", platform) if row.get("card")}
     goals.update((row["id"], row["goal"]) for row in smoke_rows(platform))
     pending = [entry for entry in report["scenarios"] if entry.get("reason") == NOT_JUDGED and entry["id"] in records]
     token = model = None
@@ -1890,7 +1966,7 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
                                    private / "judge" / entry["id"], token, model)
             except (OSError, subprocess.SubprocessError, KeyError):
                 judged = ("error", "")
-        verdict_reason = combined(entry, record, judged, entry["id"] in sending)
+        verdict_reason = combined(entry, record, judged, entry["id"] in sending, entry["id"] in looking)
         entry["agent"] = sealed_agent(record)
         entry["verdict"] = verdict_reason["verdict"]
         entry.pop("reason", None)

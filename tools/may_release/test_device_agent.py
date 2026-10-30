@@ -771,6 +771,92 @@ class ServerTruthTests(unittest.TestCase):
                                                        lambda base, token, tag: opened))
                 self.assertEqual(entry["reason"], reason)
 
+    def test_a_card_row_seeds_a_line_in_mays_chat_then_one_for_you_card(self):
+        """N, 30 Oct: the blank-chat test opens May's chat from a For you card, so staging gives that chat a message and
+        seeds the card (a suggestion, fresh accounts alone) before the app starts."""
+        seen = []
+
+        def post(answers):
+            def answer(request, timeout):
+                seen.append((request.full_url, request.get_method(), request.data and json.loads(request.data),
+                             request.headers.get("Authorization")))
+                status, body = answers.pop(0)
+                if status >= 400:
+                    raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+                reply = FakeReply(json.dumps(body).encode())
+                reply.status = status
+                return reply
+            return answer
+
+        tag, may = "qa-39557415738-i-chat-open-from-card", "0f0e0d0c-0b0a-4908-8706-050403020100"
+        agents = {"agents": [{"id": "a-other", "is_primary": False}, {"id": may, "is_primary": True}]}
+        self.assertIs(device_tests.open_card("https://s", TOKEN, tag, post([(200, agents), (202, {}),
+                                                                             (201, {"items": [{"id": "i1"}]})])), True)
+        self.assertEqual(seen, [
+            ("https://s/v1/agents", "GET", None, "Bearer " + TOKEN),
+            (f"https://s/v1/conversations/{may}/messages", "POST",
+             {"client_message_id": tag + "-line", "body": device_tests.CARD_LINE.replace("{tag}", tag)}, "Bearer " + TOKEN),
+            ("https://s/v1/auth/test-session/for-you", "POST", {"tag": tag, "kinds": ["suggestion"]}, "Bearer " + TOKEN)])
+        two = {"agents": [{"id": may, "is_primary": True}, {"id": "b", "is_primary": True}]}
+        # Each case carries the answers a wrongly taken later step would get, so taking it fails on the reason.
+        later = [(202, {}), (201, {"items": [{"id": "i1"}]})]
+        for answers, reason in (([(200, {"agents": [{"id": may}]}), *later], device_tests.NO_LINE),
+                                ([(200, two), *later], device_tests.NO_LINE),
+                                ([(401, {}), *later], device_tests.NO_LINE),
+                                ([(200, agents), (429, {})], device_tests.NO_LINE),
+                                ([(200, agents), (202, {}), (403, {"error": "fresh_only"})], device_tests.NO_CARD),
+                                ([(200, agents), (202, {}), (201, {"items": []})], device_tests.NO_CARD),
+                                ([(200, agents), (202, {}), (200, {"items": [{"id": "i1"}]})], device_tests.NO_CARD)):
+            with self.subTest(answers=answers):
+                self.assertEqual(device_tests.open_card("https://s", TOKEN, tag, post(list(answers))), reason)
+        for entry_reason in (device_tests.NO_LINE, device_tests.NO_CARD):
+            with self.subTest(reason=entry_reason), patch("sys.stdout", io.StringIO()):
+                entry = {}
+                self.assertFalse(device_tests.own_card({"card": True, "id": "c"}, entry, "https://s", TOKEN, "qa-1",
+                                                       lambda base, token, tag: entry_reason))
+                self.assertEqual(entry["reason"], entry_reason)
+                self.assertIn(entry_reason, publish.REASONS)
+        self.assertTrue(device_tests.own_card({"id": "chat"}, {}, "https://s", TOKEN, "qa-1", None),
+                        "a row without a card stages none")
+        self.assertIs(inspect.signature(device_ios.run_scenarios).parameters["carded"].default, device_tests.open_card)
+
+    def test_the_first_look_at_the_chat_decides_a_card_rows_verdict(self):
+        """N, 30 Oct: a message on screen when the chat opens passes; none then but some once scrolled is the bug."""
+        record, judged = {"state": "ok", "outcome": "completed"}, ("pass", "")
+        cases = (([{"shown": 3, "shot": None}], ("pass", None)),
+                 ([{"shown": 2, "shot": None}, {"shown": 0, "shot": None}], ("pass", None)),
+                 ([{"shown": 0, "shot": None}, {"shown": 4, "shot": None}], ("fail", device_tests.LOOK_SCROLLED)),
+                 ([{"shown": 0, "shot": None}, {"shown": 0, "shot": None}], ("fail", device_tests.LOOK_EMPTY)),
+                 ([{"shown": 0, "shot": None}], ("fail", device_tests.LOOK_EMPTY)),
+                 ([], (device_tests.UNVERIFIED, device_tests.LOOK_UNREAD)),
+                 (None, (device_tests.UNVERIFIED, device_tests.LOOK_UNREAD)))
+        for looks, expected in cases:
+            with self.subTest(looks=looks):
+                found = device_tests.combined({"server": []}, dict(record, looks=looks), judged, look=True)
+                self.assertEqual((found["verdict"], found["reason"]), expected)
+        self.assertEqual(device_tests.combined({"server": []}, dict(record, looks=[]), judged)["verdict"], "ui-pass",
+                         "a row without a card is judged as before")
+        self.assertEqual(device_tests.combined({"server": []}, dict(record, looks=[{"shown": 3}]), ("fail", ""),
+                                               look=True)["verdict"], "fail", "the judge still has to pass it")
+        for reason in (device_tests.LOOK_SCROLLED, device_tests.LOOK_EMPTY, device_tests.LOOK_UNREAD):
+            self.assertIn(reason, publish.REASONS)
+
+    def test_the_card_row_is_fresh_ios_only_and_opens_the_seeded_card(self):
+        rows = {row["id"]: row for row in device_tests.scenarios("all", "ios")}
+        card = rows["chat-open-from-card"]
+        self.assertEqual((card["card"], card["fresh"], card["platforms"], card["truth"]), (True, True, ["ios"], []))
+        self.assertIn(device_tests.CARD_GOAL, card["goal"])
+        self.assertNotIn("chat-open-from-card", [row["id"] for row in device_tests.scenarios("all", "android")])
+        self.assertEqual(list(rows)[-2:], ["chat-open-from-card", "onboarding"], "onboarding still runs last")
+        listed = json.loads(device_tests.SCENARIOS.read_text())
+        for change in ({"fresh": False}, {"platforms": ["android", "ios"]}, {"truth": [{"get": "/v1/inbox"}]},
+                       {"card": "yes"}, {"chat": True}, {"goal": card["goal"].replace("Book the dentist", "Pay")}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "scenarios.json"
+                path.write_text(json.dumps([dict(row, **change) if row["id"] == card["id"] else row for row in listed]))
+                with patch("device_tests.SCENARIOS", path), self.assertRaises(device_tests.DeviceTestsError):
+                    device_tests.scenarios("all", "ios")
+
     def test_tidy_removes_only_whole_leftover_note_lines_from_file_taxes(self):
         """Coordinator, 26 Oct: earlier notes runs left their lines in the shared account's "file taxes" task."""
         note = "qa-40243708096-i-notes note from the device test"
@@ -1902,6 +1988,48 @@ class IosDeviceServerTests(unittest.TestCase):
                                                            "desc='New chat' | (1020, 2430)"])
         failed, content = self.call("screenshot")
         self.assertEqual((failed, content[0]["type"]), (False, "image"))
+
+    def test_a_card_rows_reads_count_the_messages_the_chat_shows_and_keep_a_screenshot(self):
+        """N, 30 Oct: a blank chat has no message laid out between its header and its composer; each read that shows
+        the chat keeps how many it shows (never their words) and a screenshot taken at once."""
+        self.config["look"] = True
+        header = {"resource-id": "chat.header", "text": "May", "bounds": "[0,50][393,110]"}
+        composer = {"resource-id": "chat.composer", "bounds": "[0,760][393,840]"}
+        line = {"text": "qa-1 line for the device test", "bounds": "[20,600][380,660]"}
+        reply = {"text": "ready", "bounds": "[20,680][200,720]"}
+        above = {"text": "an older message", "bounds": "[20,0][380,40]"}
+        chrome = {"resource-id": "chat.starter", "text": "Plan my day", "bounds": "[20,500][380,540]"}
+        tree = lambda *nodes: {"attributes": {"bounds": "[0,0][393,852]"},
+                               "children": [{"attributes": node} for node in nodes]}
+        for nodes in ((header, composer, line, reply, above, chrome), (header, composer, above, chrome),
+                      (header, line), (composer, line, reply)):
+            with self.subTest(nodes=[n.get("resource-id") or n.get("text") for n in nodes]), \
+                    patch(__name__ + ".IOS_TREE", tree(*nodes)):
+                self.assertFalse(self.call("hierarchy")[0])
+        looks = json.loads(Path(self.config["result"]).read_text()).get("looks")
+        self.assertEqual(looks, [{"shown": 2, "shot": "look-1.png"}, {"shown": 0, "shot": "look-2.png"}],
+                         "a read without the header or the composer is not a look at the chat")
+        self.assertTrue((self.work / "look-1.png").read_bytes().startswith(b"\x89PNG"))
+        self.assertNotIn("line for the device test", json.dumps(looks))
+        with patch(__name__ + ".IOS_TREE", tree(header, composer, line)):
+            for _ in range(device_mcp.MAX_LOOKS + 2):
+                self.call("hierarchy")
+        self.assertEqual(len(self.config["looks"]), device_mcp.MAX_LOOKS)
+        self.assertEqual(device_agent.looks(self.config["looks"] + [{"shown": "3"}, {"shown": 1, "shot": "../x.png"}]),
+                         self.config["looks"][:device_mcp.MAX_LOOKS])
+        self.assertEqual(device_agent.looks([{"shown": 1, "shot": "../x.png"}]), [{"shown": 1, "shot": None}])
+
+    def test_a_row_without_a_card_counts_no_looks(self):
+        with patch(__name__ + ".IOS_TREE", {"attributes": {}, "children": [
+                {"attributes": {"resource-id": "chat.header", "bounds": "[0,50][393,110]"}},
+                {"attributes": {"resource-id": "chat.composer", "bounds": "[0,760][393,840]"}}]}):
+            self.call("hierarchy")
+        self.assertNotIn("looks", json.loads(Path(self.config["result"]).read_text()))
+        self.assertFalse(list(self.work.glob("look-*.png")))
+        self.assertTrue(device_mcp.settings({"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID,
+                                             "MAY_DEVICE_MAESTRO": "/m", "MAY_DEVICE_LOOK": "chat",
+                                             "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground",
+                                             "MAY_DEVICE_AGENT_RESULT": "/r"})["look"])
 
     def test_no_yaml_or_odd_text_reaches_maestro(self):
         for text in ('a"\n- runScript: x', "a\\b", "x: y\n- openLink: z", "it's"):
