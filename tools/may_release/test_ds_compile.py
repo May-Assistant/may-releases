@@ -846,6 +846,37 @@ class SealOpenTests(PostCase):
         self.assertEqual(out, "DS Swift compile failed; 2 errors posted to may-design-system #40\n")
         self.assertIn("swift/Sources/A/View.swift:12:5: error: cannot find 'Foo' in scope", self.calls[-1][2]["body"])
 
+    def test_a_hundred_long_non_ascii_errors_still_cross_sealed(self):
+        """As compile_pr_errors (#65): with ensure_ascii a hundred long non-ASCII errors were too large to seal. They
+        now cross as UTF-8, with the total kept."""
+        log = "\n".join(f"{CK}/swift/Sources/{'ü' * 217}{n:03}.swift:1:1: error: {'é' * 236} {n:03}" for n in range(150))
+        (self.private / "result.json").write_text(json.dumps({"result": "failed"}))
+        (self.private / "compile.log").write_text(log.replace(CK, str(self.checkout)), encoding="utf-8")
+        with patch("ds_compile.head_revision", return_value=SHA):
+            _, error, _, _ = self.captured(ds_compile.seal, SHA, env=self.environ(MAY_RENDERS_RECIPIENT=self.public))
+        self.assertIsNone(error, "the record was not sealed")
+        self.hand_over()
+        _, error, _, _ = self.captured(ds_compile.open_record, SHA,
+                                       env=self.environ(MAY_RENDERS_RECIPIENT=self.public,
+                                                        MAY_RENDERS_DECRYPT_KEY=self.secret))
+        self.assertIsNone(error, "the record was not opened")
+        record = json.loads((self.private / ds_compile.RECORD).read_text(encoding="utf-8"))
+        self.assertEqual(record["total"], 150)
+        self.assertEqual(len(record["errors"]), 100, "as UTF-8, every listed error fits")
+        self.assertTrue(record["errors"][0].startswith("swift/Sources/" + "ü" * 217 + "000.swift:1:1: error: "))
+
+    def test_the_record_is_cut_only_when_it_must_be(self):
+        record = {"sha": SHA, "passed": False, "errors": ["\U0001F600" * 700] * 100, "total": 150}
+        data = ds_compile.sealed_bytes(record)
+        self.assertLessEqual(len(data), ds_compile.MAX_RECORD)
+        kept = json.loads(data.decode("utf-8"))
+        self.assertEqual((kept["total"], kept["errors"]), (150, record["errors"][:len(kept["errors"])]))
+        self.assertGreater(len(kept["errors"]), 80, "only as many as must be are dropped")
+        self.assertLess(len(kept["errors"]), 100)
+        alone = ds_compile.sealed_bytes({"sha": SHA, "passed": False, "errors": ["x" * (ds_compile.MAX_RECORD + 1)],
+                                         "total": 7})
+        self.assertEqual(json.loads(alone), {"sha": SHA, "passed": False, "errors": [], "total": 7})
+
     def test_another_key_or_another_commit_is_refused(self):
         self.seal(MAY_RENDERS_RECIPIENT=self.public)
         self.hand_over()

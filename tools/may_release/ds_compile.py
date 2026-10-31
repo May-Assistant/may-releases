@@ -432,6 +432,17 @@ def compile_record(sha, root):
     return checked_record({"sha": sha, "passed": passed, "errors": errors, "total": total}, sha)
 
 
+def sealed_bytes(record):
+    """The record as UTF-8 JSON within MAX_RECORD, as compile_pr_errors.sealed_bytes: non-ASCII text stays as itself,
+    and while it is still too large its last listed errors are dropped, its counts kept."""
+    record = dict(record, errors=list(record["errors"]))
+    while True:
+        data = json.dumps(record, ensure_ascii=False).encode("utf-8")
+        if len(data) <= MAX_RECORD or not record["errors"]:
+            return data
+        record["errors"].pop()
+
+
 def seal(sha):
     """The native job's record, age-encrypted to RECIPIENT for the post job; nothing in the clear leaves the runner.
     Without the recipient nothing is sealed, and the post job posts the job's result alone."""
@@ -448,7 +459,7 @@ def seal(sha):
         raise DsCompileError("MAY_RENDERS_RECIPIENT is not an age public key")
     plain, sealed = private / RECORD, root / SEALED
     sealed.mkdir(mode=0o700, exist_ok=True)
-    data = json.dumps(record).encode()
+    data = sealed_bytes(record)
     if len(data) > MAX_RECORD:
         raise DsCompileError("The compile record is too large to seal")
     try:
@@ -505,7 +516,7 @@ def open_record(sha):
                           env=env).returncode or plain.stat().st_size != MAX_RECORD:
             raise DsCompileError("The compile record failed to decrypt or authenticate")
         try:
-            record = checked_record(json.loads(plain.read_text()), sha)
+            record = checked_record(json.loads(plain.read_text(encoding="utf-8")), sha)
         except (ValueError, RecursionError):
             raise DsCompileError("The compile record is malformed or for another commit; nothing was posted") from None
         (private / RECORD).unlink(missing_ok=True)
