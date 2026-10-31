@@ -272,7 +272,8 @@ WORKFLOW_MINTS = {
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
-    "ds-swift-compile.yml": {"native": ("ci-ds-read", "ci-ds-comment")},
+    # ds-swift-compile.yml splits like ds-tests-pr.yml: native runs the design system's code and mints nothing.
+    "ds-swift-compile.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment",)},
     "may-app-review.yml": {"review": ("ci-review",)},
     "may-ds-review.yml": {"review": ("ci-ds-review",)},
     "device-tests.yml": {"publish": ("renders-release",)},
@@ -298,7 +299,7 @@ COMMENT_SLUG_POSTS = {
     ("ios-core-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
     ("native-compile-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
     ("ios-renders.yml", "publish"): ("ci-comment", "publish.py comment "),
-    ("ds-swift-compile.yml", "native"): ("ci-ds-comment", "ds_compile.py post "),
+    ("ds-swift-compile.yml", "post"): ("ci-ds-comment", "ds_compile.py post "),
 }
 
 
@@ -2553,38 +2554,62 @@ def ds_tests_print_problems(root):
 
 
 # Swift compile of a may-design-system pull request head (ds-swift-compile.yml, gate.py --action ds-compile, ds_compile.py).
-# may-design-system is private and this repository public, so the workflow is pinned whole: dispatch with exactly ds_sha
-# and ds_pr, read-only permissions, admission then native in the environment admission chose (may-ds-renders), the
-# design-system pull-request read token in the check alone, the read key in the fetch alone, nothing on the compile,
-# the comment token in the post alone, nothing run but these five commands, and no artifact, step summary or carried
-# value. ds_compile.py prints only fixed lines, the inputs and the error count (ds_compile_print_problems).
+# may-design-system is private and this repository public, so the workflow is pinned whole, job by job and step by step:
+# dispatch with exactly ds_sha and ds_pr, read-only permissions, admission then pull, native and post in the environment
+# admission chose (may-ds-renders), the read token minted in pull alone and the comment token in post alone, the read
+# key in native's fetch alone and nothing else secret in native (it runs the design system's code), its only upload
+# its sealed record (one day), the decrypt key in open alone, and no step summary or carried value. ds_compile.py prints
+# only fixed lines, the inputs and the error count (ds_compile_print_problems).
 DS_COMPILE = "ds-swift-compile.yml"
+_DCI = {"sha": ("MAY_DS_SHA", "${{ inputs.ds_sha }}"), "pr": ("MAY_DS_PR", "${{ inputs.ds_pr }}")}
 GATE_DS = 'python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
-GATE_DS_CHECK = GATE_DS + " --check-pull"
-DS_FETCH = 'python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
-DS_BUILD = "python3 -I -S -B tools/may_release/ds_compile.py compile"
-DS_POST = 'python3 -I -S -B tools/may_release/ds_compile.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'
-DS_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-derived" '
-              '"$RUNNER_TEMP/may-ds-packages"')
-DS_RUNS = [GATE_DS, GATE_DS_CHECK, DS_FETCH, DS_BUILD, DS_POST, DS_CLEANUP]
-DS_STEP_NAMES = ["Check the design-system pull request head and environment before fetching",
-                 "Fetch the exact design-system commit quietly",
-                 "Compile the Swift package without signing or any credential",
-                 "Post the errors on the design-system pull request, never in this log",
-                 "Remove the design-system checkout, logs and products"]
-DS_PR_READ, DS_READ_KEY, DS_COMMENT = "MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_DS_PR_COMMENT_TOKEN"
-DS_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_DS_SHA", "${{ inputs.ds_sha }}"), ("MAY_DS_PR", "${{ inputs.ds_pr }}")} | \
-    {(n, "${{ secrets." + n + " }}") for n in (DS_PR_READ, DS_READ_KEY, DS_COMMENT)}
+DS_COMPILE_SECRETS = {"MAY_DS_PR_READ_TOKEN", "MAY_DS_READ_KEY", "MAY_RENDERS_DECRYPT_KEY", "MAY_DS_PR_COMMENT_TOKEN"}
+# job: (runs-on, needs, timeout, [(step name, uses, env entries, run)]) after the checkout (and, in pull and post, the
+# mint, which unminted takes out first).
+DS_COMPILE_JOBS = {
+    "admission": ("ubuntu-24.04", None, None, [("", None, [("GH_TOKEN", "${{ github.token }}"), _DCI["sha"], _DCI["pr"]],
+                                                GATE_DS)]),
+    "pull": ("ubuntu-24.04", "admission", 10, [
+        ("Check the design-system pull request head and environment before fetching", None,
+         [("GH_TOKEN", "${{ github.token }}"), ("MAY_DS_PR_READ_TOKEN", "${{ secrets.MAY_DS_PR_READ_TOKEN }}"),
+          _DCI["sha"], _DCI["pr"]], GATE_DS + " --check-pull")]),
+    "native": ("macos-15", "[admission, pull]", 55, [
+        ("Install pinned age, before any pull request code", None, [],
+         "python3 -I -S -B tools/may_release/toolchain.py age"),
+        ("Fetch the exact design-system commit quietly", None,
+         [_DCI["sha"], _DCI["pr"], ("MAY_DS_READ_KEY", "${{ secrets.MAY_DS_READ_KEY }}")],
+         'python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'),
+        ("Compile the Swift package without signing or any credential", None, [],
+         "python3 -I -S -B tools/may_release/ds_compile.py compile"),
+        ("Seal the errors for the post job, with no secret", None,
+         [_DCI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")],
+         'python3 -I -S -B tools/may_release/ds_compile.py seal --ds-sha "$MAY_DS_SHA"'),
+        ("Hand over only the sealed record", UPLOAD_ARTIFACT, [], None),
+        ("Fail if the compile failed", None, [], "python3 -I -S -B tools/may_release/ds_compile.py verdict"),
+        ("Remove the design-system checkout, logs and products", None, [],
+         'rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-derived" '
+         '"$RUNNER_TEMP/may-ds-packages" "$RUNNER_TEMP/may-ds-compile-sealed" "$RUNNER_TEMP/may-tools"')]),
+    "post": ("ubuntu-24.04", "[admission, native]", 10, [
+        ("Install pinned age", None, [], "python3 -I -S -B tools/may_release/toolchain.py age"),
+        ("", DOWNLOAD_ARTIFACT, [], None),
+        ("Decrypt and check the compile record", None,
+         [_DCI["sha"], ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}"),
+          ("MAY_RENDERS_DECRYPT_KEY", "${{ secrets.MAY_RENDERS_DECRYPT_KEY }}")],
+         'python3 -I -S -B tools/may_release/ds_compile.py open --ds-sha "$MAY_DS_SHA"'),
+        ("Post the errors on the design-system pull request, never in this log", None,
+         [_DCI["sha"], _DCI["pr"], ("MAY_NATIVE_RESULT", "${{ needs.native.result }}"),
+          ("MAY_DS_PR_COMMENT_TOKEN", "${{ secrets.MAY_DS_PR_COMMENT_TOKEN }}")],
+         'python3 -I -S -B tools/may_release/ds_compile.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"'),
+        ("Remove the decrypted record", None, [],
+         'rm -rf -- "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-compile-download" "$RUNNER_TEMP/may-tools"')]),
+}
 
 
 @with_app_tokens("ds-swift-compile.yml")
 def ds_compile_workflow_problems(text):
-    name = DS_COMPILE + ": "
-    found = []
-    if "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or \
-            "GITHUB_OUTPUT" in text or "toolchain.py" in text or \
-            "    runs-on: macos-15\n" not in job_text(text, "native") or "    runs-on: ubuntu-24.04\n" not in job_text(text, "admission"):
-        found.append(name + "publishes an artifact or summary, carries values, or runs somewhere other than its two runners")
+    name, found = DS_COMPILE + ": ", []
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or "--export" in text:
+        found.append(name + "writes a step summary or carries an environment")
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
@@ -2594,41 +2619,49 @@ def ds_compile_workflow_problems(text):
         found.append(name + "is not dispatched with exactly ds_sha and ds_pr")
     if "\nconcurrency:\n  group: may-ds-swift-compile\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
-    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
-            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "native")] != [1, 1] or \
-            text.count("permissions:") != 3:
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r"(?m)^\s+[\w-]+:\s*write\b", text) or \
+            any(job_text(text, job).count(JOB_PERMISSIONS) != 1 for job in DS_COMPILE_JOBS):
         found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
-    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "native"]:
-        found.append(name + "jobs are not exactly admission and native")
-    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
-    if runs != DS_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
-        found.append(name + "runs something other than the gate, the check, the fetch, the compile, the post and the cleanup")
-    steps = {job: job_steps(text, job)[1] for job in ("admission", "native")}
-    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
-    names = [step for step, _ in steps["native"]]
-    cleanup = steps["native"][-1][1] if steps["native"] else ""
-    if leading != {"admission": ["uses", "id"], "native": ["uses"] + ["name"] * len(DS_STEP_NAMES)} or \
-            names != [""] + DS_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
-            uses_in(text) != [CHECKOUT, CHECKOUT]:
-        found.append(name + "native's steps are not exactly the check, fetch, compile, post and an always-run cleanup")
-    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "")) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 55\n" not in job_text(text, "native"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than native's 55 minutes")
-    native = job_text(text, "native")
-    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in native or \
-            "    needs: admission\n" not in native or re.search(r"(?m)^    environment:", job_text(text, "admission")):
-        found.append(name + "native's environment is not the one admission chose, after admission")
-    by_name = dict(steps["native"])
-    check, fetch, build, post, clean = (by_name.get(n, "") for n in DS_STEP_NAMES)
-    # Each secret is bound exactly once, in its own step; the compile and the cleanup have no env at all.
-    if secrets_in(text) != {DS_PR_READ, DS_READ_KEY, DS_COMMENT} or \
-            any(text.count("secrets." + n) != 1 for n in (DS_PR_READ, DS_READ_KEY, DS_COMMENT)) or \
-            secrets_in(check) != {DS_PR_READ} or secrets_in(fetch) != {DS_READ_KEY} or secrets_in(post) != {DS_COMMENT} or \
-            "env:" in build or "env:" in clean or "GH_TOKEN" in fetch + post or \
-            any(e not in DS_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
-        found.append(name + "a secret or env entry other than the check's read token, the fetch's read key and the post's comment token")
-    if "${{ inputs." in "\n".join(runs):
-        found.append(name + "interpolates inputs into shell")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(DS_COMPILE_JOBS):
+        found.append(name + "jobs are not exactly admission, pull, native and post")
+    for job, (runner, needs, timeout, expected) in DS_COMPILE_JOBS.items():
+        header, steps = job_steps(text, job)
+        if f"    runs-on: {runner}\n" not in header or \
+                (needs is None) != ("    needs:" not in header) or (needs and f"    needs: {needs}\n" not in header) or \
+                (timeout is None) != ("timeout-minutes:" not in header) or \
+                (timeout and f"    timeout-minutes: {timeout}\n" not in header) or \
+                (job != "admission") != ("    environment: ${{ needs.admission.outputs.environment }}\n" in header) or \
+                (job == "admission" and re.search(r"(?m)^    environment:", header)):
+            found.append(name + f"job {job}'s runner, needs, timeout or environment is not as pinned")
+        condition = "    if: ${{ !cancelled() && needs.admission.result == 'success' }}\n"
+        if (job == "post") != (condition in header) or re.search(r"(?m)^    if:", header.replace(condition, "")):
+            found.append(name + f"job {job} runs on a condition other than post's (the compile finished)")
+        if not steps or uses_in(steps[0][1]) != [CHECKOUT] or "persist-credentials: false" not in steps[0][1]:
+            found.append(name + f"job {job} does not start with the pinned checkout, without credentials")
+            continue
+        actual = [(step, (uses_in(chunk) or [None])[0], env_entries(chunk), (run_commands(chunk) or [None])[0])
+                  for step, chunk in steps[1:]]
+        if actual != expected:
+            found.append(name + f"job {job}'s steps, their environments or commands are not exactly as pinned")
+        for step, chunk in steps[1:]:
+            cond = step_condition(chunk)
+            if cond not in (None, "always()") or (cond == "always()") != step.startswith("Remove "):
+                found.append(name + f"job {job} has a step condition other than the cleanup's always()")
+            if "continue-on-error" in chunk and DOWNLOAD_ARTIFACT not in chunk:
+                found.append(name + f"job {job} lets a step other than the download fail quietly")
+    upload = next((c for s_, c in job_steps(text, "native")[1] if UPLOAD_ARTIFACT in c), "")
+    if "          name: may-ds-compile-record-${{ github.run_attempt }}\n" not in upload or \
+            "          path: ${{ runner.temp }}/may-ds-compile-sealed/compile.age\n" not in upload or \
+            "          retention-days: 1\n" not in upload or "          if-no-files-found: ignore\n" not in upload:
+        found.append(name + "native's upload is not its sealed record alone, kept one day")
+    download = next((c for s_, c in job_steps(text, "post")[1] if DOWNLOAD_ARTIFACT in c), "")
+    if "          name: may-ds-compile-record-${{ github.run_attempt }}\n" not in download or \
+            "          path: ${{ runner.temp }}/may-ds-compile-download\n" not in download or \
+            text.count(UPLOAD_ARTIFACT) != 1 or text.count(DOWNLOAD_ARTIFACT) != 1:
+        found.append(name + "post does not download exactly the sealed record")
+    if secrets_in(text) != DS_COMPILE_SECRETS or any(text.count("secrets." + n) != 1 for n in DS_COMPILE_SECRETS) or \
+            re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret is held outside its one step")
     return found
 
 

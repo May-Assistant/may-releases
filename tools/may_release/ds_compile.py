@@ -15,11 +15,18 @@ Steps, one per workflow step, each holding only what it needs:
   has already read the pull request (open, in may-design-system itself, against claude/may-integration or main).
 - compile (no secret in its environment or on disk): the pinned Xcode 26.3 builds the package for the iOS Simulator
   without signing. Every tool writes to a private log; the outcome is recorded in a private file. A failed build
-  (a timeout or a tool that will not start included) does not fail this step: post reports it and then fails the job.
-- post (MAY_DS_PR_COMMENT_TOKEN alone): the private log is reduced to file-located errors inside the checkout,
-  repo-relative (diagnostics), and posted as one comment on the pull request (comment_body), after the pull request
-  is read again and is still open at that head, and unless a comment already carries this head's marker. Only the
-  pull request's comments endpoint is ever written.
+  (a timeout or a tool that will not start included) does not fail this step: verdict fails the job after the seal.
+- seal (the same job, no secret): the private log is reduced to file-located errors inside the checkout,
+  repo-relative (diagnostics), into a record ({sha, passed, errors, total}) padded to MAX_RECORD and age-encrypted to
+  MAY_RENDERS_RECIPIENT; only that sealed file leaves the job (one day). The design system's code ran in this job, so
+  it holds no token (coordinator, 30 Oct: the split native-compile-pr.yml and ds-tests-pr.yml already have).
+- verdict (the same job): fails it when the compile failed, whether or not the post job can post.
+- open (a fresh post job, MAY_RENDERS_DECRYPT_KEY alone): decrypts the record after checking the key against the
+  recipient, and checks it whole and for this commit.
+- post (that job, MAY_DS_PR_COMMENT_TOKEN alone): posts the record as one comment on the pull request (comment_body),
+  or, with no record, the native job's pass or fail alone (MAY_NATIVE_RESULT), after the pull request is read again
+  and is still open at that head, and unless a comment already carries this head's marker. Only the pull request's
+  comments endpoint is ever written.
 """
 
 import argparse
@@ -38,10 +45,11 @@ import urllib.request
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from compile import credentials_left
-from gate import CONTROL_REPO, DS_REPO, GateDenial, pull_number, validate_ds_pull_request
+from gate import AGE_RECIPIENT, CONTROL_REPO, DS_REPO, GateDenial, pull_number, validate_ds_pull_request
 from prepare import DS, PrepareError, fetch as fetch_private, head_revision
 from review_mcp import FOOTER, TOKEN_SHAPED, holds
-from store import StoreError, require_step_secrets
+from store import StoreError, child_env, require_step_secrets, write_private
+import toolchain
 
 READ_KEY = "MAY_DS_READ_KEY"
 COMMENT_TOKEN = "MAY_DS_PR_COMMENT_TOKEN"
@@ -53,6 +61,13 @@ BUILD_SECONDS = 45 * 60
 MAX_SCHEMES = 20
 # At most this many errors are posted; the rest are counted.
 MAX_ERRORS = 100
+# The sealed record between the native and post jobs (the same scheme as compile_pr_errors.py's): every record is padded
+# to MAX_RECORD bytes, so its size says nothing about how many errors it holds.
+RECIPIENT, DECRYPT_KEY = "MAY_RENDERS_RECIPIENT", "MAY_RENDERS_DECRYPT_KEY"
+AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
+SEALED, DOWNLOAD, SEALED_NAME, RECORD = "may-ds-compile-sealed", "may-ds-compile-download", "compile.age", "record.json"
+MAX_RECORD, MAX_ERROR_LINE, MAX_TOTAL = 256 * 1024, 600, 1_000_000
+NATIVE_RESULT, RESULTS = "MAY_NATIVE_RESULT", {"success": True, "failure": False}
 MAX_PATH, MAX_MESSAGE = 240, 240
 MAX_BODY = 65_000
 API = "https://api.github.com"
@@ -372,33 +387,170 @@ def post_once(call_api, repo, number, sha, body, token, name=MARKER, author=None
     return True
 
 
-def post(sha, pr, call_api=github):
-    require_step_secrets((COMMENT_TOKEN,))
-    exact(sha)
-    number = pull_number(pr)
-    # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
-    token = os.environ.pop(COMMENT_TOKEN, "")
-    if len(token) < 20:
-        raise DsCompileError("Design-system comment token unavailable (MAY_DS_PR_COMMENT_TOKEN in may-ds-renders)")
-    root = runner_root()
-    checkout, private = root / SOURCE, root / PRIVATE
+def outcome(private):
+    """True when the compile passed, False when it failed; refuses when no outcome is recorded."""
     try:
         result = json.loads((private / "result.json").read_text())
     except (OSError, ValueError):
         raise DsCompileError("No compile outcome is recorded; nothing was posted") from None
     if not isinstance(result, dict) or result.get("result") not in ("passed", "failed"):
         raise DsCompileError("No compile outcome is recorded; nothing was posted")
+    return result["result"] == "passed"
+
+
+def checked_record(data, sha):
+    """The record seal wrote, checked whole: {sha, passed, errors, total}, its commit the dispatched one, its errors
+    single lines of a bounded length; refuses otherwise."""
+    count = lambda v: type(v) is int and 0 <= v <= MAX_TOTAL
+    if not (isinstance(data, dict) and set(data) == {"sha", "passed", "errors", "total"} and data["sha"] == sha and
+            type(data["passed"]) is bool and isinstance(data["errors"], list) and len(data["errors"]) <= MAX_ERRORS and
+            all(isinstance(e, str) and 0 < len(e) <= MAX_ERROR_LINE and "\n" not in e and "\r" not in e
+                for e in data["errors"]) and count(data["total"]) and data["total"] >= len(data["errors"]) and
+            (not data["passed"] or (data["errors"] == [] and data["total"] == 0))):
+        raise DsCompileError("The compile record is malformed or for another commit; nothing was posted")
+    return data
+
+
+def compile_record(sha, root):
+    """The compile's record from the native job's private files, the errors reduced from its log."""
+    checkout, private = root / SOURCE, root / PRIVATE
+    passed = outcome(private)
+    # A sanity check only: the build could have changed the checkout. The pull request's own head, read again by the
+    # post job, is the check that counts.
     if head_revision(checkout) != sha:
-        raise DsCompileError("The compiled checkout is not the dispatched commit; nothing was posted")
-    passed = result["result"] == "passed"
+        raise DsCompileError("The compiled checkout is not the dispatched commit; nothing was sealed")
     errors, total = [], 0
     if not passed:
+        log = private / "compile.log"
+        # The build ran before this step and could leave a link in place of its log: only a regular file is read.
         try:
-            text = (private / "compile.log").read_text(encoding="utf-8", errors="replace")
+            text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() and not log.is_symlink() else ""
         except OSError:
             text = ""
         errors, total = diagnostics(text, [checkout, checkout.resolve()])
-    body = comment_body(sha, run_url(os.environ), passed, errors, total)
+        errors = [e for e in errors if 0 < len(e) <= MAX_ERROR_LINE and "\n" not in e and "\r" not in e]
+    return checked_record({"sha": sha, "passed": passed, "errors": errors, "total": total}, sha)
+
+
+def seal(sha):
+    """The native job's record, age-encrypted to RECIPIENT for the post job; nothing in the clear leaves the runner.
+    Without the recipient nothing is sealed, and the post job posts the job's result alone."""
+    require_step_secrets(())
+    exact(sha)
+    root = runner_root()
+    record, private = compile_record(sha, root), root / PRIVATE
+    recipient = os.environ.get(RECIPIENT, "").strip()
+    if not recipient:
+        print("DS Swift compile: MAY_RENDERS_RECIPIENT is not set in may-ds-renders; nothing is sealed, so only the "
+              "result will be posted")
+        return
+    if not AGE_RECIPIENT.fullmatch(recipient):
+        raise DsCompileError("MAY_RENDERS_RECIPIENT is not an age public key")
+    plain, sealed = private / RECORD, root / SEALED
+    sealed.mkdir(mode=0o700, exist_ok=True)
+    data = json.dumps(record).encode()
+    if len(data) > MAX_RECORD:
+        raise DsCompileError("The compile record is too large to seal")
+    try:
+        plain.unlink(missing_ok=True)
+        write_private(plain, data + b" " * (MAX_RECORD - len(data)))
+        if subprocess.run([toolchain.tool_path("age", "age"), "-r", recipient, "-o", str(sealed / SEALED_NAME),
+                           str(plain)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          stdin=subprocess.DEVNULL, env=child_env()).returncode:
+            raise DsCompileError("The compile record could not be encrypted")
+    finally:
+        plain.unlink(missing_ok=True)
+    print("DS Swift compile: its record is encrypted for the post job")
+
+
+def verdict():
+    """The native job's last word: it fails when the compile failed, whether or not the post job can post."""
+    require_step_secrets(())
+    if outcome(runner_root() / PRIVATE):
+        print(f"DS Swift compile passed with Xcode {XCODE}")
+        return 0
+    print("DS Swift compile failed; its errors go to the design-system pull request only")
+    return 1
+
+
+def open_record(sha):
+    """The post job's sealed record, decrypted with DECRYPT_KEY after the key is checked against RECIPIENT, then
+    checked whole into the private folder. No sealed record: a fixed line."""
+    require_step_secrets((DECRYPT_KEY,))
+    lines = [l.strip() for l in os.environ.pop(DECRYPT_KEY, "").splitlines() if l.strip() and not l.startswith("#")]
+    exact(sha)
+    root = runner_root()
+    sealed = root / DOWNLOAD / SEALED_NAME
+    if not sealed.is_file() or sealed.is_symlink():
+        print("DS Swift compile: no sealed record from this run attempt; only the result will be posted")
+        return
+    recipient = os.environ.get(RECIPIENT, "").strip()
+    if not AGE_RECIPIENT.fullmatch(recipient):
+        raise DsCompileError("MAY_RENDERS_RECIPIENT is not set to an age public key in may-ds-renders")
+    if len(lines) != 1 or not AGE_IDENTITY.fullmatch(lines[0]):
+        raise DsCompileError("The decryption key is malformed (MAY_RENDERS_DECRYPT_KEY in may-ds-renders)")
+    private = root / PRIVATE
+    private.mkdir(mode=0o700, exist_ok=True)
+    key, plain, env = private / "compile.key", private / (RECORD + ".part"), child_env()
+    try:
+        write_private(key, (lines[0] + "\n").encode())
+        derived = subprocess.run([toolchain.tool_path("age", "age-keygen"), "-y", str(key)], capture_output=True,
+                                 stdin=subprocess.DEVNULL, env=env)
+        if derived.returncode or derived.stdout.decode().strip() != recipient:
+            raise DsCompileError("The decryption key does not match MAY_RENDERS_RECIPIENT")
+        plain.unlink(missing_ok=True)
+        write_private(plain, b"")
+        if subprocess.run([toolchain.tool_path("age", "age"), "-d", "-i", str(key), "-o", str(plain), str(sealed)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                          env=env).returncode or plain.stat().st_size != MAX_RECORD:
+            raise DsCompileError("The compile record failed to decrypt or authenticate")
+        try:
+            record = checked_record(json.loads(plain.read_text()), sha)
+        except (ValueError, RecursionError):
+            raise DsCompileError("The compile record is malformed or for another commit; nothing was posted") from None
+        (private / RECORD).unlink(missing_ok=True)
+        write_private(private / RECORD, json.dumps(record).encode())
+    finally:
+        key.unlink(missing_ok=True)
+        plain.unlink(missing_ok=True)
+    print("DS Swift compile: its record is decrypted and checked")
+
+
+def result_body(sha, url, passed):
+    """The comment when no record reached the post job: the native job's pass or fail, and why there is no detail."""
+    exact(sha)
+    lines = [f"### May DS Swift compile: {'passed' if passed else 'failed'}", "",
+             f"`{sha}`: the compile job {'passed' if passed else 'failed'}. Its details are not posted: no sealed record "
+             "reached the post job (`MAY_RENDERS_RECIPIENT` or `MAY_RENDERS_DECRYPT_KEY` may be unset in may-ds-renders, "
+             "or the job stopped before its seal)."]
+    if url:
+        lines += ["", f"Run: {url}"]
+    return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
+
+
+def post(sha, pr, call_api=github):
+    require_step_secrets((COMMENT_TOKEN,))
+    exact(sha)
+    number = pull_number(pr)
+    # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
+    token = os.environ.pop(COMMENT_TOKEN, "")
+    path = runner_root() / PRIVATE / RECORD
+    sealed = path.is_file() and not path.is_symlink()
+    if sealed:
+        try:
+            record = checked_record(json.loads(path.read_text()), sha)
+        except (OSError, ValueError, RecursionError):
+            raise DsCompileError("The compile record is malformed or for another commit; nothing was posted") from None
+        passed, errors, total = record["passed"], record["errors"], record["total"]
+    else:
+        passed, errors, total = RESULTS.get(os.environ.get(NATIVE_RESULT, "")), [], 0
+        if passed is None:
+            print("DS Swift compile: no record and no compile result to post; nothing posted")
+            return 0
+    if len(token) < 20:
+        raise DsCompileError("Design-system comment token unavailable (MAY_DS_PR_COMMENT_TOKEN in may-ds-renders)")
+    url = run_url(os.environ)
+    body = comment_body(sha, url, passed, errors, total) if sealed else result_body(sha, url, passed)
     if holds(body, token):
         raise DsCompileError("The comment holds a credential; nothing was posted")
     status, pull = call_api("GET", f"/repos/{DS_REPO}/pulls/{number}", None, token)
@@ -411,6 +563,9 @@ def post(sha, pr, call_api=github):
     if not post_once(call_api, DS_REPO, number, sha, body, token, author=comment_author(os.environ)):
         print(f"DS Swift compile result already posted for this head on may-design-system #{number}; nothing posted again")
         return 0 if passed else 1
+    if not sealed:
+        print(f"DS Swift compile result alone posted to may-design-system #{number} (no sealed record: no details)")
+        return 0 if passed else 1
     if passed:
         print(f"DS Swift compile passed with Xcode {XCODE}; result posted to may-design-system #{number}")
         return 0
@@ -420,16 +575,25 @@ def post(sha, pr, call_api=github):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("step", choices=("fetch", "compile", "post"))
+    parser.add_argument("step", choices=("fetch", "compile", "seal", "verdict", "open", "post"))
     parser.add_argument("--ds-sha")
     parser.add_argument("--pr-number")
     args = parser.parse_args()
-    if (args.step == "compile") != (args.ds_sha is None and args.pr_number is None):
-        raise DsCompileError("fetch and post take --ds-sha and --pr-number; compile takes neither")
+    takes = {"fetch": (True, True), "compile": (False, False), "seal": (True, False), "verdict": (False, False),
+             "open": (True, False), "post": (True, True)}[args.step]
+    if (args.ds_sha is not None, args.pr_number is not None) != takes:
+        raise DsCompileError("fetch and post take --ds-sha and --pr-number, seal and open --ds-sha alone, compile and "
+                             "verdict neither")
     if args.step == "fetch":
         fetch(args.ds_sha, args.pr_number)
     elif args.step == "compile":
         compile_ds()
+    elif args.step == "seal":
+        seal(args.ds_sha)
+    elif args.step == "verdict":
+        return verdict()
+    elif args.step == "open":
+        open_record(args.ds_sha)
     else:
         return post(args.ds_sha, args.pr_number)
     return 0

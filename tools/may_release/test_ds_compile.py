@@ -478,6 +478,9 @@ class CompileTests(RunnerCase):
                 return subprocess.CompletedProcess(argv, 0, b"Xcode 26.3\n", b"")
             raise subprocess.TimeoutExpired("xcodebuild", 600)
         self.compile(listing_times_out)
+        with patch.dict(os.environ, self.environ(), clear=True), patch("ds_compile.head_revision", return_value=SHA):
+            record = ds_compile.compile_record(SHA, self.root)
+        (self.private / ds_compile.RECORD).write_text(json.dumps(record))
         poster = PostCase()
         poster.root, poster.checkout, poster.private = self.root, self.checkout, self.private
         poster.pull, poster.calls, poster.pages = ds_pull(), [], {}
@@ -523,9 +526,16 @@ class PostCase(RunnerCase):
         self.pages = {}
 
     def write(self, result="failed", log=None):
+        """The record the post job opens: the native job's outcome and log, reduced there (compile_record) as the
+        seal step does. The log and outcome stay behind in the native job; post reads the record alone."""
         (self.private / "result.json").write_text(json.dumps({"result": result}))
         # The log names the checkout as the runner would.
         (self.private / "compile.log").write_text((log or self.LOG).replace(CK, str(self.checkout)))
+        with patch.dict(os.environ, self.environ(), clear=True), patch("ds_compile.head_revision", return_value=SHA):
+            record = ds_compile.compile_record(SHA, self.root)
+        (self.private / "result.json").unlink()
+        (self.private / "compile.log").unlink()
+        (self.private / ds_compile.RECORD).write_text(json.dumps(record))
 
     def call_api(self, method, path, payload, token, status=201):
         self.calls.append((method, path, payload, token))
@@ -576,7 +586,10 @@ class PostTests(PostCase):
         env = self.environ(MAY_DS_PR_COMMENT_TOKEN=TOKEN)
         with patch.dict(os.environ, env, clear=True), patch("ds_compile.head_revision", return_value=SHA), \
                 contextlib.redirect_stdout(io.StringIO()):
-            ds_compile.post(SHA, "40", self.call_api)
+            try:
+                ds_compile.post(SHA, "40", self.call_api)
+            except DsCompileError as refused:
+                self.fail("the post was refused: " + refused.args[0])
             self.assertNotIn("MAY_DS_PR_COMMENT_TOKEN", os.environ)
         self.assertEqual({t for _, _, _, t in self.calls}, {TOKEN})
 
@@ -594,14 +607,17 @@ class PostTests(PostCase):
         _, error, _, _ = self.post(call_api=lambda *a: (404, None))
         self.assertIn("could not be read again", error.args[0])
 
-    def test_nothing_is_posted_without_an_outcome_a_token_the_compiled_head_or_with_another_secret(self):
-        _, error, _, _ = self.post()
-        self.assertEqual(error.args[0], "No compile outcome is recorded; nothing was posted")
+    def test_nothing_is_posted_without_a_record_or_result_a_token_or_with_another_secret(self):
+        code, error, out, _ = self.post()
+        self.assertEqual((code, error, out), (0, None, "DS Swift compile: no record and no compile result to post; "
+                                                       "nothing posted\n"))
         self.write()
         _, error, _, _ = self.post(env=self.environ())
         self.assertIn("comment token unavailable", error.args[0])
-        _, error, _, _ = self.post(head=OTHER)
-        self.assertIn("not the dispatched commit", error.args[0])
+        (self.private / ds_compile.RECORD).write_text(json.dumps({"sha": OTHER, "passed": True, "errors": [], "total": 0}))
+        _, error, _, _ = self.post()
+        self.assertIn("for another commit", error.args[0])
+        self.write()
         _, error, _, _ = self.post(env=self.environ(MAY_DS_PR_COMMENT_TOKEN=TOKEN, MAY_DS_READ_KEY="k"))
         self.assertIsInstance(error, StoreError)
         self.assertEqual(self.calls, [])
@@ -781,12 +797,111 @@ class GitHubCallTests(unittest.TestCase):
                 self.assertEqual((calls, slept), ([method], []))
 
 
+@unittest.skipUnless(shutil.which("age") and shutil.which("age-keygen"), "age and age-keygen are needed")
+class SealOpenTests(PostCase):
+    """The split (coordinator, 30 Oct): native seals its record with no secret, post opens it with the decrypt key
+    alone, and nothing from the design system is in the sealed file or the log."""
+
+    def setUp(self):
+        self.found = {name: shutil.which(name) for name in ("age", "age-keygen")}
+        super().setUp()
+        self.secret = next(line for line in subprocess.run([self.found["age-keygen"]], capture_output=True, text=True,
+                                                            check=True).stdout.splitlines()
+                           if line.startswith("AGE-SECRET-KEY-1"))
+        self.public = subprocess.run([self.found["age-keygen"], "-y"], input=self.secret, capture_output=True, text=True,
+                                     check=True).stdout.strip()
+        tools = patch("ds_compile.toolchain.tool_path", side_effect=lambda name, relative: self.found[relative])
+        tools.start()
+        self.addCleanup(tools.stop)
+
+    def seal(self, result="failed", **env):
+        (self.private / "result.json").write_text(json.dumps({"result": result}))
+        (self.private / "compile.log").write_text(self.LOG.replace(CK, str(self.checkout)))
+        with patch("ds_compile.head_revision", return_value=SHA):
+            return self.captured(ds_compile.seal, SHA, env=self.environ(**env))
+
+    def hand_over(self):
+        sealed = self.root / ds_compile.SEALED / ds_compile.SEALED_NAME
+        (self.root / ds_compile.DOWNLOAD).mkdir()
+        shutil.copyfile(sealed, self.root / ds_compile.DOWNLOAD / ds_compile.SEALED_NAME)
+        shutil.rmtree(self.private)
+        self.private.mkdir()
+        return sealed.read_bytes()
+
+    def test_the_errors_cross_sealed_and_are_posted_from_the_post_job(self):
+        _, error, out, _ = self.seal(MAY_RENDERS_RECIPIENT=self.public)
+        self.assertIsNone(error)
+        self.assertEqual(out, "DS Swift compile: its record is encrypted for the post job\n")
+        sealed = self.hand_over()
+        self.assertNotIn(b"cannot find", sealed)
+        self.assertNotIn(MARKER.encode(), sealed)
+        self.assertFalse((self.private / ds_compile.RECORD).exists(), "no plaintext record is left behind")
+        _, error, out, _ = self.captured(ds_compile.open_record, SHA,
+                                         env=self.environ(MAY_RENDERS_RECIPIENT=self.public,
+                                                          MAY_RENDERS_DECRYPT_KEY=self.secret))
+        self.assertIsNone(error)
+        self.assertEqual(out, "DS Swift compile: its record is decrypted and checked\n")
+        code, error, out, _ = self.post()
+        self.assertEqual((code, error), (1, None))
+        self.assertEqual(out, "DS Swift compile failed; 2 errors posted to may-design-system #40\n")
+        self.assertIn("swift/Sources/A/View.swift:12:5: error: cannot find 'Foo' in scope", self.calls[-1][2]["body"])
+
+    def test_another_key_or_another_commit_is_refused(self):
+        self.seal(MAY_RENDERS_RECIPIENT=self.public)
+        self.hand_over()
+        other = next(line for line in subprocess.run([self.found["age-keygen"]], capture_output=True, text=True,
+                                                     check=True).stdout.splitlines() if line.startswith("AGE-SECRET-KEY-1"))
+        _, error, _, _ = self.captured(ds_compile.open_record, SHA,
+                                       env=self.environ(MAY_RENDERS_RECIPIENT=self.public, MAY_RENDERS_DECRYPT_KEY=other))
+        self.assertEqual(error.args[0], "The decryption key does not match MAY_RENDERS_RECIPIENT")
+        _, error, _, _ = self.captured(ds_compile.open_record, OTHER,
+                                       env=self.environ(MAY_RENDERS_RECIPIENT=self.public,
+                                                        MAY_RENDERS_DECRYPT_KEY=self.secret))
+        self.assertIn("for another commit", error.args[0])
+        self.assertFalse((self.private / ds_compile.RECORD).exists())
+
+    def test_no_recipient_seals_nothing_and_the_result_alone_is_posted(self):
+        _, error, out, _ = self.seal()
+        self.assertIsNone(error)
+        self.assertIn("nothing is sealed, so only the result will be posted", out)
+        self.assertFalse((self.root / ds_compile.SEALED / ds_compile.SEALED_NAME).exists())
+        shutil.rmtree(self.private)
+        self.private.mkdir()
+        _, _, out, _ = self.captured(ds_compile.open_record, SHA, env=self.environ(MAY_RENDERS_DECRYPT_KEY=self.secret))
+        self.assertEqual(out, "DS Swift compile: no sealed record from this run attempt; only the result will be posted\n")
+        code, error, out, _ = self.post(env=self.environ(MAY_DS_PR_COMMENT_TOKEN=TOKEN, MAY_NATIVE_RESULT="failure"))
+        self.assertEqual((code, error), (1, None))
+        self.assertEqual(out, "DS Swift compile result alone posted to may-design-system #40 (no sealed record: no details)\n")
+        body = self.calls[-1][2]["body"]
+        self.assertIn("the compile job failed", body)
+        self.assertIn(f"<!-- may-ds-swift-compile head={SHA} -->", body)
+
+    def test_the_native_job_fails_on_a_failed_compile_whatever_the_post_job_does(self):
+        (self.private / "result.json").write_text(json.dumps({"result": "failed"}))
+        self.assertEqual(self.captured(ds_compile.verdict, env=self.environ())[:3],
+                         (1, None, "DS Swift compile failed; its errors go to the design-system pull request only\n"))
+        (self.private / "result.json").write_text(json.dumps({"result": "passed"}))
+        self.assertEqual(self.captured(ds_compile.verdict, env=self.environ())[0], 0)
+        _, error, _, _ = self.captured(ds_compile.verdict, env=self.environ(MAY_DS_PR_COMMENT_TOKEN=TOKEN))
+        self.assertIsInstance(error, StoreError, "the native job holds no token")
+
+    def test_seal_and_open_refuse_another_steps_secret(self):
+        _, error, _, _ = self.seal(MAY_RENDERS_RECIPIENT=self.public, MAY_RENDERS_DECRYPT_KEY=self.secret)
+        self.assertIsInstance(error, StoreError)
+        _, error, _, _ = self.captured(ds_compile.open_record, SHA,
+                                       env=self.environ(MAY_RENDERS_DECRYPT_KEY=self.secret, MAY_DS_PR_COMMENT_TOKEN=TOKEN))
+        self.assertIsInstance(error, StoreError)
+
+
 class CommandLineTests(RunnerCase):
     def test_the_cli_prints_fixed_lines_and_exits_non_zero_on_a_failed_compile(self):
         self.checkout.mkdir()
         self.private.mkdir()
         (self.private / "result.json").write_text(json.dumps({"result": "failed"}))
         (self.private / "compile.log").write_text(f"{self.checkout}/A.swift:1:1: error: {MARKER}\n")
+        with patch.dict(os.environ, self.environ(), clear=True), patch("ds_compile.head_revision", return_value=SHA):
+            record = ds_compile.compile_record(SHA, self.root)
+        (self.private / ds_compile.RECORD).write_text(json.dumps(record))
         pull = ds_pull()
 
         def urlopen(request, timeout):
@@ -841,32 +956,35 @@ class ShapeTests(unittest.TestCase):
 
     def test_each_widening_of_the_workflow_is_flagged(self):
         name = "ds-swift-compile.yml: "
-        secret = name + "a secret or env entry other than"
-        runs = name + "runs something other than"
+        steps = lambda job: name + f"job {job}'s steps, their environments or commands are not exactly as pinned"
         build = "      - name: Compile the Swift package without signing or any credential\n"
         fetch_key = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
         comment = "          MAY_DS_PR_COMMENT_TOKEN: ${{ steps.ci-ds-comment.outputs.token || secrets.MAY_DS_PR_COMMENT_TOKEN }}\n"
+        condition = "    if: ${{ !cancelled() && needs.admission.result == 'success' }}\n"
         cases = {
-            "the read key on the compile": (build, build + "        env:\n          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n", secret),
-            "any env on the compile": (build, build + "        env:\n          MAY_DS_SHA: ${{ inputs.ds_sha }}\n", secret),
-            "the comment token in the fetch": (fetch_key, fetch_key + comment, secret),
-            "the read key in the post": (comment, comment + fetch_key, secret),
-            "the read token in the post": (comment, comment + "          MAY_DS_PR_READ_TOKEN: ${{ secrets.MAY_DS_PR_READ_TOKEN }}\n", secret),
-            "a job-level env": ("    timeout-minutes: 55\n", "    timeout-minutes: 55\n    env:\n      CI: '1'\n", secret),
-            "printing the log": (build, "      - name: Show\n        run: cat \"$RUNNER_TEMP/may-ds-private/compile.log\"\n" + build, runs),
-            "a step summary": (build, "      - name: Summary\n        run: echo x >> \"$GITHUB_STEP_SUMMARY\"\n" + build, name + "publishes an artifact or summary"),
-            "an artifact": (build, "      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n" + build,
-                            name + "publishes an artifact or summary"),
-            "an input in shell": ('--pr-number "$MAY_DS_PR"\n  native:', "--pr-number '${{ inputs.ds_pr }}'\n  native:", runs),
-            "no recheck": ('"$MAY_DS_PR" --check-pull\n', '"$MAY_DS_PR"\n', runs),
+            "the read key on the compile": (build, build + "        env:\n          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n", steps("native")),
+            "any env on the compile": (build, build + "        env:\n          MAY_DS_SHA: ${{ inputs.ds_sha }}\n", steps("native")),
+            "the comment token in the fetch": (fetch_key, fetch_key + comment, steps("native")),
+            "the read key in the post": (comment, comment + fetch_key, steps("post")),
+            "the read token in the post": (comment, comment + "          MAY_DS_PR_READ_TOKEN: ${{ secrets.MAY_DS_PR_READ_TOKEN }}\n", steps("post")),
+            "a job-level env": ("    timeout-minutes: 55\n", "    timeout-minutes: 55\n    env:\n      CI: '1'\n", name + "a secret is held outside"),
+            "printing the log": (build, "      - name: Show\n        run: cat \"$RUNNER_TEMP/may-ds-private/compile.log\"\n" + build, steps("native")),
+            "a step summary": (build, "      - name: Summary\n        run: echo x >> \"$GITHUB_STEP_SUMMARY\"\n" + build, name + "writes a step summary"),
+            "a second artifact": (build, "      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n" + build,
+                                  name + "post does not download exactly the sealed record"),
+            "the record kept a month": ("          retention-days: 1\n", "          retention-days: 30\n", name + "native's upload is not its sealed record alone"),
+            "an input in shell": ('--pr-number "$MAY_DS_PR"\n  pull:', "--pr-number '${{ inputs.ds_pr }}'\n  pull:", steps("admission")),
+            "no recheck": ('"$MAY_DS_PR" --check-pull\n', '"$MAY_DS_PR"\n', steps("pull")),
             "a fixed environment": ("    environment: ${{ needs.admission.outputs.environment }}\n", "    environment: may-ds-renders\n",
-                                    name + "native's environment is not the one admission chose"),
+                                    name + "job pull's runner, needs, timeout or environment"),
+            "the compile before the check": ("    needs: [admission, pull]\n", "    needs: admission\n", name + "job native's runner, needs"),
+            "the post on any outcome": (condition, "    if: always()\n", name + "job post runs on a condition other than post's"),
             "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n  workflow_dispatch:\n", name + "is not dispatched with exactly"),
             "write permission": ("permissions:\n  contents: read\nconcurrency:", "permissions:\n  pull-requests: write\nconcurrency:",
                                  name + "permissions are not exactly read-only"),
-            "cleanup not always": ("        if: always()\n", "", name + "native's steps are not exactly"),
-            "continue on error": (build, build + "        continue-on-error: true\n", name + "sets a shell, defaults, a condition"),
-            "a longer timeout": ("    timeout-minutes: 55\n", "    timeout-minutes: 360\n", name + "sets a shell"),
+            "cleanup not always": ("        if: always()\n", "", name + "job native has a step condition other than"),
+            "continue on error": (build, build + "        continue-on-error: true\n", name + "job native lets a step other than the download"),
+            "a longer timeout": ("    timeout-minutes: 55\n", "    timeout-minutes: 360\n", name + "job native's runner, needs, timeout"),
             "a shared concurrency group": ("  group: may-ds-swift-compile\n", "  group: may-native-compile-pr\n", name + "does not run one at a time"),
         }
         for case, (old, new, message) in cases.items():
