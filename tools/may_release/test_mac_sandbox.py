@@ -1,6 +1,7 @@
 """The macOS native compile's unprivileged user (mac_sandbox.py, compile.py --sandbox; #65)."""
 
 import contextlib
+import hashlib
 import io
 from pathlib import Path
 import tempfile
@@ -233,6 +234,7 @@ class SandboxedCompileTests(unittest.TestCase):
         self.temp.cleanup()
 
     said = b"Error: Spec validation failed\n"
+    envs = []
 
     def build(self, statuses, setup_error=None, target="playground"):
         statuses = iter(statuses)
@@ -243,7 +245,8 @@ class SandboxedCompileTests(unittest.TestCase):
                 raise setup_error
 
         def step(argv, log, cwd, deadline):
-            command = argv[argv.index("-i") + 5:]
+            command = argv[argv.index("-i") + 6:]  # PATH, HOME, TMPDIR, DEVELOPER_DIR, XDG_CACHE_HOME
+            self.envs.append(" ".join(argv[argv.index("-i") + 1:argv.index("-i") + 6]))
             self.events.append(("step", command[0] if command[0] != "xcodegen" else " ".join(command[:2]), cwd))
             status = next(statuses, 0)
             if status:
@@ -270,10 +273,11 @@ class SandboxedCompileTests(unittest.TestCase):
         passed, out = self.build([0, 0])
         self.assertIs(passed, True)
         self.assertEqual(self.events, [("setup", ["src", "xcodegen"], None), ("step", "xcodegen version", "/"),
-                                       ("stop",), ("step", "xcodegen generate", "/"), ("stop",),
+                                       ("stop",), ("step", "xcodegen dump", "/"), ("stop",),
+                                       ("step", "xcodegen generate", "/"), ("stop",),
                                        ("step", "/usr/bin/xcodebuild", "/"), ("stop",)])
-        self.assertEqual(out, "May iOS compile xcodegen version: exit 0\nMay iOS compile xcodegen: exit 0\n"
-                              "May iOS compile xcodebuild MayPlayground: exit 0\n")
+        self.assertEqual(out, "May iOS compile xcodegen version: exit 0\nMay iOS compile xcodegen dump: exit 0\n"
+                              "May iOS compile xcodegen: exit 0\nMay iOS compile xcodebuild MayPlayground: exit 0\n")
 
     def test_a_failed_or_late_stage_ends_the_build_there(self):
         # Run 41173870659: a failed stage's line names the class of what it wrote, never its words.
@@ -288,13 +292,45 @@ class SandboxedCompileTests(unittest.TestCase):
         self.events = []
         passed, out = self.build([0, 65], target=None)
         self.assertIs(passed, False)
-        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodegen: exit 65 (spec invalid)")
+        # Run 41177789639: a build stage's line carries the mark of its telling line, the same failure the same mark.
+        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodegen dump: exit 65 (spec invalid #6c86c912)")
         self.assertEqual(len([e for e in self.events if e[0] == "step"]), 2)
         self.events = []
+        passed, out = self.build([0, 0, 65], target=None)
+        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodegen: exit 65 (spec invalid #6c86c912)")
+        self.events = []
         self.said = b"xcodebuild: error: '/private/var/may-sandbox/src/ios/May.xcodeproj' does not exist.\n"
-        passed, out = self.build([0, 0, 0, 65], target=None)
-        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodebuild MayPlayground: exit 65 (not found)")
+        passed, out = self.build([0, 0, 0, 0, 65], target=None)
+        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodebuild MayPlayground: exit 65 (not found #240a0d8e)")
         self.assertNotIn("may-sandbox", out, "the stage's words never reach the line")
+
+    def test_finer_classes_and_a_mark_never_carry_a_word(self):
+        for said, word in ((b"error: Could not write project: File exists\n", "exists"),
+                           (b"Error: The file couldn't be saved because the volume is read-only.\n", "read-only"),
+                           (b"error: cannot create cache directory\n", "cache"),
+                           (b"error: /private/var/may-sandbox/src/ios is not a directory\n", "invalid path"),
+                           (b"error: You don't have permission to save the file\n", "permission"),
+                           (b"Writing project...\nfatal: something unforeseen\n", "other")):
+            with self.subTest(word=word):
+                self.assertEqual(mac_sandbox.error_class(said), word)
+        log = self.private / "marks.log"
+        log.write_bytes("before\n\u2699\ufe0f  Generating plists...\nError: something /Users/runner\nmore\n".encode())
+        mark = mac_sandbox.said_mark(log, len(b"before\n"))
+        self.assertRegex(mark, "^[0-9a-f]{8}$")
+        self.assertEqual(mark, mac_sandbox.said_mark(log, len(b"before\n")), "the same words, the same mark")
+        log.write_bytes(b"Generating\nlast line alone\n")
+        self.assertEqual(mac_sandbox.said_mark(log, 0), hashlib.sha256(b"last line alone").hexdigest()[:8])
+        self.assertIsNone(mac_sandbox.said_mark(log, log.stat().st_size))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            compile_tool.say("xcodegen", 1, "other", "/Users/r")
+            compile_tool.say("xcodegen", 1, "free words", "0123abcd")
+        self.assertEqual(out.getvalue().splitlines(), ["May iOS compile xcodegen: exit 1 (other)",
+                                                       "May iOS compile xcodegen: exit 1"])
+
+    def test_the_tools_caches_are_the_users_own(self):
+        self.build([0, 0])
+        self.assertTrue(any(f"XDG_CACHE_HOME={ROOT}/home/.cache" in e for e in self.envs))
 
     def test_a_sandbox_that_cannot_be_made_runs_nothing(self):
         passed, out = self.build([0, 0], setup_error=SandboxError("The unprivileged user could not be set up; nothing ran"))

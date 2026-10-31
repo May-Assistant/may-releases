@@ -22,6 +22,7 @@ request's code runs, and the job ends red; nothing falls back to the runner user
 sandbox's own setup or teardown, never the pull request's code. Nothing is printed; errors are fixed literals.
 """
 
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -58,13 +59,17 @@ ERROR_CLASSES = (("no such file", re.compile(rb"No such file", re.IGNORECASE)),
                  ("not permitted", re.compile(rb"Operation not permitted", re.IGNORECASE)),
                  ("permission denied", re.compile(rb"Permission denied", re.IGNORECASE)),
                  ("sudo refused", re.compile(rb"password is required|sudo: ", re.IGNORECASE)),
-                 # A build stage's own words (run 41173870659: xcodegen exited 1 as the user, and nothing said why).
+                 # A build stage's own words (run 41173870659: xcodegen exited 1 as the user, and nothing said why;
+                 # run 41177789639: generate's words matched none of these, so finer ones, coordinator, 31 Oct).
+                 ("exists", re.compile(rb"already exists|eDSRecordAlreadyExists|File exists", re.IGNORECASE)),
+                 ("read-only", re.compile(rb"Read-only file system|read-only", re.IGNORECASE)),
+                 ("cache", re.compile(rb"cache", re.IGNORECASE)),
+                 ("invalid path", re.compile(rb"invalid path|not a directory|is a directory|bad path", re.IGNORECASE)),
+                 ("permission", re.compile(rb"permission|not allowed|EACCES|EPERM", re.IGNORECASE)),
                  ("spec invalid", re.compile(rb"Spec validation|Decoding failed|Parsing|is not a valid", re.IGNORECASE)),
                  ("not found", re.compile(rb"command not found|not found|could not be found|does ?n[o']t exist",
                                           re.IGNORECASE)),
-                 ("usage", re.compile(rb"usage:|illegal option|invalid", re.IGNORECASE)),
-                 ("exists", re.compile(rb"already exists|eDSRecordAlreadyExists", re.IGNORECASE)),
-                 ("read-only", re.compile(rb"Read-only file system", re.IGNORECASE)))
+                 ("usage", re.compile(rb"usage:|illegal option|invalid", re.IGNORECASE)))
 
 
 ERROR_WORDS = (*(name for name, _ in ERROR_CLASSES), "other", "did not start")
@@ -73,6 +78,22 @@ TEARDOWN_NAMES = (*LEFTOVER_DIRS, "the sandbox", "the user", "the group")
 
 def error_class(said):
     return next((name for name, pattern in ERROR_CLASSES if pattern.search(said or b"")), "other")
+
+
+def said_mark(log, start):
+    """Eight hex digits of the SHA-256 of a failed step's telling line (its first line naming an error, else its last
+    line): the same failure gives the same mark, so runs can be told apart or matched without a word of it
+    (coordinator, 31 Oct)."""
+    try:
+        with log.open("rb") as written:
+            written.seek(start)
+            lines = [line.strip() for line in written.read(64 * 1024).splitlines() if line.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    line = next((line for line in lines if re.search(rb"error|fatal|failed", line, re.IGNORECASE)), lines[-1])
+    return hashlib.sha256(line).hexdigest()[:8]
 
 
 def said_since(log, start):
