@@ -183,7 +183,7 @@ STORE_JOBS = {
         {FETCH: READ_KEYS, IOS_BUILD: {"MAY_POSTHOG_IOS_KEY"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "ios-release": (
         ["Install pinned age", DECRYPT, "Sign and verify internal-TestFlight IPA",
-         "Upload verified IPA for internal TestFlight", CONFIRM, NOTES_SEND, REPORT],
+         "Upload verified IPA for internal TestFlight", CONFIRM, REPORT, NOTES_SEND],
         {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
          "Sign and verify internal-TestFlight IPA": {"MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD",
                                                      "MAY_IOS_PROFILE_BASE64"},
