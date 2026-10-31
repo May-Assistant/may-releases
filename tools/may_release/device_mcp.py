@@ -191,6 +191,12 @@ RUNNER_KINDS = (("idle waits", re.compile(rb"to (?:become )?idle|wait(?:ing)? fo
                 ("snapshots", re.compile(rb"snapshot", re.IGNORECASE)),
                 ("timeouts", re.compile(rb"timed? ?out|timeout", re.IGNORECASE)))
 RUNNER_SECONDS = 20
+# Run 41180883244: 133 of the runner's lines in a hung act matched no kind. The other lines are also counted by their
+# log category, "[subsystem:category]" in log show's compact style, a name alone and only when it has a name's shape
+# (else "no category"); the RUNNER_TOP most frequent are kept (coordinator, 31 Oct).
+# A name starts with a letter, so the process's [pid:tid] is never one.
+LOG_CATEGORY = re.compile(rb"\[([A-Za-z][A-Za-z0-9._-]{0,47}:[A-Za-z][A-Za-z0-9._-]{0,31})\]")
+RUNNER_TOP = 5
 
 
 def runner_counts(config, started, ended):
@@ -203,19 +209,29 @@ def runner_counts(config, started, ended):
     if status:
         return None
     counts = dict.fromkeys([kind for kind, _ in RUNNER_KINDS] + ["other"], 0)
+    categories = {}
     for line in out.splitlines():
         # log show's own header ("Timestamp ...", "Filtering the log data using ...") is not one of the runner's lines.
         if not line.strip() or line.startswith((b"Timestamp", b"Filtering", b"Skipping")):
             continue
-        counts[next((kind for kind, pattern in RUNNER_KINDS if pattern.search(line)), "other")] += 1
-    return counts
+        kind = next((kind for kind, pattern in RUNNER_KINDS if pattern.search(line)), "other")
+        counts[kind] += 1
+        if kind == "other":
+            named = LOG_CATEGORY.search(line)
+            name = named.group(1).decode() if named else "no category"
+            categories[name] = categories.get(name, 0) + 1
+    top = sorted(categories.items(), key=lambda item: (-item[1], item[0]))[:RUNNER_TOP]
+    return dict(counts, **({"other by category": top} if top else {}))
 
 
 def runner_line(counts):
     """The fixed line the counts are kept as."""
     if counts is None:
         return b"runner log: unreadable\n"
-    return ("runner log: " + ", ".join(f"{kind} {int(n)}" for kind, n in counts.items()) + "\n").encode()
+    top = counts.get("other by category", [])
+    line = "runner log: " + ", ".join(f"{kind} {int(n)}" for kind, n in counts.items() if kind != "other by category")
+    return (line + "\n" + ("runner other by category: " + ", ".join(f"{name} {int(n)}" for name, n in top) + "\n"
+                           if top else "")).encode()
 
 
 def flow(config, command):
