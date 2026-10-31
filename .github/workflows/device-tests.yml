@@ -13,10 +13,10 @@ on:
         type: string
         default: all
       ios_reduce_motion:
-        description: Turn on Reduce Motion in the iOS simulator before the app starts (to compare iOS runs with and without it)
+        description: Reduce Motion in the iOS simulator before the app starts (on by default and nightly; off, iOS taps can hang)
         required: false
         type: boolean
-        default: false
+        default: true
       ios_diagnostics:
         description: Ask the iOS app for its main-thread watchdog (on by default and nightly; off, stalls are not collected)
         required: false

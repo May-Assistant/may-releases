@@ -292,23 +292,28 @@ class RunTests(Workspace):
                       out.splitlines())
         self.assertNotIn("0 main-thread stalls", out)
 
-    def test_reduce_motion_is_turned_on_before_the_app_starts_only_when_dispatched(self):
-        """The coordinator's A/B switch (25 Oct): ios_reduce_motion, off unless dispatched true."""
+    def test_reduce_motion_is_on_before_the_app_starts_unless_dispatched_false(self):
+        """The coordinator's A/B switch (25 Oct), on by default since 31 Oct: with it off, three runs hung on iOS taps."""
         reduce = ["xcrun", "simctl", "spawn", UDID, "defaults", "write", "com.apple.Accessibility",
                   "ReduceMotionEnabled", "-bool", "true"]
-        calls, minted, report, out, run = self.run_it(env={device_ios.REDUCE_MOTION: "true"})
-        argvs = [argv for argv, _ in calls]
-        self.assertIn(reduce, argvs)
-        self.assertLess(argvs.index(reduce), argvs.index(["xcrun", "simctl", "install", UDID,
-                                                         str(self.root / device_ios.APP)]),
-                        "on before the app is installed and first started")
-        self.assertIn("May device tests (ios): Reduce Motion is on for this run", out.splitlines())
-        for value in (None, "false", "", "TRUE "):
+        for value in (None, "", "true", "TRUE ", "anything"):
+            with self.subTest(value=value):
+                (self.private / device_tests.AGENTS).unlink(missing_ok=True)
+                calls, minted, report, out, run = self.run_it(env={device_ios.REDUCE_MOTION: value})
+                argvs = [argv for argv, _ in calls]
+                self.assertIn(reduce, argvs, "on unless dispatched false, so the nightly run (no inputs) has it")
+                self.assertLess(argvs.index(reduce), argvs.index(["xcrun", "simctl", "install", UDID,
+                                                                 str(self.root / device_ios.APP)]),
+                                "on before the app is installed and first started")
+                self.assertIn("May device tests (ios): Reduce Motion is on for this run", out.splitlines())
+        for value in ("false", " false "):
             with self.subTest(value=value):
                 (self.private / device_tests.AGENTS).unlink(missing_ok=True)
                 calls, minted, report, out, run = self.run_it(env={device_ios.REDUCE_MOTION: value})
                 self.assertNotIn(reduce, [argv for argv, _ in calls])
-                self.assertNotIn("Reduce Motion", out)
+                self.assertIn("May device tests (ios): Reduce Motion is off for this run (dispatched false)",
+                              out.splitlines())
+                self.assertNotIn("Reduce Motion is on", out)
 
     def test_swiftuis_info_lines_are_persisted_for_that_subsystem_alone_before_the_app_starts(self):
         """Run 40232904242: the body-change lines stayed in memory alone, so most were gone by the read."""
@@ -352,6 +357,7 @@ class RunTests(Workspace):
                          [("ui-pass", ["sign-in.mp4"], ["sign-in-end.png"]),
                           ("ui-pass", ["connections.mp4"], ["connections-end.png"])])
         self.assertEqual(out.splitlines(), [
+            "May device tests (ios): Reduce Motion is on for this run",
             "May device tests (ios): the main-thread watchdog is on for this run",
             "May device tests (ios): 2 scenarios ran; verdicts follow the judge step",
             "May device tests (ios): 2 test sessions were signed out at their end",
