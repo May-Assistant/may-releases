@@ -37,10 +37,15 @@ class SetupTests(unittest.TestCase):
         self.temp.cleanup()
 
     def setup(self, admin, checks=lambda argv, log: 0, ids=lambda: False, project=None):
-        with mock.patch("mac_sandbox.admin", admin), mock.patch("mac_sandbox.as_sandbox", side_effect=checks) as sandbox:
+        def said(argv, log, data=None):
+            status = admin(argv, log, data)
+            return status, None if status == 0 else "did not start" if status is None else "no such file"
+
+        with mock.patch("mac_sandbox.admin", admin), mock.patch("mac_sandbox.admin_said", side_effect=said), \
+                mock.patch("mac_sandbox.as_sandbox", side_effect=checks) as sandbox:
             try:
                 mac_sandbox.setup(self.log, self.copies, Path("/Users/runner"), Path("/runner"), project, ids=ids,
-                                  say=lambda stage, status: self.said.append((stage, status)))
+                                  say=lambda stage, status, cause=None: self.said.append((stage, status, cause)))
                 return None, sandbox.call_args_list
             except SandboxError as error:
                 return error, sandbox.call_args_list
@@ -60,10 +65,14 @@ class SetupTests(unittest.TestCase):
 
     def test_the_checkout_is_its_own_and_the_generator_is_readable_but_roots(self):
         commands = mac_sandbox.setup_commands(self.copies)
-        self.assertIn(["chown", "-R", f"{USER}:{USER}", "--", str(ROOT / "src")], commands)
-        self.assertIn(["chown", "-R", "root:wheel", "--", str(ROOT / "xcodegen")], commands)
-        self.assertIn(["chmod", "-R", "u=rwX,go=rX", "--", str(ROOT / "xcodegen")], commands)
-        self.assertNotIn(["chmod", "-R", "u=rwX,go=rX", "--", str(ROOT / "src")], commands)
+        # Run 41170609342: macOS's getopt stops at the first operand, so "--" comes before the owner or mode.
+        self.assertIn(["chown", "-R", "--", f"{USER}:{USER}", str(ROOT / "src")], commands)
+        self.assertIn(["chown", "-R", "--", "root:wheel", str(ROOT / "xcodegen")], commands)
+        self.assertIn(["chmod", "-R", "--", "u=rwX,go=rX", str(ROOT / "xcodegen")], commands)
+        self.assertNotIn(["chmod", "-R", "--", "u=rwX,go=rX", str(ROOT / "src")], commands)
+        for argv in commands:
+            if argv[0] in ("chmod", "chown") and "--" in argv:
+                self.assertEqual(argv.index("--"), len(argv) - 3, "the owner or mode follows --, never the other way")
         self.assertIn(["install", "-d", "-o", "root", "-g", "wheel", "-m", "0755", str(ROOT)], commands)
         self.assertEqual(commands[-1], ["install", "-d", "-o", USER, "-g", USER, "-m", "0700",
                                         *(str(ROOT / d) for d in ("home", "tmp", "derived", "packages"))])
@@ -72,7 +81,7 @@ class SetupTests(unittest.TestCase):
         admin = Admin()
         error, checks = self.setup(admin, project=Path("/runner/may-private/sandbox-project.yml"))
         self.assertIsNone(error)
-        self.assertEqual(admin.calls[0], ["chmod", "0700", "--", "/Users/runner"])
+        self.assertEqual(admin.calls[0], ["chmod", "--", "0700", "/Users/runner"])
         self.assertIn(["install", "-o", USER, "-g", USER, "-m", "0644", "/runner/may-private/sandbox-project.yml",
                        str(ROOT / "src/ios/project.yml")], admin.calls)
         self.assertEqual([c for c in admin.calls if c[0] == "tee"],
@@ -80,11 +89,11 @@ class SetupTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in checks], [["/bin/test", "!", "-x", "/Users/runner"],
                                                        ["/bin/test", "!", "-x", "/runner"],
                                                        ["/bin/test", "-w", str(ROOT / "src")]])
-        stages = [stage for stage, _ in self.said]
+        stages = [stage for stage, _, _ in self.said]
         self.assertEqual(stages[:2], ["ids", "home"])
         self.assertEqual(stages[-6:], ["project", "deny", "deny", "unreachable", "unreachable", "writable"])
         self.assertEqual(len(stages), 2 + len(mac_sandbox.setup_commands(self.copies)) + 6)
-        self.assertTrue(all(status == 0 for _, status in self.said))
+        self.assertTrue(all(status == 0 and cause is None for _, status, cause in self.said))
 
     def test_it_fails_closed_at_the_first_stage_that_does_not_succeed(self):
         # Coordinator, 31 Oct: any sandbox step that fails ends the job red, with nothing compiled and nothing run as
@@ -109,13 +118,14 @@ class SetupTests(unittest.TestCase):
                 self.assertIn(refusal, str(error))
                 self.assertTrue(str(error).endswith("; nothing ran"))
                 self.assertNotEqual(self.said[-1][1], 0, "the failing stage's status is the last one said")
+                self.assertIn(self.said[-1][2], mac_sandbox.ERROR_WORDS, "and its class, in fixed words")
 
     def test_a_taken_name_or_id_refuses_before_any_root_command(self):
         admin = Admin()
         error, _ = self.setup(admin, ids=lambda: True)
         self.assertIn("already taken", str(error))
         self.assertEqual(admin.calls, [])
-        self.assertEqual(self.said, [("ids", 1)])
+        self.assertEqual(self.said, [("ids", 1, "other")])
 
     def test_ids_are_read_from_both_users_and_groups(self):
         def listing(users, groups):
@@ -153,11 +163,54 @@ class StopAndTeardownTests(unittest.TestCase):
     def test_teardown_kills_sweeps_and_removes_the_user_and_group(self):
         admin = Admin()
         with mock.patch("mac_sandbox.admin", admin), mock.patch("mac_sandbox.os.path.isdir", return_value=True):
-            self.assertTrue(mac_sandbox.teardown(self.log))
+            self.assertEqual(mac_sandbox.teardown(self.log, exists=lambda kind: True), [])
         self.assertEqual(admin.calls[-3:], [["rm", "-rf", "--", str(ROOT)], ["dscl", ".", "-delete", f"/Users/{USER}"],
                                             ["dscl", ".", "-delete", f"/Groups/{USER}"]])
-        self.assertIn(["find", "/private/tmp", "/private/var/tmp", "/private/var/folders", str(ROOT), "-xdev", "-user",
-                       USER, "-delete"], admin.calls)
+        self.assertEqual([c for c in admin.calls if c[0] == "find"],
+                         [["find", folder, "-xdev", "-user", USER, "-delete"] for folder in mac_sandbox.LEFTOVER_DIRS])
+        self.assertIn(["-u", USER, "/bin/kill", "-KILL", "-1"], admin.calls)
+
+    def test_teardown_names_what_it_could_not_remove(self):
+        # Run 41170609342 said "some files of the build user could not be removed" and nothing of which.
+        admin = Admin({("find", "/private/var/folders", "-xdev"): 1, ("dscl", ".", "-delete"): 1})
+        with mock.patch("mac_sandbox.admin", admin), mock.patch("mac_sandbox.os.path.isdir", return_value=True):
+            left = mac_sandbox.teardown(self.log, exists=lambda kind: True)
+        self.assertEqual(left, ["/private/var/folders", "the user", "the group"])
+        self.assertTrue(set(left) <= set(mac_sandbox.TEARDOWN_NAMES))
+
+    def test_a_setup_refused_before_the_user_was_made_leaves_nothing_to_report(self):
+        # Run 41170609342: the home step failed before the user existed, so find -user and dscl -delete failed on a
+        # user that was never made, and teardown said files were left.
+        admin = Admin({"find": 1, "dscl": 1, "pgrep": 0})
+        with mock.patch("mac_sandbox.admin", admin), mock.patch("mac_sandbox.os.path.isdir", return_value=True):
+            self.assertEqual(mac_sandbox.teardown(self.log, exists=lambda kind: False), [])
+        self.assertEqual(admin.calls, [["rm", "-rf", "--", str(ROOT)]], "no user, files or processes are looked for")
+
+    def test_a_failed_commands_words_are_sorted_into_fixed_classes(self):
+        for said, word in ((b"chmod: --: No such file or directory\n", "no such file"),
+                           (b"chmod: /Users/runner: Operation not permitted\n", "not permitted"),
+                           (b"sudo: a password is required\n", "sudo refused"),
+                           (b"usage: chmod [-fhv] mode file\n", "usage"),
+                           (b"<dscl_cmd> DS Error: -14135 (eDSRecordAlreadyExists)\n", "exists"),
+                           (b"something else /Users/runner\n", "other")):
+            with self.subTest(word=word):
+                self.assertEqual(mac_sandbox.error_class(said), word)
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "log"
+            log.write_bytes(b"before\n")
+            done = mock.Mock(returncode=1)
+
+            def run(argv, stdout, **kwargs):
+                stdout.write(b"chmod: --: No such file or directory\n")
+                return done
+
+            with mock.patch("mac_sandbox.subprocess.run", side_effect=run):
+                self.assertEqual(mac_sandbox.admin_said(["chmod", "0700", "--", "/x"], log), (1, "no such file"))
+            done.returncode = 0
+            with mock.patch("mac_sandbox.subprocess.run", side_effect=run):
+                self.assertEqual(mac_sandbox.admin_said(["chmod", "--", "0700", "/x"], log), (0, None))
+            with mock.patch("mac_sandbox.subprocess.run", side_effect=OSError):
+                self.assertEqual(mac_sandbox.admin_said(["chmod"], log), (None, "did not start"))
 
     def test_commands_run_as_the_user_with_none_of_the_runners_environment(self):
         argv = mac_sandbox.sandboxed(["xcodegen"], [ROOT / "xcodegen/xcodegen/bin"], ["DEVELOPER_DIR=/x"])
@@ -265,7 +318,7 @@ class SandboxedCompileTests(unittest.TestCase):
         digest = mock.Mock(hexdigest=mock.Mock(return_value=compile_tool.XCODEGEN_SHA256))
         with mock.patch.dict("os.environ", {"RUNNER_TEMP": str(root), "HOME": "/Users/runner"}, clear=True), \
                 mock.patch("compile.run", side_effect=run), mock.patch("compile.build_sandboxed", side_effect=build_sandboxed), \
-                mock.patch("compile.mac_sandbox.teardown", return_value=True) as teardown, \
+                mock.patch("compile.mac_sandbox.teardown", return_value=[]) as teardown, \
                 mock.patch("compile.subprocess.run", return_value=version), \
                 mock.patch("compile.hashlib.sha256", return_value=digest), \
                 mock.patch("compile.extract_generator", return_value=self.private / "xcodegen/xcodegen/bin/xcodegen"), \
@@ -294,6 +347,18 @@ class SandboxedCompileTests(unittest.TestCase):
                 self.assertEqual((sandboxed, teardowns), (["playground"], 1))
                 self.assertEqual(outcome, result, "a sandbox that fails records no outcome; the step ends red")
                 self.assertEqual(error is not None, isinstance(build, Exception))
+
+    def test_a_failed_stage_line_names_its_class_in_fixed_words_alone(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            compile_tool.say("home", 1, "no such file")
+            compile_tool.say("setup 3 dscl", 0)
+            compile_tool.say("xcodegen", None)
+            compile_tool.say("home", 1, "/Users/runner: whatever")
+        self.assertEqual(out.getvalue().splitlines(), ["May iOS compile home: exit 1 (no such file)",
+                                                       "May iOS compile setup 3 dscl: exit 0",
+                                                       "May iOS compile xcodegen: did not finish",
+                                                       "May iOS compile home: exit 1"])
 
     def test_only_the_recorded_ios_compile_runs_sandboxed(self):
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -343,7 +408,7 @@ class SandboxStaticCheckTests(unittest.TestCase):
                                        'mac_sandbox.step((["xcodegen"', compile_message),
             "no stop after xcodegen": (self.TOOL, "    stop_all(log)\n    say(\"xcodegen\", status)",
                                        "    say(\"xcodegen\", status)", compile_message),
-            "no teardown": (self.TOOL, "if not mac_sandbox.teardown(log):", "if not mac_sandbox.teardown(None):",
+            "no teardown": (self.TOOL, "left = mac_sandbox.teardown(log)", "left = mac_sandbox.teardown(None)",
                             compile_message),
             "a fallback to the runner": (self.TOOL, "            return\n        try:\n            run([str(binary)",
                                          "        try:\n            run([str(binary)", compile_message),
@@ -360,9 +425,11 @@ class SandboxStaticCheckTests(unittest.TestCase):
             "one kill round": (self.SANDBOX, "    for _ in range(STOP_ROUNDS):", "    for _ in range(1):", held),
             "no cache sweep": (self.SANDBOX, '"/private/var/folders", str(ROOT))', "str(ROOT))", held),
             "no reach check": (self.SANDBOX, "    for path in (home, runner_temp):", "    for path in ():", held),
-            "the group left": (self.SANDBOX, '    admin(["dscl", ".", "-delete", f"/Groups/{USER}"], log)\n', "", held),
+            "the group left": (self.SANDBOX, '    if exists("/Groups") and admin(["dscl", ".", "-delete", f"/Groups/{USER}"], '
+                                             'log) != 0:\n        left.append("the group")\n', "", held),
             "the id not checked": (self.SANDBOX, '1 if ids() else 0', "0", held),
-            "the generator its own": (self.SANDBOX, '"root:wheel" if name != "src" else', '"root:wheel" if name == "x" else',
+            "the generator its own": (self.SANDBOX, '"--", "root:wheel" if name != "src" else',
+                                      '"--", "root:wheel" if name == "x" else',
                                       held),
         }
         for case, (path, old, new, message) in cases.items():

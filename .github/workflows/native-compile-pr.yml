@@ -268,7 +268,9 @@ jobs:
     # finished, passed or failed; with nothing sealed (no key pair set yet) it posts native's result line alone, with no
     # detail, still head-marked, so the may-app merge gate is never left without a result.
     needs: [admission, native]
-    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    # A sandboxed run (the temporary sandbox input, #161) posts nothing: it is an experiment, never the pull request's
+    # own iOS check (coordinator, 31 Oct, run 41170609342).
+    if: ${{ !cancelled() && needs.admission.result == 'success' && !inputs.sandbox }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
     timeout-minutes: 10

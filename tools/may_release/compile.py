@@ -74,8 +74,11 @@ def credentials_left(private):
 BUILD_SECONDS = 40 * 60
 
 
-def say(stage, status):
-    print(f"May iOS compile {stage}: " + ("did not finish" if status is None else f"exit {int(status)}"))
+def say(stage, status, cause=None):
+    """One fixed line: the stage's name, its exit status, and for a failed sandbox command mac_sandbox's
+    ERROR_CLASSES word."""
+    line = f"May iOS compile {stage}: " + ("did not finish" if status is None else f"exit {int(status)}")
+    print(line + (f" ({cause})" if cause in mac_sandbox.ERROR_WORDS else ""))
 
 
 def sandbox_project(source, private):
@@ -162,8 +165,10 @@ def compile_native(platform, target=None, record=False, sandbox=False):
             try:
                 passed = build_sandboxed(source, private, binary.parents[2], developer, target, log)
             finally:
-                if not mac_sandbox.teardown(log):
-                    print("May iOS compile: some files of the build user could not be removed")
+                left = mac_sandbox.teardown(log)
+                if left:
+                    print("May iOS compile: the build user's files could not all be removed from "
+                          + ", ".join(name for name in left if name in mac_sandbox.TEARDOWN_NAMES))
             (private / OUTCOME).write_text(json.dumps({"result": "passed" if passed else "failed"}))
             print("Protected May iOS compile finished; its outcome and log stay in this runner's private files")
             return
