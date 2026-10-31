@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -74,11 +75,16 @@ def credentials_left(private):
 BUILD_SECONDS = 40 * 60
 
 
-def say(stage, status, cause=None):
+MARK = re.compile(r"[0-9a-f]{8}")
+
+
+def say(stage, status, cause=None, mark=None):
     """One fixed line: the stage's name, its exit status, and for a failed sandbox command mac_sandbox's
-    ERROR_CLASSES word."""
+    ERROR_CLASSES word and, for a build stage, the eight-digit mark of its telling line (mac_sandbox.said_mark)."""
     line = f"May iOS compile {stage}: " + ("did not finish" if status is None else f"exit {int(status)}")
-    print(line + (f" ({cause})" if cause in mac_sandbox.ERROR_WORDS else ""))
+    word = cause if cause in mac_sandbox.ERROR_WORDS else None
+    mark = mark if isinstance(mark, str) and MARK.fullmatch(mark) else None
+    print(line + (f" ({word}{' #' + mark if mark else ''})" if word else ""))
 
 
 def sandbox_project(source, private):
@@ -103,7 +109,8 @@ def build_sandboxed(source, private, generator, developer, target, log):
                       Path(os.environ["RUNNER_TEMP"]), sandbox_project(source, private), say=say)
     root = mac_sandbox.ROOT
     tools = [root / "xcodegen/xcodegen/bin"]
-    env = [f"DEVELOPER_DIR={developer}"]
+    # Every cache the tools may keep is the user's own (coordinator, 31 Oct): HOME and TMPDIR are set by sandboxed.
+    env = [f"DEVELOPER_DIR={developer}", f"XDG_CACHE_HOME={root / 'home/.cache'}"]
     deadline = time.monotonic() + BUILD_SECONDS
     # Run 41173870659: xcodegen generate exited 1 as the user. Its version first tells the binary (unreadable, not
     # run) from the spec; each stage's line carries mac_sandbox.ERROR_CLASSES' word for what it wrote when it failed.
@@ -113,11 +120,22 @@ def build_sandboxed(source, private, generator, developer, target, log):
     say("xcodegen version", status, mac_sandbox.said_since(log, start) if status else None)
     if status != 0:
         return False
+    # Run 41177789639: generate failed with words matching no class. dump reads and checks the spec and writes
+    # nothing, so a spec that cannot be read shows apart from a project that cannot be written.
+    start = mac_sandbox.log_size(log)
+    status = mac_sandbox.step(mac_sandbox.sandboxed(["xcodegen", "dump", "--spec", str(root / "src/ios/project.yml"),
+                                                     "--type", "summary"], tools, env), log, "/", deadline)
+    stop_all(log)
+    say("xcodegen dump", status, *((mac_sandbox.said_since(log, start), mac_sandbox.said_mark(log, start))
+                                   if status else ()))
+    if status != 0:
+        return False
     start = mac_sandbox.log_size(log)
     status = mac_sandbox.step(mac_sandbox.sandboxed(["xcodegen", "generate", "--spec", str(root / "src/ios/project.yml")],
                                                     tools, env), log, "/", deadline)
     stop_all(log)
-    say("xcodegen", status, mac_sandbox.said_since(log, start) if status else None)
+    say("xcodegen", status, *((mac_sandbox.said_since(log, start), mac_sandbox.said_mark(log, start))
+                              if status else ()))
     if status != 0:
         return False
     for scheme in IOS_SCHEMES[target]:
@@ -128,7 +146,8 @@ def build_sandboxed(source, private, generator, developer, target, log):
              "-derivedDataPath", str(root / "derived"), "-clonedSourcePackagesDirPath", str(root / "packages"),
              "CODE_SIGNING_ALLOWED=NO", "build"], tools, env), log, "/", deadline)
         stop_all(log)
-        say("xcodebuild " + scheme, status, mac_sandbox.said_since(log, start) if status else None)
+        say("xcodebuild " + scheme, status, *((mac_sandbox.said_since(log, start), mac_sandbox.said_mark(log, start))
+                                             if status else ()))
         if status != 0:
             return False
     return True
