@@ -46,6 +46,7 @@ from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
 from store import StoreError, child_env, require_step_secrets, runner_root, write_private
+import mac_sandbox
 import toolchain
 
 COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
@@ -193,7 +194,9 @@ def compile_record(sha, root):
             text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() and not log.is_symlink() else ""
         except OSError:
             text = ""
-        errors, total = diagnostics(text, [checkout, checkout.resolve()], exclude=EXCLUDED)
+        # A sandboxed build (compile.py --sandbox) names its own copy, under /private/var or its /var link.
+        copies = [mac_sandbox.ROOT / "src", Path("/var") / mac_sandbox.ROOT.relative_to("/private/var") / "src"]
+        errors, total = diagnostics(text, [checkout, checkout.resolve(), *copies], exclude=EXCLUDED)
         errors = [e for e in errors if 0 < len(e) <= MAX_ERROR_LINE and "\n" not in e and "\r" not in e]
     return checked_record({"sha": sha, "passed": passed, "errors": errors, "total": total}, sha)
 

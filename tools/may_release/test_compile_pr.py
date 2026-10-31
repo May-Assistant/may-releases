@@ -351,7 +351,7 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
             "an artifact": (compile_step, "      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n" + compile_step,
                 name + "is not the iOS-only May Playground compile with its one sealed record as the only artifact"),
             "a push trigger": ("on:\n  workflow_dispatch:\n", "on:\n  push:\n  workflow_dispatch:\n",
-                name + "is not dispatched with exactly pr_number and source_sha"),
+                name + "is not dispatched with exactly pr_number, source_sha and the sandbox input"),
             "the PR token in admission": ('          GH_TOKEN: ${{ github.token }}\n          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n          MAY_PR_NUMBER',
                 '          GH_TOKEN: ${{ github.token }}\n          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n'
                 '          MAY_SOURCE_SHA: ${{ inputs.source_sha }}\n          MAY_PR_NUMBER', secret),
