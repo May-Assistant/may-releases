@@ -499,6 +499,28 @@ class SealOpenPostTests(Case):
         self.assertEqual((code, [c[0] for c in calls]), (0, ["GET", "GET"]))
         self.assertIn("already posted", out)
 
+    def test_a_hundred_long_non_ascii_failures_still_seal(self):
+        """Coordinator, 31 Oct (#65): ensure_ascii made a hundred long non-ASCII failures too large to seal."""
+        failures = [{"name": "ü" * tool.MAX_NAME, "message": "é" * tool.MAX_MESSAGE}] * tool.MAX_FAILURES
+        self.record("swift", passed=False, failed=300, total=500, failures=failures)
+        os.environ[tool.RECIPIENT] = self.public
+        try:
+            self.quiet(tool.seal, SHA, "swift")
+        except DsTestsError as refused:
+            self.fail("the record was not sealed: " + refused.args[0])
+        data = tool.sealed_bytes({**self.record("swift", passed=False, failed=300, total=500, failures=failures)})
+        kept = json.loads(data.decode("utf-8"))
+        self.assertLessEqual(len(data), tool.MAX_RECORD)
+        self.assertEqual(kept["failed"], 300)
+        self.assertEqual(kept["failures"], failures, "as UTF-8, every listed failure fits")
+        big = [{"name": "x", "message": "\U0001F600" * 800}] * tool.MAX_FAILURES
+        data = tool.sealed_bytes({"sha": SHA, "suite": "swift", "ran": True, "passed": False, "total": 500,
+                                  "failed": 300, "skipped": 0, "failures": big})
+        cut = json.loads(data.decode("utf-8"))
+        self.assertLessEqual(len(data), tool.MAX_RECORD)
+        self.assertTrue(70 < len(cut["failures"]) < tool.MAX_FAILURES, "only as many as must be are dropped")
+        self.assertEqual(cut["failed"], 300)
+
     def test_a_record_for_another_commit_or_suite_is_refused(self):
         for changes in ({"sha": OTHER}, {"suite": "android"}, {"passed": True, "failed": 1}, {"total": -1},
                         {"failures": [{"name": "x\ny", "message": ""}], "failed": 1, "passed": False}):

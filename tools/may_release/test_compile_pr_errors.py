@@ -743,6 +743,50 @@ class SealedRoundTripTests(PostCase):
             self.run_step(lambda: tool.open_record(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public,
                                                                     MAY_RENDERS_DECRYPT_KEY=self.secret))
 
+    def test_a_hundred_long_non_ascii_errors_still_cross_sealed(self):
+        """Coordinator, 31 Oct (#65): with ensure_ascii, each non-ASCII character cost six bytes, so a hundred long
+        non-ASCII errors were too large to seal and nothing was posted. They now cross as UTF-8, the last dropped if
+        need be, with the total kept."""
+        # The worst case the caps allow: a 240-character path and a 240-character message, every character non-ASCII.
+        log = "\n".join(f"{CK}/ios/{'ü' * 226}{n:03}.swift:1:1: error: {'é' * 236} {n:03}" for n in range(150))
+        (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": "failed"}))
+        (self.private / tool.LOG).write_text(log.replace(CK, str(self.checkout)), encoding="utf-8")
+        try:
+            self.run_step(lambda: tool.seal(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public))
+        except CompilePrError as refused:
+            self.fail("the record was not sealed: " + refused.args[0])
+        sealed = (self.root / tool.SEALED / tool.SEALED_NAME).read_bytes()
+        shutil.rmtree(self.private)
+        self.private.mkdir()
+        (self.root / tool.DOWNLOAD).mkdir()
+        (self.root / tool.DOWNLOAD / tool.SEALED_NAME).write_bytes(sealed)
+        try:
+            self.run_step(lambda: tool.open_record(SHA), self.environ(MAY_RENDERS_RECIPIENT=self.public,
+                                                                    MAY_RENDERS_DECRYPT_KEY=self.secret))
+        except CompilePrError as refused:
+            self.fail("the record was not opened: " + refused.args[0])
+        record = json.loads((self.private / tool.RECORD).read_text())
+        self.assertEqual(record["total"], 150)
+        self.assertEqual(len(record["errors"]), 100, "as UTF-8, every listed error fits")
+        self.assertTrue(record["errors"][0].startswith("ios/" + "ü" * 226 + "000.swift:1:1: error: " + "é" * 10))
+
+    def test_the_record_is_cut_only_when_it_must_be(self):
+        # Larger than the caps allow (four-byte characters, 700 of them a line), so the cut is reached.
+        record = {"sha": SHA, "passed": False, "errors": ["\U0001F600" * 700] * 100, "total": 150}
+        data = tool.sealed_bytes(record)
+        self.assertLessEqual(len(data), tool.MAX_RECORD)
+        kept = json.loads(data.decode("utf-8"))
+        self.assertEqual((kept["total"], kept["errors"]), (150, record["errors"][:len(kept["errors"])]))
+        self.assertGreater(len(kept["errors"]), 80, "only as many as must be are dropped")
+        self.assertLess(len(kept["errors"]), 100)
+        self.assertEqual(len(record["errors"]), 100, "the caller's record is not changed")
+        # Coordinator, 31 Oct: a hard bound. When not even one listed error fits, the counts-only record is sealed.
+        alone = tool.sealed_bytes({"sha": SHA, "passed": False, "errors": ["x" * (tool.MAX_RECORD + 1)], "total": 7})
+        self.assertEqual(json.loads(alone), {"sha": SHA, "passed": False, "errors": [], "total": 7})
+        self.assertLessEqual(len(alone), tool.MAX_RECORD)
+        small = {"sha": SHA, "passed": False, "errors": ["ü" * 10] * 3, "total": 3}
+        self.assertEqual(json.loads(tool.sealed_bytes(small)), small)
+
     def test_another_key_a_tampered_record_or_another_commit_is_refused(self):
         self.sealed_and_handed_over()
         other = next(line for line in subprocess.run(["age-keygen"], capture_output=True, text=True,
