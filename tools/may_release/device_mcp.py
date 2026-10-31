@@ -345,6 +345,17 @@ LOOK_ENV, MAX_LOOKS = "MAY_DEVICE_LOOK", 4
 # shows one view's header and composer; that view's own ids (its prefix) are chrome, never messages.
 LOOK_ANCHORS = (("chat.header", "chat.composer"), ("messageThread.header", "messageThread.composer"),
                 ("thread.header", "thread.composer"))
+# A thread's replies rule ("No replies yet", "N replies") is chrome in any view, whoever names it (N and the
+# coordinator, 31 Oct): iOS's message thread (messageThread.replies), a task thread (thread.replies), and the design
+# system's, which Android shows (mayThread.replies).
+LOOK_CHROME = ("messageThread.replies", "thread.replies", "mayThread.replies")
+
+
+def shown_words(attributes):
+    """Whether a node shows words: its text, or its label. Run 41169912308: on iOS, Maestro puts a SwiftUI Text's string
+    in accessibilityText (its label) and leaves text empty, so a thread showing May's message and its card counted
+    none, and the row failed as blank. Android's content-desc counts the same way."""
+    return any(str(attributes.get(key) or "").strip() for key in ("text", "accessibilityText", "content-desc"))
 
 
 def chat_shown(nodes, boxes):
@@ -364,8 +375,8 @@ def chat_shown(nodes, boxes):
     chrome = pair[0].rpartition(".")[0] + "."
     shown = 0
     for attributes, box in zip(nodes, boxes):
-        if not box or str(attributes.get("resource-id") or "").startswith(chrome) or \
-                not str(attributes.get("text") or "").strip():
+        rid = str(attributes.get("resource-id") or "")
+        if not box or rid.startswith(chrome) or rid in LOOK_CHROME or not shown_words(attributes):
             continue
         x, y = (int(box[1]) + int(box[3])) / 2, (int(box[2]) + int(box[4])) / 2
         shown += left <= x <= right and top < y < bottom
