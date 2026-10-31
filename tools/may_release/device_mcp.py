@@ -178,6 +178,46 @@ def tool(config, argv, timeout=90, both=False):
 DRIVER_FILE, DRIVER_LINES, MAX_DRIVER = "driver.txt", 40, 32 * 1024
 
 
+# Coordinator, 31 Oct (run 41164564379): in a card's thread a tap never returned and a swipe hung after COMPLETED, on a
+# screen whose pixels did not change, and nothing kept said what the XCTest runner was waiting for. For each refused
+# act, the runner's own unified log over the act's window is read and its lines counted into RUNNER_KINDS' fixed words
+# (first match, else other); only the counts are kept, on one line after the act's driver lines. Waits for the app to
+# idle that never end point at the app (a repeating animation, or main-queue work), not at the harness.
+RUNNER_LOG = 'process BEGINSWITH "maestro-driver"'
+RUNNER_KINDS = (("idle waits", re.compile(rb"to (?:become )?idle|wait(?:ing)? for [^\n]*idle", re.IGNORECASE)),
+                ("animations not complete", re.compile(rb"animations? complete", re.IGNORECASE)),
+                ("quiescence", re.compile(rb"quiescen", re.IGNORECASE)),
+                ("event synthesis", re.compile(rb"synthesi[sz]", re.IGNORECASE)),
+                ("snapshots", re.compile(rb"snapshot", re.IGNORECASE)),
+                ("timeouts", re.compile(rb"timed? ?out|timeout", re.IGNORECASE)))
+RUNNER_SECONDS = 20
+
+
+def runner_counts(config, started, ended):
+    """RUNNER_KINDS' counts, and other, over the runner's log lines from started to a second after ended; None when the
+    log could not be read."""
+    status, out = tool(config, ["xcrun", "simctl", "spawn", config["udid"], "log", "show", "--style", "compact",
+                                "--start", stamp(started)[:19], "--end",
+                                stamp(ended + datetime.timedelta(seconds=1))[:19], "--predicate", RUNNER_LOG],
+                       timeout=RUNNER_SECONDS)
+    if status:
+        return None
+    counts = dict.fromkeys([kind for kind, _ in RUNNER_KINDS] + ["other"], 0)
+    for line in out.splitlines():
+        # log show's own header ("Timestamp ...", "Filtering the log data using ...") is not one of the runner's lines.
+        if not line.strip() or line.startswith((b"Timestamp", b"Filtering", b"Skipping")):
+            continue
+        counts[next((kind for kind, pattern in RUNNER_KINDS if pattern.search(line)), "other")] += 1
+    return counts
+
+
+def runner_line(counts):
+    """The fixed line the counts are kept as."""
+    if counts is None:
+        return b"runner log: unreadable\n"
+    return ("runner log: " + ", ".join(f"{kind} {int(n)}" for kind, n in counts.items()) + "\n").encode()
+
+
 def flow(config, command):
     """One Maestro flow holding exactly one command this server wrote, run on the configured simulator."""
     path = os.path.join(config["flows"], "act.yaml")
@@ -187,7 +227,8 @@ def flow(config, command):
     status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], timeout=ACT_SECONDS,
                         both=True)
     if status:
-        refused(config, command, said, started, utc_now())
+        ended = utc_now()
+        refused(config, command, said, started, ended, runner_line(runner_counts(config, started, ended)))
         config["refusal_cause"] = driver_cause(said)
     return status
 
@@ -201,11 +242,13 @@ def stamp(moment):
     return moment.strftime("%Y-%m-%d %H:%M:%S.") + f"{moment.microsecond // 1000:03d}"
 
 
-def refused(config, command, said, started, ended):
+def refused(config, command, said, started, ended, runner=b""):
     """One refused act's last lines, redacted, added to DRIVER_FILE while it has room; never an error. Its header has
-    the act's start and end in UTC (coordinator, 25 Oct), so the watchdog's stalls line up with the acts."""
+    the act's start and end in UTC (coordinator, 25 Oct), so the watchdog's stalls line up with the acts; runner, the
+    XCTest runner's counts for the act (runner_line), follows its lines."""
     lines, _ = kept_lines(b"".join(said.splitlines(keepends=True)[-DRIVER_LINES:]), "")
     act, _ = kept_lines(command.splitlines()[0].encode(), "")
+    lines = (lines if not lines or lines.endswith(b"\n") else lines + b"\n") + runner
     part = (b"== refused: " + act.strip() + b" (action " + str(config["actions"]).encode() + b", " +
             stamp(started).encode() + b" to " + stamp(ended).encode() + b" UTC) ==\n" + lines)
     path = os.path.join(config["flows"], DRIVER_FILE)
@@ -420,8 +463,13 @@ DUMP_FAILURES = ("adb failed", "no idle state", "unreadable", "iOS hierarchy fai
 # Maestro was waiting for the screen to settle after it ("settle timeout": Maestro's own status line for the command
 # ending "... COMPLETED", then tool's "(timed out)"). Anchored to that line's end, so typed text holding the word is
 # not one (independent review of #139).
+# Run 41164564379: a tap whose status line never reached COMPLETED (Maestro's line for the command ending "...", then
+# nothing but the tool's "(timed out)") is "hung in act", not a snapshot time-out: the driver never came back from the
+# act itself.
 CAUSE_PATTERNS = (("settle timeout", re.compile(rb"(?m)(?:Tap|Input text|Swip|Press)[^\n]*\.\.\. COMPLETED[ \t\r]*$"
                                                 rb"(?s:.*)\n\(timed out\)\n\Z")),
+                  ("hung in act", re.compile(rb"(?m)^(?:Tap|Input text|Swip|Press)[^\n]*\.\.\.[ \t\r]*\n"
+                                             rb"(?:[ \t\r]*\n)*\(timed out\)\n\Z")),
                   ("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
                   ("snapshot timeout", re.compile(rb"timed? ?out|timeout|snapshot", re.IGNORECASE)),
                   ("lost connection", re.compile(rb"connection (?:refused|reset|lost|closed)|broken pipe|unavailable|"
@@ -656,7 +704,10 @@ def ios_act(name, args, ints, config):
             refused(config, command, TYPED_NOTHING_LINE, started, utc_now())
             config["refusal_cause"] = "typed nothing"
     config["refusals"] = config["refusals"] + 1 if status else 0
-    stuck = bool(status) and config.get("refusal_cause") == "snapshot timeout" == config.get("dump_cause")
+    # A tap that hung in the act was counted as a snapshot time-out until run 41164564379 named it apart; it stops the
+    # agent after a timed-out read just as before.
+    stuck = bool(status) and config.get("refusal_cause") in ("snapshot timeout", "hung in act") and \
+        config.get("dump_cause") == "snapshot timeout"
     if not status:
         # A taken act changes the screen, so an earlier read's time-out no longer says it is stuck (independent review
         # of #139).

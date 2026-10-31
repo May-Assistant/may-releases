@@ -1891,12 +1891,65 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertIn(b"***@example.com was signed in", kept)
         for absent in (b"Bearer", b"sam@", b"step 0\n", b"step 20\n"):
             self.assertNotIn(absent, kept)
-        self.assertEqual(len(kept.splitlines()), 1 + device_mcp.DRIVER_LINES - 1, "the last 40 lines, one dropped")
+        self.assertEqual(len(kept.splitlines()), 1 + device_mcp.DRIVER_LINES - 1 + 1,
+                         "the last 40 lines, one dropped, and the runner's counts")
+        self.assertTrue(kept.endswith(b"runner log: unreadable\n"), "this fake's log show fails too")
         with patch("device_mcp.subprocess.run", side_effect=run):
             for _ in range(200):
                 device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
         self.assertLessEqual((self.work / device_mcp.DRIVER_FILE).stat().st_size, device_mcp.MAX_DRIVER)
         self.assertTrue((self.work / device_mcp.DRIVER_FILE).read_bytes().startswith(kept), "the first refusals stay")
+
+    def test_a_refused_act_keeps_the_xctest_runners_counts_for_its_window(self):
+        """Coordinator, 31 Oct (run 41164564379): a tap never came back and a swipe hung after COMPLETED on a static
+        screen. The XCTest runner's own log over each refused act's window is counted into fixed words, never kept."""
+        said = b"Running on iPhone 16 Pro\n > Flow act\nTap on point (237,316)...\n(timed out)\n"
+        runner = (b"Timestamp               Ty Process[PID:TID]\n"
+                  b"2026-10-31 03:48:57.001 Df maestro-driver-iosUITests-Runner[1:2] Synthesize event\n"
+                  b"2026-10-31 03:48:57.020 Df maestro-driver-iosUITests-Runner[1:2] Wait for io.github.x to idle\n"
+                  b"2026-10-31 03:49:27.020 Df maestro-driver-iosUITests-Runner[1:2] Wait for io.github.x to idle\n"
+                  b"2026-10-31 03:49:30.000 Df maestro-driver-iosUITests-Runner[1:2] App animations complete "
+                  b"notification not received, will attempt to continue.\n"
+                  b"2026-10-31 03:49:31.000 Df maestro-driver-iosUITests-Runner[1:2] sam@example.com Bearer abc\n"
+                  b"\n")
+        asked = []
+
+        def run(argv, capture_output, stdin, timeout, env):
+            listed = simctl_list(argv, self.bundle)
+            if listed is not None:
+                return subprocess.CompletedProcess(argv, 0, listed, b"")
+            if "log" in argv:
+                asked.append((argv[argv.index("--start") + 1], argv[argv.index("--end") + 1],
+                              argv[argv.index("--predicate") + 1], timeout))
+                return subprocess.CompletedProcess(argv, 0, runner, b"")
+            return subprocess.CompletedProcess(argv, 1, said, b"")
+
+        start = datetime.datetime(2026, 10, 31, 3, 48, 56, 579000, tzinfo=datetime.timezone.utc)
+        moments = iter([start, start + datetime.timedelta(seconds=60, milliseconds=707)])
+        with patch("device_mcp.subprocess.run", side_effect=run), patch("device_mcp.utc_now", side_effect=moments):
+            failed, _ = device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
+        self.assertTrue(failed)
+        self.assertEqual(asked, [("2026-10-31 03:48:56", "2026-10-31 03:49:58", 'process BEGINSWITH "maestro-driver"',
+                                  device_mcp.RUNNER_SECONDS)])
+        kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
+        self.assertTrue(kept.endswith(b"Tap on point (237,316)...\n(timed out)\nrunner log: idle waits 2, animations not "
+                                      b"complete 1, quiescence 0, event synthesis 1, snapshots 0, timeouts 0, other 1\n"),
+                        kept)
+        for absent in (b"Bearer", b"sam@", b"io.github.x", b"Synthesize"):
+            self.assertNotIn(absent, kept, "only the counts are kept")
+        self.assertEqual(self.config["refusal_cause"], "hung in act", "the tap never came back from the act itself")
+
+    def test_a_tap_that_hung_in_the_act_after_a_timed_out_read_still_stops_the_agent(self):
+        def hung(config, command):
+            config["refusal_cause"] = "hung in act"
+            return 1
+
+        for read, wedged in (("snapshot timeout", True), (None, False)):
+            with self.subTest(read=read):
+                self.config.update(refusals=0, wedged=False, dump_cause=read)
+                with patch("device_mcp.flow", side_effect=hung):
+                    self.call("tap", x=180, y=120)
+                self.assertEqual(self.config["wedged"], wedged)
 
     def test_refused_acts_are_stamped_on_the_utc_clock_the_watchdog_lines_use(self):
         self.assertEqual(device_mcp.utc_now().utcoffset(), datetime.timedelta(0))
@@ -1948,7 +2001,7 @@ class IosDeviceServerTests(unittest.TestCase):
         DRIVER_CAUSES and only the word is kept (coordinator, 26 Oct)."""
         cases = {b"Tap on point (189,250)... COMPLETED\nWARNING: GL pipe is running in software mode\n\n(timed out)\n":
                  "settle timeout",
-                 b"Tap on point (133,577)...\n(timed out)\n": "snapshot timeout",
+                 b"Tap on point (133,577)...\n(timed out)\n": "hung in act",
                  b"Timed out waiting for the snapshot of the accessibility hierarchy": "snapshot timeout",
                  b"Failed to wait for app to idle (quiescence)": "not idle",
                  b"io.grpc.StatusRuntimeException: UNAVAILABLE: Connection refused": "lost connection",
@@ -1970,14 +2023,16 @@ class IosDeviceServerTests(unittest.TestCase):
         stored = json.loads(Path(self.config["result"]).read_text())
         self.assertEqual((stored["hierarchy_failure"], stored["hierarchy_cause"]), (None, None),
                          "a read that worked keeps no cause")
-        self.assertEqual(device_mcp.DRIVER_CAUSES, ("settle timeout", "not idle", "snapshot timeout", "lost connection", "app not running",
+        self.assertEqual(device_mcp.DRIVER_CAUSES, ("settle timeout", "hung in act", "not idle", "snapshot timeout",
+                                                    "lost connection", "app not running",
                                                     "scale unknown", "typed nothing", "other"))
         self.assertEqual(device_mcp.driver_cause(b"Tap on point (201,803)... COMPLETED\nidle\n"), "not idle",
                          "COMPLETED alone, with no act that ran out of time, is no settle timeout")
         for typed in (b"Input text COMPLETED...\n(timed out)\n", b"Input text a COMPLETED b...\n(timed out)\n"):
             with self.subTest(typed=typed):
-                self.assertEqual(device_mcp.driver_cause(typed), "snapshot timeout",
-                                 "typed text holding COMPLETED is not Maestro's status line (independent review of #139)")
+                # Typed text holding COMPLETED is not Maestro's status line (independent review of #139): the type
+                # never came back from the act, so it hung in it.
+                self.assertEqual(device_mcp.driver_cause(typed), "hung in act")
         self.assertEqual(device_mcp.driver_cause(b"Swipe from (1,2) to (3,4)... COMPLETED\n(timed out)\n"),
                          "settle timeout")
 
