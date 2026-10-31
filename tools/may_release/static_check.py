@@ -974,7 +974,8 @@ COMPILE_PR_STEP_NAMES = ["Install pinned age, before any pull request code",
 POST_STEP_NAMES = ["Install pinned age", "", "Decrypt and check the compile record",
                    "Post the errors on the may-app pull request, never in this log", "Remove the decrypted record"]
 COMPILE_PR_CONDITIONS = ["if: ${{ !inputs.sandbox }}", "if: ${{ inputs.sandbox }}", "if: always()", "if: always()",
-                         "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
+                         "if: ${{ !cancelled() && needs.admission.result == 'success' && !inputs.sandbox }}",
+                         "if: always()"]
 SWIFT_STEP_NAMES = ["Check the pull request head and environment before fetching",
                     "Fetch the pull request head and pinned design system quietly",
                     "Run the Swift checks without any credential, printing only pass or fail and a count",
@@ -2000,13 +2001,33 @@ MAC_SANDBOX_TOOL = "mac_sandbox.py"
 MAC_SANDBOX_LEFTOVER_DIRS = ("/private/tmp", "/private/var/tmp", "/private/var/folders")
 SANDBOXES = {
     SANDBOX_TOOL: {"deny": ("/etc/cron.deny", "/etc/at.deny"), "dirs": SANDBOX_LEFTOVER_DIRS, "bin": "/usr/bin",
+                   "home": "'chmod', '0700'",
                    "groups": r"'(-G|--groups|-aG|sudo|wheel|admin)'", "removal": ["admin(['userdel', USER], log)"]},
     MAC_SANDBOX_TOOL: {"deny": ("/usr/lib/cron/cron.deny", "/usr/lib/cron/at.deny"), "dirs": MAC_SANDBOX_LEFTOVER_DIRS,
                        # root:wheel owns its folders; no membership of wheel, admin or any group is given to it.
+                       # BSD getopt: "--" before the mode (run 41170609342).
+                       "home": "'chmod', '--', '0700'",
                        "bin": "/bin", "groups": r"'(GroupMembership|GroupMembers|-append|-merge|admin|staff|sudo)'",
                        "removal": ["admin(['dscl', '.', '-delete', f'/Users/{USER}'], log)",
                                                   "admin(['dscl', '.', '-delete', f'/Groups/{USER}'], log)"]},
 }
+
+
+def teardown_pinned(tool, function, spec):
+    """sandbox.py's teardown is exactly its five statements; mac_sandbox.py's (run 41170609342: it names what it could
+    not remove, and looks for no user, files or processes that were never made) kills, sweeps each LEFTOVER_DIRS folder,
+    removes the sandbox and deletes the user and the group."""
+    body = [ast.unparse(n) for n in function.body[1:] if not isinstance(n, ast.Expr) or
+            not isinstance(n.value, ast.Constant)]
+    if tool == SANDBOX_TOOL:
+        return body == ["stop_all(log, strict=False)", "swept = admin(leftovers(), log) == 0",
+                        "admin(['rm', '-rf', '--', str(ROOT)], log)", *spec["removal"], "return swept"]
+    text = ast.unparse(function)
+    return all(part in text for part in ("stop_all(log, strict=False)", "for folder in LEFTOVER_DIRS",
+                                         "admin(leftovers(folder), log) != 0",
+                                         "admin(['rm', '-rf', '--', str(ROOT)], log) != 0",
+                                         *(r.replace(", log)", ", log) != 0") for r in spec["removal"]),
+                                         "return left"))
 
 
 def sandbox_problems(root, tool=SANDBOX_TOOL):
@@ -2027,16 +2048,12 @@ def sandbox_problems(root, tool=SANDBOX_TOOL):
             f"'{spec['bin']}/kill', '-KILL', '-1'" not in text["stop_all"] or \
             "'pgrep', '-u', USER" not in text["stop_all"] or "for _ in range(STOP_ROUNDS)" not in text["stop_all"] or \
             "for path in DENY_FILES" not in text["setup"] or f"'{spec['bin']}/test', '!', '-x'" not in text["setup"] or \
-            "for path in (home, runner_temp)" not in text["setup"] or "'chmod', '0700'" not in text["setup"] or \
-            [ast.unparse(n) for n in fns["teardown"].body[1:] if not isinstance(n, ast.Expr) or
-             not isinstance(n.value, ast.Constant)] != ["stop_all(log, strict=False)",
-                                                         "swept = admin(leftovers(), log) == 0",
-                                                         "admin(['rm', '-rf', '--', str(ROOT)], log)",
-                                                         *spec["removal"], "return swept"] or \
+            "for path in (home, runner_temp)" not in text["setup"] or spec["home"] not in text["setup"] or \
+            not teardown_pinned(tool, fns["teardown"], spec) or \
             "stop_all(log, strict=False)" not in text["step"] or ".kill(" in text["step"] or ".terminate(" in text["step"]:
         return [tool + ": the unprivileged user is not exactly a fresh, groupless, sealed-off user, killed until "
                 "none is left and removed with its files"]
-    if tool == MAC_SANDBOX_TOOL and ("'chown', '-R', 'root:wheel' if name != 'src'" not in text["setup_commands"] or
+    if tool == MAC_SANDBOX_TOOL and ("'chown', '-R', '--', 'root:wheel' if name != 'src'" not in text["setup_commands"] or
                                      "'UserShell', '/usr/bin/false'" not in text["setup_commands"] or
                                      "if ids()" not in text["setup"] and "1 if ids() else 0" not in text["setup"]):
         return [tool + ": the unprivileged user is not exactly a fresh, groupless, sealed-off user, killed until "

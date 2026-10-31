@@ -906,6 +906,9 @@ class ShapeTests(unittest.TestCase):
             "the sandbox on by default": ("        type: boolean\n        default: false\n",
                                           "        type: boolean\n        default: true\n",
                                           name + "is not dispatched with exactly pr_number, source_sha and the sandbox"),
+            # Run 41170609342 posted "failed" on may-app #1510 from a sandbox experiment (coordinator, 31 Oct).
+            "a sandboxed run that posts": (" && !inputs.sandbox }}\n", " }}\n",
+                                           name + "sets a shell, defaults, a condition or a timeout"),
             "no sandbox input": ("      sandbox:\n", "      sandboxed:\n",
                                  name + "is not dispatched with exactly pr_number, source_sha and the sandbox"),
             "both builds by default": ("        if: ${{ inputs.sandbox }}\n", "",

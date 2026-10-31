@@ -24,6 +24,7 @@ sandbox's own setup or teardown, never the pull request's code. Nothing is print
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 
@@ -47,13 +48,49 @@ class SandboxError(ValueError):
 def admin(argv, log, data=None):
     """One root command of the sandbox's own setup or teardown, with data on its stdin when given; its status, or
     None."""
+    return admin_said(argv, log, data)[0]
+
+
+# Run 41170609342: the runner's home could not be closed, and nothing said why. What a failed setup command wrote is
+# sorted into ERROR_CLASSES' fixed words (first match, else "other"; "did not start" when it never ran) for the
+# caller's fixed line; the words themselves go to the private log alone.
+ERROR_CLASSES = (("no such file", re.compile(rb"No such file", re.IGNORECASE)),
+                 ("not permitted", re.compile(rb"Operation not permitted", re.IGNORECASE)),
+                 ("permission denied", re.compile(rb"Permission denied", re.IGNORECASE)),
+                 ("sudo refused", re.compile(rb"password is required|sudo: ", re.IGNORECASE)),
+                 ("usage", re.compile(rb"usage:|illegal option|invalid", re.IGNORECASE)),
+                 ("exists", re.compile(rb"already exists|eDSRecordAlreadyExists", re.IGNORECASE)),
+                 ("read-only", re.compile(rb"Read-only file system", re.IGNORECASE)))
+
+
+ERROR_WORDS = (*(name for name, _ in ERROR_CLASSES), "other", "did not start")
+TEARDOWN_NAMES = (*LEFTOVER_DIRS, "the sandbox", "the user", "the group")
+
+
+def error_class(said):
+    return next((name for name, pattern in ERROR_CLASSES if pattern.search(said or b"")), "other")
+
+
+def admin_said(argv, log, data=None):
+    """admin's (status, class): what the command wrote goes to the private log, and is sorted into ERROR_CLASSES'
+    words when it failed (None when it succeeded)."""
     try:
         with log.open("ab") as output:
-            return subprocess.run(["sudo", "-n", *argv], stdout=output, stderr=subprocess.STDOUT, input=data,
-                                  stdin=None if data is not None else subprocess.DEVNULL,
-                                  timeout=ADMIN_SECONDS).returncode
+            start = output.tell()
+            status = subprocess.run(["sudo", "-n", *argv], stdout=output, stderr=subprocess.STDOUT, input=data,
+                                    stdin=None if data is not None else subprocess.DEVNULL,
+                                    timeout=ADMIN_SECONDS).returncode
     except (OSError, subprocess.SubprocessError):
-        return None
+        return None, "did not start"
+    if not status:
+        return status, None
+    try:
+        with log.open("rb") as written:
+            written.seek(start)
+            said = written.read(64 * 1024)
+    except OSError:
+        said = b""
+    return status, error_class(said)
 
 
 def sandboxed(argv, path=(), env=()):
@@ -106,37 +143,40 @@ def setup_commands(copies):
                 ["install", "-d", "-o", "root", "-g", "wheel", "-m", "0755", str(ROOT)]]
     for name, path in copies.items():
         commands.append(["cp", "-R", "-p", "--", str(path), str(ROOT / name)])
-        commands.append(["chown", "-R", "root:wheel" if name != "src" else f"{USER}:{USER}", "--", str(ROOT / name)])
+        # macOS's getopt stops at the first operand, so "--" goes before the owner or mode, never after it (run
+        # 41170609342: "chmod 0700 -- home" took "--" for a file).
+        commands.append(["chown", "-R", "--", "root:wheel" if name != "src" else f"{USER}:{USER}", str(ROOT / name)])
         if name != "src":
             # A copy of a private folder keeps its 0700: readable by all, written by none but root.
-            commands.append(["chmod", "-R", "u=rwX,go=rX", "--", str(ROOT / name)])
+            commands.append(["chmod", "-R", "--", "u=rwX,go=rX", str(ROOT / name)])
     commands.append(["install", "-d", "-o", USER, "-g", USER, "-m", "0700", *(str(ROOT / d) for d in OWN_DIRS)])
     return commands
 
 
-def setup(log, copies, home, runner_temp, project=None, ids=ids_taken, say=lambda stage, status: None):
+def setup(log, copies, home, runner_temp, project=None, ids=ids_taken, say=lambda stage, status, cause=None: None):
     """The sandbox made (setup_commands), denied cron and at, and checked as USER unable to enter the runner's home
     or runner temp; refuses otherwise, before any of the pull request's code runs. project, when given, is the
     copy's own project.yml (prepared by the caller), installed over the copied one as USER's. say(stage, status) hears
-    each command's exit status as it ends (the caller prints fixed lines: its stage name and the integer)."""
-    def check(stage, status, refusal):
-        say(stage, status)
+    each command's exit status as it ends, and a failed one's ERROR_CLASSES word (the caller prints fixed lines)."""
+    def check(stage, result, refusal):
+        status, cause = result if isinstance(result, tuple) else (result, None if result == 0 else "other")
+        say(stage, status, cause)
         if status != 0:
             raise SandboxError(refusal + "; nothing ran")
 
     if "src" not in copies:
         raise SandboxError("The unprivileged user has no checkout to build; nothing ran")
     check("ids", 1 if ids() else 0, "The unprivileged user's name or id is already taken")
-    check("home", admin(["chmod", "0700", "--", str(home)], log),
+    check("home", admin_said(["chmod", "--", "0700", str(home)], log),
           "The runner's home could not be closed to the unprivileged user")
     for index, argv in enumerate(setup_commands(copies), 1):
-        check(f"setup {index} {argv[0]}", admin(argv, log), "The unprivileged user could not be set up")
+        check(f"setup {index} {argv[0]}", admin_said(argv, log), "The unprivileged user could not be set up")
     if project is not None:
-        check("project", admin(["install", "-o", USER, "-g", USER, "-m", "0644", str(project),
+        check("project", admin_said(["install", "-o", USER, "-g", USER, "-m", "0644", str(project),
                                 str(ROOT / "src/ios/project.yml")], log),
               "The unprivileged user's project could not be pointed at its own copy")
     for path in DENY_FILES:
-        check("deny", admin(["tee", "-a", "--", path], log, data=(USER + "\n").encode()),
+        check("deny", admin_said(["tee", "-a", "--", path], log, data=(USER + "\n").encode()),
               "The unprivileged user could not be denied cron and at")
     for path in (home, runner_temp):
         check("unreachable", as_sandbox(["/bin/test", "!", "-x", str(path)], log),
@@ -157,20 +197,37 @@ def stop_all(log, strict=True):
         raise SandboxError("A process of the unprivileged user could not be stopped")
 
 
-def leftovers():
-    """The root command that deletes USER's files in each of LEFTOVER_DIRS that exists here."""
-    return ["find", *(d for d in LEFTOVER_DIRS if os.path.isdir(d)), "-xdev", "-user", USER, "-delete"]
+def leftovers(folder):
+    """The root command that deletes USER's files in folder, one of LEFTOVER_DIRS."""
+    return ["find", folder, "-xdev", "-user", USER, "-delete"]
 
 
-def teardown(log):
+def known(kind, run=subprocess.run):
+    """Whether USER exists as a user (kind "/Users") or a group ("/Groups") here, read without root."""
+    try:
+        return run(["dscl", ".", "-read", f"{kind}/{USER}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   stdin=subprocess.DEVNULL, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def teardown(log, exists=known):
     """The sandbox gone: its user's processes, its files in the world-writable places and caches, its copies, the
-    user and the group. True when its files were all removed (the caller says so in a fixed line otherwise)."""
-    stop_all(log, strict=False)
-    swept = admin(leftovers(), log) == 0
-    admin(["rm", "-rf", "--", str(ROOT)], log)
-    admin(["dscl", ".", "-delete", f"/Users/{USER}"], log)
-    admin(["dscl", ".", "-delete", f"/Groups/{USER}"], log)
-    return swept
+    user and the group. What could not be removed, as fixed names (a LEFTOVER_DIRS folder, "the sandbox", "the user",
+    "the group"); empty when all of it went. Run 41170609342: a setup refused before the user was made has no user, so
+    its files, processes and records are not looked for, and nothing is said to be left."""
+    user = exists("/Users")
+    if user:
+        stop_all(log, strict=False)
+    left = [folder for folder in LEFTOVER_DIRS
+            if user and os.path.isdir(folder) and admin(leftovers(folder), log) != 0]
+    if admin(["rm", "-rf", "--", str(ROOT)], log) != 0:
+        left.append("the sandbox")
+    if user and admin(["dscl", ".", "-delete", f"/Users/{USER}"], log) != 0:
+        left.append("the user")
+    if exists("/Groups") and admin(["dscl", ".", "-delete", f"/Groups/{USER}"], log) != 0:
+        left.append("the group")
+    return left
 
 
 def step(argv, log, cwd, deadline):
