@@ -1933,11 +1933,40 @@ class IosDeviceServerTests(unittest.TestCase):
                                   device_mcp.RUNNER_SECONDS)])
         kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
         self.assertTrue(kept.endswith(b"Tap on point (237,316)...\n(timed out)\nrunner log: idle waits 2, animations not "
-                                      b"complete 1, quiescence 0, event synthesis 1, snapshots 0, timeouts 0, other 1\n"),
+                                      b"complete 1, quiescence 0, event synthesis 1, snapshots 0, timeouts 0, other 1\n"
+                                      b"runner other by category: no category 1\n"),
                         kept)
         for absent in (b"Bearer", b"sam@", b"io.github.x", b"Synthesize"):
             self.assertNotIn(absent, kept, "only the counts are kept")
         self.assertEqual(self.config["refusal_cause"], "hung in act", "the tap never came back from the act itself")
+
+    def test_the_runners_other_lines_are_counted_by_category_alone(self):
+        """Run 41180883244: 133 of a hung act's runner lines matched no kind. They are counted by their log category
+        ([subsystem:category]), a name alone, the RUNNER_TOP most frequent kept; never a word of the line."""
+        lines = [b"Timestamp               Ty Process[PID:TID]\n"]
+        lines += [b"2026-10-31 07:53:40.0 Df maestro-driver-iosUITests-Runner[1:2] [com.apple.dt.xctest:Automation] "
+                  b"sam@example.com tapped\n"] * 4
+        lines += [b"2026-10-31 07:53:41.0 Df maestro-driver-iosUITests-Runner[1:2] [com.apple.UIKit:EventDispatch] x\n"] * 2
+        lines += [b"2026-10-31 07:53:42.0 Df maestro-driver-iosUITests-Runner[1:2] Bearer abc no bracket\n"]
+        lines += [b"2026-10-31 07:53:42.0 Df maestro-driver-iosUITests-Runner[1:2] [not a name: has spaces] y\n"]
+        lines += [b"2026-10-31 07:53:43.0 Df maestro-driver-iosUITests-Runner[1:2] [a.b:c%d] y\n"]
+        lines += [b"2026-10-31 07:53:44.0 Df maestro-driver-iosUITests-Runner[1:2] [k%d.sub:cat] z\n" % n for n in range(6)]
+        with patch("device_mcp.tool", return_value=(0, b"".join(lines))):
+            counts = device_mcp.runner_counts(self.config, device_mcp.utc_now(), device_mcp.utc_now())
+        self.assertEqual(counts["other"], 15)
+        self.assertEqual(counts["other by category"], [("com.apple.dt.xctest:Automation", 4), ("no category", 3),
+                                                       ("com.apple.UIKit:EventDispatch", 2), ("k0.sub:cat", 1),
+                                                       ("k1.sub:cat", 1)])
+        line = device_mcp.runner_line(counts)
+        self.assertTrue(line.endswith(b"other 15\nrunner other by category: com.apple.dt.xctest:Automation 4, "
+                                      b"no category 3, com.apple.UIKit:EventDispatch 2, k0.sub:cat 1, k1.sub:cat 1\n"),
+                        line)
+        for absent in (b"sam@", b"Bearer", b"tapped", b"spaces"):
+            self.assertNotIn(absent, line)
+        with patch("device_mcp.tool", return_value=(0, b"x [s:c] idle wait for io.x to idle\n")):
+            self.assertNotIn(b"by category", device_mcp.runner_line(
+                device_mcp.runner_counts(self.config, device_mcp.utc_now(), device_mcp.utc_now())),
+                "with no other line there is no category line")
 
     def test_a_tap_that_hung_in_the_act_after_a_timed_out_read_still_stops_the_agent(self):
         def hung(config, command):
