@@ -86,6 +86,9 @@ def sandbox_project(source, private):
     system is at an absolute path there), in a private file; None when it names no path in the checkout."""
     text = (source / "ios/project.yml").read_text(encoding="utf-8")
     pointed = text.replace(str(source) + "/", str(mac_sandbox.ROOT / "src") + "/")
+    # Fails closed: a spec still naming runner temp would send XcodeGen to files the user cannot reach.
+    if str(source.parent) in pointed or os.environ.get("RUNNER_TEMP", "\0") in pointed:
+        raise SandboxError("The unprivileged user's project still names runner temp; nothing ran")
     if pointed == text:
         return None
     project = private / "sandbox-project.yml"
@@ -102,20 +105,30 @@ def build_sandboxed(source, private, generator, developer, target, log):
     tools = [root / "xcodegen/xcodegen/bin"]
     env = [f"DEVELOPER_DIR={developer}"]
     deadline = time.monotonic() + BUILD_SECONDS
+    # Run 41173870659: xcodegen generate exited 1 as the user. Its version first tells the binary (unreadable, not
+    # run) from the spec; each stage's line carries mac_sandbox.ERROR_CLASSES' word for what it wrote when it failed.
+    start = mac_sandbox.log_size(log)
+    status = mac_sandbox.step(mac_sandbox.sandboxed(["xcodegen", "version"], tools, env), log, "/", deadline)
+    stop_all(log)
+    say("xcodegen version", status, mac_sandbox.said_since(log, start) if status else None)
+    if status != 0:
+        return False
+    start = mac_sandbox.log_size(log)
     status = mac_sandbox.step(mac_sandbox.sandboxed(["xcodegen", "generate", "--spec", str(root / "src/ios/project.yml")],
                                                     tools, env), log, "/", deadline)
     stop_all(log)
-    say("xcodegen", status)
+    say("xcodegen", status, mac_sandbox.said_since(log, start) if status else None)
     if status != 0:
         return False
     for scheme in IOS_SCHEMES[target]:
+        start = mac_sandbox.log_size(log)
         status = mac_sandbox.step(mac_sandbox.sandboxed(
             ["/usr/bin/xcodebuild", "-project", str(root / "src/ios/May.xcodeproj"), "-scheme", scheme,
              "-configuration", "Release", "-destination", "generic/platform=iOS Simulator",
              "-derivedDataPath", str(root / "derived"), "-clonedSourcePackagesDirPath", str(root / "packages"),
              "CODE_SIGNING_ALLOWED=NO", "build"], tools, env), log, "/", deadline)
         stop_all(log)
-        say("xcodebuild " + scheme, status)
+        say("xcodebuild " + scheme, status, mac_sandbox.said_since(log, start) if status else None)
         if status != 0:
             return False
     return True

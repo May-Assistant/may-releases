@@ -58,6 +58,10 @@ ERROR_CLASSES = (("no such file", re.compile(rb"No such file", re.IGNORECASE)),
                  ("not permitted", re.compile(rb"Operation not permitted", re.IGNORECASE)),
                  ("permission denied", re.compile(rb"Permission denied", re.IGNORECASE)),
                  ("sudo refused", re.compile(rb"password is required|sudo: ", re.IGNORECASE)),
+                 # A build stage's own words (run 41173870659: xcodegen exited 1 as the user, and nothing said why).
+                 ("spec invalid", re.compile(rb"Spec validation|Decoding failed|Parsing|is not a valid", re.IGNORECASE)),
+                 ("not found", re.compile(rb"command not found|not found|could not be found|does ?n[o']t exist",
+                                          re.IGNORECASE)),
                  ("usage", re.compile(rb"usage:|illegal option|invalid", re.IGNORECASE)),
                  ("exists", re.compile(rb"already exists|eDSRecordAlreadyExists", re.IGNORECASE)),
                  ("read-only", re.compile(rb"Read-only file system", re.IGNORECASE)))
@@ -69,6 +73,23 @@ TEARDOWN_NAMES = (*LEFTOVER_DIRS, "the sandbox", "the user", "the group")
 
 def error_class(said):
     return next((name for name, pattern in ERROR_CLASSES if pattern.search(said or b"")), "other")
+
+
+def said_since(log, start):
+    """ERROR_CLASSES' word for what was written to log from byte start on (a failed step's own words)."""
+    try:
+        with log.open("rb") as written:
+            written.seek(start)
+            return error_class(written.read(64 * 1024))
+    except OSError:
+        return "other"
+
+
+def log_size(log):
+    try:
+        return log.stat().st_size
+    except OSError:
+        return 0
 
 
 def admin_said(argv, log, data=None):
