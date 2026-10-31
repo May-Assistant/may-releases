@@ -2019,6 +2019,27 @@ class IosDeviceServerTests(unittest.TestCase):
                          self.config["looks"][:device_mcp.MAX_LOOKS])
         self.assertEqual(device_agent.looks([{"shown": 1, "shot": "../x.png"}]), [{"shown": 1, "shot": None}])
 
+    def test_a_cards_thread_is_looked_at_like_the_chat(self):
+        """Coordinator, 31 Oct (run 41146800805): the card opens its thread, where Samuel saw the blank. A message or
+        item thread and a task thread count by their own header and composer (N, iOS #1527), their own ids are chrome,
+        and one view's header with another's composer is no look."""
+        self.config["look"] = True
+        line = {"text": "May's tagged line", "bounds": "[20,600][380,660]"}
+        tree = lambda *nodes: {"attributes": {"bounds": "[0,0][393,852]"},
+                               "children": [{"attributes": node} for node in nodes]}
+        for prefix in ("messageThread", "thread"):
+            header = {"resource-id": prefix + ".header", "text": "Book the dentist", "bounds": "[0,50][393,110]"}
+            composer = {"resource-id": prefix + ".composer", "text": "Reply", "bounds": "[0,760][393,840]"}
+            card = {"resource-id": prefix + ".replies", "text": "No replies yet", "bounds": "[20,700][380,740]"}
+            with self.subTest(prefix=prefix), patch(__name__ + ".IOS_TREE", tree(header, composer, line, card)):
+                self.assertFalse(self.call("hierarchy")[0])
+        mixed = ({"resource-id": "chat.header", "bounds": "[0,50][393,110]"},
+                 {"resource-id": "messageThread.composer", "bounds": "[0,760][393,840]"}, line)
+        with patch(__name__ + ".IOS_TREE", tree(*mixed)):
+            self.assertFalse(self.call("hierarchy")[0])
+        looks = json.loads(Path(self.config["result"]).read_text()).get("looks")
+        self.assertEqual([look["shown"] for look in looks], [1, 1], "each thread shows its one message; mixed is none")
+
     def test_a_row_without_a_card_counts_no_looks(self):
         with patch(__name__ + ".IOS_TREE", {"attributes": {}, "children": [
                 {"attributes": {"resource-id": "chat.header", "bounds": "[0,50][393,110]"}},
