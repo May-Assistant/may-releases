@@ -271,6 +271,8 @@ class RunTests(Workspace):
                                      {"SIMCTL_CHILD_MAY_DIAG_LOOPS"} if asked else set(),
                                      "the watchdog stays off with it")
                 self.assertEqual(line in out.splitlines(), asked)
+                self.assertEqual("May device tests (ios): the loop census kept 0 lines" in out.splitlines(), asked,
+                                 "its count is said only when it was asked for, 0 included")
         self.assertIn("watchdog", device_ios.WATCHDOG, "the census's lines are read by the watchdog's predicate")
 
     def test_a_plain_run_says_its_stalls_were_not_collected_never_zero(self):
@@ -819,6 +821,30 @@ class DiagnosticsTests(Workspace):
                           b"stall 3800 ms", b"stall-after sync-publish", b"stall 300 ms", b"stall-after not-agreed"],
                          "each after its own stall, in the log's order")
         self.assertEqual(len(device_ios.STALL_AFTER_NAMES), 13, "N's twelve and may-app #1318's view-chat-row")
+
+    def test_the_loop_census_lines_are_kept_among_the_stalls_and_counted_alone(self):
+        """Run 41197247993: the census's "may-loops:" lines were read but dropped; they are kept in the log's order, in
+        a name's shape alone, and counted."""
+        def line(second, text):
+            return (b"2026-10-31 11:45:%02d.000 Df MayPlayground[1:2] [io.github.mayassistant.may.playground:watchdog] "
+                    b"%s\n" % (second, text))
+
+        shown = b"".join([line(1, b"may-loops: MayShimmer, MayPulse"), line(2, b"main-thread stall 300 ms"),
+                          line(3, b"may-loops: MayTypingDots"), line(4, b"may-loops: not a name list!"),
+                          line(5, b"may-loops: MayShimmer during sam.avery@example.com"), line(6, b"may-loops:")])
+        diagnostics = self.diagnostics(shown=shown)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertEqual([entry.split(b"] ")[-1] for entry in text.split(b"== watchdog ==\n")[1].splitlines()],
+                         [b"may-loops: MayShimmer, MayPulse", b"main-thread stall 300 ms", b"may-loops: MayTypingDots",
+                          b"may-loops:"], "names alone, in the log's order among the stalls")
+        self.assertEqual(diagnostics.loops, 3)
+        self.assertEqual((diagnostics.stalls, diagnostics.longest), (1, 300), "a census line is never a stall")
+        self.assertNotIn(b"example.com", text)
+        self.assertTrue(publish.diagnostics_ok(text))
 
     def test_the_chat_bodys_changes_are_kept_privately_near_each_chat_stall_and_never_counted(self):
         """may-app #1318 (coordinator, 25 Oct): ChatView's changed properties, private, capped around each stall."""

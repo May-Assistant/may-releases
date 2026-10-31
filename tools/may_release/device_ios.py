@@ -72,8 +72,9 @@ WATCHDOG_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG": "1"}
 LOG_CHANGES_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES": "1"}
 # N, 31 Oct (may-app claude/ios-loop-census, DS #240): the debug Playground's loop census, asked for only when the run is
 # dispatched with ios_loop_census. Every 5 s while a design-system loop drew a frame in the last 2 s, it logs
-# "may-loops: <Name>, <Name>" (names from a fixed set, no user content) in the watchdog's category, so the private diag
-# keeps those lines beside each refused act's times. Run it with ios_diagnostics off: the watchdog's pings blur idle.
+# "may-loops: <Name>, <Name>" (names from a fixed set, no user content) in the watchdog's category. Diagnostics keeps
+# those lines (LOOPS) in the private diag among the stalls, beside each refused act's times; the public log counts them
+# alone. Run it with ios_diagnostics off: the watchdog's pings blur idle.
 LOOP_CENSUS = "MAY_IOS_LOOP_CENSUS"
 LOOP_CENSUS_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_LOOPS": "1"}
 SWIFTUI_PERSIST = ("log", "config", "--subsystem", "com.apple.SwiftUI", "--mode", "level:info,persist:info")
@@ -366,6 +367,10 @@ MAX_SPAN_SECTION = device_tests.MAX_DIAG // 8
 # may-app #1309 (N, 25 Oct): after each stall line, "main-thread stall-after <name>", the last main-actor step that ran
 # before it, from a fixed set agreed with N. The public log counts each name, and any other as "other".
 STALL_AFTER = re.compile(rb"main-thread stall-after ([a-z-]{1,40})[ \t]*\r?\n?$")
+# Run 41197247993: the census's lines were read but dropped, since only the lines above were kept. A line is the tag
+# and up to 32 names, each a name's shape alone, so nothing else in the watchdog's category rides along.
+LOOP_NAME = rb"[A-Za-z][A-Za-z0-9_.-]{0,47}"
+LOOPS = re.compile(rb"may-loops:(?: " + LOOP_NAME + rb"(?:, " + LOOP_NAME + rb"){0,31})?[ \t]*\r?\n?$")
 STALL_AFTER_NAMES = ("launch", "sync-start", "sync-transcript", "sync-publish", "sync-inbox", "sync-end", "agenda-load",
                      "connections-load", "pill-read", "view-root", "view-shell", "view-chat", "view-chat-row")
 # Run 40181517145: chat's and notes' onboarding subflow did not pass, with nothing to say where it stopped. Its last
@@ -420,6 +425,7 @@ class Diagnostics:
         self.spans = {}  # name: [count, longest ms], for SPAN_NAMES alone
         self.after = {}  # name: count, for STALL_AFTER_NAMES and "other"
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
+        self.loops = 0  # the loop census's lines kept, for the public log's count
 
     def crash_reports(self):
         try:
@@ -450,7 +456,7 @@ class Diagnostics:
         self.crashes += bool(found)
         lines = body_changes([line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
                               .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line) or
-                              STALL_AFTER.search(line) or BODY_CHANGE.search(line)])
+                              STALL_AFTER.search(line) or BODY_CHANGE.search(line) or LOOPS.search(line)])
         stalls = [int(STALL.search(line).group(1)) for line in lines if STALL.search(line)]
         self.stalls += len(stalls)
         self.longest = max([self.longest, *stalls])
@@ -489,6 +495,8 @@ class Diagnostics:
         section = b"".join(spans)[:MAX_SPAN_SECTION] if trimmed else b""
         room -= len(section)
         watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
+        # Counted from what is published, after the trim.
+        self.loops += sum(1 for line in watchdog.splitlines(keepends=True) if LOOPS.search(line))
         if not (crashes or refused or watchdog or onboarding):
             return
         text = (crashes + (b"== onboarding ==\n" + onboarding if onboarding else b"") +
@@ -792,6 +800,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     wedged = sum(1 for record in records.values() if isinstance(record, dict) and record.get("wedged") is True)
     if wedged:
         print(f"May device tests (ios): {wedged} scenarios stopped after the device stopped taking acts (fail-fast)")
+    if loop_census_wanted():
+        loops = diagnostics.loops
+        print(f"May device tests (ios): the loop census kept {loops} lines")
     for scenario, dropped in diagnostics.dropped.items():
         print(f"May device tests (ios): {scenario} diagnostics: {dropped} lines dropped")
     if cleaned_count is not None:
