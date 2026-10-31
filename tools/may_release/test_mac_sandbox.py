@@ -232,6 +232,8 @@ class SandboxedCompileTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    said = b"Error: Spec validation failed\n"
+
     def build(self, statuses, setup_error=None, target="playground"):
         statuses = iter(statuses)
 
@@ -241,8 +243,13 @@ class SandboxedCompileTests(unittest.TestCase):
                 raise setup_error
 
         def step(argv, log, cwd, deadline):
-            self.events.append(("step", argv[argv.index("-i") + 5], cwd))
-            return next(statuses, 0)
+            command = argv[argv.index("-i") + 5:]
+            self.events.append(("step", command[0] if command[0] != "xcodegen" else " ".join(command[:2]), cwd))
+            status = next(statuses, 0)
+            if status:
+                with log.open("ab") as written:
+                    written.write(self.said)
+            return status
 
         out = io.StringIO()
         (self.source / "ios/project.yml").write_text("name: May\n")
@@ -262,13 +269,16 @@ class SandboxedCompileTests(unittest.TestCase):
     def test_each_stage_runs_as_the_user_is_stopped_after_and_prints_its_status(self):
         passed, out = self.build([0, 0])
         self.assertIs(passed, True)
-        self.assertEqual(self.events, [("setup", ["src", "xcodegen"], None), ("step", "xcodegen", "/"), ("stop",),
+        self.assertEqual(self.events, [("setup", ["src", "xcodegen"], None), ("step", "xcodegen version", "/"),
+                                       ("stop",), ("step", "xcodegen generate", "/"), ("stop",),
                                        ("step", "/usr/bin/xcodebuild", "/"), ("stop",)])
-        self.assertEqual(out, "May iOS compile xcodegen: exit 0\nMay iOS compile xcodebuild MayPlayground: exit 0\n")
+        self.assertEqual(out, "May iOS compile xcodegen version: exit 0\nMay iOS compile xcodegen: exit 0\n"
+                              "May iOS compile xcodebuild MayPlayground: exit 0\n")
 
     def test_a_failed_or_late_stage_ends_the_build_there(self):
-        for statuses, line in (([65], "May iOS compile xcodegen: exit 65\n"),
-                               ([None], "May iOS compile xcodegen: did not finish\n")):
+        # Run 41173870659: a failed stage's line names the class of what it wrote, never its words.
+        for statuses, line in (([65], "May iOS compile xcodegen version: exit 65 (spec invalid)\n"),
+                               ([None], "May iOS compile xcodegen version: did not finish\n")):
             with self.subTest(status=statuses[0]):
                 self.events = []
                 passed, out = self.build(statuses)
@@ -276,16 +286,28 @@ class SandboxedCompileTests(unittest.TestCase):
                 self.assertEqual([e[0] for e in self.events], ["setup", "step", "stop"])
                 self.assertEqual(out, line)
         self.events = []
-        passed, out = self.build([0, 65, 0], target=None)
+        passed, out = self.build([0, 65], target=None)
         self.assertIs(passed, False)
-        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodebuild May: exit 65")
+        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodegen: exit 65 (spec invalid)")
         self.assertEqual(len([e for e in self.events if e[0] == "step"]), 2)
+        self.events = []
+        self.said = b"xcodebuild: error: '/private/var/may-sandbox/src/ios/May.xcodeproj' does not exist.\n"
+        passed, out = self.build([0, 0, 0, 65], target=None)
+        self.assertEqual(out.splitlines()[-1], "May iOS compile xcodebuild MayPlayground: exit 65 (not found)")
+        self.assertNotIn("may-sandbox", out, "the stage's words never reach the line")
 
     def test_a_sandbox_that_cannot_be_made_runs_nothing(self):
         passed, out = self.build([0, 0], setup_error=SandboxError("The unprivileged user could not be set up; nothing ran"))
         self.assertIsInstance(passed, SandboxError)
         self.assertEqual([e[0] for e in self.events], ["setup"])
         self.assertEqual(out, "")
+
+    def test_a_project_still_naming_runner_temp_is_refused(self):
+        project = self.source / "ios/project.yml"
+        project.write_text(f"packages:\n  Other:\n    path: {self.source.parent}/may-design-system\n")
+        with mock.patch.dict("os.environ", {"RUNNER_TEMP": str(self.source.parent)}):
+            with self.assertRaisesRegex(SandboxError, "still names runner temp"):
+                compile_tool.sandbox_project(self.source, self.private)
 
     def test_the_projects_design_system_is_pointed_at_the_sandboxs_copy(self):
         project = self.source / "ios/project.yml"
@@ -406,8 +428,8 @@ class SandboxStaticCheckTests(unittest.TestCase):
         cases = {
             "xcodegen as the runner": (self.TOOL, 'mac_sandbox.step(mac_sandbox.sandboxed(["xcodegen"',
                                        'mac_sandbox.step((["xcodegen"', compile_message),
-            "no stop after xcodegen": (self.TOOL, "    stop_all(log)\n    say(\"xcodegen\", status)",
-                                       "    say(\"xcodegen\", status)", compile_message),
+            "no stop after xcodegen": (self.TOOL, "    stop_all(log)\n    say(\"xcodegen\", status",
+                                       "    say(\"xcodegen\", status", compile_message),
             "no teardown": (self.TOOL, "left = mac_sandbox.teardown(log)", "left = mac_sandbox.teardown(None)",
                             compile_message),
             "a fallback to the runner": (self.TOOL, "            return\n        try:\n            run([str(binary)",
