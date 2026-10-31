@@ -296,24 +296,32 @@ def ios_hierarchy(config):
 # screenshot taken at once (look-<n>.png in the agent's folder, for people to see whether the screen agrees), at most
 # MAX_LOOKS of them; the count alone reaches the record, never a word of the text.
 LOOK_ENV, MAX_LOOKS = "MAY_DEVICE_LOOK", 4
+# Coordinator, 31 Oct (run 41146800805): a For you card opens its thread ("In May's chat"), not the May chat, and the
+# thread is where Samuel saw the blank, so a thread counts too. Each conversation view's (header, composer) ids, as
+# may-app names them (N, iOS #1527): the May chat, a message or item thread, a task thread. A read is a look when it
+# shows one view's header and composer; that view's own ids (its prefix) are chrome, never messages.
+LOOK_ANCHORS = (("chat.header", "chat.composer"), ("messageThread.header", "messageThread.composer"),
+                ("thread.header", "thread.composer"))
 
 
 def chat_shown(nodes, boxes):
-    """How many message texts the chat shows on screen, or None when the read does not show the chat."""
+    """How many message texts a conversation view shows on screen, or None when the read shows none of them."""
     marks = {}
     for attributes, box in zip(nodes, boxes):
         rid = str(attributes.get("resource-id") or "")
-        if box and rid in ("chat.header", "chat.composer") and rid not in marks:
+        if box and any(rid in pair for pair in LOOK_ANCHORS) and rid not in marks:
             marks[rid] = [int(value) for value in box.groups()]
-    if len(marks) < 2:
+    pair = next((pair for pair in LOOK_ANCHORS if pair[0] in marks and pair[1] in marks), None)
+    if pair is None:
         return None
-    left, _, right, top = marks["chat.header"]
-    bottom = marks["chat.composer"][1]
+    left, _, right, top = marks[pair[0]]
+    bottom = marks[pair[1]][1]
     if bottom <= top:
         return None
+    chrome = pair[0].rpartition(".")[0] + "."
     shown = 0
     for attributes, box in zip(nodes, boxes):
-        if not box or str(attributes.get("resource-id") or "").startswith("chat.") or \
+        if not box or str(attributes.get("resource-id") or "").startswith(chrome) or \
                 not str(attributes.get("text") or "").strip():
             continue
         x, y = (int(box[1]) + int(box[3])) / 2, (int(box[2]) + int(box[4])) / 2
