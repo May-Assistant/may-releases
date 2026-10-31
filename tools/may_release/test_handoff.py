@@ -14,12 +14,16 @@ import handoff
 import prepare
 import store
 from store import StoreError
+from testflight_notes import NOTES_FILE
 
 SHA = "a" * 40
 HAS_AGE = bool(shutil.which("age") and shutil.which("age-keygen"))
 RUN = {"GITHUB_REPOSITORY": "May-Assistant/may-releases", "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1"}
 IOS_PIN, ANDROID_PIN = "1" * 40, "2" * 40
 PINS = {"ios": IOS_PIN, "android": ANDROID_PIN}  # differing, as on may-app main today
+# What testflight_notes.py compose writes: private may-app titles, which ride only inside the encrypted handoff.
+NOTES = "Try: Brief: PRIVATE-TITLE-41c2\nTry: Agenda: another"
+real_tar = handoff.write_tar
 DS_CHECKOUT = "may-source/android/build-deps/may-design-system"
 
 
@@ -47,10 +51,14 @@ class TarRulesTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def tar(self, manifest, members, design_system=PINS):
-        """A plaintext handoff; the manifest carries `design_system` unless it is None."""
+    def tar(self, manifest, members, design_system=PINS, notes=None):
+        """A plaintext handoff; the manifest carries `design_system` unless it is None, and an iOS one NOTES unless
+        notes says otherwise ("" for none)."""
         if design_system is not None:
             manifest = dict(manifest, design_system=design_system)
+        notes = (NOTES if manifest.get("platform") == "ios" else "") if notes is None else notes
+        if notes:
+            manifest = dict(manifest, notes=notes)
         self.count += 1
         path = self.root / ("handoff-%d.tar" % self.count)
         types = {"file": tarfile.REGTYPE, "dir": tarfile.DIRTYPE, "sym": tarfile.SYMTYPE,
@@ -84,7 +92,7 @@ class TarRulesTests(unittest.TestCase):
     def test_matching_android_manifest_yields_product(self):
         out = self.destination()
         path = self.tar(expected(), [entry("product/unsigned.aab", data=b"bundle")])
-        product, pins = handoff.read_tar(path, out, expected(), allow_symlinks=False)
+        product, pins, _ = handoff.read_tar(path, out, expected(), allow_symlinks=False)
         self.assertEqual(product.read_bytes(), b"bundle")
         self.assertEqual(pins, PINS)
         self.assertEqual(oct(product.stat().st_mode & 0o777), oct(0o600))
@@ -103,7 +111,7 @@ class TarRulesTests(unittest.TestCase):
                    entry(fw + "/Headers", "sym", link="Versions/Current/Headers"),
                    entry(fw + "/Resources", "sym", link="Versions/Current/Resources")]
         out = self.destination()
-        product, _ = handoff.read_tar(self.tar(expected(platform="ios"), members), out, expected(platform="ios"),
+        product, _, _ = handoff.read_tar(self.tar(expected(platform="ios"), members), out, expected(platform="ios"),
                                       allow_symlinks=True)
         binary = product / "Products/Applications/May.app/May"
         self.assertEqual(binary.stat().st_mode & 0o777, 0o700)
@@ -136,7 +144,7 @@ class TarRulesTests(unittest.TestCase):
                     handoff.read_tar(path, out, expected(), allow_symlinks=False)
                 self.assertEqual(list(out.iterdir()), [])
         same = {"ios": IOS_PIN, "android": IOS_PIN}
-        _, pins = handoff.read_tar(self.tar(expected(), [entry("product/unsigned.aab")], design_system=same),
+        _, pins, _ = handoff.read_tar(self.tar(expected(), [entry("product/unsigned.aab")], design_system=same),
                                    self.destination(), expected(), allow_symlinks=False)
         self.assertEqual(pins, same)
 
@@ -148,6 +156,19 @@ class TarRulesTests(unittest.TestCase):
                                  allow_symlinks=False)
             self.assertIn("pins differ", refused.exception.args[0])
             self.assertEqual(list(out.iterdir()), [])
+
+    def test_ios_needs_well_formed_notes_and_android_has_none(self):
+        ios, android = [entry("product/May.xcarchive", "dir")], [entry("product/unsigned.aab")]
+        self.assertEqual(handoff.read_tar(self.tar(expected(platform="ios"), ios), self.destination(),
+                                          expected(platform="ios"), True)[2], NOTES)
+        self.assertIsNone(handoff.read_tar(self.tar(expected(), android), self.destination(), expected(), False)[2])
+        for platform, members, notes in (("ios", ios, ""), ("ios", ios, "x" * 4001), ("ios", ios, "bad\x1b[0m"),
+                                         ("ios", ios, ["list"]), ("android", android, NOTES)):
+            with self.subTest(platform=platform, notes=str(notes)[:20]), self.assertRaises(StoreError):
+                manifest = expected(platform=platform)
+                path = self.tar(manifest, members, notes=notes) if notes != "" else \
+                    self.tar(manifest, members, notes="")
+                handoff.read_tar(path, self.destination(), manifest, platform == "ios")
 
     def test_open_applies_the_pin_rule_to_its_own_target(self):
         # Differing pins pass for each Playground target and are refused for each May production target.
@@ -480,16 +501,41 @@ class AgeRoundTripTests(unittest.TestCase):
         os.symlink("A", fw / "Versions/Current")
         os.symlink("Versions/Current/Kit", fw / "Kit")
         self.record("ios")
+        (self.root / "may-private" / NOTES_FILE).write_text(NOTES)
         handoff.seal("ios", "playground", SHA, "9")
+        (self.root / "may-private" / NOTES_FILE).unlink()
         download = self.root / "may-handoff-download"
         download.mkdir()
         shutil.move(str(self.root / "may-handoff/handoff.age"), str(download / "handoff.age"))
         shutil.rmtree(self.root / "may-release")
         with patch.dict(os.environ, MAY_ARTIFACT_DECRYPT_KEY=self.keyfile):
-            handoff.open_handoff("ios", "playground", SHA, "9")
+            try:
+                handoff.open_handoff("ios", "playground", SHA, "9")
+            except StoreError as refused:
+                self.fail("the iOS handoff was refused: " + refused.args[0])
         kit = self.root / "may-release/May.xcarchive/Products/Applications/May.app/Frameworks/Kit.framework/Kit"
         self.assertTrue(kit.is_symlink())
         self.assertEqual(kit.read_bytes(), b"lib")
+        written = self.root / "may-private" / NOTES_FILE
+        self.assertTrue(written.is_file(), "open writes the notes for the notes step")
+        self.assertEqual((written.read_text(), oct(written.stat().st_mode & 0o777)), (NOTES, "0o600"))
+
+    def test_the_ios_manifest_gains_exactly_the_notes_and_android_gains_nothing(self):
+        sealed = []
+        with patch("handoff.write_tar", side_effect=lambda path, manifest, product: sealed.append(manifest) or
+                   real_tar(path, manifest, product)):
+            self.record("ios")
+            (self.root / "may-private" / NOTES_FILE).write_text(NOTES)
+            shutil.rmtree(self.root / "may-release")
+            (self.root / "may-release/May.xcarchive").mkdir(parents=True)
+            handoff.seal("ios", "playground", SHA, "9")
+        self.assertEqual(set(sealed[0]) - set(handoff.expected_manifest("ios", "playground", SHA, "9")),
+                         {"design_system", "notes"})
+        self.assertEqual(sealed[0]["notes"], NOTES)
+        (self.root / "may-private" / NOTES_FILE).unlink()
+        shutil.rmtree(self.root / "may-handoff")
+        with self.assertRaises(StoreError):
+            handoff.seal("ios", "playground", SHA, "9")
 
     def test_plaintext_file_is_private_before_age_writes_it(self):
         handoff.seal("android", "playground", SHA, "9")
