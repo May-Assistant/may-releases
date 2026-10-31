@@ -19,18 +19,25 @@ hands over only that; a fresh post job opens both and posts (the split of may-re
            summary (xcresulttool) is reduced to counts and the failing tests, in a private file.
   android  (ubuntu-24.04, no secret) `./gradlew --no-daemon --continue :components:testDebugUnitTest` in android/; its JUnit
            reports are reduced the same way.
+  tokens   (ubuntu-24.04, no secret, the pinned Node; coordinator, 30 Oct) both generators' --check and
+           `node --test tools/*.test.mjs` with its JUnit report: each check is one test, node's own tests one each.
+  web      (ubuntu-24.04, no secret, the pinned Node) npm ci, npm test, npm run typecheck and npm run build in web/: each
+           step is one test, vitest's own tests one each when it reports them. With no web/ yet: skipped, and a pass.
+  prototype (ubuntu-24.04, no secret, the pinned Node) `npm --prefix prototype ci` and `npm --prefix prototype test`
+           from the checkout (its pretest builds web/ first), counted as web. With no prototype/ yet: skipped, a pass.
   seal     (the same job, no secret) that suite's record ({sha, suite, ran, passed, total, failed, skipped, failures})
            padded to MAX_RECORD and age-encrypted to MAY_RENDERS_RECIPIENT; without the recipient nothing is sealed.
   verdict  (the same job, no secret) fails the job when the suite did not pass, whether or not the post job can post.
   open     (post job, MAY_RENDERS_DECRYPT_KEY alone) decrypts each sealed record after checking the key against the
            recipient, and checks its shape and commit before anything reads it.
   status   (post job, MAY_DS_STATUS_TOKEN alone, before post) sets the head commit's "may-ds-tests" status: success
-           when both suites passed, failure otherwise (error when neither finished), with counts alone, so a merge can
+           when every suite passed, failure otherwise (error when none finished), with counts alone, so a merge can
            gate on one check (coordinator, 28 Oct).
-  post     (post job, MAY_DS_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts one comment for both
-           suites on the pull request, after it is read again and is still open at that head, unless a comment already
+  post     (post job, MAY_DS_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts one comment for every
+           suite on the pull request, after it is read again and is still open at that head, unless a comment already
            carries this head's marker. A suite whose record never arrived is reported from its job's result alone
-           (MAY_SWIFT_RESULT, MAY_ANDROID_RESULT: success, failure). It fails when a suite did not pass.
+           (MAY_SWIFT_RESULT, MAY_ANDROID_RESULT, MAY_TOKENS_RESULT, MAY_WEB_RESULT,
+           MAY_PROTOTYPE_RESULT: success, failure). It fails when a suite did not pass.
 """
 
 import argparse
@@ -38,13 +45,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it after the standard library.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from android_unit import UnitTestsError, clean, install_sdk, parsed_report, pinned_java_home, sdk_home
+from android_unit import ANSI, UnitTestsError, clean, install_sdk, parsed_report, pinned_java_home, sdk_home
 from compile import credentials_left
 from ds_compile import (DEVELOPER, PACKAGES, PRIVATE, SOURCE, XCODE, DsCompileError, build_env, fence_for, github,
                         post_once, request, run_url, runner_root, schemes_of)
@@ -63,8 +71,9 @@ CONTEXT = "may-ds-tests"
 RECIPIENT, DECRYPT_KEY = "MAY_RENDERS_RECIPIENT", "MAY_RENDERS_DECRYPT_KEY"
 AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
 SHA = re.compile(r"[0-9a-f]{40}")
-SUITES = ("swift", "android")
-RESULT_ENV = {"swift": "MAY_SWIFT_RESULT", "android": "MAY_ANDROID_RESULT"}
+SUITES = ("swift", "android", "tokens", "web", "prototype")
+RESULT_ENV = {"swift": "MAY_SWIFT_RESULT", "android": "MAY_ANDROID_RESULT", "tokens": "MAY_TOKENS_RESULT",
+              "web": "MAY_WEB_RESULT", "prototype": "MAY_PROTOTYPE_RESULT"}
 DERIVED = "may-ds-tests-derived"
 SEALED, DOWNLOAD = "may-ds-tests-sealed", "may-ds-tests-download"
 # Every sealed record is padded to MAX_RECORD bytes, so its size says nothing about how many tests failed.
@@ -79,8 +88,29 @@ REPORTS = "android/components/build/test-results/testDebugUnitTest"
 BASELINE_SHA = "b0e9c28"
 BASELINES = {"swift": 283, "android": 1533}
 MARKER = "may-ds-tests"
+# The tokens and web suites (coordinator, 30 Oct), with the pinned Node (toolchain.py, 22.22.0). Each command is one
+# check; node --test's own tests (its JUnit report) and vitest's (its closing `Tests` line) count one each instead of
+# their command when they report.
+TOKEN_CHECKS = (("tools/generate-tokens.mjs", "--check"), ("tools/generate-agent-marks.mjs", "--check"))
+TOKEN_TESTS = "tools"
+WEB = "web"
+WEB_STEPS = (("npm ci", ("npm", "ci", "--no-audit", "--no-fund")), ("npm test", ("npm", "test")),
+             ("npm run typecheck", ("npm", "run", "typecheck")), ("npm run build", ("npm", "run", "build")))
+# The prototype's tests (coordinator, 30 Oct), run from the checkout as given: its pretest builds the web package first.
+PROTOTYPE = "prototype"
+PROTOTYPE_STEPS = (("npm --prefix prototype ci", ("npm", "--prefix", "prototype", "ci", "--no-audit", "--no-fund")),
+                   ("npm --prefix prototype test", ("npm", "--prefix", "prototype", "test")))
+# A suite whose folder is not there yet: skipped, and a pass (web/ until DS #223, prototype/ until DS #235).
+OPTIONAL = {"web": WEB, "prototype": PROTOTYPE}
+NODE_SECONDS = 20 * 60
+VITEST_TOTAL = re.compile(r"\s*Tests\s+(.*?)\s*\((\d+)\)\s*")
+VITEST_PART = re.compile(r"(\d+) (passed|failed|skipped|todo)")
 TITLES = {"swift": f"Swift (`xcodebuild test`, Xcode {XCODE}, {DEVICE} simulator)",
-          "android": f"Android (`{GRADLE_TASK}`, JDK 21)"}
+          "android": f"Android (`{GRADLE_TASK}`, JDK 21)",
+          "tokens": "Tokens (`generate-tokens.mjs --check`, `generate-agent-marks.mjs --check`, "
+                    "`node --test tools/*.test.mjs`, Node 22.22.0)",
+          "web": "Web (`npm ci`, `npm test`, `npm run typecheck`, `npm run build` in `web/`, Node 22.22.0)",
+          "prototype": "Prototype (`npm --prefix prototype ci`, `npm --prefix prototype test`, Node 22.22.0)"}
 
 
 class DsTestsError(ValueError):
@@ -105,9 +135,16 @@ def checked_record(data, sha, suite):
             all(isinstance(f, dict) and set(f) == {"name", "message"} and isinstance(f["name"], str) and
                 0 < len(f["name"]) <= MAX_NAME and isinstance(f["message"], str) and len(f["message"]) <= MAX_MESSAGE and
                 "\n" not in f["name"] + f["message"] for f in data["failures"]) and
-            (not data["passed"] or (data["ran"] and data["total"] > 0 and data["failed"] == 0))):
+            (not data["passed"] or (data["ran"] and data["total"] > 0 and data["failed"] == 0) or absent(data))):
         raise DsTestsError("A suite record is malformed or for another commit; nothing was posted")
     return data
+
+
+def absent(record):
+    """An optional suite's record when the design system does not have its folder yet: not run, and a pass
+    (coordinator, 30 Oct)."""
+    return record["suite"] in OPTIONAL and not record["ran"] and record["passed"] and record["total"] == 0 and \
+        not record["failures"]
 
 
 def prepared():
@@ -255,9 +292,143 @@ def run_android(sha, tool=quiet, sdk=install_sdk):
     report(record)
 
 
+# ---- tokens and web ----
+
+def node_env(root):
+    """The suites' environment: the pinned Node's bin folder first (never the runner's own Node), npm's cache in the
+    runner's temporary folder, and nothing secret."""
+    try:
+        node_bin = Path(toolchain.tool_path("node", "bin/node")).parent
+    except StoreError:
+        raise DsTestsError("The pinned Node is not installed; no suite ran") from None
+    return child_env(PATH=str(node_bin) + os.pathsep + os.environ.get("PATH", ""), npm_config_cache=str(root / "may-ds-npm"),
+                     npm_config_update_notifier="false", npm_config_fund="false", npm_config_audit="false",
+                     GIT_TERMINAL_PROMPT="0")
+
+
+def checked_run(argv, log, cwd, env, tool):
+    """True when the command exited 0 within NODE_SECONDS; its output goes to the private log alone."""
+    try:
+        return tool(list(argv), log, cwd=cwd, env=env, timeout=NODE_SECONDS).returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def counted(checks, tests):
+    """(total, failed, skipped, failures) from the checks (name, passed) and a test runner's own counts, or None."""
+    total, failed, skipped, failures = tests or (0, 0, 0, [])
+    for name, passed in checks:
+        total += 1
+        if not passed:
+            failed += 1
+            failures = failures + [{"name": name, "message": "failed"}]
+    return min(total, MAX_COUNT), min(failed, MAX_COUNT), skipped, failures[:MAX_FAILURES]
+
+
+def run_tokens(sha, tool=quiet):
+    # The design system's own Node scripts and tests run with no secret at all.
+    require_step_secrets(())
+    exact(sha)
+    root, checkout, private = prepared()
+    if head_revision(checkout) != sha:
+        raise DsTestsError("The checkout is not the exact design-system commit")
+    env, log = node_env(root), private / "tokens.log"
+    roots = [str(checkout), str(checkout.resolve())]
+    checks = [(" ".join(check), checked_run(("node",) + check, log, checkout, env, tool)) for check in TOKEN_CHECKS]
+    folder = checkout / TOKEN_TESTS
+    files = sorted(f"{TOKEN_TESTS}/{p.name}" for p in folder.glob("*.test.mjs") if p.is_file() and not p.is_symlink()) \
+        if folder.is_dir() and not folder.is_symlink() else []
+    reports = private / "tokens-junit"
+    shutil.rmtree(reports, ignore_errors=True)
+    reports.mkdir(mode=0o700)
+    tests = None
+    if files:
+        done = checked_run(("node", "--test", "--test-reporter=junit",
+                            "--test-reporter-destination=" + str(reports / "TEST-node.xml"), *files),
+                           log, checkout, env, tool)
+        tests = junit_results(reports, roots)
+        if tests is None or (not done and not tests[1]):
+            checks.append(("node --test tools/*.test.mjs", done and tests is not None))
+    else:
+        checks.append(("node --test tools/*.test.mjs (no test file)", False))
+    total, failed, skipped, failures = counted(checks, tests)
+    record = record_of(sha, "tokens", True, total, failed, skipped, failures)
+    write_record(private, record)
+    report(record)
+
+
+def vitest_counts(text):
+    """(total, failed, skipped) from vitest's last closing `Tests` line, or None."""
+    found = None
+    for line in text.splitlines():
+        match = VITEST_TOTAL.fullmatch(ANSI.sub("", line))
+        if match:
+            parts = {kind: int(n) for n, kind in VITEST_PART.findall(match.group(1))}
+            total = int(match.group(2))
+            failed, skipped = parts.get("failed", 0), parts.get("skipped", 0) + parts.get("todo", 0)
+            found = (total, failed, skipped) if failed + skipped <= total <= MAX_COUNT else None
+    return found
+
+
+def run_npm(sha, suite, steps, cwd_of, tool):
+    """An npm suite: each step in order (a failed install leaves the rest unrun and failed), vitest's own tests
+    counted in place of the test step when it reports them. With no package.json in the suite's folder: skipped."""
+    require_step_secrets(())
+    exact(sha)
+    root, checkout, private = prepared()
+    if head_revision(checkout) != sha:
+        raise DsTestsError("The checkout is not the exact design-system commit")
+    folder = checkout / OPTIONAL[suite]
+    if folder.is_symlink() or not folder.is_dir() or not (folder / "package.json").is_file() or \
+            (folder / "package.json").is_symlink():
+        record = checked_record({"sha": sha, "suite": suite, "ran": False, "passed": True, "total": 0, "failed": 0,
+                                 "skipped": 0, "failures": []}, sha, suite)
+        write_record(private, record)
+        report(record)
+        return
+    cwd = cwd_of(checkout)
+    env, log, test_log = node_env(root), private / f"{suite}.log", private / f"{suite}-test.log"
+    # Counts come only from this run's own test output, never a log left from before.
+    test_log.unlink(missing_ok=True)
+    checks, tests = [], None
+    installed = checked_run(steps[0][1], log, cwd, env, tool)
+    checks.append((steps[0][0], installed))
+    for name, argv in steps[1:]:
+        if not installed:
+            checks.append((name + f" (not run: {steps[0][0]} failed)", False))
+            continue
+        testing = argv[-1] == "test"
+        done = checked_run(argv, test_log if testing else log, cwd, env, tool)
+        if testing:
+            counts = vitest_counts(test_log.read_text(errors="replace")) if test_log.is_file() else None
+            if counts and (done or counts[1]):
+                tests = (counts[0], counts[1], counts[2],
+                         [{"name": name, "message": f"{int(counts[1])} vitest tests failed"}] if counts[1] else [])
+                continue
+        checks.append((name, done))
+    total, failed, skipped, failures = counted(checks, tests)
+    record = record_of(sha, suite, True, total, failed, skipped, failures)
+    write_record(private, record)
+    report(record)
+
+
+def run_web(sha, tool=quiet):
+    return run_npm(sha, "web", WEB_STEPS, lambda checkout: checkout / WEB, tool)
+
+
+def run_prototype(sha, tool=quiet):
+    return run_npm(sha, "prototype", PROTOTYPE_STEPS, lambda checkout: checkout, tool)
+
+
 def report(record):
     """One fixed line: the suite and its counts, never a name or a message."""
     suite = record["suite"]
+    if absent(record):
+        if suite == "web":
+            print("May DS tests web: skipped: no web/")
+        else:
+            print("May DS tests prototype: skipped: no prototype/")
+        return
     if not record["ran"]:
         print(f"May DS tests {suite}: did not run (the build or the tool stopped before a result)")
         return
@@ -270,7 +441,7 @@ def report(record):
 
 def suite_of(suite):
     if suite not in SUITES:
-        raise DsTestsError("The suite is neither swift nor android")
+        raise DsTestsError("The suite is not swift, android, tokens, web or prototype")
     return suite
 
 
@@ -382,10 +553,13 @@ def comment_body(sha, url, records, results):
             state = {"success": "passed", "failure": "failed"}.get(results.get(suite), "no result")
             lines.append(f"| {TITLES[suite]} | {state} (no detail reached the post job) | | | |")
             continue
+        if absent(record):
+            lines.append(f"| {TITLES[suite]} | skipped (no `{OPTIONAL[suite]}/` yet) | | | |")
+            continue
         state = "passed" if record["passed"] else "failed" if record["ran"] else "did not run"
         lines.append(f"| {TITLES[suite]} | {state} | {int(record['total'])} | {int(record['failed'])} | "
                      f"{int(record['skipped'])} |")
-        if record["ran"] and record["total"] < BASELINES[suite]:
+        if record["ran"] and suite in BASELINES and record["total"] < BASELINES[suite]:
             details.append(f"> **Warning:** {suite} ran {int(record['total'])} tests, fewer than the "
                            f"{BASELINES[suite]} at `{BASELINE_SHA}`.")
         if record["failures"]:
@@ -431,6 +605,8 @@ def status_description(records, results):
         record = records.get(suite)
         if record is None:
             parts.append(f"{suite} {'passed' if results.get(suite) == 'success' else 'failed'}")
+        elif absent(record):
+            parts.append(f"{suite} skipped")
         elif not record["ran"]:
             parts.append(f"{suite} did not run")
         else:
@@ -496,7 +672,8 @@ def post(sha, pr, call_api=github):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("swift", "android", "seal", "verdict", "open", "status", "post"))
+    parser.add_argument("command", choices=("swift", "android", "tokens", "web", "prototype", "seal", "verdict", "open",
+                                            "status", "post"))
     parser.add_argument("--ds-sha")
     parser.add_argument("--pr-number")
     parser.add_argument("--suite")
@@ -505,6 +682,12 @@ def main():
         return run_swift(args.ds_sha)
     if args.command == "android":
         return run_android(args.ds_sha)
+    if args.command == "tokens":
+        return run_tokens(args.ds_sha)
+    if args.command == "web":
+        return run_web(args.ds_sha)
+    if args.command == "prototype":
+        return run_prototype(args.ds_sha)
     if args.command == "seal":
         return seal(args.ds_sha, args.suite)
     if args.command == "verdict":

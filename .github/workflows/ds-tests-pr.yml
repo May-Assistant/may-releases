@@ -1,4 +1,4 @@
-name: May design-system tests at a may-design-system pull request head (Swift and Android suites; pass or fail and counts only)
+name: May design-system tests at a may-design-system pull request head (Swift, Android, tokens, web and prototype suites; pass or fail and counts only)
 # The pull request number and head SHA only (both public in this log already): ds_tests_schedule.py reads it to run a
 # head once.
 run-name: 'May DS tests for may-design-system #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'
@@ -157,11 +157,147 @@ jobs:
       - name: Remove the design-system checkout, logs, Gradle home and the pinned JDK
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-gradle" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"
+  tokens:
+    # The token and agent-mark generators' --check and the tools' node --test suite (coordinator, 30 Oct), with
+    # the pinned Node and the read-only deploy key in the fetch alone.
+    needs: [admission, pull]
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned, checksum-verified Node
+        run: python3 -I -S -B tools/may_release/toolchain.py node
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the exact design-system commit quietly
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Run the tokens suite without any credential, printing only pass or fail and counts
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py tokens --ds-sha "$MAY_DS_SHA"
+      - name: Seal the tokens record for the post job, with no secret
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py seal --suite tokens --ds-sha "$MAY_DS_SHA"
+      - name: Hand over only the sealed tokens record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-ds-tests-tokens-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-sealed/tokens.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the tokens suite did not pass
+        run: python3 -I -S -B tools/may_release/ds_tests.py verdict --suite tokens
+      - name: Remove the design-system checkout, logs, npm cache and the pinned Node
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-npm" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"
+  web:
+    # web/'s npm ci, npm test, typecheck and build (coordinator, 30 Oct), with the pinned Node and the read-only
+    # deploy key in the fetch alone. Before web/ exists, the suite reports "skipped: no web/" and passes.
+    needs: [admission, pull]
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned, checksum-verified Node
+        run: python3 -I -S -B tools/may_release/toolchain.py node
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the exact design-system commit quietly
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Run the web suite without any credential, printing only pass or fail and counts
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py web --ds-sha "$MAY_DS_SHA"
+      - name: Seal the web record for the post job, with no secret
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py seal --suite web --ds-sha "$MAY_DS_SHA"
+      - name: Hand over only the sealed web record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-ds-tests-web-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-sealed/web.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the web suite did not pass
+        run: python3 -I -S -B tools/may_release/ds_tests.py verdict --suite web
+      - name: Remove the design-system checkout, logs, npm cache and the pinned Node
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-npm" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"
+  prototype:
+    # The prototype's npm ci and npm test from the checkout, its pretest building web/ first (coordinator, 30 Oct),
+    # with the pinned Node and the read-only deploy key in the fetch alone. Before prototype/ exists, the suite reports
+    # "skipped: no prototype/" and passes.
+    needs: [admission, pull]
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned, checksum-verified Node
+        run: python3 -I -S -B tools/may_release/toolchain.py node
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the exact design-system commit quietly
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_DS_PR: ${{ inputs.pr_number }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Run the prototype suite without any credential, printing only pass or fail and counts
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py prototype --ds-sha "$MAY_DS_SHA"
+      - name: Seal the prototype record for the post job, with no secret
+        env:
+          MAY_DS_SHA: ${{ inputs.source_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/ds_tests.py seal --suite prototype --ds-sha "$MAY_DS_SHA"
+      - name: Hand over only the sealed prototype record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-ds-tests-prototype-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-sealed/prototype.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the prototype suite did not pass
+        run: python3 -I -S -B tools/may_release/ds_tests.py verdict --suite prototype
+      - name: Remove the design-system checkout, logs, npm cache and the pinned Node
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-npm" "$RUNNER_TEMP/may-ds-tests-sealed" "$RUNNER_TEMP/may-tools"
   post:
     # A fresh runner that runs no design-system code: the comment token is minted here alone, and the decrypt key and
-    # the comment token each live in one step. It runs once both suites have finished, passed or failed; a suite whose
+    # the comment token each live in one step. It runs once every suite has finished, passed or failed; a suite whose
     # record did not arrive is posted from its job's result alone, still head-marked.
-    needs: [admission, swift, android]
+    needs: [admission, swift, android, tokens, web, prototype]
     if: ${{ !cancelled() && needs.admission.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
@@ -206,6 +342,21 @@ jobs:
         with:
           name: may-ds-tests-android-${{ github.run_attempt }}
           path: ${{ runner.temp }}/may-ds-tests-download/android
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: may-ds-tests-tokens-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-download/tokens
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: may-ds-tests-web-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-download/web
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: may-ds-tests-prototype-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-tests-download/prototype
       - name: Decrypt and check the suite records
         env:
           MAY_DS_SHA: ${{ inputs.source_sha }}
@@ -218,14 +369,20 @@ jobs:
           MAY_DS_STATUS_TOKEN: ${{ steps.ci-ds-status.outputs.token || secrets.MAY_DS_STATUS_TOKEN }}
           MAY_SWIFT_RESULT: ${{ needs.swift.result }}
           MAY_ANDROID_RESULT: ${{ needs.android.result }}
+          MAY_TOKENS_RESULT: ${{ needs.tokens.result }}
+          MAY_WEB_RESULT: ${{ needs.web.result }}
+          MAY_PROTOTYPE_RESULT: ${{ needs.prototype.result }}
         run: python3 -I -S -B tools/may_release/ds_tests.py status --ds-sha "$MAY_DS_SHA"
-      - name: Post both suites' results on the design-system pull request, never in this log
+      - name: Post every suite's result on the design-system pull request, never in this log
         env:
           MAY_DS_SHA: ${{ inputs.source_sha }}
           MAY_DS_PR: ${{ inputs.pr_number }}
           MAY_DS_PR_COMMENT_TOKEN: ${{ steps.ci-ds-comment.outputs.token || secrets.MAY_DS_PR_COMMENT_TOKEN }}
           MAY_SWIFT_RESULT: ${{ needs.swift.result }}
           MAY_ANDROID_RESULT: ${{ needs.android.result }}
+          MAY_TOKENS_RESULT: ${{ needs.tokens.result }}
+          MAY_WEB_RESULT: ${{ needs.web.result }}
+          MAY_PROTOTYPE_RESULT: ${{ needs.prototype.result }}
         run: python3 -I -S -B tools/may_release/ds_tests.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
       - name: Remove the decrypted records
         if: always()
