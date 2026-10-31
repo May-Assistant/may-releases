@@ -163,7 +163,7 @@ class MintMutationTests(unittest.TestCase):
         self.assertEqual(set(static_check.COMMENT_SLUG_POSTS),
                          {("native-compile-pr.yml", "post"), ("native-compile-pr.yml", "swift-checks"),
                           ("ios-core-pr.yml", "core"), ("native-compile-pr.yml", "core"), ("ios-renders.yml", "publish"),
-                          ("ds-swift-compile.yml", "native")},
+                          ("ds-swift-compile.yml", "post")},
                          "every post that dedupes on its head's marker")
         for (name, job), (step_id, run) in static_check.COMMENT_SLUG_POSTS.items():
             with self.subTest(workflow=name, job=job):

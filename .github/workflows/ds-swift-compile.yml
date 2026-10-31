@@ -21,7 +21,10 @@ jobs:
     # compiles may-design-system's Swift package alone and posts its compile errors (path:line:col and the compiler's
     # message, never source) as one comment on that private pull request. This repository is public: nothing derived
     # from the design system (paths, messages, file or scheme names, logs) is printed, summarised or uploaded here.
-    # The log carries only fixed lines, the dispatch's inputs and the number of errors (ds_compile.py). Admission has
+    # The log carries only fixed lines, the dispatch's inputs and the number of errors (ds_compile.py). The same split as
+    # ds-tests-pr.yml and native-compile-pr.yml: pull mints the read token and checks the pull request, native runs the
+    # design system's code with the read-only deploy key in the fetch alone and never a token, and seals its errors;
+    # post, a fresh runner, opens them and mints the comment token (coordinator, 30 Oct). Admission has
     # no environment, so a missing one is denied on its 404 and never auto-created; it checks the inputs and
     # may-ds-renders' policy (no required reviewer, administrator bypass off, main only).
     runs-on: ubuntu-24.04
@@ -40,11 +43,12 @@ jobs:
           MAY_DS_SHA: ${{ inputs.ds_sha }}
           MAY_DS_PR: ${{ inputs.ds_pr }}
         run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
-  native:
+  pull:
+    # Mints the read token and checks the pull request, on a runner that never runs the design system's code.
     needs: admission
-    runs-on: macos-15
+    runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
-    timeout-minutes: 55
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -62,6 +66,69 @@ jobs:
           owner: May-Assistant
           repositories: may-design-system
           permission-pull-requests: read
+      - name: Check the design-system pull request head and environment before fetching
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAY_DS_PR_READ_TOKEN: ${{ steps.ci-ds-read.outputs.token || secrets.MAY_DS_PR_READ_TOKEN }}
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_DS_PR: ${{ inputs.ds_pr }}
+        run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR" --check-pull
+  native:
+    # The Swift package's compile, holding no token: the read-only deploy key in the fetch alone.
+    needs: [admission, pull]
+    runs-on: macos-15
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned age, before any pull request code
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - name: Fetch the exact design-system commit quietly
+        env:
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_DS_PR: ${{ inputs.ds_pr }}
+          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
+      - name: Compile the Swift package without signing or any credential
+        run: python3 -I -S -B tools/may_release/ds_compile.py compile
+      - name: Seal the errors for the post job, with no secret
+        env:
+          MAY_DS_SHA: ${{ inputs.ds_sha }}
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py seal --ds-sha "$MAY_DS_SHA"
+      - name: Hand over only the sealed record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: may-ds-compile-record-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-compile-sealed/compile.age
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Fail if the compile failed
+        run: python3 -I -S -B tools/may_release/ds_compile.py verdict
+      - name: Remove the design-system checkout, logs and products
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-derived" "$RUNNER_TEMP/may-ds-packages" "$RUNNER_TEMP/may-ds-compile-sealed" "$RUNNER_TEMP/may-tools"
+  post:
+    # A fresh runner that runs no design-system code: the comment token is minted here alone, and the decrypt key and
+    # the comment token each live in one step. It runs once the compile finished, passed or failed; with no record,
+    # the compile job's result alone is posted, still head-marked.
+    needs: [admission, native]
+    if: ${{ !cancelled() && needs.admission.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Mint the May CI token for MAY_DS_PR_COMMENT_TOKEN, before any pull request code
         id: ci-ds-comment
         if: vars.MAY_CI_APP_ID != ''
@@ -72,28 +139,28 @@ jobs:
           owner: May-Assistant
           repositories: may-design-system
           permission-pull-requests: write
-      - name: Check the design-system pull request head and environment before fetching
+      - name: Install pinned age
+        run: python3 -I -S -B tools/may_release/toolchain.py age
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Nothing to download (no key pair, or the compile stopped before its seal) is reported by the open step.
+        continue-on-error: true
+        with:
+          name: may-ds-compile-record-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/may-ds-compile-download
+      - name: Decrypt and check the compile record
         env:
-          GH_TOKEN: ${{ github.token }}
-          MAY_DS_PR_READ_TOKEN: ${{ steps.ci-ds-read.outputs.token || secrets.MAY_DS_PR_READ_TOKEN }}
           MAY_DS_SHA: ${{ inputs.ds_sha }}
-          MAY_DS_PR: ${{ inputs.ds_pr }}
-        run: python3 -I -S -B tools/may_release/gate.py --action ds-compile --source-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR" --check-pull
-      - name: Fetch the exact design-system commit quietly
-        env:
-          MAY_DS_SHA: ${{ inputs.ds_sha }}
-          MAY_DS_PR: ${{ inputs.ds_pr }}
-          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
-        run: python3 -I -S -B tools/may_release/ds_compile.py fetch --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
-      - name: Compile the Swift package without signing or any credential
-        run: python3 -I -S -B tools/may_release/ds_compile.py compile
+          MAY_RENDERS_RECIPIENT: ${{ vars.MAY_RENDERS_RECIPIENT }}
+          MAY_RENDERS_DECRYPT_KEY: ${{ secrets.MAY_RENDERS_DECRYPT_KEY }}
+        run: python3 -I -S -B tools/may_release/ds_compile.py open --ds-sha "$MAY_DS_SHA"
       - name: Post the errors on the design-system pull request, never in this log
         env:
           MAY_DS_SHA: ${{ inputs.ds_sha }}
           MAY_DS_PR: ${{ inputs.ds_pr }}
+          MAY_NATIVE_RESULT: ${{ needs.native.result }}
           MAY_DS_PR_COMMENT_TOKEN: ${{ steps.ci-ds-comment.outputs.token || secrets.MAY_DS_PR_COMMENT_TOKEN }}
           MAY_CI_APP_SLUG: ${{ steps.ci-ds-comment.outputs.app-slug }}
         run: python3 -I -S -B tools/may_release/ds_compile.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
-      - name: Remove the design-system checkout, logs and products
+      - name: Remove the decrypted record
         if: always()
-        run: rm -rf -- "$RUNNER_TEMP/may-ds-source" "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-derived" "$RUNNER_TEMP/may-ds-packages"
+        run: rm -rf -- "$RUNNER_TEMP/may-ds-private" "$RUNNER_TEMP/may-ds-compile-download" "$RUNNER_TEMP/may-tools"
