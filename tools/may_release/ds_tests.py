@@ -445,6 +445,18 @@ def suite_of(suite):
     return suite
 
 
+def sealed_bytes(record):
+    """The record as UTF-8 JSON within MAX_RECORD. Non-ASCII text stays as itself (ensure_ascii's \\u escapes cost six
+    bytes a character, so a hundred long non-ASCII lines did not fit), and while it is still too large its last listed
+    failures are dropped, its counts kept, so the comment says how many more there were."""
+    record = dict(record, failures=list(record["failures"]))
+    while True:
+        data = json.dumps(record, ensure_ascii=False).encode("utf-8")
+        if len(data) <= MAX_RECORD or not record["failures"]:
+            return data
+        record["failures"].pop()
+
+
 def seal(sha, suite):
     require_step_secrets(())
     exact(sha)
@@ -462,7 +474,7 @@ def seal(sha, suite):
         return
     if not AGE_RECIPIENT.fullmatch(recipient):
         raise DsTestsError("MAY_RENDERS_RECIPIENT is not an age public key")
-    data = json.dumps(record).encode()
+    data = sealed_bytes(record)
     if len(data) > MAX_RECORD:
         raise DsTestsError("The suite record is too large to seal")
     plain, sealed = private / f"{suite}.plain", root / SEALED
@@ -527,7 +539,7 @@ def open_records(sha):
                         plain.stat().st_size != MAX_RECORD:
                     raise DsTestsError("A suite record failed to decrypt or authenticate")
                 try:
-                    record = checked_record(json.loads(plain.read_text()), sha, suite)
+                    record = checked_record(json.loads(plain.read_text(encoding="utf-8")), sha, suite)
                 except (ValueError, RecursionError):
                     raise DsTestsError("A suite record is malformed or for another commit; nothing was posted") from None
                 write_record(private, record)
