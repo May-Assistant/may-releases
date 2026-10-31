@@ -385,6 +385,48 @@ CRASH_REPORT = re.compile(r"MayPlayground[-_][A-Za-z0-9._-]{1,120}\.(?:ips|crash
 OWN_REPORT = re.compile(rb'"bundleID"[ \t]*:[ \t]*"' + re.escape(BUNDLE.encode()) + rb'"|^Identifier:[ \t]+' +
                         re.escape(BUNDLE.encode()) + rb"[ \t]*\r?$", re.MULTILINE)
 REPORT_HEAD = 16 * 1024
+# Run 41197247993: an .ips report writes its whole threads array on one line, which kept_lines drops (its long runs
+# trip the base64 rule), so the crash came with no backtrace. The faulting thread's top CRASH_FRAMES frames go ahead of
+# the report as short "frame <n> <image> <symbol>" lines, each through the same redaction, Swift symbols demangled
+# (coordinator, 31 Oct). Up to MAX_REPORT bytes are read to find them; the report itself is still cut as before.
+CRASH_FRAMES, MAX_FRAME_NAME, MAX_REPORT = 15, 200, 4 * 1024 * 1024
+MANGLED = re.compile(r"_?\$s[A-Za-z0-9_$]{1,400}")
+FRAME_NAME = re.compile(r"[^\x20-\x7e]")
+
+
+def demangled(symbols, env):
+    """{mangled: demangled} for Swift symbols, by the toolchain's swift-demangle; {} when it could not answer, so a
+    frame keeps its symbol as it was. Only MANGLED names are passed, as arguments, never through a shell."""
+    if not symbols:
+        return {}
+    done = device_tests.bounded_output(["xcrun", "swift-demangle", "--simplified", "--compact", *symbols], env)
+    names = done[1].decode("utf-8", "replace").splitlines() if done is not None and done[0] == 0 else []
+    return dict(zip(symbols, names)) if len(names) == len(symbols) else {}
+
+
+def crash_frames(data, env, demangle=demangled):
+    """The faulting thread's top CRASH_FRAMES frames of an .ips report (a JSON header line, then a JSON body), one
+    "frame <n> <image> <symbol>" line each, every name printable ASCII cut to MAX_FRAME_NAME; b"" when the report has
+    none (a .crash report, a cut or unreadable body)."""
+    try:
+        report = json.loads(data.partition(b"\n")[2])
+        thread = report["threads"][report["faultingThread"]]
+        frames, images = thread["frames"][:CRASH_FRAMES], report.get("usedImages") or []
+    except (ValueError, KeyError, IndexError, TypeError):
+        return b""
+    if not isinstance(frames, list) or not isinstance(images, list):
+        return b""
+    found = []
+    for frame in frames:
+        frame = frame if isinstance(frame, dict) else {}
+        index, symbol = frame.get("imageIndex"), frame.get("symbol")
+        image = images[index] if isinstance(index, int) and 0 <= index < len(images) else None
+        image = image.get("name") if isinstance(image, dict) else None
+        found.append((image if isinstance(image, str) else "?", symbol if isinstance(symbol, str) else "?"))
+    names = demangle(sorted({symbol for _, symbol in found if MANGLED.fullmatch(symbol)}), env)
+    return b"".join(f"frame {number} {FRAME_NAME.sub('?', image)[:MAX_FRAME_NAME]} "
+                    f"{FRAME_NAME.sub('?', names.get(symbol, symbol))[:MAX_FRAME_NAME]}\n".encode()
+                    for number, (image, symbol) in enumerate(found))
 
 
 def body_changes(lines):
@@ -417,8 +459,8 @@ class Diagnostics:
     new crash report of the Playground's, through the same redaction, as <scenario>.diag.txt. Reports already there at
     the start are left out, so each scenario keeps its own."""
 
-    def __init__(self, udid, env, reports=CRASH_REPORTS, shown=show_log):
-        self.udid, self.env, self.reports, self.shown = udid, env, reports, shown
+    def __init__(self, udid, env, reports=CRASH_REPORTS, shown=show_log, demangle=demangled):
+        self.udid, self.env, self.reports, self.shown, self.demangle = udid, env, reports, shown, demangle
         self.seen = set(self.crash_reports())
         self.start = None
         self.kept = self.stalls = self.longest = self.crashes = self.drivers = 0
@@ -448,11 +490,13 @@ class Diagnostics:
                 self.seen.add(path)
                 try:
                     with path.open("rb") as report:
-                        data = report.read(device_tests.MAX_DIAG // 2)
+                        whole = report.read(MAX_REPORT)
                 except OSError:
                     continue
-                if OWN_REPORT.search(data[:REPORT_HEAD]):
-                    found.append(b"== crash ==\n" + data + b"\n")
+                if OWN_REPORT.search(whole[:REPORT_HEAD]):
+                    frames = crash_frames(whole, self.env, self.demangle)
+                    found.append(b"== crash ==\n" + (b"faulting thread, top frames:\n" + frames if frames else b"") +
+                                 whole[:device_tests.MAX_DIAG // 2] + b"\n")
         self.crashes += bool(found)
         lines = body_changes([line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
                               .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line) or
