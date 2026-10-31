@@ -2122,6 +2122,28 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertTrue(device_mcp.shown_words({"content-desc": "Photo of the receipt"}), "Android's label counts too")
         self.assertFalse(device_mcp.shown_words({"text": " ", "accessibilityText": ""}))
 
+    def test_a_threads_replies_rule_is_chrome(self):
+        """N and the coordinator, 31 Oct: "No replies yet" is the thread's rule, never a message, by each id it has:
+        iOS's messageThread.replies, a task thread's thread.replies, and the design system's mayThread.replies (Android),
+        in whichever view shows it."""
+        self.config["look"] = True
+        tree = lambda *nodes: {"attributes": {"bounds": "[0,0][402,874]"},
+                               "children": [{"attributes": node} for node in nodes]}
+        rule = {"text": "", "accessibilityText": "No replies yet", "bounds": "[20,620][380,650]"}
+        shapes = (("messageThread", "messageThread.replies"), ("thread", "thread.replies"), ("thread", "mayThread.replies"),
+                  ("messageThread", "mayThread.replies"), ("chat", "messageThread.replies"))
+        for prefix, rule_id in shapes:
+            self.config["looks"] = []  # at most MAX_LOOKS are kept a run; each shape is its own look here
+            header = {"resource-id": prefix + ".header", "accessibilityText": "Book the dentist",
+                      "bounds": "[60,52][390,104]"}
+            composer = {"resource-id": prefix + ".composer", "bounds": "[14,730][388,830]"}
+            with self.subTest(rule=rule_id), patch(__name__ + ".IOS_TREE",
+                                                   tree(header, composer, dict(rule, **{"resource-id": rule_id}))):
+                self.assertFalse(self.call("hierarchy")[0])
+                self.assertEqual([look["shown"] for look in self.config["looks"]], [0],
+                                 "a thread showing only its rule is blank")
+        self.assertEqual(device_mcp.LOOK_CHROME, ("messageThread.replies", "thread.replies", "mayThread.replies"))
+
     def test_a_row_without_a_card_counts_no_looks(self):
         with patch(__name__ + ".IOS_TREE", {"attributes": {}, "children": [
                 {"attributes": {"resource-id": "chat.header", "bounds": "[0,50][393,110]"}},
