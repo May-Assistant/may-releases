@@ -2551,7 +2551,7 @@ class WorkflowPinTests(unittest.TestCase):
         self.assertEqual(static_check.device_tests_workflow_problems(self.text), [])
         self.assertEqual(static_check.device_tests_print_problems(ROOT), [])
 
-    def test_reduce_motion_is_an_optional_boolean_read_by_the_ios_scenarios_step_alone(self):
+    def test_reduce_motion_is_a_boolean_on_by_default_read_by_the_ios_scenarios_step_alone(self):
         line = "          MAY_IOS_REDUCE_MOTION: ${{ inputs.ios_reduce_motion }}\n"
         self.assertEqual(self.text.count(line), 1)
         android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
@@ -2561,6 +2561,10 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace("        type: boolean\n        default: false\n", "        type: string\n"
                                        "        default: \"\"\n"), "ios_diagnostics, ios_log_changes, ios_loop_census and tidy_file_taxes booleans")
         self.flagged(self.text.replace("      ios_reduce_motion:\n", "      reduce_motion:\n"),
+                     "ios_diagnostics, ios_log_changes, ios_loop_census and tidy_file_taxes booleans")
+        block = self.text[self.text.index("      ios_reduce_motion:\n"):self.text.index("      ios_diagnostics:\n")]
+        self.assertTrue(block.endswith("        type: boolean\n        default: true\n"), "on unless dispatched off")
+        self.flagged(self.text.replace(block, block.replace("default: true", "default: false")),
                      "ios_diagnostics, ios_log_changes, ios_loop_census and tidy_file_taxes booleans")
 
     def test_diagnostics_is_an_optional_boolean_read_by_the_ios_scenarios_step_alone(self):

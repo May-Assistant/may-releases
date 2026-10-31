@@ -56,8 +56,12 @@ IOS_LAST = ("notes", "chat", "onboarding")
 COMPILE_SECONDS = 300
 # A launch argument (UserDefaults' argument domain), never the environment: may-app #1194's in-app touch overlay.
 SHOW_TOUCHES = ("-MayShowTouches", "YES")
-# The coordinator's A/B switch (25 Oct): with ios_reduce_motion dispatched true, the simulator's Reduce Motion is on
-# before the app first starts, which stops the chat header's mark redrawing every frame (N's audit).
+# The coordinator's A/B switch (25 Oct), on by default since 31 Oct: the simulator's Reduce Motion is on before the app
+# first starts unless ios_reduce_motion is dispatched false, so the nightly run (no inputs) has it too. With it off,
+# runs 41164564379, 41180883244 and 41201894346 hung on iOS taps (XCTest never saw the app idle); with it on, run
+# 41169912308 took every act. No app or design-system loop was found drawing in the hangs (the loop census of
+# 41201894346), so the likeliest cause is a system animation keeping XCTest from idling (coordinator, 31 Oct: stop
+# hunting). Dispatched false, the log says it is off, so a run can still compare.
 REDUCE_MOTION = "MAY_IOS_REDUCE_MOTION"
 REDUCE_MOTION_ON = ("defaults", "write", "com.apple.Accessibility", "ReduceMotionEnabled", "-bool", "true")
 # may-app #1338 (N, 26 Oct): the debug Playground's main-thread watchdog and SwiftUI's change log run only when the
@@ -619,6 +623,10 @@ def boot(log, env):
     return udid
 
 
+def reduce_motion_wanted():
+    return os.environ.get(REDUCE_MOTION, "").strip() != "false"
+
+
 def diagnostics_wanted():
     return os.environ.get(DIAGNOSTICS, "").strip() != "false"
 
@@ -698,11 +706,12 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                        **device_tests.maestro_isolation(device_tests.maestro_home(root)))
     at("booting the simulator")
     udid = boot(log, env)
-    if os.environ.get(REDUCE_MOTION, "").strip() == "true":
-        if renders.quiet(["xcrun", "simctl", "spawn", udid, *REDUCE_MOTION_ON], log, env=env).returncode:
-            print("May device tests (ios): Reduce Motion could not be turned on; the run goes on without it")
-        else:
-            print("May device tests (ios): Reduce Motion is on for this run")
+    if not reduce_motion_wanted():
+        print("May device tests (ios): Reduce Motion is off for this run (dispatched false)")
+    elif renders.quiet(["xcrun", "simctl", "spawn", udid, *REDUCE_MOTION_ON], log, env=env).returncode:
+        print("May device tests (ios): Reduce Motion could not be turned on; the run goes on without it")
+    else:
+        print("May device tests (ios): Reduce Motion is on for this run")
     if diagnostics_wanted():
         print("May device tests (ios): the main-thread watchdog is on for this run")
     if log_changes_wanted():

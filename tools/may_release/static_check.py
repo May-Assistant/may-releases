@@ -1452,10 +1452,11 @@ DEVICE_VARS = {("MAY_STAGING_API_URL", "${{ vars.MAY_STAGING_API_URL }}"),
                ("MAY_DEVICE_TESTS_FRESH", "${{ vars.MAY_DEVICE_TESTS_FRESH }}"),
                ("MAY_DEVICE_TESTS_MODEL", "${{ vars.MAY_DEVICE_TESTS_MODEL }}"),
                ("MAY_RENDERS_RECIPIENT", "${{ vars.MAY_RENDERS_RECIPIENT }}")}
-# The coordinator's A/B switch for iOS (25 Oct): Reduce Motion on in the simulator, in the iOS scenarios step alone.
+# The coordinator's A/B switch for iOS (25 Oct): Reduce Motion in the simulator, in the iOS scenarios step alone; on
+# unless dispatched false since 31 Oct, so the nightly run has it too (with it off, iOS taps hung in three runs).
 DEVICE_REDUCE_MOTION = ("MAY_IOS_REDUCE_MOTION", "${{ inputs.ios_reduce_motion }}")
 DEVICE_REDUCE_MOTION_INPUT = ("      ios_reduce_motion:\n        description: [^\n]+\n        required: false\n"
-                              "        type: boolean\n        default: false\n")
+                              "        type: boolean\n        default: true\n")
 # The iOS app's watchdog (may-app #1338), asked for at launch, in the iOS scenarios step alone: on unless dispatched
 # false, so the nightly run (no inputs) has it too (coordinator, 26 Oct: runs 40309200520 and 40319309252 showed no
 # measurable cost). SwiftUI's change log has its own input, off unless dispatched true (may-app #1302: it brought the
