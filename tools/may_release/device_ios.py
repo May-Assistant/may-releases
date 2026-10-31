@@ -70,6 +70,12 @@ REDUCE_MOTION_ON = ("defaults", "write", "com.apple.Accessibility", "ReduceMotio
 DIAGNOSTICS, LOG_CHANGES = "MAY_IOS_DIAGNOSTICS", "MAY_IOS_LOG_CHANGES"
 WATCHDOG_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_WATCHDOG": "1"}
 LOG_CHANGES_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES": "1"}
+# N, 31 Oct (may-app claude/ios-loop-census, DS #240): the debug Playground's loop census, asked for only when the run is
+# dispatched with ios_loop_census. Every 5 s while a design-system loop drew a frame in the last 2 s, it logs
+# "may-loops: <Name>, <Name>" (names from a fixed set, no user content) in the watchdog's category, so the private diag
+# keeps those lines beside each refused act's times. Run it with ios_diagnostics off: the watchdog's pings blur idle.
+LOOP_CENSUS = "MAY_IOS_LOOP_CENSUS"
+LOOP_CENSUS_LAUNCH = {"SIMCTL_CHILD_MAY_DIAG_LOOPS": "1"}
 SWIFTUI_PERSIST = ("log", "config", "--subsystem", "com.apple.SwiftUI", "--mode", "level:info,persist:info")
 # Ad-hoc simulator signing, with no identity, team or secret: Xcode embeds the Playground's entitlements as simulated
 # ones. Unsigned (CODE_SIGNING_ALLOWED=NO), the app had none, so the Keychain refused its test session
@@ -569,15 +575,20 @@ def log_changes_wanted():
     return os.environ.get(LOG_CHANGES, "").strip() == "true"
 
 
+def loop_census_wanted():
+    return os.environ.get(LOOP_CENSUS, "").strip() == "true"
+
+
 def launch(udid, env, token, log):
     """The app, stopped and started again with a fresh test session in its launch environment (never an argument);
     signed out, with no token (the smoke scenario). SHOW_TOUCHES draws each tap in the app (may-app #1194, May
     Playground alone), as Android's show_touches does, since the simulator's recording never shows touches. The
     watchdog is asked for unless the run turned it off (WATCHDOG_LAUNCH), SwiftUI's change log only when the run
-    turned it on (LOG_CHANGES_LAUNCH)."""
+    turned it on (LOG_CHANGES_LAUNCH), the loop census only when the run turned it on (LOOP_CENSUS_LAUNCH)."""
     renders.quiet(["xcrun", "simctl", "terminate", udid, BUNDLE], log, env=env)
     env = dict(env, **WATCHDOG_LAUNCH) if diagnostics_wanted() else env
     env = dict(env, **LOG_CHANGES_LAUNCH) if log_changes_wanted() else env
+    env = dict(env, **LOOP_CENSUS_LAUNCH) if loop_census_wanted() else env
     launched = renders.quiet(["xcrun", "simctl", "launch", udid, BUNDLE, *SHOW_TOUCHES], log,
                              env=dict(env, SIMCTL_CHILD_MAY_TEST_SESSION=token) if token else env)
     if launched.returncode:
@@ -644,6 +655,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         print("May device tests (ios): the main-thread watchdog is on for this run")
     if log_changes_wanted():
         print("May device tests (ios): SwiftUI's change log is on for this run")
+    if loop_census_wanted():
+        print("May device tests (ios): the design-system loop census is on for this run")
     # Run 40232904242: SwiftUI's info lines stayed in the simulator's memory alone, so a scenario's later read kept
     # only its last minutes of body changes. They are persisted for that subsystem alone, before the app starts; the
     # read and its rules are unchanged (private diag alone).

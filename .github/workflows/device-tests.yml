@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      ios_loop_census:
+        description: Ask the iOS app which design-system loops are drawing (may-loops lines; evidence runs only, with ios_diagnostics off)
+        required: false
+        type: boolean
+        default: false
       tidy_file_taxes:
         description: One-off, instead of the scenarios - remove earlier runs' leftover note lines from the test account's "file taxes" task
         required: false
@@ -196,6 +201,7 @@ jobs:
           MAY_IOS_REDUCE_MOTION: ${{ inputs.ios_reduce_motion }}
           MAY_IOS_DIAGNOSTICS: ${{ inputs.ios_diagnostics }}
           MAY_IOS_LOG_CHANGES: ${{ inputs.ios_log_changes }}
+          MAY_IOS_LOOP_CENSUS: ${{ inputs.ios_loop_census }}
         run: python3 -I -S -B tools/may_release/device_tests.py run --platform ios --scenarios "$MAY_SCENARIOS"
       - name: Judge the agent scenarios
         env:

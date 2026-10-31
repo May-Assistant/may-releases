@@ -255,6 +255,24 @@ class RunTests(Workspace):
                 self.assertEqual((watchdog_line in lines, change_log_line in lines),
                                  ("SIMCTL_CHILD_MAY_DIAG_WATCHDOG" in asked, "SIMCTL_CHILD_MAY_DIAG_LOG_CHANGES" in asked))
 
+    def test_the_loop_census_is_asked_for_at_launch_only_when_dispatched(self):
+        """N, 31 Oct: MAY_DIAG_LOOPS=1 at launch, only with ios_loop_census dispatched true; its may-loops lines are
+        in the watchdog's category, so they reach the private diag with ios_diagnostics off too."""
+        line = "May device tests (ios): the design-system loop census is on for this run"
+        for census, asked in (("true", True), (" true ", True), ("TRUE", False), ("false", False), ("", False), (None, False)):
+            with self.subTest(census=census):
+                (self.private / device_tests.AGENTS).unlink(missing_ok=True)
+                calls, minted, report, out, run = self.run_it(env={device_ios.DIAGNOSTICS: "false",
+                                                                   device_ios.LOOP_CENSUS: census})
+                launched = [env for argv, env in calls if argv[:3] == ["xcrun", "simctl", "launch"]]
+                self.assertTrue(launched)
+                for env in launched:
+                    self.assertEqual({k for k in env if k.startswith("SIMCTL_CHILD_MAY_DIAG_")},
+                                     {"SIMCTL_CHILD_MAY_DIAG_LOOPS"} if asked else set(),
+                                     "the watchdog stays off with it")
+                self.assertEqual(line in out.splitlines(), asked)
+        self.assertIn("watchdog", device_ios.WATCHDOG, "the census's lines are read by the watchdog's predicate")
+
     def test_a_plain_run_says_its_stalls_were_not_collected_never_zero(self):
         (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
         test = self
