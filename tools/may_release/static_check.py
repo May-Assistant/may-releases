@@ -271,6 +271,7 @@ WORKFLOW_MINTS = {
     "backend-unit-pr.yml": {"backend": ("ci-read", "ci-comment")},
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
+    "ios-core-schedule.yml": {"pick": ("ci-read",)},
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
     # ds-swift-compile.yml splits like ds-tests-pr.yml: native runs the design system's code and mints nothing.
     "ds-swift-compile.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment",)},
@@ -1931,7 +1932,7 @@ def ios_core_workflow_problems(text):
     if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
         found.append(name + "top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
     if IOS_CORE_RUN_NAME not in text or text.count("run-name:") != 1:
-        found.append(name + "run-name is not exactly the pull request number and head SHA")
+        found.append(name + "run-name is not exactly the pull request number and head SHA (ios_core_schedule.py reads it)")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
@@ -2144,8 +2145,9 @@ def backend_unit_silence_problems(root):
                 "request code"]
     return []
 
-# The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py) each
-# dispatch their lane's workflow (android-unit-pr.yml, backend-unit-pr.yml) for at most one may-app head a run. Each is
+# The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py;
+# ios-core-schedule.yml, ios_core_schedule.py) each dispatch their lane's workflow (android-unit-pr.yml,
+# backend-unit-pr.yml, ios-core-pr.yml) for at most one may-app head a run. Each is
 # pinned whole by the same rules (SCHEDULES): the schedule and a bare dispatch as its only triggers, one run at a time,
 # admission with no environment then pick in the environment admission chose, actions: write in pick alone, and no step
 # holding both credentials: GITHUB_TOKEN in runs and dispatch, the PR read token in pick alone, nothing in the cleanup.
@@ -2173,6 +2175,13 @@ SCHEDULES = {
          "Dispatch the backend checks for the picked head, with no may-app credential",
          "Remove the carried numbers"],
         "May backend checks for may-app #{number} at {sha}", "actions/workflows/backend-unit-pr.yml/dispatches"),
+    "ios-core-schedule.yml": (
+        "ios_core_schedule.py", "may-ios-core-schedule", "may-ios-core-ci",
+        ["List the core runs of the last 30 days, with no may-app credential",
+         "Pick the oldest may-app head touching MayCore with no run yet, with no GitHub token",
+         "Dispatch the iOS core suite for the picked head, with no may-app credential",
+         "Remove the carried numbers"],
+        "May iOS core suite for may-app #{number} at {sha}", "actions/workflows/ios-core-pr.yml/dispatches"),
     "ds-tests-schedule.yml": (
         "ds_tests_schedule.py", "may-ds-tests-schedule", "may-ds-tests-ci",
         ["List the design-system test runs of the last 30 days, with no design-system credential",
@@ -2195,6 +2204,7 @@ SCHEDULE = "android-ci-schedule.yml"
 SCHEDULE_TOOL = SCHEDULES[SCHEDULE][0]
 SCHEDULE_DISPATCH = SCHEDULES[SCHEDULE][5]
 BACKEND_SCHEDULE = "backend-ci-schedule.yml"
+IOS_CORE_SCHEDULE = "ios-core-schedule.yml"
 WEEKLY_RELEASE = "weekly-release.yml"
 
 
@@ -2271,6 +2281,11 @@ def backend_ci_schedule_workflow_problems(text):
     return schedule_workflow_problems(BACKEND_SCHEDULE, text)
 
 
+@with_app_tokens("ios-core-schedule.yml")
+def ios_core_schedule_workflow_problems(text):
+    return schedule_workflow_problems(IOS_CORE_SCHEDULE, text)
+
+
 def schedule_tool_problems(root, workflow):
     tool, _, _, _, run_name, dispatch_path = SCHEDULES[workflow]
     lane = dispatch_path.split("/")[2]
@@ -2306,6 +2321,15 @@ def backend_ci_schedule_tool_problems(root):
     tree = ast.parse((root / "tools/may_release" / SCHEDULES[BACKEND_SCHEDULE][0]).read_text())
     if function_source(tree, "app_get") is not None or "APP_REPO}/" in ast.unparse(tree):
         found.append(SCHEDULES[BACKEND_SCHEDULE][0] + ": reads may-app other than through android_ci_schedule.app_get")
+    return found
+
+
+def ios_core_schedule_tool_problems(root):
+    found = schedule_tool_problems(root, IOS_CORE_SCHEDULE)
+    # Its may-app reads go through android_ci_schedule.app_get (pinned above), never a reader of its own.
+    tree = ast.parse((root / "tools/may_release" / SCHEDULES[IOS_CORE_SCHEDULE][0]).read_text())
+    if function_source(tree, "app_get") is not None or "APP_REPO}/" in ast.unparse(tree):
+        found.append(SCHEDULES[IOS_CORE_SCHEDULE][0] + ": reads may-app other than through android_ci_schedule.app_get")
     return found
 
 
@@ -3104,6 +3128,8 @@ def control_problems(root):
     found += compile_sandbox_problems(root)
     found += backend_ci_schedule_workflow_problems((flows / BACKEND_SCHEDULE).read_text())
     found += backend_ci_schedule_tool_problems(root)
+    found += ios_core_schedule_workflow_problems((flows / IOS_CORE_SCHEDULE).read_text())
+    found += ios_core_schedule_tool_problems(root)
     found += renders_workflow_problems((flows / RENDERS).read_text())
     found += renders_print_problems(root)
     found += device_tests_workflow_problems((flows / DEVICE_TESTS).read_text())

@@ -16,6 +16,7 @@ CHECKERS = {
     "backend-unit-pr.yml": static_check.backend_unit_workflow_problems,
     "backend-ci-schedule.yml": static_check.backend_ci_schedule_workflow_problems,
     "ios-core-pr.yml": static_check.ios_core_workflow_problems,
+    "ios-core-schedule.yml": static_check.ios_core_schedule_workflow_problems,
     "ios-renders.yml": static_check.renders_workflow_problems,
     "ds-swift-compile.yml": static_check.ds_compile_workflow_problems,
     "may-app-review.yml": static_check.review_workflow_problems,

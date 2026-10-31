@@ -1,0 +1,72 @@
+name: May iOS core suite on a schedule (dispatches ios-core-pr.yml for one may-app head touching MayCore)
+on:
+  # Every 15 minutes, and by hand: ios_core_schedule.py picks at most one head and dispatches ios-core-pr.yml.
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: may-ios-core-schedule
+  cancel-in-progress: false
+jobs:
+  admission:
+    # Chooses which may-app pull request head runs next, nothing else: the dispatched ios-core-pr.yml admits and
+    # checks that head again itself (gate.py --action compile-pr). Admission has no environment, so a missing one is
+    # denied on its 404 and never auto-created; it checks the run (schedule or dispatch, main only) and
+    # may-native-compile-pr's policy. pick holds two credentials, never in the same step: GITHUB_TOKEN (actions: write,
+    # used for one dispatch alone) in runs and dispatch, MAY_APP_PR_READ_TOKEN in pick alone. Only counts, the picked
+    # number and its head SHA are printed.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/ios_core_schedule.py admit
+  pick:
+    needs: admission
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.admission.outputs.environment }}
+    timeout-minutes: 10
+    # actions: write is for ios-core-pr.yml's dispatch alone (ios_core_schedule.control_dispatch refuses any
+    # other write); actions: read, which it includes, lists that workflow's recent runs.
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Mint the May CI token for MAY_APP_PR_READ_TOKEN, before any pull request code
+        id: ci-read
+        if: vars.MAY_CI_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MAY_CI_APP_ID }}
+          private-key: ${{ secrets.MAY_CI_APP_PRIVATE_KEY }}
+          owner: May-Assistant
+          repositories: may-app
+          permission-pull-requests: read
+      - name: List the core runs of the last 30 days, with no may-app credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/ios_core_schedule.py runs
+      - name: Pick the oldest may-app head touching MayCore with no run yet, with no GitHub token
+        env:
+          MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
+        run: python3 -I -S -B tools/may_release/ios_core_schedule.py pick
+      - name: Dispatch the iOS core suite for the picked head, with no may-app credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/ios_core_schedule.py dispatch
+      - name: Remove the carried numbers
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/may-ios-core-ci"
