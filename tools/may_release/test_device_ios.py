@@ -946,6 +946,96 @@ class DiagnosticsTests(Workspace):
         diagnostics.keep(folder, "notes", TOKEN)
         self.assertEqual(diagnostics.crashes, 1, "a crash report is kept once, by the scenario it came in")
 
+    @staticmethod
+    def ips(frames, faulting=1, pad=0):
+        """A real-shaped .ips report: its JSON header line, then a pretty body whose threads array is one long line."""
+        threads = [{"id": 1, "frames": [{"imageOffset": 4, "imageIndex": 0, "symbol": "start"}]},
+                   {"triggered": True, "id": 167, "queue": "com.apple.root.utility-qos",
+                    "threadState": {"x": [{"value": 6444301952}] * 8, "pc": {"value": 6444301952}},
+                    "frames": frames}]
+        body = ('{\n  "app_name" : "MayPlayground",\n  "exception" : {"type":"EXC_BREAKPOINT","signal":"SIGTRAP"},\n'
+                f'  "faultingThread" : {faulting},\n  "threads" : {json.dumps(threads, separators=(",", ":"))},\n'
+                '  "usedImages" : [\n  {\n    "base" : 4294967296,\n    "name" : "MayPlayground.debug.dylib"\n  },\n'
+                '  {\n    "base" : 6442450944,\n    "name" : "libswift_Concurrency.dylib"\n  }\n],\n'
+                f'  "vmSummary" : "{"x " * pad}",\n'
+                '  "legacyInfo" : {\n  "threadTriggered" : {\n    "queue" : "com.apple.root.utility-qos"\n  }\n}\n}')
+        return (b'{"app_name":"MayPlayground","bug_type":"309","bundleID":"io.github.mayassistant.may.playground"}\n' +
+                body.encode())
+
+    def test_the_faulting_threads_top_frames_go_ahead_of_an_ips_report_demangled_and_redacted(self):
+        """Run 41197247993: kept_lines dropped the .ips threads line whole, so the crash came with no backtrace."""
+        mangled = "$s7MayCore14LoopCensusLogV4tickyyFZTf4d_nAAyyFZ"
+        frames = ([{"imageOffset": 9, "imageIndex": 1, "symbol": "swift_task_checkIsolatedSwift", "symbolLocation": 40},
+                   {"imageOffset": 8, "imageIndex": 0, "symbol": mangled},
+                   {"imageOffset": 7, "imageIndex": 9},
+                   {"imageOffset": 6, "imageIndex": 0, "symbol": "leak " + TOKEN},
+                   {"imageOffset": 5, "imageIndex": 0, "symbol": "odd\u0007name"}] +
+                  [{"imageOffset": n, "imageIndex": 1, "symbol": f"_dispatch_frame_{n}"} for n in range(20)])
+        reports = self.root / "reports"
+        reports.mkdir()
+        asked = []
+
+        def demangle(symbols, env):
+            asked.append(symbols)
+            return {mangled: "static LoopCensusLog.tick()"}
+
+        diagnostics = device_ios.Diagnostics(UDID, {}, reports=reports, shown=lambda *a: b"", demangle=demangle)
+        (reports / "MayPlayground-2026-10-31-114117.ips").write_bytes(self.ips(frames))
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"faulting thread, top frames:\n", text)
+        top = text.split(b"faulting thread, top frames:\n")[1].split(b'{"app_name"')[0].splitlines()
+        self.assertEqual(top[:4], [b"frame 0 libswift_Concurrency.dylib swift_task_checkIsolatedSwift",
+                                   b"frame 1 MayPlayground.debug.dylib static LoopCensusLog.tick()",
+                                   b"frame 2 ? ?", b"frame 4 MayPlayground.debug.dylib odd?name"],
+                         "frame 3 carried the session, so kept_lines dropped it")
+        self.assertEqual(top[-1], b"frame 14 libswift_Concurrency.dylib _dispatch_frame_9", "the top 15 alone")
+        self.assertEqual(asked, [[mangled]], "only Swift's mangled names are demangled, once")
+        self.assertNotIn(b'"threads"', text, "the long threads line is still dropped")
+        self.assertNotIn(TOKEN.encode(), text)
+        self.assertIn(b"com.apple.root.utility-qos", text)
+        self.assertEqual(diagnostics.dropped, {"chat": 2}, "the threads line and the session's frame")
+        self.assertTrue(publish.diagnostics_ok(text))
+
+    def test_a_report_longer_than_its_published_cut_still_gives_its_frames(self):
+        """The report is cut to half the diag when published; its frames are read from the whole body."""
+        reports = self.root / "reports"
+        reports.mkdir()
+        diagnostics = device_ios.Diagnostics(UDID, {}, reports=reports, shown=lambda *a: b"",
+                                             demangle=lambda symbols, env: {})
+        data = self.ips([{"imageIndex": 0, "symbol": "main"}], pad=device_tests.MAX_DIAG)
+        self.assertGreater(len(data), device_tests.MAX_DIAG)
+        (reports / "MayPlayground-2026-10-31-114117.ips").write_bytes(data)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"faulting thread, top frames:\nframe 0 MayPlayground.debug.dylib main\n", text)
+        self.assertLessEqual(len(text), device_tests.MAX_DIAG)
+
+    def test_a_report_with_no_readable_faulting_thread_has_no_frames(self):
+        for data in (b"Thread 0 Crashed:\n0 MayPlayground ChatView.body\n", self.ips([], faulting=5),
+                     self.ips([{"imageIndex": 0}])[:-40], b'{"x":1}\n{"threads":{"1":[]},"faultingThread":1}',
+                     b'{"x":1}\n{"threads":[{"frames":"abc"}],"faultingThread":0}'):
+            with self.subTest(data=data[-30:]):
+                self.assertEqual(device_ios.crash_frames(data, {}, demangle=lambda symbols, env: {}), b"")
+
+    def test_swift_demangle_answers_each_symbol_or_nothing(self):
+        with patch.object(device_tests, "bounded_output", return_value=(0, b"a()\nb()\n")) as ran:
+            self.assertEqual(device_ios.demangled(["$sA", "$sB"], {"E": "1"}), {"$sA": "a()", "$sB": "b()"})
+        self.assertEqual(ran.call_args.args, (["xcrun", "swift-demangle", "--simplified", "--compact", "$sA", "$sB"],
+                                              {"E": "1"}))
+        for answer in ((0, b"a()\n"), (1, b"a()\nb()\n"), None):
+            with patch.object(device_tests, "bounded_output", return_value=answer):
+                self.assertEqual(device_ios.demangled(["$sA", "$sB"], {}), {}, "a short or failed answer is unused")
+        with patch.object(device_tests, "bounded_output") as ran:
+            self.assertEqual(device_ios.demangled([], {}), {})
+        ran.assert_not_called()
+
     def test_a_report_named_for_the_playground_is_kept_only_when_its_header_names_its_bundle(self):
         """The security read of #115: the file name alone is not proof."""
         reports = self.root / "reports"
