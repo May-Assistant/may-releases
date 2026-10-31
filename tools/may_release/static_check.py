@@ -917,7 +917,8 @@ PREPARE_IOS_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform ios 
 # hands over only that file, and fails when the compile failed. The post job, on a fresh Linux runner, mints the comment
 # token, decrypts with the key in one step and posts in another (compile_pr_errors.py); nothing derived from may-app
 # reaches this log (compile_pr_errors_print_problems).
-COMPILE_IOS_PR = COMPILE_IOS + " --record-outcome"
+# Its build runs as mac_sandbox.py's unprivileged user, never as the runner (--sandbox, #65; compile_sandbox_problems).
+COMPILE_IOS_PR = COMPILE_IOS + " --record-outcome --sandbox"
 AGE_INSTALL = "python3 -I -S -B tools/may_release/toolchain.py age"
 COMPILE_PR_TOOL = "python3 -I -S -B tools/may_release/compile_pr_errors.py "
 SEAL_PR = COMPILE_PR_TOOL + 'seal --source-sha "$MAY_SOURCE_SHA"'
@@ -1979,8 +1980,25 @@ SANDBOX_LEFTOVER_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mque
                          "/mnt")
 
 
-def sandbox_problems(root):
-    path = root / "tools/may_release" / SANDBOX_TOOL
+# mac_sandbox.py (#65) is its macOS counterpart for the native compile: the same user, made with dscl as a hidden user
+# and group of their own (no admin or any other group), killed with /bin/kill, checked with /bin/test, and removed with
+# dscl, with its per-user caches under /private/var/folders swept too.
+MAC_SANDBOX_TOOL = "mac_sandbox.py"
+MAC_SANDBOX_LEFTOVER_DIRS = ("/private/tmp", "/private/var/tmp", "/private/var/folders")
+SANDBOXES = {
+    SANDBOX_TOOL: {"deny": ("/etc/cron.deny", "/etc/at.deny"), "dirs": SANDBOX_LEFTOVER_DIRS, "bin": "/usr/bin",
+                   "groups": r"'(-G|--groups|-aG|sudo|wheel|admin)'", "removal": ["admin(['userdel', USER], log)"]},
+    MAC_SANDBOX_TOOL: {"deny": ("/usr/lib/cron/cron.deny", "/usr/lib/cron/at.deny"), "dirs": MAC_SANDBOX_LEFTOVER_DIRS,
+                       # root:wheel owns its folders; no membership of wheel, admin or any group is given to it.
+                       "bin": "/bin", "groups": r"'(GroupMembership|GroupMembers|-append|-merge|admin|staff|sudo)'",
+                       "removal": ["admin(['dscl', '.', '-delete', f'/Users/{USER}'], log)",
+                                                  "admin(['dscl', '.', '-delete', f'/Groups/{USER}'], log)"]},
+}
+
+
+def sandbox_problems(root, tool=SANDBOX_TOOL):
+    spec = SANDBOXES[tool]
+    path = root / "tools/may_release" / tool
     tree = ast.parse(path.read_text())
     fns = {name: function_source(tree, name) for name in ("sandboxed", "setup_commands", "setup", "stop_all",
                                                           "teardown", "step", "leftovers")}
@@ -1988,25 +2006,29 @@ def sandbox_problems(root):
     dirs = [n for n in tree.body if isinstance(n, ast.Assign) and [getattr(t, "id", None) for t in n.targets]
             == ["LEFTOVER_DIRS"]]
     if assigned_literal(path, "USER") != "may-sandbox" or None in fns.values() or \
-            assigned_literal(path, "DENY_FILES") != ("/etc/cron.deny", "/etc/at.deny") or \
-            len(dirs) != 1 or [ast.unparse(e).strip("'") for e in dirs[0].value.elts] != [*SANDBOX_LEFTOVER_DIRS,
-                                                                                         "str(ROOT)"] or \
+            assigned_literal(path, "DENY_FILES") != spec["deny"] or \
+            len(dirs) != 1 or [ast.unparse(e).strip("'") for e in dirs[0].value.elts] != [*spec["dirs"], "str(ROOT)"] or \
             "'-xdev', '-user', USER, '-delete'" not in text["leftovers"] or "'/'," in text["leftovers"] or \
-            re.search(r"'(-G|--groups|-aG|sudo|wheel|admin)'", text["setup_commands"]) or \
+            re.search(spec["groups"], text["setup_commands"]) or \
             "'-u', USER" not in text["sandboxed"] or "'-i'" not in text["sandboxed"] or \
-            "'/usr/bin/kill', '-KILL', '-1'" not in text["stop_all"] or "'pgrep', '-u', USER" not in text["stop_all"] or \
-            "for _ in range(STOP_ROUNDS)" not in text["stop_all"] or \
-            "for path in DENY_FILES" not in text["setup"] or "'/usr/bin/test', '!', '-x'" not in text["setup"] or \
+            f"'{spec['bin']}/kill', '-KILL', '-1'" not in text["stop_all"] or \
+            "'pgrep', '-u', USER" not in text["stop_all"] or "for _ in range(STOP_ROUNDS)" not in text["stop_all"] or \
+            "for path in DENY_FILES" not in text["setup"] or f"'{spec['bin']}/test', '!', '-x'" not in text["setup"] or \
             "for path in (home, runner_temp)" not in text["setup"] or "'chmod', '0700'" not in text["setup"] or \
             [ast.unparse(n) for n in fns["teardown"].body[1:] if not isinstance(n, ast.Expr) or
              not isinstance(n.value, ast.Constant)] != ["stop_all(log, strict=False)",
                                                          "swept = admin(leftovers(), log) == 0",
                                                          "admin(['rm', '-rf', '--', str(ROOT)], log)",
-                                                         "admin(['userdel', USER], log)", "return swept"] or \
+                                                         *spec["removal"], "return swept"] or \
             "stop_all(log, strict=False)" not in text["step"] or ".kill(" in text["step"] or ".terminate(" in text["step"]:
-        return [SANDBOX_TOOL + ": the unprivileged user is not exactly a fresh, groupless, sealed-off user, killed until "
+        return [tool + ": the unprivileged user is not exactly a fresh, groupless, sealed-off user, killed until "
                 "none is left and removed with its files"]
-    return quiet_tool_problems(root, SANDBOX_TOOL, set(), {"SandboxError"})
+    if tool == MAC_SANDBOX_TOOL and ("'chown', '-R', 'root:wheel' if name != 'src'" not in text["setup_commands"] or
+                                     "'UserShell', '/usr/bin/false'" not in text["setup_commands"] or
+                                     "if ids()" not in text["setup"] and "1 if ids() else 0" not in text["setup"]):
+        return [tool + ": the unprivileged user is not exactly a fresh, groupless, sealed-off user, killed until "
+                "none is left and removed with its files"]
+    return quiet_tool_problems(root, tool, set(), {"SandboxError"})
 
 
 # Each lane that runs a pull request's own code does so only through sandbox.step on a sandboxed command, each step
@@ -2014,26 +2036,50 @@ def sandbox_problems(root):
 SANDBOXED_TOOLS = {"ios_core.py": {"swift", "sandbox.sandboxed"}, "swift_checks.py": {"sandbox.sandboxed"}}
 
 
-def sandboxed_tool_problems(root, tool, wrappers):
-    tree = ast.parse((root / "tools/may_release" / tool).read_text())
-    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "sandbox.step"]
+def sandboxed_tool_problems(root, tool, wrappers, module="sandbox", tree=None):
+    """tree, when given, is the part of tool to check (compile_sandbox_problems)."""
+    tree = tree or ast.parse((root / "tools/may_release" / tool).read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == module + ".step"]
     blocks = [n.body for n in ast.walk(tree) if hasattr(n, "body") and isinstance(n.body, list)]
     stopped = [i + 1 < len(block) and ast.unparse(block[i + 1]) == "stop_all(log)"
                for block in blocks for i, statement in enumerate(block)
                if not isinstance(statement, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.FunctionDef,
                                              ast.ClassDef))
-               and "sandbox.step(" in ast.unparse(statement)]
+               and module + ".step(" in ast.unparse(statement)]
     tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try) and
-             any("sandbox.teardown(log)" in ast.unparse(x) for x in n.finalbody)]
+             any(module + ".teardown(log)" in ast.unparse(x) for x in n.finalbody)]
     others = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in
               ("subprocess.run", "subprocess.Popen") and not (n.args and isinstance(n.args[0], ast.Call) and
                                                               ast.unparse(n.args[0].func) in wrappers)]
     if not calls or any(not (n.args and isinstance(n.args[0], ast.Call) and ast.unparse(n.args[0].func) in wrappers)
                         for n in calls) or len(stopped) != len(calls) or not all(stopped) or len(tries) != 1 or \
-            "sandbox.setup(" not in ast.unparse(tree) or others:
+            module + ".setup(" not in ast.unparse(tree) or others:
         return [tool + ": the pull request's code does not run as the sandbox's unprivileged user alone, stopped after "
                 "each step"]
     return []
+
+
+# compile.py --sandbox (#65): build_sandboxed runs XcodeGen and xcodebuild only through mac_sandbox.step, each followed
+# by stop_all(log), after mac_sandbox.setup; compile_native's sandbox branch calls it in a try whose finally tears the
+# sandbox down, and returns: nothing after it builds as the runner user.
+COMPILE_TOOL = "compile.py"
+
+
+def compile_sandbox_problems(root):
+    tree = ast.parse((root / "tools/may_release" / COMPILE_TOOL).read_text())
+    build, native = function_source(tree, "build_sandboxed"), function_source(tree, "compile_native")
+    branches = [n for n in ast.walk(native) if isinstance(n, ast.If) and ast.unparse(n.test) == "sandbox"] \
+        if native else []
+    refused = native is not None and any(isinstance(n, ast.If) and ast.unparse(n.test) == "sandbox and (not record)"
+                                         for n in ast.walk(native))
+    if build is None or len(branches) != 1 or not refused or not isinstance(branches[0].body[-1], ast.Return) or \
+            "build_sandboxed(" not in ast.unparse(branches[0]) or "subprocess" in ast.unparse(build) or \
+            "run(" in ast.unparse(build) or \
+            sandboxed_tool_problems(root, COMPILE_TOOL, {"mac_sandbox.sandboxed"}, "mac_sandbox",
+                                    ast.Module(body=[build, *branches[0].body], type_ignores=[])):
+        return [COMPILE_TOOL + ": the pull request's code does not run as the sandbox's unprivileged user alone, "
+                "stopped after each step"]
+    return sandbox_problems(root, MAC_SANDBOX_TOOL)
 
 
 # backend_unit.py silences the service's log before any pull request code (GitHub prints that log at teardown, and
@@ -3019,6 +3065,7 @@ def control_problems(root):
     found += backend_unit_silence_problems(root)
     found += ios_core_workflow_problems((flows / IOS_CORE).read_text())
     found += ios_core_print_problems(root)
+    found += compile_sandbox_problems(root)
     found += backend_ci_schedule_workflow_problems((flows / BACKEND_SCHEDULE).read_text())
     found += backend_ci_schedule_tool_problems(root)
     found += renders_workflow_problems((flows / RENDERS).read_text())

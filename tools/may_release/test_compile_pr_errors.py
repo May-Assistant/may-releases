@@ -612,6 +612,20 @@ class SealTests(PostCase):
         with self.assertRaisesRegex(CompilePrError, "No compile outcome is recorded"):
             tool.compile_record(SHA, self.root)
 
+    def test_a_sandboxed_build_names_its_own_copy_which_is_read_as_the_checkout(self):
+        # compile.py --sandbox (#65) builds in mac_sandbox's copy; xcodebuild may name it under /private/var or /var.
+        (self.private / compile_tool.OUTCOME).write_text(json.dumps({"result": "failed"}))
+        (self.private / tool.LOG).write_text("\n".join([
+            "/private/var/may-sandbox/src/ios/May/Home/HomeView.swift:12:5: error: cannot find 'Foo' in scope",
+            "/var/may-sandbox/src/ios/MayPlayground/App.swift:2:1: error: expected '}'",
+            "/private/var/may-sandbox/derived/Build/Gen.swift:1:1: error: not in the checkout",
+            "/private/var/may-sandbox/src/android/build-deps/may-design-system/A.swift:1:1: error: design system"]))
+        with patch("compile_pr_errors.head_revision", return_value=SHA):
+            record = tool.compile_record(SHA, self.root)
+        self.assertEqual(record["errors"], ["ios/May/Home/HomeView.swift:12:5: error: cannot find 'Foo' in scope",
+                                            "ios/MayPlayground/App.swift:2:1: error: expected '}'"])
+        self.assertEqual(record["total"], 2)
+
     def test_without_the_recipient_nothing_is_sealed_and_one_fixed_line_says_so(self):
         self.write()
         for env in (self.environ(), self.environ(MAY_RENDERS_RECIPIENT=" ")):
@@ -840,7 +854,8 @@ class ShapeTests(unittest.TestCase):
             "a read key in the post": (post_block, post_block + fetch_key, secret),
             "the read token in the post": (post_block, post_block + "          MAY_APP_PR_READ_TOKEN: ${{ secrets.MAY_APP_PR_READ_TOKEN }}\n", secret),
             "the runner token in the post": (post_block, post_block + "          GH_TOKEN: ${{ github.token }}\n", secret),
-            "a compile that fails before the post": ("--target playground --record-outcome\n", "--target playground\n", runs),
+            "a compile that fails before the post": ("--target playground --record-outcome --sandbox\n", "--target playground\n", runs),
+            "a compile as the runner user": ("--record-outcome --sandbox\n", "--record-outcome\n", runs),
             "no verdict in native": (verdict, "", runs),
             "the comment token minted in native again": (age, mint + age, name + "a GitHub App token is minted or used other "
                                                          "than by its pinned"),

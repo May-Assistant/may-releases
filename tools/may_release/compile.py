@@ -6,6 +6,11 @@ With --record-outcome (native-compile-pr.yml alone, iOS alone), a failure of the
 xcodebuild exiting non-zero, or not starting) does not fail this step: the outcome is written to a private file
 (OUTCOME) and compile_pr_errors.py, the next step, posts the errors on the may-app pull request and then fails the
 job. Every check before the build (Xcode, XcodeGen's hash, free space, keys on disk, secrets) still fails here.
+
+With --sandbox as well (native-compile-pr.yml, a pull request's own head), XcodeGen and xcodebuild run as
+mac_sandbox's unprivileged user, in its own copy of the checkout, never as the runner user (#65). It fails closed:
+a sandbox that cannot be made, checked or stopped ends the step red, with nothing compiled. Each stage's exit status is
+printed, as a fixed line with an integer.
 """
 
 import argparse
@@ -15,12 +20,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import zipfile
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import mac_sandbox
+from mac_sandbox import SandboxError, stop_all
 from store import StoreError, require_step_secrets
 
 XCODEGEN_URL = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
@@ -62,16 +70,66 @@ def credentials_left(private):
     return any(path.is_file() and (path.suffix == ".key" or path.name == "known_hosts") for path in private.rglob("*"))
 
 
+# The sandboxed build's own time, within native's 55 minutes (setup, fetch and teardown take the rest).
+BUILD_SECONDS = 40 * 60
+
+
+def say(stage, status):
+    print(f"May iOS compile {stage}: " + ("did not finish" if status is None else f"exit {int(status)}"))
+
+
+def sandbox_project(source, private):
+    """prepare.py's project.yml, pointed at the sandbox's own copy of the checkout instead of runner temp (its design
+    system is at an absolute path there), in a private file; None when it names no path in the checkout."""
+    text = (source / "ios/project.yml").read_text(encoding="utf-8")
+    pointed = text.replace(str(source) + "/", str(mac_sandbox.ROOT / "src") + "/")
+    if pointed == text:
+        return None
+    project = private / "sandbox-project.yml"
+    project.write_text(pointed, encoding="utf-8")
+    return project
+
+
+def build_sandboxed(source, private, generator, developer, target, log):
+    """XcodeGen and each scheme's xcodebuild as the sandbox's user, each stopped after; True when every one exited
+    0. A stage that fails or runs out of time ends the build there."""
+    mac_sandbox.setup(log, {"src": source, "xcodegen": generator}, Path(os.environ.get("HOME") or Path.home()),
+                      Path(os.environ["RUNNER_TEMP"]), sandbox_project(source, private), say=say)
+    root = mac_sandbox.ROOT
+    tools = [root / "xcodegen/xcodegen/bin"]
+    env = [f"DEVELOPER_DIR={developer}"]
+    deadline = time.monotonic() + BUILD_SECONDS
+    status = mac_sandbox.step(mac_sandbox.sandboxed(["xcodegen", "generate", "--spec", str(root / "src/ios/project.yml")],
+                                                    tools, env), log, "/", deadline)
+    stop_all(log)
+    say("xcodegen", status)
+    if status != 0:
+        return False
+    for scheme in IOS_SCHEMES[target]:
+        status = mac_sandbox.step(mac_sandbox.sandboxed(
+            ["/usr/bin/xcodebuild", "-project", str(root / "src/ios/May.xcodeproj"), "-scheme", scheme,
+             "-configuration", "Release", "-destination", "generic/platform=iOS Simulator",
+             "-derivedDataPath", str(root / "derived"), "-clonedSourcePackagesDirPath", str(root / "packages"),
+             "CODE_SIGNING_ALLOWED=NO", "build"], tools, env), log, "/", deadline)
+        stop_all(log)
+        say("xcodebuild " + scheme, status)
+        if status != 0:
+            return False
+    return True
+
+
 # The PR compile's recorded outcome, in may-private: {"result": "passed" | "failed"} (compile_pr_errors.py reads it).
 OUTCOME = "ios-compile-result.json"
 
 
-def compile_native(platform, target=None, record=False):
+def compile_native(platform, target=None, record=False, sandbox=False):
     # The compile runs third-party build code (XcodeGen, SwiftPM, Xcode, and for a pull request its
     # own build scripts) and holds no secret at all: not in its environment, not on disk.
     require_step_secrets(())
     if record and platform != "ios":
         raise CompileError("Only the iOS compile records its outcome")
+    if sandbox and not record:
+        raise CompileError("Only the recorded iOS compile runs as the unprivileged user")
     root = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
     source, private = root / "may-source", root / "may-private"
     if not os.environ.get("RUNNER_TEMP") or not source.is_dir() or not private.is_dir():
@@ -100,6 +158,15 @@ def compile_native(platform, target=None, record=False):
         env["PATH"] = str(binary.parent) + os.pathsep + env.get("PATH", "")
         if record:
             (private / OUTCOME).unlink(missing_ok=True)
+        if sandbox:
+            try:
+                passed = build_sandboxed(source, private, binary.parents[2], developer, target, log)
+            finally:
+                if not mac_sandbox.teardown(log):
+                    print("May iOS compile: some files of the build user could not be removed")
+            (private / OUTCOME).write_text(json.dumps({"result": "passed" if passed else "failed"}))
+            print("Protected May iOS compile finished; its outcome and log stay in this runner's private files")
+            return
         try:
             run([str(binary), "generate"], log, cwd=source / "ios", env=env)
             for scheme in IOS_SCHEMES[target]:
@@ -134,8 +201,11 @@ if __name__ == "__main__":
     parser.add_argument("--platform", choices=("ios", "android"), required=True)
     parser.add_argument("--target", choices=("production", "playground"))
     parser.add_argument("--record-outcome", action="store_true")
+    parser.add_argument("--sandbox", action="store_true")
     args = parser.parse_args()
     try:
-        compile_native(args.platform, args.target, args.record_outcome)
+        compile_native(args.platform, args.target, args.record_outcome, args.sandbox)
+    except SandboxError as error:
+        raise SystemExit(f"Protected May native compile failed: {error}") from None
     except (CompileError, StoreError, OSError, subprocess.SubprocessError, zipfile.BadZipFile):
         raise SystemExit("Protected May native compile failed; private logs were not published") from None

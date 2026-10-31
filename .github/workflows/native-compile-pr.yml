@@ -77,8 +77,9 @@ jobs:
         run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
   native:
     # The Mac compile starts only after the pull request check (pull) and may-app's Linux Swift checks (swift-checks)
-    # pass. It runs the pull request's own build code as the runner user, so it references no GitHub App key and no
-    # token (independent reviews of may-releases #130 and #133): only the two read-only deploy keys, in its fetch. It
+    # pass. It runs the pull request's own build code, as mac_sandbox.py's unprivileged user (compile.py --sandbox,
+    # #65), and references no GitHub App key and no token (independent reviews of may-releases #130 and #133): only
+    # the two read-only deploy keys, in its fetch. It
     # seals its errors to the environment's own age key, hands over only that file, and fails when the compile failed;
     # the post job, on a fresh runner, posts them.
     needs: [admission, pull, swift-checks]
@@ -102,7 +103,7 @@ jobs:
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
       - name: Compile without signing, store access or any credential
-        run: python3 -I -S -B tools/may_release/compile.py --platform ios --target playground --record-outcome
+        run: python3 -I -S -B tools/may_release/compile.py --platform ios --target playground --record-outcome --sandbox
       - name: Seal the errors for the post job, with no secret
         env:
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
