@@ -243,6 +243,58 @@ class SandboxedCompileTests(unittest.TestCase):
         project.write_text("packages:\n  MayDesignSystem:\n    url: https://example.invalid/ds\n")
         self.assertIsNone(compile_tool.sandbox_project(self.source, self.private))
 
+    def native(self, sandbox, build=True):
+        """compile_native for iOS, recorded, with the runner's tools faked: compile.run's commands, and whether the
+        sandboxed build was asked for. The build passes (True), fails (False) or its sandbox fails (an error)."""
+        root = Path(self.temp.name)
+        (root / "may-source").mkdir(exist_ok=True)
+        ran, sandboxed = [], []
+
+        def run(argv, log, cwd=None, env=None):
+            ran.append(Path(argv[0]).name)
+            if argv[0] == "curl":
+                Path(argv[argv.index("-o") + 1]).write_bytes(b"zip")
+
+        def build_sandboxed(*args):
+            sandboxed.append(args[4])
+            if isinstance(build, Exception):
+                raise build
+            return build
+
+        version = mock.Mock(returncode=0, stdout=b"Xcode 26.3\nBuild version 17C529\n")
+        digest = mock.Mock(hexdigest=mock.Mock(return_value=compile_tool.XCODEGEN_SHA256))
+        with mock.patch.dict("os.environ", {"RUNNER_TEMP": str(root), "HOME": "/Users/runner"}, clear=True), \
+                mock.patch("compile.run", side_effect=run), mock.patch("compile.build_sandboxed", side_effect=build_sandboxed), \
+                mock.patch("compile.mac_sandbox.teardown", return_value=True) as teardown, \
+                mock.patch("compile.subprocess.run", return_value=version), \
+                mock.patch("compile.hashlib.sha256", return_value=digest), \
+                mock.patch("compile.extract_generator", return_value=self.private / "xcodegen/xcodegen/bin/xcodegen"), \
+                mock.patch("compile.os.statvfs", return_value=mock.Mock(f_bavail=1 << 40, f_frsize=1)), \
+                mock.patch("compile.Path.is_dir", return_value=True), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                compile_tool.compile_native("ios", "playground", record=True, sandbox=sandbox)
+                error = None
+            except SandboxError as raised:
+                error = raised
+        outcome = self.private / compile_tool.OUTCOME
+        return ran, sandboxed, teardown.call_count, error, outcome.read_text() if outcome.exists() else None
+
+    def test_the_default_builds_as_today_and_never_sandboxed(self):
+        ran, sandboxed, teardowns, error, outcome = self.native(sandbox=False)
+        self.assertEqual((ran, sandboxed, teardowns, error), (["curl", "xcodegen", "xcodebuild"], [], 0, None))
+        self.assertEqual(outcome, '{"result": "passed"}')
+
+    def test_the_sandbox_never_falls_through_to_the_runner_build(self):
+        for build, result in ((True, '{"result": "passed"}'), (False, '{"result": "failed"}'),
+                              (SandboxError("The unprivileged user could not be set up; nothing ran"), None)):
+            with self.subTest(build=build):
+                (self.private / compile_tool.OUTCOME).unlink(missing_ok=True)
+                ran, sandboxed, teardowns, error, outcome = self.native(sandbox=True, build=build)
+                self.assertEqual(ran, ["curl"], "nothing but the download ran as the runner user")
+                self.assertEqual((sandboxed, teardowns), (["playground"], 1))
+                self.assertEqual(outcome, result, "a sandbox that fails records no outcome; the step ends red")
+                self.assertEqual(error is not None, isinstance(build, Exception))
+
     def test_only_the_recorded_ios_compile_runs_sandboxed(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             with self.assertRaisesRegex(compile_tool.CompileError, "Only the recorded iOS compile"):
@@ -268,7 +320,20 @@ class SandboxStaticCheckTests(unittest.TestCase):
 
     def test_the_committed_tools_pass(self):
         self.assertEqual(static_check.compile_sandbox_problems(static_check.ROOT), [])
-        self.assertIn("--record-outcome --sandbox", static_check.COMPILE_IOS_PR)
+        self.assertTrue(static_check.COMPILE_IOS_PR.endswith(" --record-outcome --sandbox"))
+        self.assertTrue(static_check.COMPILE_IOS_PR_RUNNER.endswith(" --record-outcome"))
+
+    def test_the_workflow_builds_as_today_unless_dispatched_with_the_sandbox(self):
+        # Coordinator, 31 Oct: the iOS compile gates every may-app pull request, so until a sandboxed run is green the
+        # sandbox is opt-in (sandbox=true on a manual dispatch) and the default, which every automatic dispatch takes,
+        # is today's build.
+        text = (static_check.ROOT / ".github/workflows/native-compile-pr.yml").read_text()
+        self.assertIn(static_check.COMPILE_PR_SANDBOX_INPUT, text)
+        runner = ("        if: ${{ !inputs.sandbox }}\n        run: " + static_check.COMPILE_IOS_PR_RUNNER + "\n")
+        sandboxed = ("        if: ${{ inputs.sandbox }}\n        run: " + static_check.COMPILE_IOS_PR + "\n")
+        self.assertIn(runner, text)
+        self.assertIn(sandboxed, text)
+        self.assertEqual(text.count("tools/may_release/compile.py"), 2)
 
     def test_each_widening_is_flagged(self):
         compile_message = "compile.py: the pull request's code does not run as the sandbox's unprivileged user alone"

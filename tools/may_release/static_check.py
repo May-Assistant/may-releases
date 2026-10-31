@@ -917,8 +917,16 @@ PREPARE_IOS_PR = ('python3 -I -S -B tools/may_release/prepare.py --platform ios 
 # hands over only that file, and fails when the compile failed. The post job, on a fresh Linux runner, mints the comment
 # token, decrypts with the key in one step and posts in another (compile_pr_errors.py); nothing derived from may-app
 # reaches this log (compile_pr_errors_print_problems).
-# Its build runs as mac_sandbox.py's unprivileged user, never as the runner (--sandbox, #65; compile_sandbox_problems).
-COMPILE_IOS_PR = COMPILE_IOS + " --record-outcome --sandbox"
+COMPILE_IOS_PR_RUNNER = COMPILE_IOS + " --record-outcome"
+# With the dispatch's sandbox input, its build runs as mac_sandbox.py's unprivileged user instead (--sandbox, #65;
+# compile_sandbox_problems). The input is temporary (coordinator, 31 Oct): false, its default and what every automatic
+# dispatch sends, builds as today; true builds sandboxed alone. Once a sandboxed run is green, the sandbox becomes the
+# only path and COMPILE_IOS_PR_RUNNER, its step and the input go.
+COMPILE_IOS_PR = COMPILE_IOS_PR_RUNNER + " --sandbox"
+COMPILE_PR_SANDBOX_INPUT = ("      sandbox:\n"
+                            "        description: Temporary (#161) - build as the unprivileged macOS user; the default, "
+                            "false, builds as today\n"
+                            "        required: false\n        type: boolean\n        default: false\n")
 AGE_INSTALL = "python3 -I -S -B tools/may_release/toolchain.py age"
 COMPILE_PR_TOOL = "python3 -I -S -B tools/may_release/compile_pr_errors.py "
 SEAL_PR = COMPILE_PR_TOOL + 'seal --source-sha "$MAY_SOURCE_SHA"'
@@ -951,20 +959,21 @@ SWIFT_POST = ('python3 -I -S -B tools/may_release/swift_checks.py post --source-
               '--pr-number "$MAY_PR_NUMBER"')
 SWIFT_CLEANUP = 'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private"'
 COMPILE_PR_RUNS = [GATE_COMPILE_PR, GATE_CHECK_PULL,
-                   AGE_INSTALL, PREPARE_IOS_PR, COMPILE_IOS_PR, SEAL_PR, VERDICT_PR, COMPILE_PR_CLEANUP,
+                   AGE_INSTALL, PREPARE_IOS_PR, COMPILE_IOS_PR_RUNNER, COMPILE_IOS_PR, SEAL_PR, VERDICT_PR, COMPILE_PR_CLEANUP,
                    GATE_CHECK_PULL, PREPARE_IOS_PR, SWIFT_RUN, SWIFT_POST, SWIFT_CLEANUP,
                    AGE_INSTALL, OPEN_PR, POST_PR, POST_CLEANUP]
 PULL_STEP_NAMES = ["Check the pull request head and environment before fetching"]
 COMPILE_PR_STEP_NAMES = ["Install pinned age, before any pull request code",
                          "Fetch the pull request head and pinned design system quietly",
                          "Compile without signing, store access or any credential",
+                         "Compile as the unprivileged sandbox user, without signing, store access or any credential",
                          "Seal the errors for the post job, with no secret",
                          "Hand over only the sealed record",
                          "Fail if the compile failed",
                          "Remove private source, logs and products"]
 POST_STEP_NAMES = ["Install pinned age", "", "Decrypt and check the compile record",
                    "Post the errors on the may-app pull request, never in this log", "Remove the decrypted record"]
-COMPILE_PR_CONDITIONS = ["if: always()", "if: always()",
+COMPILE_PR_CONDITIONS = ["if: ${{ !inputs.sandbox }}", "if: ${{ inputs.sandbox }}", "if: always()", "if: always()",
                          "if: ${{ !cancelled() && needs.admission.result == 'success' }}", "if: always()"]
 SWIFT_STEP_NAMES = ["Check the pull request head and environment before fetching",
                     "Fetch the pull request head and pinned design system quietly",
@@ -1017,8 +1026,10 @@ def compile_pr_shape_problems(text):
         found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
-            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"]:
-        found.append(name + ": is not dispatched with exactly pr_number and source_sha")
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "sandbox"] or \
+            not trigger.endswith("\n" + COMPILE_PR_SANDBOX_INPUT.rstrip("\n")):
+        found.append(name + ": is not dispatched with exactly pr_number, source_sha and the sandbox input, false by "
+                     "default")
     if "\nconcurrency:\n  group: may-native-compile-pr\n" not in text:
         found.append(name + ": does not run one at a time in its own concurrency group")
     jobs = ("admission", "pull", "native", "swift-checks", "post")
@@ -1062,7 +1073,9 @@ def compile_pr_shape_problems(text):
             re.search(r"(?m)^    environment:", job_text(text, "admission")):
         found.append(name + ": native's environment is not the one admission chose, after admission")
     by_name, swift_by_name, post_by_name = dict(steps["native"]), dict(steps["swift-checks"]), dict(steps["post"])
-    _, fetch, build, seal, upload, verdict, clean = (by_name.get(n, "") for n in COMPILE_PR_STEP_NAMES)
+    _, fetch, runner_build, sandbox_build, seal, upload, verdict, clean = (by_name.get(n, "")
+                                                                          for n in COMPILE_PR_STEP_NAMES)
+    build = runner_build + sandbox_build
     recheck = dict(steps["pull"]).get(PULL_STEP_NAMES[0], "")
     swift_recheck, swift_fetch, checks, swift_post, swift_clean = (swift_by_name.get(n, "") for n in SWIFT_STEP_NAMES)
     opener, post, post_clean = (post_by_name.get(n, "") for n in POST_STEP_NAMES[2:])
