@@ -148,6 +148,14 @@ IOS_BUILD_COMMAND = ('python3 -I -S -B tools/may_release/store.py --platform ios
 # build job -> (its crash-report key's build step, the command it runs, its PostHog host variable).
 POSTHOG_BUILD_STEPS = {"android-build": (ANDROID_BUILD, ANDROID_BUILD_COMMAND, "MAY_POSTHOG_HOST"),
                        "ios-build": (IOS_BUILD, IOS_BUILD_COMMAND, "MAY_POSTHOG_IOS_HOST")}
+# The TestFlight "What to test" notes (testflight_notes.py; coordinator, 30 Oct): composed in the iOS build job from
+# may-app's history with GITHUB_TOKEN alone, sealed in the handoff, and set after a successful upload with the
+# upload's own App Store Connect key alone.
+NOTES_COMPOSE = "Compose the TestFlight notes from may-app's history, printing only their count"
+NOTES_SEND = "Set the TestFlight What to test notes on the uploaded build"
+NOTES_IF = "${{ !cancelled() && steps.testflight_upload.outcome == 'success' }}"
+NOTES_SEND_COMMAND = ('python3 -I -S -B tools/may_release/testflight_notes.py send --target "$MAY_TARGET" '
+                      '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
     "android-build": (
@@ -170,22 +178,23 @@ STORE_JOBS = {
                                                 "MAY_ANDROID_KEY_PASSWORD"}},
         {CHECKOUT, DOWNLOAD_ARTIFACT, UPLOAD_ARTIFACT}),
     "ios-build": (
-        ["Install pinned age", FETCH, IOS_BUILD,
+        ["Install pinned age", FETCH, NOTES_COMPOSE, IOS_BUILD,
          "Encrypt unsigned archive to the target's public key"],
         {FETCH: READ_KEYS, IOS_BUILD: {"MAY_POSTHOG_IOS_KEY"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "ios-release": (
         ["Install pinned age", DECRYPT, "Sign and verify internal-TestFlight IPA",
-         "Upload verified IPA for internal TestFlight", CONFIRM, REPORT],
+         "Upload verified IPA for internal TestFlight", CONFIRM, NOTES_SEND, REPORT],
         {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
          "Sign and verify internal-TestFlight IPA": {"MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD",
                                                      "MAY_IOS_PROFILE_BASE64"},
-         "Upload verified IPA for internal TestFlight": {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"}},
+         "Upload verified IPA for internal TestFlight": {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"},
+         NOTES_SEND: {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"}},
         {CHECKOUT, DOWNLOAD_ARTIFACT}),
 }
 # In a release job every command is this repository's own Python, with arguments
 # from a safe character set: no ; | & ` ( ) < > { } or newline, so no $( or chaining.
 RELEASE_COMMAND = re.compile(
-    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|sign_only|play_upload|ios_upload|confirm_upload|dry_run|cleanup|integrity)\.py"
+    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|sign_only|play_upload|ios_upload|confirm_upload|dry_run|cleanup|integrity|testflight_notes)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
 ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" '
                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN" '
@@ -673,6 +682,10 @@ def store_problems(store):
                 pass  # loud_failure_problems pins it exactly
             elif job == SIGN_ONLY_JOB and name in (SEAL_SIGNED, PUBLISH_SIGNED, CONFIRM_SIGNED):
                 pass  # sign_only_problems pins them exactly
+            elif job == "ios-release" and name == NOTES_SEND:
+                if condition != NOTES_IF or run_commands(text) != [NOTES_SEND_COMMAND] or \
+                        ("          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n") not in text:
+                    found.append(f"store {job}: the TestFlight notes are not set only after a successful upload")
             elif release and name == REPORT:
                 if condition != REPORT_IF or not run_commands(text) or not run_commands(text)[0].startswith(
                         "python3 -I -S -B tools/may_release/dry_run.py --platform " + platform + " "):
@@ -2450,6 +2463,19 @@ def ds_tests_workflow_problems(text):
     return found
 
 
+def testflight_notes_problems(root):
+    """testflight_notes.py prints fixed lines and counts alone (never a title), and writes nothing to App Store
+    Connect but a build's beta localization."""
+    found = quiet_tool_problems(root, "testflight_notes.py", {"count", "number", "lines"},
+                                {"StoreError", "ScheduleError"})
+    tree = ast.parse((root / "tools/may_release/testflight_notes.py").read_text())
+    sender = function_source(tree, "asc_send")
+    if sender is None or not ast.unparse(sender.body[1]).startswith("if not (method == 'POST' and url == ASC_API + "
+                                                                    "LOCALIZATIONS"):
+        found.append("testflight_notes.py: asc_send does not check it writes only a beta localization, first")
+    return found
+
+
 @with_app_tokens("weekly-release.yml")
 def weekly_release_workflow_problems(text):
     return schedule_workflow_problems(WEEKLY_RELEASE, text)
@@ -2950,6 +2976,7 @@ def control_problems(root):
     found += ds_tests_schedule_tool_problems(root)
     found += weekly_release_workflow_problems((flows / WEEKLY_RELEASE).read_text())
     found += weekly_release_tool_problems(root)
+    found += testflight_notes_problems(root)
     for name, text in (("native-compile-draft.yml", compile_workflow), ("store-release-draft.yml", store)):
         if "environment: ${{ needs.admission.outputs." not in text:
             found.append(f"{name}: protected environment is not chosen by admission")

@@ -8,6 +8,11 @@ MAY_ARTIFACT_DECRYPT_KEY, checks the key matches the committed public key, and
 refuses the payload unless its manifest names exactly this repository, run,
 platform, target, source SHA and build number.
 
+An iOS manifest also carries the build's TestFlight "What to test" notes (`notes`, testflight_notes.py), its one
+field besides the pins that the release job reads: private may-app pull-request titles, so they travel only inside
+the encrypted handoff, and open writes them to the release job's private folder for the notes step. An Android
+manifest has none.
+
 The manifest also carries both design-system pins (`design_system`: iOS and
 Android) that prepare.py recorded, so drift is recorded on every release. Both
 sides re-apply store.design_system_pins: the pins may differ only for an
@@ -41,6 +46,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from gate import ENVIRONMENTS, artifact_recipient
 from prepare import checkout_is
+from testflight_notes import NOTES_FILE, checked_notes
 from store import (DESIGN_SYSTEM_RECORD, HANDOFF_SECRETS, StoreError, child_env, design_system_pins, identity,
                    require_step_secrets, runner_root, write_private)
 import toolchain
@@ -242,7 +248,7 @@ def extract(archive, members, product_root, destination, resolver=strict_resolve
 
 
 def read_tar(path, destination, expected, allow_symlinks):
-    """Validate, then extract, the product into destination; return (its path, both pins)."""
+    """Validate, then extract, the product into destination; return (its path, both pins, the iOS notes or None)."""
     product_root = "product/" + expected["product"]
     with tarfile.open(path) as archive:
         names = archive.getnames()
@@ -255,14 +261,17 @@ def read_tar(path, destination, expected, allow_symlinks):
         if not isinstance(manifest, dict):
             raise StoreError("Build handoff manifest is invalid")
         pins = manifest.pop("design_system", None)
+        notes = manifest.pop("notes", None)
         if manifest != expected:
             raise StoreError("Build handoff does not match this run, target, source or build number")
         pins = design_system_pins(pins, expected["platform"], expected["target"])
+        if (notes is None) != (expected["platform"] != "ios") or (notes is not None and checked_notes(notes) is None):
+            raise StoreError("Build handoff notes are missing, malformed or not for this platform")
         members = checked_members(archive, product_root, allow_symlinks)
         if (members[0].isdir()) != (expected["platform"] == "ios"):
             raise StoreError("Build handoff contents are unexpected")
         extract(archive, members, product_root, destination)
-    return destination / expected["product"], pins
+    return destination / expected["product"], pins, notes
 
 
 def seal(platform, target, source_sha, build_number):
@@ -271,6 +280,16 @@ def seal(platform, target, source_sha, build_number):
     recipient = recipient_for(platform, target)
     root = runner_root()
     pins = recorded_pins(root, platform, target, source_sha)
+    extra = {}
+    if platform == "ios":
+        path = root / "may-private" / NOTES_FILE
+        try:
+            notes = checked_notes(path.read_text(encoding="utf-8")) if not path.is_symlink() else None
+        except (OSError, UnicodeDecodeError):
+            notes = None
+        if notes is None:
+            raise StoreError("TestFlight notes are missing or malformed; testflight_notes.py compose runs first")
+        extra["notes"] = notes
     product = root / "may-release" / PRODUCTS[platform]
     if not product.exists() or product.is_symlink():
         raise StoreError("Unsigned product is unavailable")
@@ -278,8 +297,8 @@ def seal(platform, target, source_sha, build_number):
     handoff.mkdir(mode=0o700)
     plain = handoff / "handoff.tar"
     try:
-        write_tar(plain, dict(expected_manifest(platform, target, source_sha, build_number), design_system=pins),
-                  product)
+        write_tar(plain, dict(expected_manifest(platform, target, source_sha, build_number), design_system=pins,
+                              **extra), product)
         result = subprocess.run([toolchain.tool_path("age", "age"), "-r", recipient, "-o",
                                  str(handoff / "handoff.age"), str(plain)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -325,8 +344,10 @@ def open_handoff(platform, target, source_sha, build_number):
         finally:
             key.unlink(missing_ok=True)
         try:
-            _, pins = read_tar(plain, out, expected_manifest(platform, target, source_sha, build_number),
-                               allow_symlinks=platform == "ios")
+            _, pins, notes = read_tar(plain, out, expected_manifest(platform, target, source_sha, build_number),
+                                      allow_symlinks=platform == "ios")
+            if notes is not None:
+                write_private(private / NOTES_FILE, notes.encode("utf-8"))
         except BaseException:
             shutil.rmtree(out, ignore_errors=True)
             raise

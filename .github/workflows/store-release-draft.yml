@@ -344,6 +344,12 @@ jobs:
           MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA"
+      - name: Compose the TestFlight notes from may-app's history, printing only their count
+        # may-app's pull-request titles since the previous iOS build (testflight_notes.py), into the private folder;
+        # they leave this job only inside the encrypted handoff.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/may_release/testflight_notes.py compose --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Build unsigned iOS archive with only the crash-report key
         env:
           MAY_POSTHOG_IOS_KEY: ${{ secrets.MAY_POSTHOG_IOS_KEY }}
@@ -426,6 +432,17 @@ jobs:
         env:
           MAY_UPLOAD_OUTCOME: ${{ steps.testflight_upload.outcome }}
         run: python3 -I -S -B tools/may_release/confirm_upload.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Check the checkout is exactly its commit before setting the notes
+        run: python3 -I -S -B tools/may_release/integrity.py
+      - name: Set the TestFlight What to test notes on the uploaded build
+        # Only after a successful upload; the notes came in the handoff and are never printed, only counted.
+        if: ${{ !cancelled() && steps.testflight_upload.outcome == 'success' }}
+        env:
+          MAY_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          MAY_ASC_KEY_BASE64: ${{ secrets.MAY_ASC_KEY_BASE64 }}
+          MAY_ASC_KEY_ID: ${{ vars.MAY_ASC_KEY_ID }}
+          MAY_ASC_ISSUER_ID: ${{ secrets.MAY_ASC_ISSUER_ID }}
+        run: python3 -I -S -B tools/may_release/testflight_notes.py send --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Report what the dry run would have uploaded
         if: ${{ github.event.inputs.dry_run != 'false' }}
         run: python3 -I -S -B tools/may_release/dry_run.py --platform ios --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
