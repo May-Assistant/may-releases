@@ -45,6 +45,8 @@ def runs(condition, dry_run_input, failed=False, sign_only_input=None):
         return value == "false"
     if condition == static_check.CONFIRM_SIGNED_IF:  # !cancelled(), in the sign-only job
         return True
+    if condition == static_check.NOTES_IF:  # !cancelled() && the upload succeeded
+        return value == "false" and not failed
     if failed:
         return False
     if condition is None:

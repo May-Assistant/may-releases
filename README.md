@@ -472,6 +472,15 @@ In the Actions UI, choose **May protected store release (stage 4, Android intern
 - **What is printed:** fixed lines, build numbers and the cut's SHA, which the store run's name carries in public anyway. No may-app title, branch or file name.
 - **Pinned by `static_check.py`:** the workflow with the other schedules (`SCHEDULES`, its own cron in `SCHEDULE_CRONS`), the token mint, `TARGET`, `RUNS_PATH` and the store run name.
 
+### TestFlight "What to test" notes
+
+Every iOS store build carries its own TestFlight "What to test" notes: may-app's pull-request titles since the previous build (coordinator, 30 Oct; `testflight_notes.py`).
+
+- **compose** (`ios-build`, after the fetch, `GITHUB_TOKEN` alone): the previous build is the newest successful, non-dry iOS run of the same app with a lower build number, read from `store-release-draft.yml`'s run names (` at <sha>`). The titles are may-app main's first-parent commit subjects (squash merges) after it, up to this build's commit, from the checkout prepare already fetched. With no earlier build, or one that is not an ancestor, it takes the newest 20 instead. Each title loses its `(#N)`, any `[skip …]` mark and any `Co-Authored-By`; titles are grouped by their area (the text before the first colon) as `Try: <area>: …` lines, at most 4,000 characters, ending `…and N more` when cut. Nothing new reads "No new changes since the previous build."
+- **The handoff:** the notes go into the iOS handoff's sealed manifest as its one extra field (`notes`), so they leave the build job only age-encrypted to `may-store-release`'s committed key. Open refuses an iOS handoff without well-formed notes, or an Android one with any, and writes them to the release job's private folder.
+- **send** (`ios-release`, after the integrity check, only when the upload succeeded, with the upload's own App Store Connect key alone): finds the build in App Store Connect (waiting up to 15 minutes for its record), and creates or updates its `en-US` beta build localization's `whatsNew`. A 403 prints "no write access" and sets nothing; any other refusal fails the step. It writes nothing else (`asc_send` refuses any other request first).
+- **What is printed:** counts alone (titles read, lines set). The titles are private may-app content and never reach this log; `static_check.py` holds `testflight_notes.py` to fixed lines and counts.
+
 ### iOS compile each build
 
 `native-compile-draft.yml` checks that iOS May Playground still compiles, at the may-app commit of each build. It is a compile only: no signing, no TestFlight, no artifact. The coordinator dispatches it; Samuel approves `may-native-compile` (the same environment and read-only keys as every store build).
