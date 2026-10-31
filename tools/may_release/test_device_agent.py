@@ -2095,6 +2095,33 @@ class IosDeviceServerTests(unittest.TestCase):
         looks = json.loads(Path(self.config["result"]).read_text()).get("looks")
         self.assertEqual([look["shown"] for look in looks], [1, 1], "each thread shows its one message; mixed is none")
 
+    def test_an_ios_thread_whose_words_are_labels_is_not_blank(self):
+        """Run 41169912308: the thread showed May's message, its card and "No replies yet", and the row failed as blank.
+        On iOS, Maestro gives a SwiftUI Text's string as accessibilityText with text empty; the thread itself is a
+        container with its own id and no words (may-app MessageThreadViews: .accessibilityElement(children: .contain))."""
+        self.config["look"] = True
+        tree = lambda *nodes: {"attributes": {"bounds": "[0,0][402,874]"},
+                               "children": [{"attributes": node} for node in nodes]}
+        header = {"resource-id": "messageThread.header", "text": "", "accessibilityText": "Book the dentist, In May's chat",
+                  "bounds": "[60,52][390,104]"}
+        composer = {"resource-id": "messageThread.composer", "text": "", "accessibilityText": "",
+                    "bounds": "[14,730][388,830]"}
+        container = {"resource-id": "messageThread", "text": "", "accessibilityText": "", "bounds": "[0,0][402,874]"}
+        message = {"resource-id": "", "text": "", "accessibilityText": "I can keep track of this and check in with you",
+                   "bounds": "[84,420][380,500]"}
+        card = {"resource-id": "", "text": "", "accessibilityText": "Accept", "bounds": "[230,560][355,600]"}
+        back = {"resource-id": "", "text": "", "accessibilityText": "Back", "bounds": "[16,60][60,104]"}
+        speak = {"resource-id": "", "text": "", "accessibilityText": "Speak", "bounds": "[284,782][378,814]"}
+        for nodes, shown in (((header, composer, container, message, card, back, speak), 2),
+                             ((header, composer, container, back, speak), 0)):
+            with self.subTest(shown=shown), patch(__name__ + ".IOS_TREE", tree(*nodes)):
+                self.assertFalse(self.call("hierarchy")[0])
+        looks = json.loads(Path(self.config["result"]).read_text()).get("looks")
+        self.assertEqual([look["shown"] for look in looks], [2, 0],
+                         "labels in the thread count; the container, Back (above it) and Speak (in the composer) do not")
+        self.assertTrue(device_mcp.shown_words({"content-desc": "Photo of the receipt"}), "Android's label counts too")
+        self.assertFalse(device_mcp.shown_words({"text": " ", "accessibilityText": ""}))
+
     def test_a_row_without_a_card_counts_no_looks(self):
         with patch(__name__ + ".IOS_TREE", {"attributes": {}, "children": [
                 {"attributes": {"resource-id": "chat.header", "bounds": "[0,50][393,110]"}},

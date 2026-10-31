@@ -347,6 +347,13 @@ LOOK_ANCHORS = (("chat.header", "chat.composer"), ("messageThread.header", "mess
                 ("thread.header", "thread.composer"))
 
 
+def shown_words(attributes):
+    """Whether a node shows words: its text, or its label. Run 41169912308: on iOS, Maestro puts a SwiftUI Text's string
+    in accessibilityText (its label) and leaves text empty, so a thread showing May's message and its card counted
+    none, and the row failed as blank. Android's content-desc counts the same way."""
+    return any(str(attributes.get(key) or "").strip() for key in ("text", "accessibilityText", "content-desc"))
+
+
 def chat_shown(nodes, boxes):
     """How many message texts a conversation view shows on screen, or None when the read shows none of them."""
     marks = {}
@@ -364,8 +371,7 @@ def chat_shown(nodes, boxes):
     chrome = pair[0].rpartition(".")[0] + "."
     shown = 0
     for attributes, box in zip(nodes, boxes):
-        if not box or str(attributes.get("resource-id") or "").startswith(chrome) or \
-                not str(attributes.get("text") or "").strip():
+        if not box or str(attributes.get("resource-id") or "").startswith(chrome) or not shown_words(attributes):
             continue
         x, y = (int(box[1]) + int(box[3])) / 2, (int(box[2]) + int(box[4])) / 2
         shown += left <= x <= right and top < y < bottom
