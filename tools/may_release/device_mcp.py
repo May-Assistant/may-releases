@@ -350,6 +350,9 @@ def driver_call(config, name, arguments, seconds):
     running: status 0 when taken. Once DRIVER_STARTS children have been started, every call is refused, driver died."""
     driver = config.setdefault("driver", McpDriver(config))
     if not driver.alive():
+        if driver.child is not None:
+            # A child that ended on its own may have left its runner and xcodebuild running: its group goes first.
+            driver.stop()
         if driver.starts >= DRIVER_STARTS or not driver.start():
             config["driver_died"] = driver.starts >= DRIVER_STARTS
             return 1, DIED_LINE if config["driver_died"] else NO_START_LINE
@@ -762,13 +765,20 @@ def record(config, outcome, summary):
     """The agent's result for the judge: its hierarchy through kept_lines and within MAX_HIERARCHY, as the summary is
     redacted where it is sealed."""
     kept, _ = kept_lines(config["hierarchy"].encode(), "")
-    with open(config["result"], "w", encoding="utf-8") as output:
-        json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
-                   "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
-                   "hierarchy_failure": config.get("hierarchy_failure"),
-                   "hierarchy_cause": config.get("hierarchy_cause"), "refusal_cause": config.get("refusal_cause"),
-                   **({"wedged": True} if config.get("wedged") else {}),
-                   **({"looks": config["looks"]} if config.get("look") else {})}, output)
+    # Written beside it and moved into place, so a server that exits at once (gone()) never leaves it cut short.
+    partial = config["result"] + ".partial"
+    try:
+        with open(partial, "w", encoding="utf-8") as output:
+            json.dump({"outcome": outcome, "summary": summary[:MAX_SUMMARY], "actions": config["actions"],
+                       "hierarchy": kept.decode("utf-8", "replace")[:MAX_HIERARCHY],
+                       "hierarchy_failure": config.get("hierarchy_failure"),
+                       "hierarchy_cause": config.get("hierarchy_cause"), "refusal_cause": config.get("refusal_cause"),
+                       **({"wedged": True} if config.get("wedged") else {}),
+                       **({"looks": config["looks"]} if config.get("look") else {})}, output)
+        os.replace(partial, config["result"])
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
 
 
 def call(name, args, config):
@@ -989,21 +999,33 @@ def gone(config, exit=os._exit):
 
 
 def watch_parent(config, parent, getppid=os.getppid, sleep=time.sleep, exit=os._exit):
-    """Waits for this server's parent (claude) to go, then ends as gone() does."""
-    while getppid() == parent:
+    """Waits for this server's parent (claude) to go, then ends as gone() does. A parent of 1 is gone already: this
+    server was orphaned before it started watching."""
+    while parent != 1 and getppid() == parent:
         sleep(PARENT_SECONDS)
     gone(config, exit)
 
 
+def guard(config, parent, handle=signal.signal, thread=threading.Thread):
+    """iOS alone: a SIGTERM, or the loss of the parent this server started under, ends it as gone() does. Android
+    keeps its own exits, so stilled_dump always puts the animation scales back (re-review of #175)."""
+    if config["platform"] != "ios":
+        return False
+    handle(signal.SIGTERM, lambda number, frame: gone(config))
+    thread(target=watch_parent, args=(config, parent), daemon=True).start()
+    return True
+
+
 if __name__ == "__main__":
+    # The parent this server started under, read before anything else, so a claude killed meanwhile is still seen.
+    started_under = os.getppid()
     sys.stderr = open(os.devnull, "w")
     found = settings(os.environ)
     if found is None:
         sys.exit(1)
-    # A stopped server, or one whose claude was killed, kills its Maestro driver's group and exits at once, so the
-    # driver never outlives this scenario (independent review of #175).
-    signal.signal(signal.SIGTERM, lambda number, frame: gone(found))
-    threading.Thread(target=watch_parent, args=(found, os.getppid()), daemon=True).start()
+    # On iOS a stopped server, or one whose claude was killed, kills its Maestro driver's group and exits at once, so
+    # the driver never outlives this scenario (independent review of #175).
+    guard(found, started_under)
     try:
         serve(sys.stdin, sys.stdout, found)
     except Exception:

@@ -13,8 +13,10 @@ import signal
 import plistlib
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -2499,6 +2501,144 @@ class McpDriverTests(unittest.TestCase):
                              (1, device_mcp.NO_START_LINE))
         self.assertEqual(seen, [device_mcp.MCP_START_SECONDS, device_mcp.MCP_START_SECONDS - 100],
                          "the screen read has what initialize left of one allowance, never a second one")
+
+    def test_a_child_that_ended_on_its_own_has_its_group_stopped_before_the_next_start(self):
+        """Re-review of #175: a crashed child may leave its runner and xcodebuild behind."""
+        device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
+        first = self.started[0]
+        first.returncode = 1
+        self.assertEqual(device_mcp.driver_call(self.config, "inspect_screen", {}, 5), (0, b"{}"))
+        self.assertEqual(len(self.started), 2)
+        self.assertIn((first.pid, signal.SIGKILL), self.groups, "the crashed child's group went first")
+        self.assertEqual(self.config["driver"].group, self.started[1].pid, "only the new child's group is held")
+
+    def test_only_ios_is_guarded_and_an_orphaned_server_ends_at_once(self):
+        """Re-review of #175: on Android, an exit at once would skip stilled_dump's restore of the animation scales."""
+        handled, threads = [], []
+
+        class Thread:
+            def __init__(self, target, args, daemon):
+                threads.append((target, args, daemon))
+
+            def start(self):
+                pass
+        android = dict(self.config, platform="android")
+        self.assertFalse(device_mcp.guard(android, 10, handle=lambda *a: handled.append(a), thread=Thread))
+        self.assertEqual((handled, threads), ([], []), "Android keeps its own exits")
+        self.assertTrue(device_mcp.guard(self.config, 10, handle=lambda *a: handled.append(a), thread=Thread))
+        self.assertEqual([number for number, _ in handled], [signal.SIGTERM])
+        self.assertEqual(threads, [(device_mcp.watch_parent, (self.config, 10), True)])
+        exits = []
+        device_mcp.watch_parent({}, 1, getppid=lambda: 1, sleep=lambda seconds: self.fail("never waits"),
+                                exit=exits.append)
+        self.assertEqual(exits, [0], "a server that started orphaned is gone already")
+
+    def test_the_result_is_never_left_cut_short(self):
+        result = Path(self.config["result"])
+        device_mcp.record(self.config, "unfinished", "")
+        before = result.read_bytes()
+
+        def cut(value, output):
+            output.write('{"outcome": "compl')
+            raise KeyboardInterrupt
+        with patch("device_mcp.json.dump", side_effect=cut), self.assertRaises(KeyboardInterrupt):
+            device_mcp.record(self.config, "completed", "all done")
+        self.assertTrue(result.is_file(), "the earlier result is still there")
+        self.assertEqual(result.read_bytes(), before, "the earlier result stands whole")
+        self.assertEqual(sorted(path.name for path in result.parent.iterdir() if path.name.startswith(result.name)),
+                         [result.name], "nothing partial is left beside it")
+
+    def test_the_real_server_kills_its_driver_group_when_its_parent_is_killed_or_it_is_stopped(self):
+        """Re-review of #175: the server as it runs, under a parent that is then killed, and stopped by SIGTERM."""
+        for ending in ("parent killed", "SIGTERM"):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as directory:
+                self.run_real_server(Path(directory), ending)
+
+    def run_real_server(self, directory, ending):
+        pids = directory / "pids"
+        maestro = directory / "maestro"
+        maestro.write_text(f"""#!{sys.executable}
+import json, os, subprocess, sys
+sleeper = subprocess.Popen(["sleep", "300"])
+with open({str(pids)!r}, "w") as out:
+    out.write(f"{{os.getpid()}} {{sleeper.pid}}\\n")
+runs = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    runs += message.get("params", {{}}).get("name") == "run"
+    if runs > 1:
+        continue  # the second act never comes back: the server is mid-call when it is ended
+    result = {{"content": [{{"type": "text", "text": "{{}}"}}], "isError": False}} \\
+        if message.get("method") == "tools/call" else {{}}
+    sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}) + "\\n")
+    sys.stdout.flush()
+""")
+        maestro.chmod(0o755)
+        server = Path(device_mcp.__file__).resolve()
+        env = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID, "MAY_DEVICE_MAESTRO": str(maestro),
+               "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground",
+               "MAY_DEVICE_AGENT_RESULT": str(directory / "result.json"), "PATH": os.environ.get("PATH", "/usr/bin")}
+        parent = subprocess.Popen([sys.executable, "-I", "-c", f"""
+import json, subprocess, sys, time
+server = subprocess.Popen([sys.executable, {str(server)!r}], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+for message in ({{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {{}}}},
+                {{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {{"name": "back", "arguments": {{}}}}}}):
+    server.stdin.write((json.dumps(message) + "\\n").encode())
+    server.stdin.flush()
+    server.stdout.readline()
+print(server.pid, flush=True)
+message = {{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {{"name": "back", "arguments": {{}}}}}}
+server.stdin.write((json.dumps(message) + "\\n").encode())
+server.stdin.flush()
+time.sleep(300)
+"""], stdout=subprocess.PIPE, env=env)
+        self.addCleanup(self.end_parent, parent)
+        line = parent.stdout.readline()
+        self.assertTrue(line.strip(), "the server answered its first act")
+        server_pid = int(line)
+        maestro_pid, sleeper_pid = (int(pid) for pid in pids.read_text().split())
+        for pid in (server_pid, maestro_pid, sleeper_pid):
+            self.addCleanup(self.kill_quietly, pid)
+        self.assertTrue(all(self.running(pid) for pid in (server_pid, maestro_pid, sleeper_pid)))
+        time.sleep(0.5)  # the second act is in the server's hands, held until ACT_SECONDS without an answer
+        if ending == "parent killed":
+            parent.kill()
+            parent.wait(10)
+        else:
+            os.kill(server_pid, signal.SIGTERM)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and any(self.running(pid) for pid in (server_pid, maestro_pid, sleeper_pid)):
+            time.sleep(0.1)
+        self.assertEqual([self.running(pid) for pid in (server_pid, maestro_pid, sleeper_pid)], [False] * 3,
+                         "the server, its driver and what the driver started are all gone")
+
+    @staticmethod
+    def running(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat") as stat:
+                return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return True
+
+    @staticmethod
+    def end_parent(parent):
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(10)
+        parent.stdout.close()
+
+    @staticmethod
+    def kill_quietly(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def test_a_server_that_is_stopped_or_loses_its_parent_kills_the_driver_group_at_once(self):
         device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
