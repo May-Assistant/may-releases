@@ -1898,9 +1898,10 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertIn(b"***@example.com was signed in", kept)
         for absent in (b"Bearer", b"sam@", b"step 0\n", b"step 20\n"):
             self.assertNotIn(absent, kept)
-        self.assertEqual(len(kept.splitlines()), 1 + device_mcp.DRIVER_LINES - 1 + 1,
-                         "the last 40 lines, one dropped, and the runner's counts")
-        self.assertTrue(kept.endswith(b"runner log: unreadable\n"), "this fake's log show fails too")
+        self.assertEqual(len(kept.splitlines()), 1 + device_mcp.DRIVER_LINES - 1 + 2,
+                         "the last 40 lines, one dropped, the runner's counts and Maestro's")
+        self.assertTrue(kept.endswith(b"runner log: unreadable\nmaestro log: none\n"),
+                        "this fake's log show fails too, and its Maestro wrote no log")
         with patch("device_mcp.subprocess.run", side_effect=run):
             for _ in range(200):
                 device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
@@ -1941,11 +1942,56 @@ class IosDeviceServerTests(unittest.TestCase):
         kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
         self.assertTrue(kept.endswith(b"Tap on point (237,316)...\n(timed out)\nrunner log: idle waits 2, animations not "
                                       b"complete 1, quiescence 0, event synthesis 1, snapshots 0, timeouts 0, other 1\n"
-                                      b"runner other by category: no category 1\n"),
+                                      b"runner other by category: no category 1\nmaestro log: none\n"),
                         kept)
         for absent in (b"Bearer", b"sam@", b"io.github.x", b"Synthesize"):
             self.assertNotIn(absent, kept, "only the counts are kept")
         self.assertEqual(self.config["refusal_cause"], "hung in act", "the tap never came back from the act itself")
+
+    def test_a_refused_act_counts_maestros_own_driver_phrases_in_its_own_log(self):
+        """Run 41289745884 (coordinator, 1 Nov): Maestro still started new runners mid-scenario, and nothing said why.
+        Each act's Maestro logs to its own emptied folder; for a refused act its fixed driver phrases are counted."""
+        log = (b"09:00:00.001 [ INFO] MAESTRO.logSystemInfo: Maestro Version: 2.8.0\n"
+               b"09:00:00.100 [ INFO] xcuitest.installer.LocalXCTestInstaller.start: start()\n"
+               b"09:00:00.200 [ INFO] xcuitest.installer.LocalXCTestInstaller.xcTestDriverStatusCheck: [Failed] "
+               b"Perform XCUITest driver status check on 0A1B, exception: java.net.ConnectException\n"
+               b"09:00:00.300 [ INFO] xcuitest.installer.LocalXCTestInstaller.start: [Start] Install XCUITest runner "
+               b"on 0A1B\n"
+               b"09:00:00.400 [ INFO] xcuitest.installer.LocalXCTestInstaller.startXCTestRunner: Installing driver "
+               b"with xcodebuild\n"
+               b"09:00:30.000 [ INFO] xcuitest.installer.LocalXCTestInstaller.start: [Done] Install XCUITest runner "
+               b"on 0A1B\n"
+               b"09:00:31.000 [ INFO] xcuitest.installer.LocalXCTestInstaller.xcTestDriverStatusCheck: [Done] "
+               b"Perform XCUITest driver status check on 0A1B\n"
+               b"09:00:59.000 [ INFO] xcuitest.installer.LocalXCTestInstaller.close: [Start] Cleaning up the ui test "
+               b"runner files\n"
+               b"09:00:59.100 [TRACE] xcuitest.installer.LocalXCTestInstaller.uninstall: Skipping uninstalling XCTest "
+               b"Runner as USE_XCODE_TEST_RUNNER is set\n"
+               b"09:00:59.200 [ INFO] maestro.Orchestra: tapOn qa-1 sam@example.com\n")
+        seen = []
+
+        def run(argv, capture_output, stdin, timeout, env):
+            listed = simctl_list(argv, self.bundle)
+            if listed is not None:
+                return subprocess.CompletedProcess(argv, 0, listed, b"")
+            if "log" in argv:
+                return subprocess.CompletedProcess(argv, 1, b"", b"")
+            debug = argv[argv.index("--debug-output") + 1]
+            seen.append((debug, sorted(os.listdir(debug)), argv[argv.index("--debug-output") + 2]))
+            Path(debug, "maestro.log").write_bytes(log)
+            return subprocess.CompletedProcess(argv, 1, b"(timed out)\n", b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run):
+            self.assertTrue(device_mcp.call("tap", {"x": 180, "y": 120}, self.config)[0])
+            device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
+        self.assertEqual(seen, [(str(self.work / device_mcp.MAESTRO_DEBUG), [], "--flatten-debug-output")] * 2,
+                         "each act's own folder, emptied before it")
+        kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
+        self.assertIn(b"maestro log: driver starts 1, runner already running 0, runner installs 1, runner installed 1, "
+                      b"status checks ok 1, status checks failed 1, not ready in time 0, runner stops 0, "
+                      b"uninstall skipped 1, cleanups 1\n", kept)
+        for absent in (b"sam@", b"qa-1", b"0A1B", b"ConnectException", b"2.8.0", b"xcodebuild"):
+            self.assertNotIn(absent, kept, "only the counts leave the private folder")
 
     def test_the_runners_other_lines_are_counted_by_category_alone(self):
         """Run 41180883244: 133 of a hung act's runner lines matched no kind. They are counted by their log category

@@ -33,6 +33,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -191,6 +192,20 @@ RUNNER_LOG = 'process BEGINSWITH "maestro-driver"'
 # refused windows' runner lines were a start-up's, never an idle wait. Each call here keeps the runner instead
 # (NO_REINSTALL, Maestro's own negation of --reinstall-driver): the first starts it, the rest find it running.
 NO_REINSTALL = "--no-reinstall-driver"
+# Run 41289745884 (coordinator, 1 Nov): with the runner kept, Maestro still started 1 to 4 new ones a scenario, and
+# nothing kept said why. Each act's Maestro writes its own log to MAESTRO_DEBUG (--debug-output, flattened, emptied
+# before each act); for a refused act, MAESTRO_MARKS' fixed phrases from Maestro's own driver code are counted in it
+# and kept as one line after the runner's. Only the counts leave: the log itself stays in the private work folder.
+MAESTRO_DEBUG, MAX_MAESTRO_LOG = "maestro-debug", 4 * 1024 * 1024
+MAESTRO_MARKS = (("driver starts", b"start()"), ("runner already running", b"UI Test runner already running"),
+                 ("runner installs", b"[Start] Install XCUITest runner"),
+                 ("runner installed", b"[Done] Install XCUITest runner"),
+                 ("status checks ok", b"[Done] Perform XCUITest driver status check"),
+                 ("status checks failed", b"[Failed] Perform XCUITest driver status check"),
+                 ("not ready in time", b"iOS driver not ready in time"),
+                 ("runner stops", b"Will attempt to stop all alive XCTest Runner processes"),
+                 ("uninstall skipped", b"Skipping uninstalling XCTest Runner"),
+                 ("cleanups", b"[Start] Cleaning up the ui test runner files"))
 RUNNER_KINDS = (("idle waits", re.compile(rb"to (?:become )?idle|wait(?:ing)? for [^\n]*idle", re.IGNORECASE)),
                 ("animations not complete", re.compile(rb"animations? complete", re.IGNORECASE)),
                 ("quiescence", re.compile(rb"quiescen", re.IGNORECASE)),
@@ -241,17 +256,44 @@ def runner_line(counts):
                            if top else "")).encode()
 
 
+def maestro_counts(debug):
+    """MAESTRO_MARKS' counts in the act's own Maestro log (a line counts once, for its first mark); None when there is
+    no log to read."""
+    try:
+        with open(os.path.join(debug, "maestro.log"), "rb") as stream:
+            data = stream.read(MAX_MAESTRO_LOG)
+    except OSError:
+        return None
+    counts = {name: 0 for name, _ in MAESTRO_MARKS}
+    for line in data.splitlines():
+        name = next((name for name, mark in MAESTRO_MARKS if mark in line), None)
+        if name:
+            counts[name] += 1
+    return counts
+
+
+def maestro_line(counts):
+    """The fixed line the counts are kept as."""
+    if counts is None:
+        return b"maestro log: none\n"
+    return ("maestro log: " + ", ".join(f"{name} {int(n)}" for name, n in counts.items()) + "\n").encode()
+
+
 def flow(config, command):
     """One Maestro flow holding exactly one command this server wrote, run on the configured simulator."""
     path = os.path.join(config["flows"], "act.yaml")
     with open(path, "w", encoding="utf-8") as output:
         output.write(f"appId: {config['bundle']}\n---\n{command}\n")
+    debug = os.path.join(config["flows"], MAESTRO_DEBUG)
+    shutil.rmtree(debug, ignore_errors=True)
+    os.makedirs(debug, mode=0o700, exist_ok=True)
     started = utc_now()
-    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", NO_REINSTALL, path],
-                        timeout=ACT_SECONDS, both=True)
+    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", NO_REINSTALL, "--debug-output",
+                                 debug, "--flatten-debug-output", path], timeout=ACT_SECONDS, both=True)
     if status:
         ended = utc_now()
-        refused(config, command, said, started, ended, runner_line(runner_counts(config, started, ended)))
+        refused(config, command, said, started, ended,
+                runner_line(runner_counts(config, started, ended)) + maestro_line(maestro_counts(debug)))
         config["refusal_cause"] = driver_cause(said)
     return status
 
