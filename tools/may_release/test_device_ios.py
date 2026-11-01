@@ -612,10 +612,9 @@ class RunTests(Workspace):
             selection="chat", agent=agent,
             env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
         tests = [argv for argv, _ in calls if argv[0] == "/fake/maestro"]
-        self.assertEqual(tests, [["/fake/maestro", "--device", UDID, "test", str(subflow)],
-                                 ["/fake/maestro", "--device", UDID, "hierarchy", "--no-reinstall-driver"]],
-                         "run 41281021335: one hierarchy read that keeps its runner starts it before the agent's acts")
-        self.assertEqual(self.maestro_timeouts, [device_tests.ONBOARDING_SECONDS, device_ios.WARM_SECONDS])
+        self.assertEqual(tests, [["/fake/maestro", "--device", UDID, "test", str(subflow)]],
+                         "the agent's Maestro driver starts inside device_mcp, never here")
+        self.assertEqual(self.maestro_timeouts, [device_tests.ONBOARDING_SECONDS])
         self.assertEqual(order, ["agent"])
         self.assertNotIn("onboarding subflow", out, "a subflow that passed says nothing")
 
@@ -650,24 +649,6 @@ class RunTests(Workspace):
             raise ProcessLookupError()
         with patch.object(device_ios.renders, "quiet"):
             self.assertEqual(device_ios.sweep_driver(UDID, {}, None, listed, kill=gone), 0, "never an error")
-
-    def test_a_warm_up_that_does_not_answer_is_said_and_the_agent_still_runs(self):
-        order = []
-
-        def agent(cli, goal, tag, device, work, token, model, seconds):
-            order.append("agent")
-            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
-
-        def hook(argv, log, timeout):
-            if "hierarchy" in argv:
-                raise subprocess.TimeoutExpired(argv, timeout)
-        self.quiet_hook = hook
-        calls, _, _, out, _ = self.run_it(
-            selection="chat", agent=agent,
-            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
-        self.assertEqual(order, ["agent"])
-        self.assertIn("May device tests (ios): chat: the Maestro driver did not answer its warm-up; the agent starts "
-                      "anyway", out.splitlines())
 
     def test_an_onboarding_subflow_that_does_not_pass_leaves_its_last_lines_in_the_diag(self):
         """Run 40181517145: chat's and notes' subflow did not pass, with nothing to say where it stopped."""

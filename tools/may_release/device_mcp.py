@@ -32,10 +32,12 @@ import datetime
 import json
 import os
 import plistlib
+import queue
 import re
-import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from xml.etree import ElementTree
 
@@ -185,27 +187,6 @@ DRIVER_FILE, DRIVER_LINES, MAX_DRIVER = "driver.txt", 40, 32 * 1024
 # (first match, else other); only the counts are kept, on one line after the act's driver lines. Waits for the app to
 # idle that never end point at the app (a repeating animation, or main-queue work), not at the harness.
 RUNNER_LOG = 'process BEGINSWITH "maestro-driver"'
-# Run 41281021335 (coordinator, 1 Nov): with Reduce Motion on, every agent row wedged and every scripted flow passed.
-# Maestro 2.8.0's `test` and `hierarchy` reinstall their XCTest runner by default: each call starts a fresh runner
-# (`xcodebuild test-without-building`, allowed 120 s to answer) and kills it on exit, so every act and every look was a
-# runner start under ACT_SECONDS' 60 s, and a call cut short left a half-started runner for the next to race. The
-# refused windows' runner lines were a start-up's, never an idle wait. Each call here keeps the runner instead
-# (NO_REINSTALL, Maestro's own negation of --reinstall-driver): the first starts it, the rest find it running.
-NO_REINSTALL = "--no-reinstall-driver"
-# Run 41289745884 (coordinator, 1 Nov): with the runner kept, Maestro still started 1 to 4 new ones a scenario, and
-# nothing kept said why. Each act's Maestro writes its own log to MAESTRO_DEBUG (--debug-output, flattened, emptied
-# before each act); for a refused act, MAESTRO_MARKS' fixed phrases from Maestro's own driver code are counted in it
-# and kept as one line after the runner's. Only the counts leave: the log itself stays in the private work folder.
-MAESTRO_DEBUG, MAX_MAESTRO_LOG = "maestro-debug", 4 * 1024 * 1024
-MAESTRO_MARKS = (("driver starts", b"start()"), ("runner already running", b"UI Test runner already running"),
-                 ("runner installs", b"[Start] Install XCUITest runner"),
-                 ("runner installed", b"[Done] Install XCUITest runner"),
-                 ("status checks ok", b"[Done] Perform XCUITest driver status check"),
-                 ("status checks failed", b"[Failed] Perform XCUITest driver status check"),
-                 ("not ready in time", b"iOS driver not ready in time"),
-                 ("runner stops", b"Will attempt to stop all alive XCTest Runner processes"),
-                 ("uninstall skipped", b"Skipping uninstalling XCTest Runner"),
-                 ("cleanups", b"[Start] Cleaning up the ui test runner files"))
 RUNNER_KINDS = (("idle waits", re.compile(rb"to (?:become )?idle|wait(?:ing)? for [^\n]*idle", re.IGNORECASE)),
                 ("animations not complete", re.compile(rb"animations? complete", re.IGNORECASE)),
                 ("quiescence", re.compile(rb"quiescen", re.IGNORECASE)),
@@ -219,6 +200,133 @@ RUNNER_SECONDS = 20
 # A name starts with a letter, so the process's [pid:tid] is never one.
 LOG_CATEGORY = re.compile(rb"\[([A-Za-z][A-Za-z0-9._-]{0,47}:[A-Za-z][A-Za-z0-9._-]{0,31})\]")
 RUNNER_TOP = 5
+
+# Runs 41289745884 and 41302227814 (coordinator, 1 Nov): every refused act's own Maestro log said no runner was alive,
+# so Maestro installed a new one and polled it 44 to 63 times while the act's 60 s ran out; the runner died with each
+# Maestro process that started it. So one Maestro process now serves the whole agent session: `maestro mcp` (its own
+# MCP server over stdio, with no viewer), which keeps one session, and so one XCTest runner, per device for its life.
+# Only its "run" (this server's own one-command flow, as before) and "inspect_screen" tools are ever called (MCP_TOOLS);
+# its cloud and viewer tools never are. Its first start, and a restart, read the screen once within MCP_START_SECONDS,
+# Maestro's own 120 s start allowance and a margin, so the runner's start is never charged to an act. A call that does
+# not answer within its time kills the child, as the act's Maestro process was killed before; the next call starts a
+# new one, DRIVER_STARTS at most for a session, after which every act is refused as "driver died" and the agent stops.
+MCP_TOOLS, MCP_START_SECONDS, DRIVER_STARTS, MCP_STOP_SECONDS = ("run", "inspect_screen"), 150, 2, 10
+DIED_LINE = b"driver died\n"
+
+
+class McpDriver:
+    """One `maestro mcp` child for this server's life: a JSON-RPC client over its stdin and stdout."""
+
+    def __init__(self, config, popen=None):
+        self.config, self.popen = config, popen or subprocess.Popen
+        self.child, self.lines, self.serial, self.starts = None, None, 0, 0
+
+    def alive(self):
+        return self.child is not None and self.child.poll() is None
+
+    @staticmethod
+    def read(stream, lines):
+        try:
+            for line in stream:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        lines.put(None)
+
+    def start(self):
+        """A new child, initialized and holding a runner; False when it could not be made ready (then stopped)."""
+        self.starts += 1
+        self.lines = queue.Queue()
+        try:
+            self.child = self.popen([self.config["maestro"], "mcp", "--no-viewer", "--working-dir", self.config["flows"]],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    env=self.config["env"], start_new_session=True)
+        except OSError:
+            self.child = None
+            return False
+        threading.Thread(target=self.read, args=(self.child.stdout, self.lines), daemon=True).start()
+        ready = self.request("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
+                                            "clientInfo": {"name": "may-device-tests", "version": "1"}},
+                             MCP_START_SECONDS) is not None
+        if ready:
+            self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            ready = self.call("inspect_screen", {}, MCP_START_SECONDS)[0]
+        if not ready:
+            self.stop()
+        return ready
+
+    def send(self, message):
+        self.child.stdin.write((json.dumps(message) + "\n").encode())
+        self.child.stdin.flush()
+
+    def request(self, method, params, seconds):
+        """The reply to one request, or None when the child closed, broke or did not answer within seconds."""
+        self.serial += 1
+        serial = self.serial
+        try:
+            self.send({"jsonrpc": "2.0", "id": serial, "method": method, "params": params})
+        except (OSError, ValueError, AttributeError):
+            return None
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and message.get("id") == serial:
+                return message
+
+    def call(self, name, arguments, seconds):
+        """(taken, what it said): one of MCP_TOOLS on the configured simulator. A call that does not answer stops
+        the child."""
+        if name not in MCP_TOOLS:
+            raise ValueError("Only Maestro's run and inspect_screen tools are called")
+        reply = self.request("tools/call", {"name": name, "arguments": dict(arguments, device_id=self.config["udid"])},
+                             seconds)
+        if reply is None:
+            self.stop()
+            return False, b"(timed out)\n"
+        result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
+        text = "".join(part.get("text", "") for part in result.get("content") or []
+                       if isinstance(part, dict) and isinstance(part.get("text"), str))
+        return "error" not in reply and not result.get("isError"), text.encode("utf-8", "replace")
+
+    def stop(self):
+        """Ends the child: its stdin closed, then asked to stop, then killed; never an error."""
+        child, self.child = self.child, None
+        if child is None:
+            return
+        for end in (lambda: child.stdin.close(), child.terminate, child.kill):
+            try:
+                end()
+                child.wait(MCP_STOP_SECONDS)
+                return
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                continue
+
+
+def driver_call(config, name, arguments, seconds):
+    """(status, what the driver said) for one Maestro tool call, starting the session's driver first when it has none
+    running: status 0 when taken. Once DRIVER_STARTS children have been started, every call is refused, driver died."""
+    driver = config.setdefault("driver", McpDriver(config))
+    if not driver.alive():
+        if driver.starts >= DRIVER_STARTS or not driver.start():
+            config["driver_died"] = driver.starts >= DRIVER_STARTS
+            return 1, DIED_LINE if config["driver_died"] else b"(timed out)\n"
+    taken, said = driver.call(name, arguments, seconds)
+    return (0 if taken else 1), said
+
+
+def driver_line(config):
+    """The fixed line the session's driver starts are kept as, after a refused act's runner counts."""
+    driver = config.get("driver")
+    return f"maestro driver: starts {int(driver.starts if driver else 0)}\n".encode()
 
 
 def runner_counts(config, started, ended):
@@ -256,45 +364,16 @@ def runner_line(counts):
                            if top else "")).encode()
 
 
-def maestro_counts(debug):
-    """MAESTRO_MARKS' counts in the act's own Maestro log (a line counts once, for its first mark); None when there is
-    no log to read."""
-    try:
-        with open(os.path.join(debug, "maestro.log"), "rb") as stream:
-            data = stream.read(MAX_MAESTRO_LOG)
-    except OSError:
-        return None
-    counts = {name: 0 for name, _ in MAESTRO_MARKS}
-    for line in data.splitlines():
-        name = next((name for name, mark in MAESTRO_MARKS if mark in line), None)
-        if name:
-            counts[name] += 1
-    return counts
-
-
-def maestro_line(counts):
-    """The fixed line the counts are kept as."""
-    if counts is None:
-        return b"maestro log: none\n"
-    return ("maestro log: " + ", ".join(f"{name} {int(n)}" for name, n in counts.items()) + "\n").encode()
-
-
 def flow(config, command):
-    """One Maestro flow holding exactly one command this server wrote, run on the configured simulator."""
-    path = os.path.join(config["flows"], "act.yaml")
-    with open(path, "w", encoding="utf-8") as output:
-        output.write(f"appId: {config['bundle']}\n---\n{command}\n")
-    debug = os.path.join(config["flows"], MAESTRO_DEBUG)
-    shutil.rmtree(debug, ignore_errors=True)
-    os.makedirs(debug, mode=0o700, exist_ok=True)
+    """One Maestro flow holding exactly one command this server wrote, run on the configured simulator by the
+    session's driver."""
     started = utc_now()
-    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", NO_REINSTALL, "--debug-output",
-                                 debug, "--flatten-debug-output", path], timeout=ACT_SECONDS, both=True)
+    status, said = driver_call(config, "run", {"yaml": f"appId: {config['bundle']}\n---\n{command}\n"}, ACT_SECONDS)
     if status:
         ended = utc_now()
         refused(config, command, said, started, ended,
-                runner_line(runner_counts(config, started, ended)) + maestro_line(maestro_counts(debug)))
-        config["refusal_cause"] = driver_cause(said)
+                runner_line(runner_counts(config, started, ended)) + driver_line(config))
+        config["refusal_cause"] = "driver died" if said == DIED_LINE else driver_cause(said)
     return status
 
 
@@ -337,6 +416,24 @@ def ios_screenshot(config):
     return data if not status and data.startswith(b"\x89PNG") and len(data) > 24 else None
 
 
+# inspect_screen's compact tree (Maestro's ViewHierarchyFormatters, iOS schema): abbreviated keys, children under "c",
+# defaults left out. Expanded back into the attributes this server reads from `maestro hierarchy`'s tree.
+COMPACT_KEYS = {"b": "bounds", "txt": "text", "rid": "resource-id", "a11y": "accessibilityText", "hint": "hintText",
+                "val": "value", "cls": "class"}
+
+
+def expanded(elements, defaults, depth=0):
+    """inspect_screen's elements as `maestro hierarchy`'s tree: {"attributes": {...}, "children": [...]}."""
+    nodes = []
+    for element in elements if isinstance(elements, list) and depth <= 200 else []:
+        if not isinstance(element, dict):
+            continue
+        attributes = {name: value for name, value in defaults.items() if name not in COMPACT_KEYS}
+        attributes.update({COMPACT_KEYS.get(name, name): value for name, value in element.items() if name != "c"})
+        nodes.append({"attributes": attributes, "children": expanded(element.get("c"), defaults, depth + 1)})
+    return nodes
+
+
 def ios_nodes(node, depth=0):
     """Every element of `maestro hierarchy`'s JSON tree, as (attributes) dicts."""
     if depth > 200 or not isinstance(node, dict):
@@ -349,13 +446,17 @@ def ios_nodes(node, depth=0):
 
 
 def ios_tree(config):
-    """`maestro hierarchy`'s JSON tree, or None (and the driver's cause in config["dump_cause"])."""
-    status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy", NO_REINSTALL], both=True)
+    """The screen's tree in `maestro hierarchy`'s form, from the session driver's inspect_screen, or None (and the
+    driver's cause in config["dump_cause"])."""
+    status, data = driver_call(config, "inspect_screen", {}, ACT_SECONDS)
     try:
-        # The output holds stderr after stdout (for driver_cause); the tree is the first JSON value in it.
-        tree = json.JSONDecoder().raw_decode(data[data.find(b"{"):].decode("utf-8", "replace"))[0] if not status else None
+        found = json.loads(data.decode("utf-8", "replace")) if not status else None
     except ValueError:
-        tree = None
+        found = None
+    schema = found.get("ui_schema") if isinstance(found, dict) else None
+    defaults = schema.get("defaults") if isinstance(schema, dict) and isinstance(schema.get("defaults"), dict) else {}
+    tree = {"attributes": {}, "children": expanded(found.get("elements"), defaults)} \
+        if isinstance(found, dict) and isinstance(found.get("elements"), list) else None
     config["dump_cause"] = None if isinstance(tree, dict) else driver_cause(data)
     return tree if isinstance(tree, dict) else None
 
@@ -554,7 +655,7 @@ CAUSE_PATTERNS = (("settle timeout", re.compile(rb"(?m)(?:Tap|Input text|Swip|Pr
                   ("app not running", re.compile(rb"not running|terminated|crash", re.IGNORECASE)))
 # "typed nothing": an iOS type act Maestro took, after which the focused field holds none of the typed words
 # (coordinator, 28 Oct: inputText COMPLETED and no text appeared).
-DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "typed nothing", "other")
+DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "typed nothing", "driver died", "other")
 
 
 def driver_cause(output):
@@ -846,6 +947,8 @@ def serve(stdin, stdout, config):
 
 if __name__ == "__main__":
     sys.stderr = open(os.devnull, "w")
+    # A stopped server still stops its Maestro driver (the finally below): SIGTERM exits through it.
+    signal.signal(signal.SIGTERM, lambda number, frame: sys.exit(0))
     found = settings(os.environ)
     if found is None:
         sys.exit(1)
@@ -853,3 +956,7 @@ if __name__ == "__main__":
         serve(sys.stdin, sys.stdout, found)
     except Exception:
         sys.exit(1)
+    finally:
+        # The session's Maestro driver ends with this server, so its runner never outlives the agent.
+        if found.get("driver"):
+            found["driver"].stop()
