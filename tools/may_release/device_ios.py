@@ -639,6 +639,49 @@ def loop_census_wanted():
     return os.environ.get(LOOP_CENSUS, "").strip() == "true"
 
 
+# Run 41281021335 (coordinator, 1 Nov): the agent's Maestro calls keep their XCTest runner (device_mcp.NO_REINSTALL), so
+# a runner left by one scenario, or a half-started one a cut-short call left, must not reach the next. Before each
+# scenario the runner app is terminated on the simulator and any of this user's `xcodebuild test-without-building` for
+# this simulator is stopped (Maestro starts its runner that way). Before the agent's first act, one hierarchy read that
+# keeps its runner starts it, within Maestro's own 120 s start allowance (WARM_SECONDS), so the start is not charged to
+# an act's 60 s.
+DRIVER_BUNDLE = "dev.mobile.maestro-driver-iosUITests.xctrunner"
+WARM_SECONDS = 150
+
+
+def sweep_driver(udid, env, log, listed=None, kill=os.kill):
+    """Stops any Maestro XCTest runner left on the simulator; the number of xcodebuild processes stopped. Never an
+    error. listed: this user's processes as `ps` gives them ("pid command"), for the tests."""
+    renders.quiet(["xcrun", "simctl", "terminate", udid, DRIVER_BUNDLE], log, env=env)
+    if listed is None:
+        try:
+            listed = subprocess.run(["ps", "-U", str(os.getuid()), "-o", "pid=,command="], capture_output=True,
+                                    stdin=subprocess.DEVNULL, timeout=30).stdout.decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            return 0
+    stopped = 0
+    for line in listed.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        argv = command.split()
+        if pid.isdigit() and argv and os.path.basename(argv[0]) == "xcodebuild" and \
+                "test-without-building" in argv and "id=" + udid in argv:
+            try:
+                kill(int(pid), signal.SIGTERM)
+                stopped += 1
+            except OSError:
+                pass
+    return stopped
+
+
+def warm_driver(launcher, udid, env, log):
+    """One `maestro hierarchy` that keeps its runner, before the agent's first act; whether it answered."""
+    try:
+        return not renders.quiet([str(launcher), "--device", udid, "hierarchy", device_tests.device_mcp.NO_REINSTALL],
+                                 log, env=env, timeout=WARM_SECONDS).returncode
+    except subprocess.SubprocessError:
+        return False
+
+
 def launch(udid, env, token, log):
     """The app, stopped and started again with a fresh test session in its launch environment (never an argument);
     signed out, with no token (the smoke scenario). SHOW_TOUCHES draws each tap in the app (may-app #1194, May
@@ -767,6 +810,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 accounts.finish(row, base, token)
                 token = ""
                 continue
+            count, scenario = sweep_driver(udid, env, log), row["id"]
+            if count:
+                print(f"May device tests (ios): {count} leftover Maestro runner processes stopped before {scenario}")
             at(f"{row['id']}: launching the app")
             diagnostics.begin()
             launch(udid, env, token, log)
@@ -791,6 +837,9 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             onboarding = last_lines(onboarding_log, log) if onboarded is False else b""
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
+                if not warm_driver(launcher, udid, maestro_env, log):
+                    print(f"May device tests (ios): {scenario}: the Maestro driver did not answer its warm-up; the "
+                          "agent starts anyway")
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {}),

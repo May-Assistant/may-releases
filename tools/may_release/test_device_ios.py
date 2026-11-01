@@ -138,7 +138,7 @@ class RunTests(Workspace):
             calls.append((list(argv), dict(env or {})))
             if getattr(self, "quiet_hook", None):
                 self.quiet_hook(argv, log, timeout)  # may raise, as a timed-out run does
-            if "test" in argv and "--device" in argv:
+            if ("test" in argv or "hierarchy" in argv) and "--device" in argv:
                 self.maestro_timeouts.append(timeout)
             if argv[:4] == ["xcrun", "simctl", "io", UDID] and argv[4] == "screenshot":
                 Path(argv[-1]).write_bytes(png())
@@ -612,10 +612,62 @@ class RunTests(Workspace):
             selection="chat", agent=agent,
             env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
         tests = [argv for argv, _ in calls if argv[0] == "/fake/maestro"]
-        self.assertEqual(tests, [["/fake/maestro", "--device", UDID, "test", str(subflow)]])
-        self.assertEqual(self.maestro_timeouts, [device_tests.ONBOARDING_SECONDS])
+        self.assertEqual(tests, [["/fake/maestro", "--device", UDID, "test", str(subflow)],
+                                 ["/fake/maestro", "--device", UDID, "hierarchy", "--no-reinstall-driver"]],
+                         "run 41281021335: one hierarchy read that keeps its runner starts it before the agent's acts")
+        self.assertEqual(self.maestro_timeouts, [device_tests.ONBOARDING_SECONDS, device_ios.WARM_SECONDS])
         self.assertEqual(order, ["agent"])
         self.assertNotIn("onboarding subflow", out, "a subflow that passed says nothing")
+
+    def test_every_scenario_starts_with_no_maestro_runner_left_from_the_one_before(self):
+        """Run 41281021335 (coordinator, 1 Nov): the agent's calls keep their runner, so none may leak to the next."""
+        calls, _, _, out, _ = self.run_it()
+        argvs = [argv for argv, _ in calls]
+        terminate = ["xcrun", "simctl", "terminate", UDID, device_ios.DRIVER_BUNDLE]
+        launches = [n for n, argv in enumerate(argvs) if argv[:3] == ["xcrun", "simctl", "launch"]]
+        sweeps = [n for n, argv in enumerate(argvs) if argv == terminate]
+        self.assertTrue(launches)
+        self.assertEqual(len(sweeps), len(launches), "once per scenario")
+        self.assertTrue(all(sweep < launch for sweep, launch in zip(sweeps, launches)), "before each launch")
+        self.assertNotIn("leftover Maestro runner", out, "nothing left, nothing said")
+
+    def test_the_sweep_stops_only_this_simulators_maestro_xcodebuild(self):
+        listed = "\n".join([
+            f" 101 /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test-without-building -xctestrun "
+            f"/tmp/m/maestro-driver-ios-config.xctestrun -destination id={UDID} -derivedDataPath /tmp/x",
+            f" 102 xcodebuild test-without-building -xctestrun /tmp/a.xctestrun -destination id=OTHER-SIM",
+            f" 103 xcodebuild build -destination id={UDID}",
+            f" 104 /bin/sh -c echo xcodebuild test-without-building id={UDID}",
+            f" 105 xcodebuild test-without-building -xctestrun /tmp/b.xctestrun -destination id={UDID}",
+            "not a pid line", ""])
+        stopped, ran = [], []
+        with patch.object(device_ios.renders, "quiet", side_effect=lambda argv, *a, **k: ran.append(argv)):
+            count = device_ios.sweep_driver(UDID, {}, None, listed, kill=lambda pid, sig: stopped.append((pid, sig)))
+        self.assertEqual((count, stopped), (2, [(101, signal.SIGTERM), (105, signal.SIGTERM)]))
+        self.assertEqual(ran, [["xcrun", "simctl", "terminate", UDID, "dev.mobile.maestro-driver-iosUITests.xctrunner"]])
+
+        def gone(pid, sig):
+            raise ProcessLookupError()
+        with patch.object(device_ios.renders, "quiet"):
+            self.assertEqual(device_ios.sweep_driver(UDID, {}, None, listed, kill=gone), 0, "never an error")
+
+    def test_a_warm_up_that_does_not_answer_is_said_and_the_agent_still_runs(self):
+        order = []
+
+        def agent(cli, goal, tag, device, work, token, model, seconds):
+            order.append("agent")
+            return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
+
+        def hook(argv, log, timeout):
+            if "hierarchy" in argv:
+                raise subprocess.TimeoutExpired(argv, timeout)
+        self.quiet_hook = hook
+        calls, _, _, out, _ = self.run_it(
+            selection="chat", agent=agent,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "o" * 40, "MAY_DEVICE_TESTS_MODEL": "claude-sonnet-5-5"})
+        self.assertEqual(order, ["agent"])
+        self.assertIn("May device tests (ios): chat: the Maestro driver did not answer its warm-up; the agent starts "
+                      "anyway", out.splitlines())
 
     def test_an_onboarding_subflow_that_does_not_pass_leaves_its_last_lines_in_the_diag(self):
         """Run 40181517145: chat's and notes' subflow did not pass, with nothing to say where it stopped."""

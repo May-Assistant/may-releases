@@ -87,7 +87,7 @@ class Workspace(unittest.TestCase):
 
         def private(argv, log, *, cwd=None, env=None, check=True, timeout=None):
             self.calls.append(list(argv))
-            if argv[0] == "/fake/maestro":
+            if argv[0] == "/fake/maestro" and argv[3] == "test":
                 self.flows.append(Path(argv[4]).read_text())
                 return 1 if maestro_fails else 0
             return 0
@@ -190,7 +190,7 @@ class IosSmokeTests(Workspace):
             calls.append((list(argv), dict(env or {})))
             if argv[:4] == ["xcrun", "simctl", "io", UDID] and argv[4] == "screenshot":
                 Path(argv[-1]).write_bytes(png())
-            if argv[0] == "/fake/maestro":
+            if argv[0] == "/fake/maestro" and argv[3] == "test":
                 flows.append(Path(argv[4]).read_text())
             return Done(0)
 

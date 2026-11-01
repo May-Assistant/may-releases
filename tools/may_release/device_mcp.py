@@ -184,6 +184,13 @@ DRIVER_FILE, DRIVER_LINES, MAX_DRIVER = "driver.txt", 40, 32 * 1024
 # (first match, else other); only the counts are kept, on one line after the act's driver lines. Waits for the app to
 # idle that never end point at the app (a repeating animation, or main-queue work), not at the harness.
 RUNNER_LOG = 'process BEGINSWITH "maestro-driver"'
+# Run 41281021335 (coordinator, 1 Nov): with Reduce Motion on, every agent row wedged and every scripted flow passed.
+# Maestro 2.8.0's `test` and `hierarchy` reinstall their XCTest runner by default: each call starts a fresh runner
+# (`xcodebuild test-without-building`, allowed 120 s to answer) and kills it on exit, so every act and every look was a
+# runner start under ACT_SECONDS' 60 s, and a call cut short left a half-started runner for the next to race. The
+# refused windows' runner lines were a start-up's, never an idle wait. Each call here keeps the runner instead
+# (NO_REINSTALL, Maestro's own negation of --reinstall-driver): the first starts it, the rest find it running.
+NO_REINSTALL = "--no-reinstall-driver"
 RUNNER_KINDS = (("idle waits", re.compile(rb"to (?:become )?idle|wait(?:ing)? for [^\n]*idle", re.IGNORECASE)),
                 ("animations not complete", re.compile(rb"animations? complete", re.IGNORECASE)),
                 ("quiescence", re.compile(rb"quiescen", re.IGNORECASE)),
@@ -240,8 +247,8 @@ def flow(config, command):
     with open(path, "w", encoding="utf-8") as output:
         output.write(f"appId: {config['bundle']}\n---\n{command}\n")
     started = utc_now()
-    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", path], timeout=ACT_SECONDS,
-                        both=True)
+    status, said = tool(config, [config["maestro"], "--device", config["udid"], "test", NO_REINSTALL, path],
+                        timeout=ACT_SECONDS, both=True)
     if status:
         ended = utc_now()
         refused(config, command, said, started, ended, runner_line(runner_counts(config, started, ended)))
@@ -301,7 +308,7 @@ def ios_nodes(node, depth=0):
 
 def ios_tree(config):
     """`maestro hierarchy`'s JSON tree, or None (and the driver's cause in config["dump_cause"])."""
-    status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy"], both=True)
+    status, data = tool(config, [config["maestro"], "--device", config["udid"], "hierarchy", NO_REINSTALL], both=True)
     try:
         # The output holds stderr after stdout (for driver_cause); the tree is the first JSON value in it.
         tree = json.JSONDecoder().raw_decode(data[data.find(b"{"):].decode("utf-8", "replace"))[0] if not status else None
