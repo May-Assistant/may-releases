@@ -254,7 +254,8 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(seen.get("chats"), [(TOKEN + "1", "qa-39557415738-a-chat", []),
                                          (TOKEN + "3", "qa-39557415738-a-routines", [TOKEN + "1", TOKEN + "2"])],
                          "chat and routines alone, each with its own session and tag, each before its app starts")
-        self.assertTrue(seen["cleanup"][2] in "qa-39557415738-a-chat chat", "the run's cleanup tag covers the chat")
+        self.assertTrue(seen["cleanup"][2] in "Android test chat qa-39557415738-a-chat",
+                        "the run's cleanup tag covers the chat")
         self.assertNotIn("qa-39557415738", run_out)
         refused = []
         _, _, seen, report, run_out, _ = self.reset_and(lambda: self.run_and_judge(
@@ -698,6 +699,36 @@ class ServerTruthTests(unittest.TestCase):
         self.assertEqual(len(asked), device_tests.MAX_AGENDA_PAGES)
         self.assertEqual(asked[:2], ["https://s/v1/commitments", "https://s/v1/commitments?cursor=c"])
 
+    def test_a_goal_and_a_chat_name_say_the_tags_own_platform_in_words(self):
+        """Run 41358220544: iOS's poll opened Android's chat, whose name differed from its own by one letter mid-tag."""
+        goal = device_tests.scenarios("poll")[0]["goal"]
+        for tag, platform, other in (("qa-41358220544-i-poll", "iOS", "Android"),
+                                     ("qa-41358220544-a-poll", "Android", "iOS")):
+            with self.subTest(tag=tag):
+                filled = device_agent.filled(goal, tag)
+                self.assertIn(f"open the chat named {platform} test chat {tag},", filled)
+                self.assertNotIn(f"{other} test chat", filled)
+                self.assertNotIn("{", filled)
+        self.assertEqual(device_agent.filled("{tag} task", "anything"), "anything task",
+                         "a text without {platform} needs no platform letter")
+        for tag in ("qa-1-x-poll", "qa--a-poll", "xqa-1-a-poll", "qa-1-ab-poll", "poll"):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                device_agent.filled(device_tests.CHAT_NAME, tag)
+        self.assertEqual(device_agent.filled(device_tests.CHAT_NAME, "qa-1700000000-i"), "iOS test chat qa-1700000000-i")
+
+    def test_the_agent_and_the_judge_read_the_filled_goal(self):
+        seen = []
+        with patch.object(device_agent, "base_command", side_effect=lambda cli, goal, model: seen.append(goal) or
+                          ["true"]), patch.object(device_agent.subprocess, "run",
+                                                  side_effect=subprocess.TimeoutExpired("x", 1)):
+            with tempfile.TemporaryDirectory() as work:
+                device_agent.run_agent(Path("/cli"), device_tests.CHAT_GOAL, "qa-5-i-poll", {}, Path(work) / "w", "t",
+                                       "m")
+            with tempfile.TemporaryDirectory() as work:
+                device_agent.judge(Path("/cli"), device_tests.CHAT_GOAL, "qa-5-a-poll", {}, Path(work) / "j", "t", "m")
+        self.assertEqual(seen[0], "open the chat named iOS test chat qa-5-i-poll")
+        self.assertIn("open the chat named Android test chat qa-5-a-poll", seen[1], "the judge reads the goal as given")
+
     def test_make_chat_posts_the_tagged_name_with_the_session_and_reads_its_id(self):
         seen = []
 
@@ -714,8 +745,11 @@ class ServerTruthTests(unittest.TestCase):
 
         tag = "qa-39557415738-a-chat"
         self.assertEqual(device_tests.make_chat("https://s", TOKEN, tag, post(201, {"agent": {"id": "a7"}})), "a7")
-        self.assertEqual(seen, [("https://s/v1/agents", "POST", {"client_key": tag, "name": tag + " chat"},
-                                 "Bearer " + TOKEN)])
+        self.assertEqual(seen, [("https://s/v1/agents", "POST", {"client_key": tag, "name": "Android test chat " + tag},
+                                 "Bearer " + TOKEN)], "the platform first, in words (run 41358220544)")
+        seen.clear()
+        device_tests.make_chat("https://s", TOKEN, "qa-39557415738-i-poll", post(201, {"agent": {"id": "a7"}}))
+        self.assertEqual(seen[0][2]["name"], "iOS test chat qa-39557415738-i-poll")
         self.assertTrue(device_tests.make_chat("https://s", TOKEN, tag, post(200, {"agent": {"id": "a7"}})),
                         "a repeat with the same key is the same chat")
         for status, body in ((201, {"agent": {}}), (201, {"agent": {"id": "../x"}}), (201, []), (403, {}),
