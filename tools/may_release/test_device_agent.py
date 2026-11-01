@@ -9,6 +9,7 @@ import io
 import json
 import os
 import queue
+import signal
 import plistlib
 from pathlib import Path
 import subprocess
@@ -1858,7 +1859,9 @@ class IosDeviceServerTests(unittest.TestCase):
             return flow
 
         for read, act, wedged in (("snapshot timeout", "snapshot timeout", True), (None, "snapshot timeout", False),
-                                  (None, "settle timeout", False), ("snapshot timeout", "settle timeout", False),
+                                  ("no answer", "no answer", True), ("snapshot timeout", "no answer", True),
+                                  ("no answer", "snapshot timeout", True), (None, "no answer", False),
+                                  ("did not start", "no answer", False), ("no answer", "did not start", False),
                                   ("snapshot timeout", "lost connection", False), ("not idle", "snapshot timeout", False)):
             with self.subTest(read=read, act=act):
                 self.config.update(refusals=0, wedged=False, dump_cause=read)
@@ -1868,14 +1871,14 @@ class IosDeviceServerTests(unittest.TestCase):
                 self.assertEqual(self.config["wedged"], wedged)
                 self.assertEqual(content[0]["text"] == device_mcp.WEDGED_TEXT, wedged)
 
-    def test_a_settle_timeout_counts_toward_two_in_a_row(self):
+    def test_an_act_the_driver_did_not_answer_counts_toward_two_in_a_row(self):
         def refused(config, command):
-            config["refusal_cause"] = "settle timeout"
+            config["refusal_cause"] = "no answer"
             return 1
 
         with patch("device_mcp.flow", side_effect=refused):
             self.call("tap", x=180, y=120)
-            self.assertFalse(self.config["wedged"], "one slow settle while a reply streams does not end the scenario")
+            self.assertFalse(self.config["wedged"], "one slow act after a read that worked does not end the scenario")
             failed, content = self.call("tap", x=180, y=120)
         self.assertEqual((failed, content[0]["text"], self.config["wedged"]), (True, device_mcp.WEDGED_TEXT, True))
 
@@ -1959,7 +1962,7 @@ class IosDeviceServerTests(unittest.TestCase):
     def test_a_refused_act_keeps_the_xctest_runners_counts_for_its_window(self):
         """Coordinator, 31 Oct (run 41164564379): a tap never came back and a swipe hung after COMPLETED on a static
         screen. The XCTest runner's own log over each refused act's window is counted into fixed words, never kept."""
-        said = b"Running on iPhone 16 Pro\n > Flow act\nTap on point (237,316)...\n(timed out)\n"
+        said = device_mcp.NO_ANSWER_LINE
         runner = (b"Timestamp               Ty Process[PID:TID]\n"
                   b"2026-10-31 03:48:57.001 Df maestro-driver-iosUITests-Runner[1:2] Synthesize event\n"
                   b"2026-10-31 03:48:57.020 Df maestro-driver-iosUITests-Runner[1:2] Wait for io.github.x to idle\n"
@@ -1988,13 +1991,13 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertEqual(asked, [("2026-10-31 03:48:56", "2026-10-31 03:49:58", 'process BEGINSWITH "maestro-driver"',
                                   device_mcp.RUNNER_SECONDS)])
         kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
-        self.assertTrue(kept.endswith(b"Tap on point (237,316)...\n(timed out)\nrunner log: idle waits 2, animations not "
+        self.assertTrue(kept.endswith(device_mcp.NO_ANSWER_LINE + b"runner log: idle waits 2, animations not "
                                       b"complete 1, quiescence 0, event synthesis 1, snapshots 0, timeouts 0, other 1\n"
                                       b"runner other by category: no category 1\nmaestro driver: starts 1\n"),
                         kept)
         for absent in (b"Bearer", b"sam@", b"io.github.x", b"Synthesize"):
             self.assertNotIn(absent, kept, "only the counts are kept")
-        self.assertEqual(self.config["refusal_cause"], "hung in act", "the tap never came back from the act itself")
+        self.assertEqual(self.config["refusal_cause"], "no answer", "the driver never answered the act")
 
     def test_the_runners_other_lines_are_counted_by_category_alone(self):
         """Run 41180883244: 133 of a hung act's runner lines matched no kind. They are counted by their log category
@@ -2024,12 +2027,14 @@ class IosDeviceServerTests(unittest.TestCase):
                 device_mcp.runner_counts(self.config, device_mcp.utc_now(), device_mcp.utc_now())),
                 "with no other line there is no category line")
 
-    def test_a_tap_that_hung_in_the_act_after_a_timed_out_read_still_stops_the_agent(self):
+    def test_an_act_the_driver_did_not_answer_after_a_timed_out_read_stops_the_agent(self):
+        """Independent review of #175: the MCP driver's own time-out is "no answer", never a snapshot time-out, and it
+        stops the agent after a read that timed out just as a snapshot time-out did."""
         def hung(config, command):
-            config["refusal_cause"] = "hung in act"
+            config["refusal_cause"] = "no answer"
             return 1
 
-        for read, wedged in (("snapshot timeout", True), (None, False)):
+        for read, wedged in (("snapshot timeout", True), ("no answer", True), (None, False)):
             with self.subTest(read=read):
                 self.config.update(refusals=0, wedged=False, dump_cause=read)
                 with patch("device_mcp.flow", side_effect=hung):
@@ -2084,9 +2089,8 @@ class IosDeviceServerTests(unittest.TestCase):
     def test_a_failed_hierarchy_or_refused_act_keeps_the_drivers_cause_in_fixed_words(self):
         """Run 40290647340: "iOS hierarchy failed" said nothing of why; the driver's output is sorted into
         DRIVER_CAUSES and only the word is kept (coordinator, 26 Oct)."""
-        cases = {b"Tap on point (189,250)... COMPLETED\nWARNING: GL pipe is running in software mode\n\n(timed out)\n":
-                 "settle timeout",
-                 b"Tap on point (133,577)...\n(timed out)\n": "hung in act",
+        cases = {device_mcp.NO_ANSWER_LINE: "no answer",
+                 device_mcp.NO_START_LINE: "did not start",
                  b"Timed out waiting for the snapshot of the accessibility hierarchy": "snapshot timeout",
                  b"Failed to wait for app to idle (quiescence)": "not idle",
                  b"io.grpc.StatusRuntimeException: UNAVAILABLE: Connection refused": "lost connection",
@@ -2108,18 +2112,17 @@ class IosDeviceServerTests(unittest.TestCase):
         stored = json.loads(Path(self.config["result"]).read_text())
         self.assertEqual((stored["hierarchy_failure"], stored["hierarchy_cause"]), (None, None),
                          "a read that worked keeps no cause")
-        self.assertEqual(device_mcp.DRIVER_CAUSES, ("settle timeout", "hung in act", "not idle", "snapshot timeout",
+        self.assertEqual(device_mcp.DRIVER_CAUSES, ("no answer", "did not start", "not idle", "snapshot timeout",
                                                     "lost connection", "app not running",
                                                     "scale unknown", "typed nothing", "driver died", "other"))
-        self.assertEqual(device_mcp.driver_cause(b"Tap on point (201,803)... COMPLETED\nidle\n"), "not idle",
-                         "COMPLETED alone, with no act that ran out of time, is no settle timeout")
-        for typed in (b"Input text COMPLETED...\n(timed out)\n", b"Input text a COMPLETED b...\n(timed out)\n"):
-            with self.subTest(typed=typed):
-                # Typed text holding COMPLETED is not Maestro's status line (independent review of #139): the type
-                # never came back from the act, so it hung in it.
-                self.assertEqual(device_mcp.driver_cause(typed), "hung in act")
-        self.assertEqual(device_mcp.driver_cause(b"Swipe from (1,2) to (3,4)... COMPLETED\n(timed out)\n"),
-                         "settle timeout")
+        # Independent review of #175: `maestro test`'s step lines are retired with that driver; such words, or a
+        # driver line inside other text, are never this client's fixed lines.
+        for words, cause in ((b"Tap on point (133,577)...\n(timed out)\n", "snapshot timeout"),
+                             (b"Swipe from (1,2) to (3,4)... COMPLETED\n", "other"),
+                             (b"x " + device_mcp.NO_ANSWER_LINE, "other"),
+                             (device_mcp.NO_START_LINE + b"Timed out", "snapshot timeout")):
+            with self.subTest(words=words):
+                self.assertEqual(device_mcp.driver_cause(words), cause)
 
     def test_the_hierarchy_is_in_screenshot_pixels(self):
         failed, content = self.call("hierarchy")
@@ -2320,7 +2323,7 @@ class FakeMaestroMcp:
 
     def __init__(self, argv, answers, started, **kwargs):
         self.argv, self.kwargs, self.answers, self.out, self.got = argv, kwargs, answers, queue.Queue(), []
-        self.returncode, self.closed, self.signals = None, False, []
+        self.returncode, self.closed, self.signals, self.pid = None, False, [], 4000 + len(started)
         started.append(self)
         self.stdin, self.stdout = self, iter(self.out.get, None)
 
@@ -2329,7 +2332,11 @@ class FakeMaestroMcp:
             message = json.loads(line)
             self.got.append(message)
             if message.get("method") == "initialize":
-                self.out.put(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": {}}).encode() + b"\n")
+                # A request from the child that reuses our id is never taken for the reply.
+                self.out.put(json.dumps({"jsonrpc": "2.0", "id": message["id"], "method": "roots/list"}).encode() + b"\n")
+                said = {"error": {"code": -32603, "message": "no"}} if self.answers.get("_initialize") == "error" \
+                    else {"result": {}}
+                self.out.put(json.dumps({"jsonrpc": "2.0", "id": message["id"], **said}).encode() + b"\n")
             elif message.get("method") == "tools/call":
                 answer = self.answers.get(message["params"]["name"], ("{}", False))
                 if answer == "die":
@@ -2339,6 +2346,8 @@ class FakeMaestroMcp:
                     text, error = answer
                     for line in (b"not json\n",
                                  json.dumps({"jsonrpc": "2.0", "method": "notifications/message"}).encode() + b"\n",
+                                 json.dumps({"jsonrpc": "2.0", "id": message["id"],
+                                             "method": "sampling/createMessage"}).encode() + b"\n",
                                  json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": {
                                      "content": [{"type": "text", "text": text}], "isError": error}}).encode() + b"\n"):
                         self.out.put(line)
@@ -2359,11 +2368,15 @@ class FakeMaestroMcp:
         return self.returncode
 
     def terminate(self):
-        self.signals.append("terminate")
+        raise AssertionError("only the child's process group is signalled")
 
     def kill(self):
-        self.signals.append("kill")
-        self.returncode = -9
+        raise AssertionError("only the child's process group is signalled")
+
+    def group_signal(self, number):
+        self.signals.append({signal.SIGTERM: "terminate", signal.SIGKILL: "kill"}[number])
+        if number == signal.SIGKILL:
+            self.returncode = -9
 
 
 class McpDriverTests(unittest.TestCase):
@@ -2378,9 +2391,17 @@ class McpDriverTests(unittest.TestCase):
                                            "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground",
                                            "MAY_DEVICE_AGENT_RESULT": str(Path(self.directory.name) / "result.json"),
                                            "PATH": "/usr/bin", "SECRET_THING": "x"})
-        self.started, self.answers = [], {}
+        self.started, self.answers, self.groups = [], {}, []
         self.config["driver"] = device_mcp.McpDriver(
-            self.config, popen=lambda argv, **kwargs: FakeMaestroMcp(argv, self.answers, self.started, **kwargs))
+            self.config, popen=lambda argv, **kwargs: FakeMaestroMcp(argv, self.answers, self.started, **kwargs),
+            killpg=self.killpg)
+
+    def killpg(self, group, number):
+        self.groups.append((group, number))
+        child = next((child for child in self.started if child.pid == group), None)
+        if child is None or child.returncode is not None and number == signal.SIGKILL and child.signals[-1:] == ["kill"]:
+            raise ProcessLookupError(group)
+        child.group_signal(number)
 
     def test_one_child_serves_every_call_and_reads_the_screen_once_before_the_first(self):
         self.answers["run"] = ("Flow executed successfully", False)
@@ -2414,11 +2435,11 @@ class McpDriverTests(unittest.TestCase):
 
     def test_a_call_that_does_not_answer_stops_the_child_and_two_starts_are_all_a_session_gets(self):
         self.answers["run"] = "hang"
-        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, b"(timed out)\n"))
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, device_mcp.NO_ANSWER_LINE))
         first = self.started[0]
         self.assertTrue(first.closed, "its stdin was closed")
         self.assertFalse(self.config["driver"].alive())
-        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, b"(timed out)\n"))
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, device_mcp.NO_ANSWER_LINE))
         self.assertEqual(len(self.started), 2, "one restart")
         self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, device_mcp.DIED_LINE))
         self.assertEqual(len(self.started), 2, "never a third")
@@ -2426,7 +2447,8 @@ class McpDriverTests(unittest.TestCase):
 
     def test_a_child_that_cannot_read_the_screen_at_start_is_stopped_and_counted(self):
         self.answers["inspect_screen"] = "die"
-        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, b"(timed out)\n"))
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.NO_START_LINE))
+        self.assertEqual(device_mcp.driver_cause(device_mcp.NO_START_LINE), "did not start")
         self.assertEqual((len(self.started), self.config["driver"].starts), (1, 1))
         self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.DIED_LINE),
                          "the second start was the last one")
@@ -2439,7 +2461,62 @@ class McpDriverTests(unittest.TestCase):
         self.config["driver"].stop()
         child = self.started[0]
         self.assertEqual((child.closed, child.signals), (True, ["terminate", "kill"]))
+        self.assertEqual(self.groups, [(child.pid, signal.SIGTERM), (child.pid, signal.SIGKILL),
+                                       (child.pid, signal.SIGKILL)], "the child's own group, never one process")
         self.assertFalse(self.config["driver"].alive())
+
+    def test_a_stopped_child_that_left_its_closed_stdin_still_has_its_group_killed(self):
+        device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
+        child = self.started[0]
+        self.config["driver"].stop()
+        self.assertEqual(self.groups, [(child.pid, signal.SIGKILL)], "whatever the child started goes with it")
+        self.assertIsNone(self.config["driver"].group)
+
+    def test_an_initialize_error_or_a_child_request_is_not_ready(self):
+        self.answers["_initialize"] = "error"
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.NO_START_LINE))
+        self.assertEqual([message.get("method") for message in self.started[0].got], ["initialize"],
+                         "an initialize error is never taken as ready")
+
+    def test_a_popen_failure_is_did_not_start(self):
+        def broken(argv, **kwargs):
+            raise OSError("no java")
+        self.config["driver"].popen = broken
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.NO_START_LINE))
+
+    def test_the_start_has_one_deadline_across_initialize_and_the_screen_read(self):
+        self.answers["inspect_screen"] = "hang"
+        seen, clock = [], [1000.0]
+        real = device_mcp.McpDriver.request
+
+        def timed(driver, method, params, seconds):
+            seen.append(seconds)
+            clock[0] += 100  # each step of the start takes 100 s of the allowance
+            return real(driver, method, params, min(seconds, 0.2))
+        with patch.object(device_mcp.McpDriver, "request", timed), \
+                patch.object(device_mcp.time, "monotonic", lambda: clock[0]):
+            self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5),
+                             (1, device_mcp.NO_START_LINE))
+        self.assertEqual(seen, [device_mcp.MCP_START_SECONDS, device_mcp.MCP_START_SECONDS - 100],
+                         "the screen read has what initialize left of one allowance, never a second one")
+
+    def test_a_server_that_is_stopped_or_loses_its_parent_kills_the_driver_group_at_once(self):
+        device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
+        child = self.started[0]
+        # A SIGTERM mid-stop: the child is no longer the driver's, but its group still is.
+        self.config["driver"].child = None
+        exits = []
+        device_mcp.gone(self.config, exit=exits.append)
+        self.assertEqual((exits, self.groups), ([0], [(child.pid, signal.SIGKILL)]))
+        parents = iter([10, 10, 1])
+        sleeps = []
+        device_mcp.watch_parent(self.config, 10, getppid=lambda: next(parents), sleep=sleeps.append,
+                                exit=exits.append)
+        self.assertEqual((exits, sleeps), ([0, 0], [device_mcp.PARENT_SECONDS] * 2))
+        self.assertEqual(self.groups[-1], (child.pid, signal.SIGKILL))
+        empty = {}
+        device_mcp.gone(empty, exit=exits.append)
+        self.assertEqual(exits, [0, 0, 0], "a server with no driver still exits")
 
     def test_a_refused_act_after_the_driver_died_says_so_in_fixed_words(self):
         self.answers["run"] = "hang"

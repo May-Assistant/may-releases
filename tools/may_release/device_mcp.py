@@ -8,10 +8,11 @@ read or write a file, or reach the network itself.
 - Android (MAY_DEVICE_PLATFORM android): the emulator through adb.
 - iOS (ios): the simulator, through the pinned Maestro's driver (the coordinator's choice, 21 Oct, over adding idb).
   Each act is one Maestro flow this server writes itself, holding exactly one fixed command (tapOn point, inputText,
-  swipe) for the app's bundle id, run with `maestro --device <udid> test`; the agent never gives Maestro YAML, so
-  Maestro's scripts, links and other apps are out of its reach. Screenshots come from simctl, the hierarchy from
-  `maestro hierarchy`. Coordinates are the screenshot's pixels, as on Android; they become iOS points by the ratio of
-  the screenshot's width to the hierarchy's root. back is a swipe in from the left edge.
+  swipe) for the app's bundle id, run by the session's one long-lived `maestro mcp` driver (its run tool); the agent
+  never gives Maestro YAML, so Maestro's scripts, links and other apps are out of its reach. Screenshots come from
+  simctl, the hierarchy from the driver's inspect_screen. Coordinates are the screenshot's pixels, as on Android;
+  they become iOS points by the ratio of the screenshot's width to the hierarchy's root. back is a swipe in from the
+  left edge.
 
 - type takes plain text only (letters, digits, spaces and . , ! : - _ @; never ? or *, a glob in the device shell), so nothing reaches adb's shell as a
   command.
@@ -51,9 +52,9 @@ MOST_ACTIONS = 200
 # the agent's result says so (coordinator, 25 Oct). iOS alone. Run 40309200520: three refusals, each a 90 s snapshot
 # timeout, still cost poll and poll-skip 9 minutes apiece and chat its budget; the stop now comes at the second refusal
 # in a row, or at once when a refusal's snapshot timeout follows a screen read that timed out too (the screen is not
-# coming back), and each act's Maestro call is held ACT_SECONDS at most (coordinator, 26 Oct). A settle timeout (the
-# act was taken and its screen never settled) counts toward the two in a row like any refusal, so one slow settle while
-# a reply streams does not end the scenario (independent review of #139).
+# coming back), and each act's Maestro call is held ACT_SECONDS at most (coordinator, 26 Oct). Since #175 an act or read
+# the driver did not answer in time ("no answer") is such a time-out (STUCK_CAUSES); any other refusal only counts
+# toward the two in a row.
 FAIL_FAST, ACT_SECONDS = 2, 60
 UNFINISHED = "unfinished"  # the result's outcome until done replaces it
 WEDGED_TEXT = "The device stopped taking acts: call done now with outcome blocked"
@@ -210,16 +211,24 @@ RUNNER_TOP = 5
 # Maestro's own 120 s start allowance and a margin, so the runner's start is never charged to an act. A call that does
 # not answer within its time kills the child, as the act's Maestro process was killed before; the next call starts a
 # new one, DRIVER_STARTS at most for a session, after which every act is refused as "driver died" and the agent stops.
+# Independent review of #175: the start's initialize and warm-up read share one MCP_START_SECONDS deadline; a child that
+# does not answer in time is "no answer" and one that could not be started or made ready is "did not start" (neither is
+# a snapshot time-out); the child runs in its own process group, which is what is signalled, so its runner goes with it.
 MCP_TOOLS, MCP_START_SECONDS, DRIVER_STARTS, MCP_STOP_SECONDS = ("run", "inspect_screen"), 150, 2, 10
 DIED_LINE = b"driver died\n"
+NO_ANSWER_LINE, NO_START_LINE = b"maestro mcp: no answer\n", b"maestro mcp: did not start\n"
+# Independent review of #175: device_agent kills only claude when a scenario runs out of time, which would leave this
+# server, and its driver, running into the next scenario. So once this server's parent is gone (checked every
+# PARENT_SECONDS) the driver's process group is killed and this server exits at once.
+PARENT_SECONDS = 1
 
 
 class McpDriver:
     """One `maestro mcp` child for this server's life: a JSON-RPC client over its stdin and stdout."""
 
-    def __init__(self, config, popen=None):
-        self.config, self.popen = config, popen or subprocess.Popen
-        self.child, self.lines, self.serial, self.starts = None, None, 0, 0
+    def __init__(self, config, popen=None, killpg=None):
+        self.config, self.popen, self.killpg = config, popen or subprocess.Popen, killpg or os.killpg
+        self.child, self.group, self.lines, self.serial, self.starts = None, None, None, 0, 0
 
     def alive(self):
         return self.child is not None and self.child.poll() is None
@@ -237,6 +246,7 @@ class McpDriver:
         """A new child, initialized and holding a runner; False when it could not be made ready (then stopped)."""
         self.starts += 1
         self.lines = queue.Queue()
+        deadline = time.monotonic() + MCP_START_SECONDS
         try:
             self.child = self.popen([self.config["maestro"], "mcp", "--no-viewer", "--working-dir", self.config["flows"]],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -244,13 +254,19 @@ class McpDriver:
         except OSError:
             self.child = None
             return False
+        self.group = self.child.pid
         threading.Thread(target=self.read, args=(self.child.stdout, self.lines), daemon=True).start()
-        ready = self.request("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
+        reply = self.request("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
                                             "clientInfo": {"name": "may-device-tests", "version": "1"}},
-                             MCP_START_SECONDS) is not None
+                             deadline - time.monotonic())
+        ready = reply is not None and "error" not in reply and isinstance(reply.get("result"), dict)
         if ready:
-            self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-            ready = self.call("inspect_screen", {}, MCP_START_SECONDS)[0]
+            try:
+                self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            except (OSError, ValueError, AttributeError):
+                ready = False
+        if ready:
+            ready = self.call("inspect_screen", {}, deadline - time.monotonic())[0]
         if not ready:
             self.stop()
         return ready
@@ -279,7 +295,9 @@ class McpDriver:
                 message = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(message, dict) and message.get("id") == serial:
+            # Only a reply is ours: a request or notification from the child never is, whatever its id.
+            if isinstance(message, dict) and message.get("id") == serial and "method" not in message and \
+                    ("result" in message or "error" in message):
                 return message
 
     def call(self, name, arguments, seconds):
@@ -291,24 +309,40 @@ class McpDriver:
                              seconds)
         if reply is None:
             self.stop()
-            return False, b"(timed out)\n"
+            return False, NO_ANSWER_LINE
         result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
         text = "".join(part.get("text", "") for part in result.get("content") or []
                        if isinstance(part, dict) and isinstance(part.get("text"), str))
         return "error" not in reply and not result.get("isError"), text.encode("utf-8", "replace")
 
+    def signal_group(self, number):
+        """Signals the child's whole process group (Maestro and the runner it started); never an error."""
+        if self.group is not None:
+            try:
+                self.killpg(self.group, number)
+            except OSError:
+                pass
+
+    def kill(self):
+        """Kills the child's process group at once (a server that is going away); never an error."""
+        self.signal_group(signal.SIGKILL)
+
     def stop(self):
-        """Ends the child: its stdin closed, then asked to stop, then killed; never an error."""
+        """Ends the child: its stdin closed, then its group asked to stop, then killed; never an error. The group is
+        killed last whatever happened, so nothing the child started is left."""
         child, self.child = self.child, None
         if child is None:
             return
-        for end in (lambda: child.stdin.close(), child.terminate, child.kill):
+        for end in (lambda: child.stdin.close(), lambda: self.signal_group(signal.SIGTERM),
+                    lambda: self.signal_group(signal.SIGKILL)):
             try:
                 end()
                 child.wait(MCP_STOP_SECONDS)
-                return
+                break
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 continue
+        self.kill()
+        self.group = None
 
 
 def driver_call(config, name, arguments, seconds):
@@ -318,7 +352,7 @@ def driver_call(config, name, arguments, seconds):
     if not driver.alive():
         if driver.starts >= DRIVER_STARTS or not driver.start():
             config["driver_died"] = driver.starts >= DRIVER_STARTS
-            return 1, DIED_LINE if config["driver_died"] else b"(timed out)\n"
+            return 1, DIED_LINE if config["driver_died"] else NO_START_LINE
     taken, said = driver.call(name, arguments, seconds)
     return (0 if taken else 1), said
 
@@ -643,10 +677,11 @@ DUMP_FAILURES = ("adb failed", "no idle state", "unreadable", "iOS hierarchy fai
 # Run 41164564379: a tap whose status line never reached COMPLETED (Maestro's line for the command ending "...", then
 # nothing but the tool's "(timed out)") is "hung in act", not a snapshot time-out: the driver never came back from the
 # act itself.
-CAUSE_PATTERNS = (("settle timeout", re.compile(rb"(?m)(?:Tap|Input text|Swip|Press)[^\n]*\.\.\. COMPLETED[ \t\r]*$"
-                                                rb"(?s:.*)\n\(timed out\)\n\Z")),
-                  ("hung in act", re.compile(rb"(?m)^(?:Tap|Input text|Swip|Press)[^\n]*\.\.\.[ \t\r]*\n"
-                                             rb"(?:[ \t\r]*\n)*\(timed out\)\n\Z")),
+# Independent review of #175: "settle timeout" and "hung in act" read `maestro test`'s own step lines, which Maestro's
+# MCP run never prints, so both are retired with that driver. A call the driver did not answer in time is "no answer",
+# and a driver that could not be started or made ready is "did not start": this client's own fixed lines, whole.
+CAUSE_PATTERNS = (("no answer", re.compile(rb"\A" + re.escape(NO_ANSWER_LINE) + rb"\Z")),
+                  ("did not start", re.compile(rb"\A" + re.escape(NO_START_LINE) + rb"\Z")),
                   ("not idle", re.compile(rb"idle|quiescen", re.IGNORECASE)),
                   ("snapshot timeout", re.compile(rb"timed? ?out|timeout|snapshot", re.IGNORECASE)),
                   ("lost connection", re.compile(rb"connection (?:refused|reset|lost|closed)|broken pipe|unavailable|"
@@ -655,6 +690,7 @@ CAUSE_PATTERNS = (("settle timeout", re.compile(rb"(?m)(?:Tap|Input text|Swip|Pr
                   ("app not running", re.compile(rb"not running|terminated|crash", re.IGNORECASE)))
 # "typed nothing": an iOS type act Maestro took, after which the focused field holds none of the typed words
 # (coordinator, 28 Oct: inputText COMPLETED and no text appeared).
+STUCK_CAUSES = ("snapshot timeout", "no answer")
 DRIVER_CAUSES = (*(cause for cause, _ in CAUSE_PATTERNS), "scale unknown", "typed nothing", "driver died", "other")
 
 
@@ -881,10 +917,9 @@ def ios_act(name, args, ints, config):
             refused(config, command, TYPED_NOTHING_LINE, started, utc_now())
             config["refusal_cause"] = "typed nothing"
     config["refusals"] = config["refusals"] + 1 if status else 0
-    # A tap that hung in the act was counted as a snapshot time-out until run 41164564379 named it apart; it stops the
-    # agent after a timed-out read just as before.
-    stuck = bool(status) and config.get("refusal_cause") in ("snapshot timeout", "hung in act") and \
-        config.get("dump_cause") == "snapshot timeout"
+    # An act the driver did not answer, after a screen read it did not answer either, stops the agent at once, as a
+    # snapshot time-out after a timed-out read did (independent review of #175: the MCP driver's time-out is "no answer").
+    stuck = bool(status) and config.get("refusal_cause") in STUCK_CAUSES and config.get("dump_cause") in STUCK_CAUSES
     if not status:
         # A taken act changes the screen, so an earlier read's time-out no longer says it is stuck (independent review
         # of #139).
@@ -945,13 +980,30 @@ def serve(stdin, stdout, config):
             stdout.flush()
 
 
+def gone(config, exit=os._exit):
+    """Kills the session driver's process group and exits now: for a server that was stopped or lost its parent, even
+    in the middle of an act or of stopping the driver."""
+    if config.get("driver"):
+        config["driver"].kill()
+    exit(0)
+
+
+def watch_parent(config, parent, getppid=os.getppid, sleep=time.sleep, exit=os._exit):
+    """Waits for this server's parent (claude) to go, then ends as gone() does."""
+    while getppid() == parent:
+        sleep(PARENT_SECONDS)
+    gone(config, exit)
+
+
 if __name__ == "__main__":
     sys.stderr = open(os.devnull, "w")
-    # A stopped server still stops its Maestro driver (the finally below): SIGTERM exits through it.
-    signal.signal(signal.SIGTERM, lambda number, frame: sys.exit(0))
     found = settings(os.environ)
     if found is None:
         sys.exit(1)
+    # A stopped server, or one whose claude was killed, kills its Maestro driver's group and exits at once, so the
+    # driver never outlives this scenario (independent review of #175).
+    signal.signal(signal.SIGTERM, lambda number, frame: gone(found))
+    threading.Thread(target=watch_parent, args=(found, os.getppid()), daemon=True).start()
     try:
         serve(sys.stdin, sys.stdout, found)
     except Exception:
