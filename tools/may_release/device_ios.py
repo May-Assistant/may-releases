@@ -639,14 +639,11 @@ def loop_census_wanted():
     return os.environ.get(LOOP_CENSUS, "").strip() == "true"
 
 
-# Run 41281021335 (coordinator, 1 Nov): the agent's Maestro calls keep their XCTest runner (device_mcp.NO_REINSTALL), so
-# a runner left by one scenario, or a half-started one a cut-short call left, must not reach the next. Before each
-# scenario the runner app is terminated on the simulator and any of this user's `xcodebuild test-without-building` for
-# this simulator is stopped (Maestro starts its runner that way). Before the agent's first act, one hierarchy read that
-# keeps its runner starts it, within Maestro's own 120 s start allowance (WARM_SECONDS), so the start is not charged to
-# an act's 60 s.
+# Run 41281021335 (coordinator, 1 Nov): a runner left by one scenario (the agent's long-lived Maestro driver, or a
+# scripted flow's), or a half-started one a killed call left, must not reach the next. Before each scenario the runner
+# app is terminated on the simulator and any of this user's `xcodebuild test-without-building` for this simulator is
+# stopped (Maestro starts its runner that way).
 DRIVER_BUNDLE = "dev.mobile.maestro-driver-iosUITests.xctrunner"
-WARM_SECONDS = 150
 
 
 def sweep_driver(udid, env, log, listed=None, kill=os.kill):
@@ -671,15 +668,6 @@ def sweep_driver(udid, env, log, listed=None, kill=os.kill):
             except OSError:
                 pass
     return stopped
-
-
-def warm_driver(launcher, udid, env, log):
-    """One `maestro hierarchy` that keeps its runner, before the agent's first act; whether it answered."""
-    try:
-        return not renders.quiet([str(launcher), "--device", udid, "hierarchy", device_tests.device_mcp.NO_REINSTALL],
-                                 log, env=env, timeout=WARM_SECONDS).returncode
-    except subprocess.SubprocessError:
-        return False
 
 
 def launch(udid, env, token, log):
@@ -837,9 +825,6 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             onboarding = last_lines(onboarding_log, log) if onboarded is False else b""
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
-                if not warm_driver(launcher, udid, maestro_env, log):
-                    print(f"May device tests (ios): {scenario}: the Maestro driver did not answer its warm-up; the "
-                          "agent starts anyway")
                 device = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": udid, "MAY_DEVICE_MAESTRO": str(launcher),
                           "MAY_DEVICE_BUNDLE": BUNDLE, "DEVELOPER_DIR": str(renders.XCODE),
                           **({"JAVA_HOME": env["JAVA_HOME"]} if env.get("JAVA_HOME") else {}),

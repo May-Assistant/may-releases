@@ -8,11 +8,15 @@ import inspect
 import io
 import json
 import os
+import queue
+import signal
 import plistlib
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -1730,8 +1734,60 @@ def simctl_list(argv, bundle, udid=IOS_UDID):
     return None
 
 
+def compact_tree(tree):
+    """`maestro hierarchy`'s tree in inspect_screen's compact form (Maestro's ViewHierarchyFormatters, iOS schema)."""
+    short = {name: key for key, name in device_mcp.COMPACT_KEYS.items()}
+
+    def element(node):
+        found = {short.get(name, name): value for name, value in (node.get("attributes") or {}).items()}
+        children = [element(child) for child in node.get("children") or []]
+        return dict(found, **({"c": children} if children else {}))
+    return {"ui_schema": {"platform": "ios", "defaults": {"enabled": True, "focused": False}}, "elements": [element(tree)]}
+
+
+class CliShimDriver:
+    """A stand-in for device_mcp.McpDriver in the iOS server's tests: each run or inspect_screen call goes to
+    device_mcp.subprocess.run as the per-act Maestro command did (act.yaml then `test`, or `hierarchy`), so these tests'
+    fakes keep answering; inspect_screen's tree is handed back in Maestro's compact form. McpDriverTests test the real
+    driver against a fake `maestro mcp`."""
+
+    def __init__(self, config, popen=None):
+        self.config, self.starts = config, 1
+
+    def alive(self):
+        return True
+
+    def stop(self):
+        pass
+
+    def call(self, name, arguments, seconds):
+        config = self.config
+        if name == "run":
+            path = os.path.join(config["flows"], "act.yaml")
+            Path(path).write_text(arguments["yaml"])
+            argv = [config["maestro"], "--device", config["udid"], "test", path]
+        else:
+            argv = [config["maestro"], "--device", config["udid"], "hierarchy"]
+        try:
+            done = device_mcp.subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, timeout=seconds,
+                                             env=config["env"])
+        except subprocess.TimeoutExpired as late:
+            return False, (late.stdout or b"") + (late.stderr or b"") + b"\n(timed out)\n"
+        said = done.stdout + done.stderr
+        if name == "inspect_screen" and not done.returncode and b"{" in said:
+            try:
+                tree = json.JSONDecoder().raw_decode(said[said.find(b"{"):].decode("utf-8", "replace"))[0]
+                said = json.dumps(compact_tree(tree)).encode()
+            except ValueError:
+                pass
+        return not done.returncode, said
+
+
 class IosDeviceServerTests(unittest.TestCase):
     def setUp(self):
+        shim = patch.object(device_mcp, "McpDriver", CliShimDriver)
+        shim.start()
+        self.addCleanup(shim.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.work = Path(self.directory.name)
         self.config = device_mcp.settings({"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID,
@@ -1805,7 +1861,9 @@ class IosDeviceServerTests(unittest.TestCase):
             return flow
 
         for read, act, wedged in (("snapshot timeout", "snapshot timeout", True), (None, "snapshot timeout", False),
-                                  (None, "settle timeout", False), ("snapshot timeout", "settle timeout", False),
+                                  ("no answer", "no answer", True), ("snapshot timeout", "no answer", True),
+                                  ("no answer", "snapshot timeout", True), (None, "no answer", False),
+                                  ("did not start", "no answer", False), ("no answer", "did not start", False),
                                   ("snapshot timeout", "lost connection", False), ("not idle", "snapshot timeout", False)):
             with self.subTest(read=read, act=act):
                 self.config.update(refusals=0, wedged=False, dump_cause=read)
@@ -1815,14 +1873,14 @@ class IosDeviceServerTests(unittest.TestCase):
                 self.assertEqual(self.config["wedged"], wedged)
                 self.assertEqual(content[0]["text"] == device_mcp.WEDGED_TEXT, wedged)
 
-    def test_a_settle_timeout_counts_toward_two_in_a_row(self):
+    def test_an_act_the_driver_did_not_answer_counts_toward_two_in_a_row(self):
         def refused(config, command):
-            config["refusal_cause"] = "settle timeout"
+            config["refusal_cause"] = "no answer"
             return 1
 
         with patch("device_mcp.flow", side_effect=refused):
             self.call("tap", x=180, y=120)
-            self.assertFalse(self.config["wedged"], "one slow settle while a reply streams does not end the scenario")
+            self.assertFalse(self.config["wedged"], "one slow act after a read that worked does not end the scenario")
             failed, content = self.call("tap", x=180, y=120)
         self.assertEqual((failed, content[0]["text"], self.config["wedged"]), (True, device_mcp.WEDGED_TEXT, True))
 
@@ -1845,10 +1903,10 @@ class IosDeviceServerTests(unittest.TestCase):
 
     def test_each_act_is_held_act_seconds_at_most(self):
         seen = []
-        with patch("device_mcp.tool", side_effect=lambda config, argv, timeout=90, both=False: seen.append(timeout) or
-                   (0, b"")):
+        with patch("device_mcp.driver_call", side_effect=lambda config, name, arguments, seconds: seen.append(
+                (name, seconds)) or (0, b"")):
             device_mcp.flow(self.config, "- back")
-        self.assertEqual(seen, [device_mcp.ACT_SECONDS])
+        self.assertEqual(seen, [("run", device_mcp.ACT_SECONDS)])
         self.assertLessEqual(device_mcp.ACT_SECONDS, 60)
 
     def test_each_act_is_one_fixed_maestro_command_in_points(self):
@@ -1866,12 +1924,7 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertTrue(self.flows[-1].endswith("    waitToSettleTimeoutMs: 3000\n"))
         acts = [argv for argv, _ in self.calls if argv[0] == "/m/maestro" and argv[3:4] == ["test"]]
         self.assertEqual(len(acts), 4)
-        self.assertTrue(all(argv[:5] == ["/m/maestro", "--device", IOS_UDID, "test", "--no-reinstall-driver"]
-                            for argv in acts), "run 41281021335: each act keeps the XCTest runner, never reinstalls it")
-        reads = [argv for argv, _ in self.calls if argv[0] == "/m/maestro" and argv[3:4] == ["hierarchy"]]
-        self.assertTrue(reads)
-        self.assertTrue(all(argv == ["/m/maestro", "--device", IOS_UDID, "hierarchy", "--no-reinstall-driver"]
-                            for argv in reads), "and so does each hierarchy read")
+        self.assertTrue(self.config["driver"].starts == 1, "one Maestro driver serves every act and read")
         self.assertTrue(all(env.get("JAVA_HOME") == "/java" and "SECRET_THING" not in env for _, env in self.calls))
 
     def test_a_refused_acts_driver_lines_are_kept_redacted_and_capped(self):
@@ -1900,7 +1953,7 @@ class IosDeviceServerTests(unittest.TestCase):
             self.assertNotIn(absent, kept)
         self.assertEqual(len(kept.splitlines()), 1 + device_mcp.DRIVER_LINES - 1 + 2,
                          "the last 40 lines, one dropped, the runner's counts and Maestro's")
-        self.assertTrue(kept.endswith(b"runner log: unreadable\nmaestro log: none\n"),
+        self.assertTrue(kept.endswith(b"runner log: unreadable\nmaestro driver: starts 1\n"),
                         "this fake's log show fails too, and its Maestro wrote no log")
         with patch("device_mcp.subprocess.run", side_effect=run):
             for _ in range(200):
@@ -1911,7 +1964,7 @@ class IosDeviceServerTests(unittest.TestCase):
     def test_a_refused_act_keeps_the_xctest_runners_counts_for_its_window(self):
         """Coordinator, 31 Oct (run 41164564379): a tap never came back and a swipe hung after COMPLETED on a static
         screen. The XCTest runner's own log over each refused act's window is counted into fixed words, never kept."""
-        said = b"Running on iPhone 16 Pro\n > Flow act\nTap on point (237,316)...\n(timed out)\n"
+        said = device_mcp.NO_ANSWER_LINE
         runner = (b"Timestamp               Ty Process[PID:TID]\n"
                   b"2026-10-31 03:48:57.001 Df maestro-driver-iosUITests-Runner[1:2] Synthesize event\n"
                   b"2026-10-31 03:48:57.020 Df maestro-driver-iosUITests-Runner[1:2] Wait for io.github.x to idle\n"
@@ -1940,58 +1993,13 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertEqual(asked, [("2026-10-31 03:48:56", "2026-10-31 03:49:58", 'process BEGINSWITH "maestro-driver"',
                                   device_mcp.RUNNER_SECONDS)])
         kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
-        self.assertTrue(kept.endswith(b"Tap on point (237,316)...\n(timed out)\nrunner log: idle waits 2, animations not "
+        self.assertTrue(kept.endswith(device_mcp.NO_ANSWER_LINE + b"runner log: idle waits 2, animations not "
                                       b"complete 1, quiescence 0, event synthesis 1, snapshots 0, timeouts 0, other 1\n"
-                                      b"runner other by category: no category 1\nmaestro log: none\n"),
+                                      b"runner other by category: no category 1\nmaestro driver: starts 1\n"),
                         kept)
         for absent in (b"Bearer", b"sam@", b"io.github.x", b"Synthesize"):
             self.assertNotIn(absent, kept, "only the counts are kept")
-        self.assertEqual(self.config["refusal_cause"], "hung in act", "the tap never came back from the act itself")
-
-    def test_a_refused_act_counts_maestros_own_driver_phrases_in_its_own_log(self):
-        """Run 41289745884 (coordinator, 1 Nov): Maestro still started new runners mid-scenario, and nothing said why.
-        Each act's Maestro logs to its own emptied folder; for a refused act its fixed driver phrases are counted."""
-        log = (b"09:00:00.001 [ INFO] MAESTRO.logSystemInfo: Maestro Version: 2.8.0\n"
-               b"09:00:00.100 [ INFO] xcuitest.installer.LocalXCTestInstaller.start: start()\n"
-               b"09:00:00.200 [ INFO] xcuitest.installer.LocalXCTestInstaller.xcTestDriverStatusCheck: [Failed] "
-               b"Perform XCUITest driver status check on 0A1B, exception: java.net.ConnectException\n"
-               b"09:00:00.300 [ INFO] xcuitest.installer.LocalXCTestInstaller.start: [Start] Install XCUITest runner "
-               b"on 0A1B\n"
-               b"09:00:00.400 [ INFO] xcuitest.installer.LocalXCTestInstaller.startXCTestRunner: Installing driver "
-               b"with xcodebuild\n"
-               b"09:00:30.000 [ INFO] xcuitest.installer.LocalXCTestInstaller.start: [Done] Install XCUITest runner "
-               b"on 0A1B\n"
-               b"09:00:31.000 [ INFO] xcuitest.installer.LocalXCTestInstaller.xcTestDriverStatusCheck: [Done] "
-               b"Perform XCUITest driver status check on 0A1B\n"
-               b"09:00:59.000 [ INFO] xcuitest.installer.LocalXCTestInstaller.close: [Start] Cleaning up the ui test "
-               b"runner files\n"
-               b"09:00:59.100 [TRACE] xcuitest.installer.LocalXCTestInstaller.uninstall: Skipping uninstalling XCTest "
-               b"Runner as USE_XCODE_TEST_RUNNER is set\n"
-               b"09:00:59.200 [ INFO] maestro.Orchestra: tapOn qa-1 sam@example.com\n")
-        seen = []
-
-        def run(argv, capture_output, stdin, timeout, env):
-            listed = simctl_list(argv, self.bundle)
-            if listed is not None:
-                return subprocess.CompletedProcess(argv, 0, listed, b"")
-            if "log" in argv:
-                return subprocess.CompletedProcess(argv, 1, b"", b"")
-            debug = argv[argv.index("--debug-output") + 1]
-            seen.append((debug, sorted(os.listdir(debug)), argv[argv.index("--debug-output") + 2]))
-            Path(debug, "maestro.log").write_bytes(log)
-            return subprocess.CompletedProcess(argv, 1, b"(timed out)\n", b"")
-
-        with patch("device_mcp.subprocess.run", side_effect=run):
-            self.assertTrue(device_mcp.call("tap", {"x": 180, "y": 120}, self.config)[0])
-            device_mcp.call("tap", {"x": 180, "y": 120}, self.config)
-        self.assertEqual(seen, [(str(self.work / device_mcp.MAESTRO_DEBUG), [], "--flatten-debug-output")] * 2,
-                         "each act's own folder, emptied before it")
-        kept = (self.work / device_mcp.DRIVER_FILE).read_bytes()
-        self.assertIn(b"maestro log: driver starts 1, runner already running 0, runner installs 1, runner installed 1, "
-                      b"status checks ok 1, status checks failed 1, not ready in time 0, runner stops 0, "
-                      b"uninstall skipped 1, cleanups 1\n", kept)
-        for absent in (b"sam@", b"qa-1", b"0A1B", b"ConnectException", b"2.8.0", b"xcodebuild"):
-            self.assertNotIn(absent, kept, "only the counts leave the private folder")
+        self.assertEqual(self.config["refusal_cause"], "no answer", "the driver never answered the act")
 
     def test_the_runners_other_lines_are_counted_by_category_alone(self):
         """Run 41180883244: 133 of a hung act's runner lines matched no kind. They are counted by their log category
@@ -2021,12 +2029,14 @@ class IosDeviceServerTests(unittest.TestCase):
                 device_mcp.runner_counts(self.config, device_mcp.utc_now(), device_mcp.utc_now())),
                 "with no other line there is no category line")
 
-    def test_a_tap_that_hung_in_the_act_after_a_timed_out_read_still_stops_the_agent(self):
+    def test_an_act_the_driver_did_not_answer_after_a_timed_out_read_stops_the_agent(self):
+        """Independent review of #175: the MCP driver's own time-out is "no answer", never a snapshot time-out, and it
+        stops the agent after a read that timed out just as a snapshot time-out did."""
         def hung(config, command):
-            config["refusal_cause"] = "hung in act"
+            config["refusal_cause"] = "no answer"
             return 1
 
-        for read, wedged in (("snapshot timeout", True), (None, False)):
+        for read, wedged in (("snapshot timeout", True), ("no answer", True), (None, False)):
             with self.subTest(read=read):
                 self.config.update(refusals=0, wedged=False, dump_cause=read)
                 with patch("device_mcp.flow", side_effect=hung):
@@ -2081,9 +2091,8 @@ class IosDeviceServerTests(unittest.TestCase):
     def test_a_failed_hierarchy_or_refused_act_keeps_the_drivers_cause_in_fixed_words(self):
         """Run 40290647340: "iOS hierarchy failed" said nothing of why; the driver's output is sorted into
         DRIVER_CAUSES and only the word is kept (coordinator, 26 Oct)."""
-        cases = {b"Tap on point (189,250)... COMPLETED\nWARNING: GL pipe is running in software mode\n\n(timed out)\n":
-                 "settle timeout",
-                 b"Tap on point (133,577)...\n(timed out)\n": "hung in act",
+        cases = {device_mcp.NO_ANSWER_LINE: "no answer",
+                 device_mcp.NO_START_LINE: "did not start",
                  b"Timed out waiting for the snapshot of the accessibility hierarchy": "snapshot timeout",
                  b"Failed to wait for app to idle (quiescence)": "not idle",
                  b"io.grpc.StatusRuntimeException: UNAVAILABLE: Connection refused": "lost connection",
@@ -2105,18 +2114,17 @@ class IosDeviceServerTests(unittest.TestCase):
         stored = json.loads(Path(self.config["result"]).read_text())
         self.assertEqual((stored["hierarchy_failure"], stored["hierarchy_cause"]), (None, None),
                          "a read that worked keeps no cause")
-        self.assertEqual(device_mcp.DRIVER_CAUSES, ("settle timeout", "hung in act", "not idle", "snapshot timeout",
+        self.assertEqual(device_mcp.DRIVER_CAUSES, ("no answer", "did not start", "not idle", "snapshot timeout",
                                                     "lost connection", "app not running",
-                                                    "scale unknown", "typed nothing", "other"))
-        self.assertEqual(device_mcp.driver_cause(b"Tap on point (201,803)... COMPLETED\nidle\n"), "not idle",
-                         "COMPLETED alone, with no act that ran out of time, is no settle timeout")
-        for typed in (b"Input text COMPLETED...\n(timed out)\n", b"Input text a COMPLETED b...\n(timed out)\n"):
-            with self.subTest(typed=typed):
-                # Typed text holding COMPLETED is not Maestro's status line (independent review of #139): the type
-                # never came back from the act, so it hung in it.
-                self.assertEqual(device_mcp.driver_cause(typed), "hung in act")
-        self.assertEqual(device_mcp.driver_cause(b"Swipe from (1,2) to (3,4)... COMPLETED\n(timed out)\n"),
-                         "settle timeout")
+                                                    "scale unknown", "typed nothing", "driver died", "other"))
+        # Independent review of #175: `maestro test`'s step lines are retired with that driver; such words, or a
+        # driver line inside other text, are never this client's fixed lines.
+        for words, cause in ((b"Tap on point (133,577)...\n(timed out)\n", "snapshot timeout"),
+                             (b"Swipe from (1,2) to (3,4)... COMPLETED\n", "other"),
+                             (b"x " + device_mcp.NO_ANSWER_LINE, "other"),
+                             (device_mcp.NO_START_LINE + b"Timed out", "snapshot timeout")):
+            with self.subTest(words=words):
+                self.assertEqual(device_mcp.driver_cause(words), cause)
 
     def test_the_hierarchy_is_in_screenshot_pixels(self):
         failed, content = self.call("hierarchy")
@@ -2309,6 +2317,371 @@ class IosDeviceServerTests(unittest.TestCase):
 HIERARCHY = (b'<?xml version="1.0"?><hierarchy><node text="" content-desc="" resource-id="" clickable="false" '
              b'bounds="[0,0][1080,2400]"><node text="Chats" content-desc="" resource-id="tab" clickable="true" '
              b'bounds="[0,0][100,60]"/></node></hierarchy>UI hierchary dumped to: /dev/tty')
+
+
+class FakeMaestroMcp:
+    """A `maestro mcp` child for McpDriver's tests: JSON-RPC over its stdin and stdout. answers: tool name -> (text,
+    is_error), or "hang" (never answers) or "die" (closes its stdout)."""
+
+    def __init__(self, argv, answers, started, **kwargs):
+        self.argv, self.kwargs, self.answers, self.out, self.got = argv, kwargs, answers, queue.Queue(), []
+        self.returncode, self.closed, self.signals, self.pid = None, False, [], 4000 + len(started)
+        started.append(self)
+        self.stdin, self.stdout = self, iter(self.out.get, None)
+
+    def write(self, data):
+        for line in data.decode().splitlines():
+            message = json.loads(line)
+            self.got.append(message)
+            if message.get("method") == "initialize":
+                # A request from the child that reuses our id is never taken for the reply.
+                self.out.put(json.dumps({"jsonrpc": "2.0", "id": message["id"], "method": "roots/list"}).encode() + b"\n")
+                said = {"error": {"code": -32603, "message": "no"}} if self.answers.get("_initialize") == "error" \
+                    else {"result": {}}
+                self.out.put(json.dumps({"jsonrpc": "2.0", "id": message["id"], **said}).encode() + b"\n")
+            elif message.get("method") == "tools/call":
+                answer = self.answers.get(message["params"]["name"], ("{}", False))
+                if answer == "die":
+                    self.returncode = 1
+                    self.out.put(None)
+                elif answer != "hang":
+                    text, error = answer
+                    for line in (b"not json\n",
+                                 json.dumps({"jsonrpc": "2.0", "method": "notifications/message"}).encode() + b"\n",
+                                 json.dumps({"jsonrpc": "2.0", "id": message["id"],
+                                             "method": "sampling/createMessage"}).encode() + b"\n",
+                                 json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": {
+                                     "content": [{"type": "text", "text": text}], "isError": error}}).encode() + b"\n"):
+                        self.out.put(line)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, seconds):
+        if self.answers.get("_ignore_stop") and len(self.signals) < 2 and self.returncode is None:
+            raise subprocess.TimeoutExpired("maestro", seconds)
+        self.returncode = self.returncode if self.returncode is not None else 0
+        return self.returncode
+
+    def terminate(self):
+        raise AssertionError("only the child's process group is signalled")
+
+    def kill(self):
+        raise AssertionError("only the child's process group is signalled")
+
+    def group_signal(self, number):
+        self.signals.append({signal.SIGTERM: "terminate", signal.SIGKILL: "kill"}[number])
+        if number == signal.SIGKILL:
+            self.returncode = -9
+
+
+class McpDriverTests(unittest.TestCase):
+    """Runs 41289745884 and 41302227814: every refused act started a new XCTest runner; one `maestro mcp` per agent
+    session holds one."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.config = device_mcp.settings({"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID,
+                                           "MAY_DEVICE_MAESTRO": "/m/maestro",
+                                           "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground",
+                                           "MAY_DEVICE_AGENT_RESULT": str(Path(self.directory.name) / "result.json"),
+                                           "PATH": "/usr/bin", "SECRET_THING": "x"})
+        self.started, self.answers, self.groups = [], {}, []
+        self.config["driver"] = device_mcp.McpDriver(
+            self.config, popen=lambda argv, **kwargs: FakeMaestroMcp(argv, self.answers, self.started, **kwargs),
+            killpg=self.killpg)
+
+    def killpg(self, group, number):
+        self.groups.append((group, number))
+        child = next((child for child in self.started if child.pid == group), None)
+        if child is None or child.returncode is not None and number == signal.SIGKILL and child.signals[-1:] == ["kill"]:
+            raise ProcessLookupError(group)
+        child.group_signal(number)
+
+    def test_one_child_serves_every_call_and_reads_the_screen_once_before_the_first(self):
+        self.answers["run"] = ("Flow executed successfully", False)
+        for _ in range(3):
+            self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "appId: x\n---\n- back\n"}, 5),
+                             (0, b"Flow executed successfully"))
+        [child] = self.started
+        self.assertEqual(child.argv, ["/m/maestro", "mcp", "--no-viewer", "--working-dir", self.config["flows"]])
+        self.assertEqual(child.kwargs["env"], self.config["env"])
+        self.assertNotIn("SECRET_THING", child.kwargs["env"])
+        self.assertTrue(child.kwargs["start_new_session"])
+        methods = [message.get("method") for message in child.got]
+        self.assertEqual(methods, ["initialize", "notifications/initialized"] + ["tools/call"] * 4)
+        calls = [message["params"] for message in child.got if message.get("method") == "tools/call"]
+        self.assertEqual(calls[0], {"name": "inspect_screen", "arguments": {"device_id": IOS_UDID}},
+                         "the runner's one start, before any act")
+        self.assertEqual(calls[1], {"name": "run", "arguments": {"yaml": "appId: x\n---\n- back\n", "device_id": IOS_UDID}})
+        self.assertEqual(self.config["driver"].starts, 1)
+
+    def test_only_run_and_inspect_screen_are_ever_called(self):
+        for name in ("run_on_cloud", "open_maestro_viewer", "list_cloud_devices", "cheat_sheet", "take_screenshot"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.config["driver"].call(name, {}, 1)
+        self.assertEqual(self.started, [], "nothing was started or sent")
+
+    def test_an_error_result_is_a_refused_call_with_its_words(self):
+        self.answers["run"] = ("Element not found: point 60,40", True)
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5),
+                         (1, b"Element not found: point 60,40"))
+        self.assertTrue(self.config["driver"].alive(), "an act the driver refused leaves it running")
+
+    def test_a_call_that_does_not_answer_stops_the_child_and_two_starts_are_all_a_session_gets(self):
+        self.answers["run"] = "hang"
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, device_mcp.NO_ANSWER_LINE))
+        first = self.started[0]
+        self.assertTrue(first.closed, "its stdin was closed")
+        self.assertFalse(self.config["driver"].alive())
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, device_mcp.NO_ANSWER_LINE))
+        self.assertEqual(len(self.started), 2, "one restart")
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 0.2), (1, device_mcp.DIED_LINE))
+        self.assertEqual(len(self.started), 2, "never a third")
+        self.assertTrue(self.config["driver_died"])
+
+    def test_a_child_that_cannot_read_the_screen_at_start_is_stopped_and_counted(self):
+        self.answers["inspect_screen"] = "die"
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.NO_START_LINE))
+        self.assertEqual(device_mcp.driver_cause(device_mcp.NO_START_LINE), "did not start")
+        self.assertEqual((len(self.started), self.config["driver"].starts), (1, 1))
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.DIED_LINE),
+                         "the second start was the last one")
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.DIED_LINE))
+        self.assertEqual(len(self.started), 2)
+
+    def test_a_child_that_ignores_its_closed_stdin_is_asked_to_stop_then_killed(self):
+        self.answers["_ignore_stop"] = True
+        device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
+        self.config["driver"].stop()
+        child = self.started[0]
+        self.assertEqual((child.closed, child.signals), (True, ["terminate", "kill"]))
+        self.assertEqual(self.groups, [(child.pid, signal.SIGTERM), (child.pid, signal.SIGKILL),
+                                       (child.pid, signal.SIGKILL)], "the child's own group, never one process")
+        self.assertFalse(self.config["driver"].alive())
+
+    def test_a_stopped_child_that_left_its_closed_stdin_still_has_its_group_killed(self):
+        device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
+        child = self.started[0]
+        self.config["driver"].stop()
+        self.assertEqual(self.groups, [(child.pid, signal.SIGKILL)], "whatever the child started goes with it")
+        self.assertIsNone(self.config["driver"].group)
+
+    def test_an_initialize_error_or_a_child_request_is_not_ready(self):
+        self.answers["_initialize"] = "error"
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.NO_START_LINE))
+        self.assertEqual([message.get("method") for message in self.started[0].got], ["initialize"],
+                         "an initialize error is never taken as ready")
+
+    def test_a_popen_failure_is_did_not_start(self):
+        def broken(argv, **kwargs):
+            raise OSError("no java")
+        self.config["driver"].popen = broken
+        self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5), (1, device_mcp.NO_START_LINE))
+
+    def test_the_start_has_one_deadline_across_initialize_and_the_screen_read(self):
+        self.answers["inspect_screen"] = "hang"
+        seen, clock = [], [1000.0]
+        real = device_mcp.McpDriver.request
+
+        def timed(driver, method, params, seconds):
+            seen.append(seconds)
+            clock[0] += 100  # each step of the start takes 100 s of the allowance
+            return real(driver, method, params, min(seconds, 0.2))
+        with patch.object(device_mcp.McpDriver, "request", timed), \
+                patch.object(device_mcp.time, "monotonic", lambda: clock[0]):
+            self.assertEqual(device_mcp.driver_call(self.config, "run", {"yaml": "y"}, 5),
+                             (1, device_mcp.NO_START_LINE))
+        self.assertEqual(seen, [device_mcp.MCP_START_SECONDS, device_mcp.MCP_START_SECONDS - 100],
+                         "the screen read has what initialize left of one allowance, never a second one")
+
+    def test_a_child_that_ended_on_its_own_has_its_group_stopped_before_the_next_start(self):
+        """Re-review of #175: a crashed child may leave its runner and xcodebuild behind."""
+        device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
+        first = self.started[0]
+        first.returncode = 1
+        self.assertEqual(device_mcp.driver_call(self.config, "inspect_screen", {}, 5), (0, b"{}"))
+        self.assertEqual(len(self.started), 2)
+        self.assertIn((first.pid, signal.SIGKILL), self.groups, "the crashed child's group went first")
+        self.assertEqual(self.config["driver"].group, self.started[1].pid, "only the new child's group is held")
+
+    def test_only_ios_is_guarded_and_an_orphaned_server_ends_at_once(self):
+        """Re-review of #175: on Android, an exit at once would skip stilled_dump's restore of the animation scales."""
+        handled, threads = [], []
+
+        class Thread:
+            def __init__(self, target, args, daemon):
+                threads.append((target, args, daemon))
+
+            def start(self):
+                pass
+        android = dict(self.config, platform="android")
+        self.assertFalse(device_mcp.guard(android, 10, handle=lambda *a: handled.append(a), thread=Thread))
+        self.assertEqual((handled, threads), ([], []), "Android keeps its own exits")
+        self.assertTrue(device_mcp.guard(self.config, 10, handle=lambda *a: handled.append(a), thread=Thread))
+        self.assertEqual([number for number, _ in handled], [signal.SIGTERM])
+        self.assertEqual(threads, [(device_mcp.watch_parent, (self.config, 10), True)])
+        exits = []
+        device_mcp.watch_parent({}, 1, getppid=lambda: 1, sleep=lambda seconds: self.fail("never waits"),
+                                exit=exits.append)
+        self.assertEqual(exits, [0], "a server that started orphaned is gone already")
+
+    def test_the_result_is_never_left_cut_short(self):
+        result = Path(self.config["result"])
+        device_mcp.record(self.config, "unfinished", "")
+        before = result.read_bytes()
+
+        def cut(value, output):
+            output.write('{"outcome": "compl')
+            raise KeyboardInterrupt
+        with patch("device_mcp.json.dump", side_effect=cut), self.assertRaises(KeyboardInterrupt):
+            device_mcp.record(self.config, "completed", "all done")
+        self.assertTrue(result.is_file(), "the earlier result is still there")
+        self.assertEqual(result.read_bytes(), before, "the earlier result stands whole")
+        self.assertEqual(sorted(path.name for path in result.parent.iterdir() if path.name.startswith(result.name)),
+                         [result.name], "nothing partial is left beside it")
+
+    def test_the_real_server_kills_its_driver_group_when_its_parent_is_killed_or_it_is_stopped(self):
+        """Re-review of #175: the server as it runs, under a parent that is then killed, and stopped by SIGTERM."""
+        for ending in ("parent killed", "SIGTERM"):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as directory:
+                self.run_real_server(Path(directory), ending)
+
+    def run_real_server(self, directory, ending):
+        pids = directory / "pids"
+        maestro = directory / "maestro"
+        maestro.write_text(f"""#!{sys.executable}
+import json, os, subprocess, sys
+sleeper = subprocess.Popen(["sleep", "300"])
+with open({str(pids)!r}, "w") as out:
+    out.write(f"{{os.getpid()}} {{sleeper.pid}}\\n")
+runs = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    runs += message.get("params", {{}}).get("name") == "run"
+    if runs > 1:
+        continue  # the second act never comes back: the server is mid-call when it is ended
+    result = {{"content": [{{"type": "text", "text": "{{}}"}}], "isError": False}} \\
+        if message.get("method") == "tools/call" else {{}}
+    sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}) + "\\n")
+    sys.stdout.flush()
+""")
+        maestro.chmod(0o755)
+        server = Path(device_mcp.__file__).resolve()
+        env = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID, "MAY_DEVICE_MAESTRO": str(maestro),
+               "MAY_DEVICE_BUNDLE": "io.github.mayassistant.may.playground",
+               "MAY_DEVICE_AGENT_RESULT": str(directory / "result.json"), "PATH": os.environ.get("PATH", "/usr/bin")}
+        parent = subprocess.Popen([sys.executable, "-I", "-c", f"""
+import json, subprocess, sys, time
+server = subprocess.Popen([sys.executable, {str(server)!r}], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+for message in ({{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {{}}}},
+                {{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {{"name": "back", "arguments": {{}}}}}}):
+    server.stdin.write((json.dumps(message) + "\\n").encode())
+    server.stdin.flush()
+    server.stdout.readline()
+print(server.pid, flush=True)
+message = {{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {{"name": "back", "arguments": {{}}}}}}
+server.stdin.write((json.dumps(message) + "\\n").encode())
+server.stdin.flush()
+time.sleep(300)
+"""], stdout=subprocess.PIPE, env=env)
+        self.addCleanup(self.end_parent, parent)
+        line = parent.stdout.readline()
+        self.assertTrue(line.strip(), "the server answered its first act")
+        server_pid = int(line)
+        maestro_pid, sleeper_pid = (int(pid) for pid in pids.read_text().split())
+        for pid in (server_pid, maestro_pid, sleeper_pid):
+            self.addCleanup(self.kill_quietly, pid)
+        self.assertTrue(all(self.running(pid) for pid in (server_pid, maestro_pid, sleeper_pid)))
+        time.sleep(0.5)  # the second act is in the server's hands, held until ACT_SECONDS without an answer
+        if ending == "parent killed":
+            parent.kill()
+            parent.wait(10)
+        else:
+            os.kill(server_pid, signal.SIGTERM)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and any(self.running(pid) for pid in (server_pid, maestro_pid, sleeper_pid)):
+            time.sleep(0.1)
+        self.assertEqual([self.running(pid) for pid in (server_pid, maestro_pid, sleeper_pid)], [False] * 3,
+                         "the server, its driver and what the driver started are all gone")
+
+    @staticmethod
+    def running(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat") as stat:
+                return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return True
+
+    @staticmethod
+    def end_parent(parent):
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(10)
+        parent.stdout.close()
+
+    @staticmethod
+    def kill_quietly(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    def test_a_server_that_is_stopped_or_loses_its_parent_kills_the_driver_group_at_once(self):
+        device_mcp.driver_call(self.config, "inspect_screen", {}, 5)
+        child = self.started[0]
+        # A SIGTERM mid-stop: the child is no longer the driver's, but its group still is.
+        self.config["driver"].child = None
+        exits = []
+        device_mcp.gone(self.config, exit=exits.append)
+        self.assertEqual((exits, self.groups), ([0], [(child.pid, signal.SIGKILL)]))
+        parents = iter([10, 10, 1])
+        sleeps = []
+        device_mcp.watch_parent(self.config, 10, getppid=lambda: next(parents), sleep=sleeps.append,
+                                exit=exits.append)
+        self.assertEqual((exits, sleeps), ([0, 0], [device_mcp.PARENT_SECONDS] * 2))
+        self.assertEqual(self.groups[-1], (child.pid, signal.SIGKILL))
+        empty = {}
+        device_mcp.gone(empty, exit=exits.append)
+        self.assertEqual(exits, [0, 0, 0], "a server with no driver still exits")
+
+    def test_a_refused_act_after_the_driver_died_says_so_in_fixed_words(self):
+        self.answers["run"] = "hang"
+        with patch.object(device_mcp, "ACT_SECONDS", 0.2), patch("device_mcp.runner_counts", return_value=None):
+            for _ in range(3):
+                device_mcp.flow(self.config, "- back")
+        self.assertEqual(self.config["refusal_cause"], "driver died")
+        kept = (Path(self.config["flows"]) / device_mcp.DRIVER_FILE).read_bytes()
+        self.assertTrue(kept.endswith(b"driver died\nrunner log: unreadable\nmaestro driver: starts 2\n"), kept)
+
+    def test_inspect_screens_compact_tree_is_read_as_maestros_hierarchy(self):
+        self.answers["inspect_screen"] = (json.dumps({
+            "ui_schema": {"platform": "ios", "defaults": {"enabled": True, "focused": False, "txt": ""}},
+            "elements": [{"b": "[0,0][393,852]", "c": [
+                {"b": "[10,20][110,60]", "txt": "Chats", "rid": "tab", "clickable": True},
+                {"b": "[300,780][380,840]", "a11y": "New chat", "focused": True, "val": "x", "hint": "Ask"}]}]}), False)
+        nodes = list(device_mcp.ios_nodes(device_mcp.ios_tree(self.config)))
+        self.assertIn({"enabled": True, "focused": False, "bounds": "[10,20][110,60]", "text": "Chats",
+                       "resource-id": "tab", "clickable": True}, nodes)
+        self.assertIn({"enabled": True, "focused": True, "bounds": "[300,780][380,840]", "accessibilityText": "New chat",
+                       "value": "x", "hintText": "Ask"}, nodes)
+        for broken in ("not json", json.dumps({"elements": "x"}), json.dumps([1])):
+            with self.subTest(broken=broken):
+                self.answers["inspect_screen"] = (broken, False)
+                self.assertIsNone(device_mcp.ios_tree(self.config))
 
 
 class PublishNotesTests(unittest.TestCase):
