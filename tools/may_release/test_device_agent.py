@@ -1755,10 +1755,11 @@ class IosDeviceServerTests(unittest.TestCase):
                 Path(argv[-1]).write_bytes(png(1179, 2556))
             if argv[-1].endswith("act.yaml"):
                 self.flows.append(Path(argv[-1]).read_text())
-            failing = self.failing.get("act" if argv[-1].endswith("act.yaml") else argv[-1])
+            failing = self.failing.get("act" if argv[-1].endswith("act.yaml") else
+                                       "hierarchy" if argv[3:4] == ["hierarchy"] else argv[-1])
             if failing is not None:
                 return subprocess.CompletedProcess(argv, 1, b"", failing)
-            out = json.dumps(getattr(self, "tree", IOS_TREE)).encode() if argv[-1] == "hierarchy" else b""
+            out = json.dumps(getattr(self, "tree", IOS_TREE)).encode() if argv[3:4] == ["hierarchy"] else b""
             return subprocess.CompletedProcess(argv, 0, out, b"")
 
         with patch("device_mcp.subprocess.run", side_effect=run):
@@ -1863,8 +1864,14 @@ class IosDeviceServerTests(unittest.TestCase):
         self.call("back")
         self.assertIn('start: "1%,50%"', self.flows[-1])
         self.assertTrue(self.flows[-1].endswith("    waitToSettleTimeoutMs: 3000\n"))
-        acts = [argv for argv, _ in self.calls if argv[0] == "/m/maestro" and argv[-2] == "test"]
-        self.assertEqual(acts[0][:4], ["/m/maestro", "--device", IOS_UDID, "test"])
+        acts = [argv for argv, _ in self.calls if argv[0] == "/m/maestro" and argv[3:4] == ["test"]]
+        self.assertEqual(len(acts), 4)
+        self.assertTrue(all(argv[:5] == ["/m/maestro", "--device", IOS_UDID, "test", "--no-reinstall-driver"]
+                            for argv in acts), "run 41281021335: each act keeps the XCTest runner, never reinstalls it")
+        reads = [argv for argv, _ in self.calls if argv[0] == "/m/maestro" and argv[3:4] == ["hierarchy"]]
+        self.assertTrue(reads)
+        self.assertTrue(all(argv == ["/m/maestro", "--device", IOS_UDID, "hierarchy", "--no-reinstall-driver"]
+                            for argv in reads), "and so does each hierarchy read")
         self.assertTrue(all(env.get("JAVA_HOME") == "/java" and "SECRET_THING" not in env for _, env in self.calls))
 
     def test_a_refused_acts_driver_lines_are_kept_redacted_and_capped(self):
@@ -1998,7 +2005,7 @@ class IosDeviceServerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, listed, b"")
             if argv[-1].endswith("act.yaml"):
                 flows.append(Path(argv[-1]).read_text())
-            out = json.dumps(tree).encode() if argv[-1] == "hierarchy" else b""
+            out = json.dumps(tree).encode() if argv[3:4] == ["hierarchy"] else b""
             return subprocess.CompletedProcess(argv, 0, out, b"")
 
         with patch("device_mcp.subprocess.run", side_effect=run):
@@ -2203,7 +2210,7 @@ class IosDeviceServerTests(unittest.TestCase):
         """Coordinator, 28 Oct: iOS inputText came back COMPLETED with no text in the field, and the agent heard Done."""
         self.assertEqual(self.typed("This is device test qa-123"),
                          (False, "Done. The focused field now reads: 'This is device test qa-123'"))
-        reads = [argv for argv, _ in self.calls if argv[-1] == "hierarchy"]
+        reads = [argv for argv, _ in self.calls if argv[3:4] == ["hierarchy"]]
         self.assertEqual(len(reads), 1, "one read after the act")
         self.assertEqual((self.config["refusals"], self.config.get("refusal_cause")), (0, None))
         self.assertEqual(self.typed("This is device text qa-123.", text="This is device test qa-123")[0], False,
@@ -2239,9 +2246,9 @@ class IosDeviceServerTests(unittest.TestCase):
         self.assertEqual(self.typed("")[0], False)
         self.assertEqual((self.config["refusals"], self.config.get("refusal_cause")), (0, None))
         self.failing = {"act": b"Timed out"}
-        before = len([argv for argv, _ in self.calls if argv[-1] == "hierarchy"])
+        before = len([argv for argv, _ in self.calls if argv[3:4] == ["hierarchy"]])
         self.assertEqual(self.typed("")[1], "The device did not take it", "a refused type is not read back")
-        self.assertEqual(len([argv for argv, _ in self.calls if argv[-1] == "hierarchy"]), before)
+        self.assertEqual(len([argv for argv, _ in self.calls if argv[3:4] == ["hierarchy"]]), before)
 
     def test_settings_refuse_an_odd_simulator_or_bundle(self):
         good = {"MAY_DEVICE_PLATFORM": "ios", "MAY_DEVICE_UDID": IOS_UDID, "MAY_DEVICE_MAESTRO": "/m",
