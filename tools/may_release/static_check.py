@@ -1471,9 +1471,13 @@ DEVICE_LOG_CHANGES_INPUT = ("      ios_log_changes:\n        description: [^\n]+
 DEVICE_LOOP_CENSUS = ("MAY_IOS_LOOP_CENSUS", "${{ inputs.ios_loop_census }}")
 DEVICE_LOOP_CENSUS_INPUT = ("      ios_loop_census:\n        description: [^\n]+\n        required: false\n"
                             "        type: boolean\n        default: false\n")
+# The notification spike (coordinator, 2 Nov): off unless dispatched true, in the iOS scenarios step alone.
+DEVICE_NOTIF_SPIKE = ("MAY_IOS_NOTIF_SPIKE", "${{ inputs.ios_notif_spike }}")
+DEVICE_NOTIF_SPIKE_INPUT = ("      ios_notif_spike:\n        description: [^\n]+\n        required: false\n"
+                            "        type: boolean\n        default: false\n")
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
               ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS,
-              DEVICE_LOG_CHANGES, DEVICE_LOOP_CENSUS} | DEVICE_VARS | \
+              DEVICE_LOG_CHANGES, DEVICE_LOOP_CENSUS, DEVICE_NOTIF_SPIKE} | DEVICE_VARS | \
     {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
 
 
@@ -1487,15 +1491,17 @@ def device_tests_workflow_problems(text):
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion",
                                                              "ios_diagnostics", "ios_log_changes", "ios_loop_census",
-                                                             "tidy_file_taxes"] or \
+                                                             "ios_notif_spike", "tidy_file_taxes"] or \
             re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean",
-                                                                 "boolean", "boolean"] or \
+                                                                 "boolean", "boolean", "boolean"] or \
             not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or not re.search(DEVICE_DIAGNOSTICS_INPUT, trigger) or \
             not re.search(DEVICE_LOG_CHANGES_INPUT, trigger) or not re.search(DEVICE_LOOP_CENSUS_INPUT, trigger) or \
+            not re.search(DEVICE_NOTIF_SPIKE_INPUT, trigger) or \
             not re.search(DEVICE_TIDY_INPUT, trigger) or \
             re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
         found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion, "
-                     "ios_diagnostics, ios_log_changes, ios_loop_census and tidy_file_taxes booleans, plus one nightly schedule")
+                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans, plus one "
+                     "nightly schedule")
     if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
     jobs = ("admission", "android", "ios", "publish")
@@ -1569,7 +1575,8 @@ def device_tests_workflow_problems(text):
             text.count("inputs.ios_reduce_motion") != 1 or DEVICE_DIAGNOSTICS not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_diagnostics") != 1 or DEVICE_LOG_CHANGES not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_log_changes") != 1 or DEVICE_LOOP_CENSUS not in env_entries(ios_scenarios) or \
-            text.count("inputs.ios_loop_census") != 1 or \
+            text.count("inputs.ios_loop_census") != 1 or DEVICE_NOTIF_SPIKE not in env_entries(ios_scenarios) or \
+            text.count("inputs.ios_notif_spike") != 1 or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \
