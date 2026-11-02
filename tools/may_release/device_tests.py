@@ -100,7 +100,11 @@ NOTE_END = "check that the note is shown on it."
 # May chat that every earlier run wrote to (coordinator, 26 Oct). Its goal opens that chat by name.
 # Run 41358220544: the name says the platform first, in words (device_agent.filled), and the goal says the other
 # platform's chats are listed too and are never opened; the judge's truth stays the tag's.
-CHAT_NAME, CHAT_GOAL = "{platform} test chat {tag}", "open the chat named {platform} test chat {tag}"
+# Run 41373739501: "Android test chat qa-41373739501-a-poll-skip" was 44 characters and staging refused it (400):
+# a chat's name is at most CHAT_NAME_MAX characters (may-app backend/src/agents/service.ts, NAME_MAX_CHARS = 40). The
+# name is the platform and the tag alone, so the longest, Android's poll-skip with a 12-digit run id, is 40.
+CHAT_NAME, CHAT_GOAL = "{platform} chat {tag}", "open the chat named {platform} chat {tag}"
+CHAT_NAME_MAX = 40
 OTHER_CHATS = "Chats named for the other platform (Android or iOS) are also listed; never open them."
 # Run 40290647340: on the new chat's empty state the iOS driver refused every act, so the chat gets its first message
 # over the API (first_message) and the device never lands on it empty (coordinator, 26 Oct). The message holds no tag,
@@ -720,18 +724,28 @@ def cleanup(base, token, since, tag, post=urllib.request.urlopen):
     return sum(count for count in counts if type(count) is int and count >= 0)
 
 
-def make_chat(base, token, tag, post=urllib.request.urlopen):
+def make_chat(base, token, tag, post=urllib.request.urlopen, said=None):
     """A scenario's own chat (CHAT_NAME with its tag), made with its session before its agent starts: POST /v1/agents
     {client_key, name}, keyed by the tag so a repeat makes no second one. The chat's id when staging answered 200 or
-    201 with one, else None. Nothing else from the reply is kept, and nothing is printed."""
+    201 with one, else None; said, when given, gets staging's status (0 when it did not answer). Nothing else from the
+    reply is kept, and nothing is printed."""
     request = urllib.request.Request(base + "/v1/agents", method="POST",
                                      data=json.dumps({"client_key": tag, "name": device_agent.filled(CHAT_NAME, tag)})
                                      .encode(),
                                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    said = [] if said is None else said
     try:
         with post(request, timeout=60) as reply:
-            status, data = reply.status, json.loads(reply.read(1024 * 1024))
-    except (urllib.error.URLError, TimeoutError, ValueError):
+            status = reply.status
+            said.append(status if type(status) is int else 0)
+            data = json.loads(reply.read(1024 * 1024))
+    except urllib.error.HTTPError as error:
+        said.append(error.code if type(error.code) is int else 0)
+        return None
+    except (urllib.error.URLError, TimeoutError):
+        said.append(0)
+        return None
+    except ValueError:
         return None
     found = data.get("agent", data) if isinstance(data, dict) else None
     ok = status in (200, 201) and isinstance(found, dict) and isinstance(found.get("id"), str) and \
@@ -755,10 +769,11 @@ def first_message(base, token, chat, tag, post=urllib.request.urlopen):
 
 def open_chat(base, token, tag, post=urllib.request.urlopen):
     """The scenario's own chat, made (make_chat) and given its first message (first_message): True, or the reason it
-    could not start (NO_CHAT or NO_FIRST)."""
-    chat = make_chat(base, token, tag, post)
+    could not start: (NO_CHAT, staging's status, 0 for no answer) or NO_FIRST."""
+    said = []
+    chat = make_chat(base, token, tag, post, said)
     if chat is None:
-        return NO_CHAT
+        return NO_CHAT, said[-1] if said else 0
     return True if first_message(base, token, chat, tag, post) else NO_FIRST
 
 
@@ -842,6 +857,11 @@ def own_chat(row, entry, base, token, own, made):
     opened = made(base, token, own)
     if opened is True:
         return True
+    # Run 41373739501: staging's status for a chat it did not make stays in the row (the private report alone; publish
+    # keeps none of it), so a refusal shows what it was.
+    if isinstance(opened, tuple):
+        opened, status = opened
+        entry["chat_status"] = status if type(status) is int and 0 <= status <= 599 else 0
     if opened == NO_FIRST:
         entry["reason"] = NO_FIRST
     else:

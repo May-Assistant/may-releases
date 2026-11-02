@@ -56,7 +56,7 @@
     "id": "chat",
     "title": "Chat with May and get a reply",
     "driver": "agent",
-    "goal": "In May Playground, on the Chats screen, open the chat named {platform} test chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Tap the message field at the bottom. Send this message: This is device test {tag}. Reply with the word received. Then wait until May's reply is posted under your message.",
+    "goal": "In May Playground, on the Chats screen, open the chat named {platform} chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Tap the message field at the bottom. Send this message: This is device test {tag}. Reply with the word received. Then wait until May's reply is posted under your message.",
     "chat": true,
     "platforms": [
       "android",
@@ -94,7 +94,7 @@
     "title": "Answer May's multiple-choice question",
     "driver": "agent",
     "steps": 120,
-    "goal": "In May Playground, on the Chats screen, open the chat named {platform} test chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until that card shows your choice as the answer.",
+    "goal": "In May Playground, on the Chats screen, open the chat named {platform} chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, tap one of the choices. Then wait until that card shows your choice as the answer.",
     "chat": true,
     "platforms": [
       "android",
@@ -113,7 +113,7 @@
     "title": "Skip May's question with a free reply",
     "driver": "agent",
     "steps": 120,
-    "goal": "In May Playground, on the Chats screen, open the chat named {platform} test chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer myself: apples, {tag}. Then check that the same question card now shows as skipped, with its choices dimmed.",
+    "goal": "In May Playground, on the Chats screen, open the chat named {platform} chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer myself: apples, {tag}. Then check that the same question card now shows as skipped, with its choices dimmed.",
     "chat": true,
     "platforms": [
       "android",
@@ -131,7 +131,7 @@
     "id": "routines",
     "title": "Make a routine from chat",
     "driver": "agent",
-    "goal": "In May Playground, on the Chats screen, open the chat named {platform} test chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Make a daily routine called {tag} stretch that reminds me to stretch at 9am. When May shows a question card asking whether to create the routine, tap Create it. Then wait until May confirms the routine is made.",
+    "goal": "In May Playground, on the Chats screen, open the chat named {platform} chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Make a daily routine called {tag} stretch that reminds me to stretch at 9am. When May shows a question card asking whether to create the routine, tap Create it. Then wait until May confirms the routine is made.",
     "chat": true,
     "platforms": [
       "android",
