@@ -666,16 +666,21 @@ SPIKE_TITLE = "May device test spike"
 SPIKE_PAYLOAD = {"Simulator Target Bundle": BUNDLE, "aps": {"alert": {"title": SPIKE_TITLE, "body": "Open May"}}}
 SPIKE_WAIT_MS, SPIKE_FRONT_IDS = 15000, "chats|onboarding|signin"
 # Coordinator, 2 Nov: the spike is the crash's repro too (N cannot run a simulator). After the generic tap, a chat reply
-# and a brief, shaped as may-app's server sends them, are pushed and tapped, warm then cold. Their keys are read at run
-# time from the fetched commit's PUSH_SOURCE (its data union: the members naming kind 'chat_reply' and brief_id), never
-# kept here; the ids are placeholders (the route only opens a chat or the Agenda). A May crash report that appears is
-# "crash on notification open: yes" in the log; the report itself, its faulting thread's frames and their file:line
-# (atos, on May's own binary) go to the scenario's private diagnostics alone.
-PUSH_SOURCE = "backend/src/effects/push.ts"
-PUSH_FIELD = re.compile(r"\b([a-z_]{1,40})\s*:\s*('[a-z_]{1,40}'|string \| null|string)\s*[;}]")
-PUSH_MEMBER = re.compile(r"\{[^{}]{1,400}\}")
-PUSH_KEY = re.compile(r"\b\w+\??\s*:")
-SPIKE_KINDS = (("chat reply", "kind: 'chat_reply'"), ("brief", "brief_id:"))
+# (in the main chat, then in a thread) and a brief are pushed and tapped, warm then cold, as may-app's server sends
+# them: K's fixtures in the fetched commit's PUSH_FIXTURES (may-app #1582, kept in step with the real senders by a test
+# there), read at run time, never kept here. Their placeholders get fixed values (the ids are placeholders: the route
+# only opens a chat or the Agenda); the alert's title becomes SPIKE_TITLE, so the tap finds it. A May crash report
+# that appears is "crash on notification open: yes" in the log; the report itself, its faulting thread's frames and
+# their file:line (atos, on May's own images) go to the scenario's private diagnostics alone.
+PUSH_FIXTURES = "tools/device-tests/push"
+SPIKE_FIXTURES = (("chat reply", "chat_reply.json"), ("chat reply in a thread", "chat_reply.thread.json"),
+                  ("brief", "brief.json"))
+SPIKE_VALUES = {"{conversation_id}": "00000000-0000-4000-8000-000000000001",
+                "{message_id}": "00000000-0000-4000-8000-000000000002",
+                "{thread_root_id}": "00000000-0000-4000-8000-000000000003",
+                "{brief_id}": "00000000-0000-4000-8000-000000000004", "{agent_name}": "May"}
+PLACEHOLDER = re.compile(r"\{[a-z_]{1,40}\}")
+MAX_FIXTURE = 16 * 1024
 SPIKE_DIAG = "notification-spike"
 SPIKE_SETTLE_SECONDS = 8
 SIMCTL_SECONDS = 60
@@ -684,27 +689,44 @@ SPIKE_CRASHED = device_tests.SPIKE_CRASHED
 SPIKE_IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}")
 
 
+class Unfilled(ValueError):
+    pass
+
+
+def filled(value, values):
+    """value with every placeholder in its strings replaced; Unfilled when one is left that values does not name."""
+    if isinstance(value, str):
+        for placeholder, replacement in values.items():
+            value = value.replace(placeholder, replacement)
+        if PLACEHOLDER.search(value):
+            raise Unfilled(value)
+        return value
+    if isinstance(value, list):
+        return [filled(item, values) for item in value]
+    if isinstance(value, dict):
+        return {key: filled(item, values) for key, item in value.items()}
+    return value
+
+
 def push_payloads(source, today):
-    """(name, payload) for each SPIKE_KINDS member of may-app's push data, from PUSH_SOURCE at run time: its keys with a
-    placeholder value each (null where the server may send null, today for a date); [] when the file or a member is
-    not found, so no shape is guessed."""
-    path = source / PUSH_SOURCE
-    try:
-        text = path.read_text() if path.is_file() and not path.is_symlink() else ""
-    except (OSError, UnicodeDecodeError):
-        text = ""
+    """(name, payload) for each of SPIKE_FIXTURES, from the fetched commit's PUSH_FIXTURES at run time, placeholders
+    filled (today for the brief's date); [] when any is missing, unreadable, not an APNs body or left with a
+    placeholder, so no shape is guessed."""
+    values = dict(SPIKE_VALUES, **{"{brief_date}": today})
     found = []
-    for name, marker in SPIKE_KINDS:
-        member = next((m.group(0) for m in PUSH_MEMBER.finditer(text) if marker in m.group(0)), None)
-        fields = PUSH_FIELD.findall(member or "")
-        # Every key the member names must be one PUSH_FIELD reads (an optional, number or boolean member is not), so
-        # a payload is never built with some of its keys alone (coordinator's review of #181).
-        if not fields or len(fields) != len(PUSH_KEY.findall(member)):
+    for name, file in SPIKE_FIXTURES:
+        path = source / PUSH_FIXTURES / file
+        try:
+            if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_FIXTURE:
+                return []
+            body = filled(json.loads(path.read_text()), values)
+        except (OSError, UnicodeDecodeError, ValueError):  # Unfilled is a ValueError
             return []
-        data = {key: (kind.strip("'") if kind.startswith("'") else None if kind.endswith("null") else
-                      today if key.endswith("_date") else "device-test-" + key.replace("_", "-"))
-                for key, kind in fields}
-        found.append((name, dict(SPIKE_PAYLOAD, **data)))
+        if not isinstance(body, dict) or not isinstance(body.get("aps"), dict) or "Simulator Target Bundle" in body:
+            return []
+        alert = body["aps"].get("alert")
+        body["aps"]["alert"] = dict(alert if isinstance(alert, dict) else {}, title=SPIKE_TITLE)
+        found.append((name, dict(body, **{"Simulator Target Bundle": BUNDLE})))
     return found
 
 
@@ -859,7 +881,7 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
             return
         payloads = push_payloads(source, datetime.date.today().isoformat())
         if not payloads:
-            say("may-app's push data was not found, so no chat reply or brief was pushed")
+            say("may-app's push fixtures were not found, so no chat reply or brief was pushed")
             return
         for name, shaped in payloads:
             for variant in ("warm", "cold"):

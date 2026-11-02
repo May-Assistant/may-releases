@@ -430,9 +430,25 @@ class RunTests(Workspace):
         self.assertEqual(len([argv for argv, _ in calls if "test" in argv and "--device" in argv]), 1)
         self.assertNotIn("tried once more", out)
 
-    # Made-up keys around the two markers the spike looks for: may-app's own push data is read on the runner alone.
-    PUSH_TS = ("export interface Sent {\n  data: { item_ref: string } | { brief_id: string; issued_date: string }\n"
-               "    | { kind: 'chat_reply'; room_ref: string; parent_ref: string | null; note_ref: string };\n}\n")
+    # Made-up fixtures in the shape of may-app's (tools/device-tests/push/, #1582): may-app's own are read on the runner
+    # alone, never kept here.
+    FIXTURES = {
+        "chat_reply.json": {"aps": {"alert": {"title": "{agent_name}", "body": "Replied."}, "thread-id": "{conversation_id}"},
+                            "kind": "chat_reply", "room_ref": "{conversation_id}", "parent_ref": None,
+                            "note_ref": "{message_id}"},
+        "chat_reply.thread.json": {"aps": {"alert": {"title": "{agent_name}", "body": "Replied."}},
+                                   "kind": "chat_reply", "room_ref": "{conversation_id}", "parent_ref": "{thread_root_id}",
+                                   "note_ref": "{message_id}"},
+        "brief.json": {"aps": {"alert": {"title": "May", "body": "Brief."}, "sound": "default"},
+                       "brief_id": "{brief_id}", "issued_date": "{brief_date}"}}
+    PHASE_2 = ("chat reply", "chat reply in a thread", "brief")
+
+    def write_fixtures(self, fixtures):
+        folder = self.source / device_ios.PUSH_FIXTURES
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True)
+        for name, body in fixtures.items():
+            (folder / name).write_text(body if isinstance(body, str) else json.dumps(body))
     ATOS = "ChatRoute.open(_:) (in MayPlayground.debug.dylib) (ChatRoute.swift:42)"
 
     STUB, DYLIB = 4294934528, 4294967296
@@ -459,8 +475,7 @@ class RunTests(Workspace):
             (self.source / device_tests.FLOWS_DIR / "subflows").mkdir(parents=True, exist_ok=True)
             (self.source / device_tests.FLOWS_DIR / device_ios.ALLOW_FLOW).write_text("appId: x\n---\n- tapOn: Allow\n")
         if push:
-            (self.source / device_ios.PUSH_SOURCE).parent.mkdir(parents=True, exist_ok=True)
-            (self.source / device_ios.PUSH_SOURCE).write_text(self.PUSH_TS)
+            self.write_fixtures(self.FIXTURES)
         reports = self.root / "reports"
         reports.mkdir(exist_ok=True)
         pushed, self.atos, self.simctl_timeouts, written = [], [], [], []
@@ -535,7 +550,7 @@ class RunTests(Workspace):
         self.assertEqual(report["scenarios"], [], "the spike runs instead of the scenarios")
         self.assertEqual(self.spike_lines(out), self.GENERIC + [
             self.SAID + f"{name} {variant}: pushed yes, tap passed, crash on notification open no, May in front yes"
-            for name in ("chat reply", "brief") for variant in ("warm", "cold")])
+            for name in self.PHASE_2 for variant in ("warm", "cold")])
         self.assertEqual(pushed[:2], [device_ios.SPIKE_PAYLOAD] * 2)
         self.assertEqual(set(device_ios.SPIKE_PAYLOAD["aps"]), {"alert"}, "Apple's generic alert alone, no May key")
         self.assertEqual(len(minted), 1)
@@ -545,7 +560,7 @@ class RunTests(Workspace):
         self.assertNotIn("maestro said", out, "Maestro's output never reaches the public log")
         self.assertEqual(self.atos, [], "no crash, so nothing was symbolicated")
         shots = sorted(path.name for path in (run / "ios").glob("spike-*.png"))
-        self.assertEqual(shots, sorted(f"spike-{label}-{variant}-end.png" for label in ("generic", "chat-reply", "brief")
+        self.assertEqual(shots, sorted(f"spike-{label}-{variant}-end.png" for label in ("generic", "chat-reply", "chat-reply-in-a-thread", "brief")
                                        for variant in ("warm", "cold")),
                          "the screen after each front check, in the private run folder (run 41504861439)")
         self.assertTrue(all(publish.DEVICE_FILE.fullmatch(name) for name in shots), "names publish takes")
@@ -553,37 +568,52 @@ class RunTests(Workspace):
         self.assertFalse((self.private / device_tests.SPIKE_CRASHED).exists())
         self.assertEqual(self.uses, [[]], "no scenario's agent, account or chat is set up (review of #181)")
         pushes = [timeout for verb, timeout in self.simctl_timeouts if verb == "push"]
-        self.assertEqual(pushes, [device_ios.SIMCTL_SECONDS] * 6, "every push is bounded (review of #181)")
+        self.assertEqual(pushes, [device_ios.SIMCTL_SECONDS] * 8, "every push is bounded (review of #181)")
         self.assertIn(("terminate", device_ios.SIMCTL_SECONDS), self.simctl_timeouts, "the cold stop is bounded")
 
-    def test_a_chat_reply_and_a_brief_are_pushed_with_may_apps_own_keys_read_at_run_time(self):
-        """Coordinator, 2 Nov: the spike is the crash's repro too; the shapes come from the fetched commit, never from
-        here."""
+    def test_a_chat_reply_in_and_out_of_a_thread_and_a_brief_are_pushed_from_may_apps_fixtures(self):
+        """Coordinator, 2 Nov: K's fixtures (may-app #1582) replace reading push.ts; read at run time, never kept here."""
         _, _, _, _, pushed, _ = self.spike()
         today = device_ios.datetime.date.today().isoformat()
-        chat = dict(device_ios.SPIKE_PAYLOAD, kind="chat_reply", room_ref="device-test-room-ref", parent_ref=None,
-                    note_ref="device-test-note-ref")
-        brief = dict(device_ios.SPIKE_PAYLOAD, brief_id="device-test-brief-id", issued_date=today)
-        self.assertEqual(pushed[2:], [chat, chat, brief, brief])
-        self.assertEqual(device_ios.push_payloads(self.source, today), [("chat reply", chat), ("brief", brief)])
-        for text in ("", "{ kind: 'chat_reply'; room_ref: string }", "{ brief_id: string }",
-                     self.PUSH_TS.replace("note_ref: string", "note_ref?: string"),
-                     self.PUSH_TS.replace("issued_date: string", "issued_date: string; count: number")):
-            (self.source / device_ios.PUSH_SOURCE).write_text(text)
-            self.assertEqual(device_ios.push_payloads(self.source, today), [], "both or none: no shape is guessed")
+        values = dict(device_ios.SPIKE_VALUES, **{"{brief_date}": today})
+        alert = {"title": device_ios.SPIKE_TITLE, "body": "Replied."}
+        target = {"Simulator Target Bundle": device_ios.BUNDLE}
+        chat = dict(target, aps={"alert": alert, "thread-id": values["{conversation_id}"]}, kind="chat_reply",
+                    room_ref=values["{conversation_id}"], parent_ref=None, note_ref=values["{message_id}"])
+        thread = dict(target, aps={"alert": alert}, kind="chat_reply", room_ref=values["{conversation_id}"],
+                      parent_ref=values["{thread_root_id}"], note_ref=values["{message_id}"])
+        brief = dict(target, aps={"alert": {"title": device_ios.SPIKE_TITLE, "body": "Brief."}, "sound": "default"},
+                     brief_id=values["{brief_id}"], issued_date=today)
+        self.assertEqual(pushed[2:], [chat, chat, thread, thread, brief, brief])
+        self.assertEqual(device_ios.push_payloads(self.source, today),
+                         [("chat reply", chat), ("chat reply in a thread", thread), ("brief", brief)])
+        bad = {"no brief": {k: v for k, v in self.FIXTURES.items() if k != "brief.json"},
+               "a placeholder no value fills": dict(self.FIXTURES, **{"brief.json": {"aps": {}, "x": "{unknown_id}"}}),
+               "no aps": dict(self.FIXTURES, **{"brief.json": {"brief_id": "{brief_id}"}}),
+               "not JSON": dict(self.FIXTURES, **{"brief.json": "{"}),
+               "a list": dict(self.FIXTURES, **{"brief.json": [1]}),
+               "its own target": dict(self.FIXTURES, **{"brief.json": {"aps": {}, "Simulator Target Bundle": "x"}}),
+               "too long": dict(self.FIXTURES, **{"brief.json": {"aps": {}, "x": "y" * device_ios.MAX_FIXTURE}})}
+        for case, fixtures in bad.items():
+            with self.subTest(case=case):
+                self.write_fixtures(fixtures)
+                self.assertEqual(device_ios.push_payloads(self.source, today), [], "all or none: no shape is guessed")
+        self.write_fixtures(self.FIXTURES)
+        link = self.source / device_ios.PUSH_FIXTURES / "brief.json"
+        link.unlink()
+        link.symlink_to(self.source / device_ios.PUSH_FIXTURES / "chat_reply.json")
+        self.assertEqual(device_ios.push_payloads(self.source, today), [], "a link is never read")
 
     def test_a_crash_on_opening_a_notification_is_yes_in_the_log_and_its_frames_go_to_the_private_diag(self):
         _, _, _, out, _, run = self.spike(crash=["kind"])
         self.assertEqual(self.spike_lines(out)[4:], [
-            self.SAID + "chat reply warm: pushed yes, tap passed, crash on notification open yes, May in front yes",
-            self.SAID + "chat reply cold: pushed yes, tap passed, crash on notification open yes, May in front yes",
-            self.SAID + "brief warm: pushed yes, tap passed, crash on notification open no, May in front yes",
-            self.SAID + "brief cold: pushed yes, tap passed, crash on notification open no, May in front yes"])
+            self.SAID + f"{name} {variant}: pushed yes, tap passed, crash on notification open "
+            f"{'no' if name == 'brief' else 'yes'}, May in front yes" for name in self.PHASE_2 for variant in ("warm", "cold")])
         for absent in ("ChatRoute", "swift_unexpectedError", ".swift", "room_ref", "chat_reply"):
             self.assertNotIn(absent, out, "the public log says yes or no alone")
         text = self.spike_diag(run)
         self.assertIsNotNone(text, "the crash's private diag was kept")
-        self.assertEqual(text.count(b"== crash ==\n"), 2, "each crash report, kept once")
+        self.assertEqual(text.count(b"== crash ==\n"), 4, "each crash report, kept once")
         self.assertIn(b"faulting thread, top frames:\nframe 0 libswift_Concurrency.dylib swift_unexpectedError\n"
                       b"frame 1 MayPlayground.debug.dylib $s3May9ChatRouteV4openyyF\n", text, "frame 0 included")
         self.assertIn(b"== May's frames, file:line ==\nframe 1 " + self.ATOS.encode() + b"\nframe 3 main (in "
@@ -592,7 +622,7 @@ class RunTests(Workspace):
         self.assertEqual(self.atos, [
             ["xcrun", "atos", "-o", str(app / "MayPlayground.debug.dylib"), "-l", hex(self.DYLIB),
              hex(self.DYLIB + 4096), hex(self.DYLIB + 8192)],
-            ["xcrun", "atos", "-o", str(app / "MayPlayground"), "-l", hex(self.STUB), hex(self.STUB + 1024)]] * 2,
+            ["xcrun", "atos", "-o", str(app / "MayPlayground"), "-l", hex(self.STUB), hex(self.STUB + 1024)]] * 4,
             "each crash's images at their own bases, the Debug stub's too (review of #181)")
         self.assertTrue((self.private / device_tests.SPIKE_CRASHED).exists())
         with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
@@ -627,7 +657,7 @@ class RunTests(Workspace):
             "tried, crash on notification open yes, May in front yes",
             self.SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, crash on "
             "notification open yes, May in front yes",
-            self.SAID + "may-app's push data was not found, so no chat reply or brief was pushed"])
+            self.SAID + "may-app's push fixtures were not found, so no chat reply or brief was pushed"])
         self.assertIn(b"frame 0 libswift_Concurrency.dylib swift_unexpectedError\n", self.spike_diag(run))
         self.assertTrue((self.private / device_tests.SPIKE_CRASHED).exists())
 
@@ -643,7 +673,7 @@ class RunTests(Workspace):
     def test_without_may_apps_push_data_only_the_generic_notification_is_pushed(self):
         _, _, _, out, pushed, run = self.spike(push=False)
         self.assertEqual(self.spike_lines(out), self.GENERIC + [
-            self.SAID + "may-app's push data was not found, so no chat reply or brief was pushed"])
+            self.SAID + "may-app's push fixtures were not found, so no chat reply or brief was pushed"])
         self.assertEqual(pushed, [device_ios.SPIKE_PAYLOAD] * 2)
         self.assertEqual(self.signed_out, [TOKEN + "1"])
 
