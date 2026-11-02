@@ -559,6 +559,12 @@ class RunTests(Workspace):
         self.assertNotIn(TOKEN, out)
         self.assertNotIn("maestro said", out, "Maestro's output never reaches the public log")
         self.assertEqual(self.atos, [], "no crash, so nothing was symbolicated")
+        shots = sorted(path.name for path in (run / "ios").glob("spike-*.png"))
+        self.assertEqual(shots, sorted(f"spike-{label}-{variant}-end.png" for label in ("generic", "chat-reply", "chat-reply-in-a-thread", "brief")
+                                       for variant in ("warm", "cold")),
+                         "the screen after each front check, in the private run folder (run 41504861439)")
+        self.assertTrue(all(publish.DEVICE_FILE.fullmatch(name) for name in shots), "names publish takes")
+        self.assertNotIn("spike-", out.replace("notification spike", ""), "never named in the public log")
         self.assertFalse((self.private / device_tests.SPIKE_CRASHED).exists())
         self.assertEqual(self.uses, [[]], "no scenario's agent, account or chat is set up (review of #181)")
         pushes = [timeout for verb, timeout in self.simctl_timeouts if verb == "push"]
