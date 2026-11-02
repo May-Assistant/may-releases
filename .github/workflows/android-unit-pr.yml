@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   admission:
-    # may-app's three Android unit suites (android_unit.py SUITES) at the head of an open may-app pull request, on a
+    # may-app's four Android unit suites (android_unit.py SUITES) at the head of an open may-app pull request, on a
     # free Linux runner with the pinned JDK. The same gate, fetch and environment as native-compile-pr.yml (gate.py
     # --action compile-pr: may-native-compile-pr, no required reviewer, main only), because it holds the same things:
     # two read-only deploy keys and a pull-request read token, each in its own step, and the pull-request comment

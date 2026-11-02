@@ -37,7 +37,8 @@ COMMENT_TOKEN = "MAY_APP_PR_COMMENT_TOKEN"
 SOURCE, PRIVATE = "may-source", "may-private"
 MARKER = "may-android-unit-pr"
 LABELS = {"core": "core (`:core:test`)", "playground": "May Playground (`:app:testPlaygroundDebugUnitTest`)",
-          "production": "May production (`:app:testProductionDebugUnitTest`)"}
+          "production": "May production (`:app:testProductionDebugUnitTest`)",
+          "production-release": "May production, release (`:app:testProductionReleaseUnitTest`)"}
 GRADLE = {"ok": None, "failed": "Gradle exited with a failure.", "timeout": "Gradle did not finish within 50 minutes."}
 
 
