@@ -855,19 +855,28 @@ class ServerTruthTests(unittest.TestCase):
 
     def test_every_chat_name_fits_stagings_forty_characters(self):
         """Run 41373739501: "Android test chat qa-41373739501-a-poll-skip" was 44 characters; staging takes 40 at most
-        (may-app NAME_MAX_CHARS). Every chat row's name fits on both platforms, with a run id of 12 digits."""
+        (may-app NAME_MAX_CHARS). Every chat row's name fits on its own platform, with the widest tag run_tag makes
+        (independent review of #178: a 13-digit run id made Android's poll-skip 41)."""
         self.assertEqual(device_tests.CHAT_NAME_MAX, 40)
-        rows = [row for row in device_tests.scenarios("all") if row.get("chat")]
-        self.assertTrue(rows)
+
+        def tag(platform, run):
+            with patch.dict(os.environ, {"GITHUB_RUN_ID": run}), patch("device_tests.time.time", return_value=1e9):
+                return device_tests.run_tag(platform)
+        kept = [digits for digits in range(1, 26) if "9" * digits in tag("android", "9" * digits)]
+        self.assertEqual(kept, list(range(5, 12)), "run ids of 5 to 11 digits are the tag's")
+        self.assertEqual(tag("android", "9" * 13), "qa-1000000000-a", "a longer one takes the clock's seconds")
         longest = 0
-        for row in rows:
-            for letter in ("a", "i"):
-                with self.subTest(row=row["id"], letter=letter):
-                    name = device_agent.filled(device_tests.CHAT_NAME,
-                                               device_tests.scenario_tag(f"qa-{'9' * 12}-{letter}", row))
-                    longest = max(longest, len(name))
-                    self.assertLessEqual(len(name), device_tests.CHAT_NAME_MAX, name)
-        self.assertEqual(longest, 40, "Android's poll-skip, the longest, is at the limit")
+        for platform in ("android", "ios"):
+            rows = [row for row in device_tests.scenarios("all", platform) if row.get("chat")]
+            self.assertTrue(rows)
+            for run in ("9" * max(kept), "9" * 25):
+                for row in rows:
+                    with self.subTest(platform=platform, row=row["id"], run=len(run)):
+                        name = device_agent.filled(device_tests.CHAT_NAME,
+                                                   device_tests.scenario_tag(tag(platform, run), row))
+                        longest = max(longest, len(name))
+                        self.assertLessEqual(len(name), device_tests.CHAT_NAME_MAX, name)
+        self.assertEqual(longest, 39, "Android's poll-skip with an 11-digit run id, the longest, is within it")
 
     def test_a_card_row_seeds_a_line_in_mays_chat_then_one_for_you_card(self):
         """N, 30 Oct: the blank-chat test opens May's chat from a For you card, so staging gives that chat a message and

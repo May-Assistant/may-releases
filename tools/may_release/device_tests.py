@@ -1033,11 +1033,17 @@ def scenario_tag(tag, row):
 PLATFORM_LETTERS = {"android": "a", "ios": "i"}
 
 
+# Independent review of #178: a run id of 13 digits made Android's poll-skip chat name 41 characters, past staging's
+# CHAT_NAME_MAX. A run id of 5 to 11 digits is the tag's; a longer one takes the clock's seconds (10 digits) instead.
+RUN_ID = re.compile(r"[1-9][0-9]{4,10}")
+
+
 def run_tag(platform):
     """qa-<GitHub run id>-<a or i>: K's cleanup takes a tag of at least 8 characters, matched in names and titles, so
-    one platform's cleanup never matches the other's (qa-1-a is in no qa-1-i-... title)."""
+    one platform's cleanup never matches the other's (qa-1-a is in no qa-1-i-... title). A run id RUN_ID does not take
+    gives way to the clock's seconds, so every chat name fits CHAT_NAME_MAX."""
     run = os.environ.get("GITHUB_RUN_ID", "")
-    return "qa-" + (run if re.fullmatch(r"[1-9][0-9]{4,19}", run) else str(int(time.time()))) + "-" + \
+    return "qa-" + (run if RUN_ID.fullmatch(run) else str(int(time.time()))) + "-" + \
         PLATFORM_LETTERS[platform]
 
 
