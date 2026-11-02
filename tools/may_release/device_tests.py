@@ -1662,14 +1662,30 @@ def finish_onboarding(row, source, platform, drive):
     return passed
 
 
-def settle(entry, row, passed):
-    """A scenario's verdict after its run: a Maestro row's from its flow and server checks; an agent or smoke row waits
-    for the judge (a smoke row keeps whether Maestro drove the app)."""
+# Run 41358220544: iOS's sign-in failed with no reason given, and no result file: Maestro never ran the flow. A
+# Maestro row that fails says why in fixed words: the flow never ran (no JUnit result file, flow_ran), it ran and
+# failed, or it passed and a server check failed.
+FLOW_NOT_RUN, FLOW_FAILED, SERVER_FAILED = ("Maestro never ran the flow (no result file)", "the flow failed",
+                                            "a server check failed")
+
+
+def flow_ran(folder, row):
+    """Whether Maestro wrote the row's JUnit result (<id>.xml), which it does for a flow it ran, passed or failed."""
+    result = folder / (row["id"] + ".xml")
+    return result.is_file() and not result.is_symlink()
+
+
+def settle(entry, row, passed, ran=True):
+    """A scenario's verdict after its run: a Maestro row's from its flow and server checks, and when it fails, why
+    (ran: whether Maestro wrote its result, flow_ran); an agent or smoke row waits for the judge (a smoke row keeps
+    whether Maestro drove the app)."""
     if row["driver"] == "maestro":
         server_ok = all(check["pass"] for check in entry["server"])
         entry["verdict"] = "fail" if not passed or not server_ok else "pass" if row["server"] else "ui-pass"
         if entry["verdict"] == "ui-pass":
             entry["reason"] = UNCONFIGURED
+        elif entry["verdict"] == "fail":
+            entry["reason"] = SERVER_FAILED if passed else FLOW_FAILED if ran else FLOW_NOT_RUN
         return
     entry.update(verdict="fail", reason=NOT_JUDGED)
     if row["driver"] == SMOKE:
@@ -1823,7 +1839,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             diagnostics.keep(folder, row["id"], token)
             accounts.finish(row, base, token)
             entry["videos"] = recorder.stop(folder)
-            settle(entry, row, passed if flow is not None else None)
+            settle(entry, row, passed if flow is not None else None, ran=flow_ran(folder, row))
             token = ""
     finally:
         cleaned_count = tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)

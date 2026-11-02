@@ -1614,8 +1614,11 @@ class ReasonTests(unittest.TestCase):
                     isinstance(value.slice, ast.Constant) and hasattr(device_tests, value.value.id):
                 reasons.add(getattr(device_tests, value.value.id)[value.slice.value])
             elif isinstance(value, ast.IfExp):
-                reasons |= {getattr(device_tests, v.id) if isinstance(v, ast.Name) else v.value
-                            for v in (value.body, value.orelse)}
+                branches = [value]
+                while any(isinstance(branch, ast.IfExp) for branch in branches):
+                    branches = [part for branch in branches for part in
+                                ((branch.body, branch.orelse) if isinstance(branch, ast.IfExp) else (branch,))]
+                reasons |= {getattr(device_tests, v.id) if isinstance(v, ast.Name) else v.value for v in branches}
             else:
                 reasons.add(ast.unparse(value))  # a reason worked out at run time must be added here by hand
         # The judge step copies combined()'s reason, whose own values are read above from its returned dicts.
@@ -1624,8 +1627,33 @@ class ReasonTests(unittest.TestCase):
             reasons |= {device_tests.FreshExhausted.reason, device_tests.FreshRefused.reason}
         return reasons - {None, "verdict_reason['reason']", "self.refused"}
 
+    def test_a_failed_maestro_row_says_why_in_fixed_words(self):
+        """Run 41358220544: iOS's sign-in failed with no reason given."""
+        row = {"driver": "maestro", "server": [{"get": "/v1/me"}]}
+        for passed, ran, server, reason in ((False, False, True, device_tests.FLOW_NOT_RUN),
+                                            (False, True, True, device_tests.FLOW_FAILED),
+                                            (True, True, False, device_tests.SERVER_FAILED),
+                                            (False, False, False, device_tests.FLOW_NOT_RUN)):
+            with self.subTest(passed=passed, ran=ran, server=server):
+                entry = {"server": [{"pass": server}]}
+                device_tests.settle(entry, row, passed, ran=ran)
+                self.assertEqual((entry["verdict"], entry.get("reason")), ("fail", reason))
+        entry = {"server": [{"pass": True}]}
+        device_tests.settle(entry, row, True, ran=True)
+        self.assertEqual(entry, {"server": [{"pass": True}], "verdict": "pass"})
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            self.assertFalse(device_tests.flow_ran(folder, {"id": "sign-in"}))
+            (folder / "elsewhere.xml").write_text("x")
+            (folder / "sign-in.xml").symlink_to(folder / "elsewhere.xml")
+            self.assertFalse(device_tests.flow_ran(folder, {"id": "sign-in"}), "a link is never a result")
+            (folder / "sign-in.xml").unlink()
+            (folder / "sign-in.xml").write_text("<testsuites/>")
+            self.assertTrue(device_tests.flow_ran(folder, {"id": "sign-in"}))
+
     def test_every_reason_a_device_job_writes_is_one_publish_accepts(self):
         written = self.written_reasons()
+        self.assertTrue({device_tests.FLOW_NOT_RUN, device_tests.FLOW_FAILED, device_tests.SERVER_FAILED} <= written)
         self.assertIn(device_tests.BUDGET, written)
         self.assertIn(device_tests.UNTAGGED["android"], written)
         self.assertEqual(written - set(publish.REASONS), set())
