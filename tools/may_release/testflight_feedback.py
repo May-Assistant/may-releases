@@ -46,6 +46,9 @@ from store import StoreError, require_step_secrets, runner_root, secret_bytes, w
 ENVIRONMENT = "may-testflight-feedback"
 APP_REPO = "May-Assistant/may-app"
 LABEL = "testflight-feedback"
+# Coordinator, 2 Nov: a crash submission's issue also carries CRASH_LABEL, so crashes can be listed apart; the known
+# submissions are still read from LABEL's issues, which every filed issue carries.
+CRASH_LABEL = "crash"
 MARKER = "testflight-feedback"
 STATE = "may-testflight"
 ISSUES_TOKEN = "MAY_APP_ISSUES_TOKEN"
@@ -349,6 +352,11 @@ def issue_body(record, run):
     return "\n".join(lines) + f"\n\n<!-- {MARKER} id={record['id']} -->\n"
 
 
+def labels(record):
+    """A filed issue's labels: LABEL always, and CRASH_LABEL too for a crash."""
+    return [LABEL, CRASH_LABEL] if record["kind"] == "crash" else [LABEL]
+
+
 def file_issues(call_api=github):
     token = issues_token()
     folder = state()
@@ -364,7 +372,7 @@ def file_issues(call_api=github):
     for record in records[:MAX_NEW]:
         title = f"TestFlight feedback: {record['kind']} in {record['app']}"
         status, _ = call_api("POST", f"/repos/{APP_REPO}/issues",
-                             {"title": title, "body": issue_body(record, run), "labels": [LABEL]}, token)
+                             {"title": title, "body": issue_body(record, run), "labels": labels(record)}, token)
         if status != 201:
             raise FeedbackError("A may-app issue could not be filed; the ones not filed are read again next run")
         filed += 1
