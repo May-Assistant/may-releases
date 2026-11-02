@@ -819,7 +819,7 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
 
     payload = private / "spike.apns"
 
-    def tap(variant, shaped):
+    def tap(label, variant, shaped):
         if variant == "warm":
             ready = flow("home", spike_flow(SPIKE_HOME), maestro_env)
         else:
@@ -833,6 +833,10 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
         crashed = fresh()
         front = flow(f"{variant}-front", spike_flow(SPIKE_FRONT), maestro_env) if banner or centre else False
         crashed += fresh()
+        # Run 41504861439: May was "in front: no" after every tap, with nothing to say what the screen showed. The
+        # screen after the front check is kept beside the report, in the private run folder alone (never the log).
+        if folder is not None:
+            screenshot(udid, env, folder / f"spike-{label}-{variant}-end.png", log)
         return ready, pushed, banner, centre, crashed, front
 
     def variants():
@@ -845,7 +849,7 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
             allowed = False
         say("notifications allowed: " + ("passed" if allowed else "failed"))
         for variant in ("warm", "cold"):
-            ready, pushed, banner, centre, crashed, front = tap(variant, SPIKE_PAYLOAD)
+            ready, pushed, banner, centre, crashed, front = tap("generic", variant, SPIKE_PAYLOAD)
             say(f"{variant}: May {'sent to the background' if variant == 'warm' else 'stopped'} "
                 f"{'yes' if ready else 'no'}, pushed {'yes' if pushed else 'no'}, banner tap "
                 f"{'passed' if banner else 'failed'}, Notification Centre tap "
@@ -860,7 +864,7 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
         for name, shaped in payloads:
             for variant in ("warm", "cold"):
                 launch(udid, env, token, log)
-                ready, pushed, banner, centre, crashed, front = tap(variant, shaped)
+                ready, pushed, banner, centre, crashed, front = tap(name.replace(" ", "-"), variant, shaped)
                 say(f"{name} {variant}: pushed {'yes' if pushed else 'no'}, tap "
                     f"{'passed' if banner or centre else 'failed'}, crash on notification open "
                     f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}")
