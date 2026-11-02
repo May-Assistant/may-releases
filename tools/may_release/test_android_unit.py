@@ -97,23 +97,24 @@ class Fixture(unittest.TestCase):
 class RunTests(Fixture):
     def test_every_suite_passing_prints_only_fixed_lines_and_counts(self):
         quiet = self.fake(suites={"core": [junit(3), junit(4, skipped=1)], "playground": [junit(5)],
-                                  "production": [junit(2)]})
+                                  "production": [junit(2)], "production-release": [junit(1)]})
         out, error = self.run_suites(quiet)
         self.assertIsNone(error)
         self.assertEqual(out.splitlines(), [
             "May Android unit suite core: passed, 7 tests, 0 failed, 1 skipped",
             "May Android unit suite playground: passed, 5 tests, 0 failed, 0 skipped",
             "May Android unit suite production: passed, 2 tests, 0 failed, 0 skipped",
+            "May Android unit suite production-release: passed, 1 tests, 0 failed, 0 skipped",
             "Every May Android unit suite passed"])
         for private in (PRIVATE, MESSAGE, "a private test", str(self.root)):
             self.assertNotIn(private, out)
 
-    def test_the_design_system_check_runs_before_gradle_which_runs_all_three_suites_on_with_continue(self):
+    def test_the_design_system_check_runs_before_gradle_which_runs_all_four_suites_on_with_continue(self):
         self.run_suites(self.fake())
         self.assertEqual([call[0] for call in self.calls], [
             ["bash", "android/scripts/fetch-design-system.sh"],
             ["./gradlew", "--no-daemon", "--continue", ":core:test", ":app:testPlaygroundDebugUnitTest",
-             ":app:testProductionDebugUnitTest"]])
+             ":app:testProductionDebugUnitTest", ":app:testProductionReleaseUnitTest"]])
         self.assertEqual(self.calls[0][1], self.root / "may-source")
         self.assertEqual(self.calls[1][1], self.root / "may-source/android")
 
@@ -132,7 +133,7 @@ class RunTests(Fixture):
         for case, text in (("a failure", junit(4, failures=1)), ("an error", junit(4, errors=2))):
             with self.subTest(case=case):
                 self.calls = []
-                quiet = self.fake(suites={"core": [junit(3)], "playground": [text], "production": [junit(2)]}, gradle=1)
+                quiet = self.fake(suites={"core": [junit(3)], "playground": [text], "production": [junit(2)], "production-release": [junit(1)]}, gradle=1)
                 shutil.rmtree(self.root / "may-source/android/app", ignore_errors=True)
                 shutil.rmtree(self.root / "may-source/android/core", ignore_errors=True)
                 out, error = self.run_suites(quiet)
@@ -143,7 +144,7 @@ class RunTests(Fixture):
 
     def test_a_suite_with_no_tests_fails(self):
         out, error = self.run_suites(self.fake(suites={"core": [junit(0)], "playground": [junit(5)],
-                                                       "production": [junit(2)]}))
+                                                       "production": [junit(2)], "production-release": [junit(1)]}))
         self.assertEqual(error, "At least one May Android unit suite did not pass")
         self.assertIn("May Android unit suite core: failed, 0 tests, 0 failed, 0 skipped", out)
 

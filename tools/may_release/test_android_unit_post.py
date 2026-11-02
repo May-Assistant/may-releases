@@ -77,17 +77,19 @@ class RecordTests(Fixture):
         self.source_file()
         source = str(self.root / "may-source")
         quiet = self.fake(gradle=1, suites={"core": [failing_report(source)], "playground": [junit(5)],
-                                            "production": [junit(2)]})
+                                            "production": [junit(2)], "production-release": [junit(1)]})
         out, outcome, failed = self.record(quiet)
         self.assertEqual(out.splitlines(), [
             "May Android unit suite core: failed, 2 tests, 1 failed, 0 skipped",
             "May Android unit suite playground: passed, 5 tests, 0 failed, 0 skipped",
             "May Android unit suite production: passed, 2 tests, 0 failed, 0 skipped",
+            "May Android unit suite production-release: passed, 1 tests, 0 failed, 0 skipped",
             "May Android unit suites finished; any failing tests stay in this runner's private files for the next step"])
         for private in (PRIVATE, SECRET_TEXT, "shows the private screen", source):
             self.assertNotIn(private, out)
         self.assertEqual(outcome, {"result": "failed", "gradle": "failed",
-                                   "suites": {"core": [2, 1, 0], "playground": [5, 0, 0], "production": [2, 0, 0]}})
+                                   "suites": {"core": [2, 1, 0], "playground": [5, 0, 0], "production": [2, 0, 0],
+                                   "production-release": [1, 0, 0]}})
         self.assertEqual(failed, {"total": 1, "unreadable": 0, "failures": [{
             "suite": "core", "test": PRIVATE + " > shows the private screen", "kind": "failure",
             "message": f"expected:<{SECRET_TEXT}> but was:<other>",
@@ -102,7 +104,8 @@ class RecordTests(Fixture):
     def test_gradle_that_does_not_finish_is_recorded(self):
         out, outcome, failed = self.record(self.fake(timeout=True))
         self.assertEqual((outcome["result"], outcome["gradle"]), ("failed", "timeout"))
-        self.assertEqual(outcome["suites"], {"core": None, "playground": None, "production": None})
+        self.assertEqual(outcome["suites"], {"core": None, "playground": None, "production": None,
+                                             "production-release": None})
 
     def test_a_check_before_gradle_still_fails_the_step_and_records_nothing(self):
         (self.root / "may-source/android/scripts/fetch-design-system.sh").unlink()
@@ -115,7 +118,7 @@ class RecordTests(Fixture):
         message = (f"file {source}/android/core/src/x.json missing; cache /home/runner/.gradle/caches/x.bin; "
                    f"key ghp_{'A' * 36}; see https://example.com/a/b")
         quiet = self.fake(gradle=1, suites={"core": [failing_report(source, message=message, frame=False)],
-                                            "playground": [junit(5)], "production": [junit(2)]})
+                                            "playground": [junit(5)], "production": [junit(2)], "production-release": [junit(1)]})
         _, _, failed = self.record(quiet)
         entry = failed["failures"][0]
         self.assertEqual(entry["message"], "file android/core/src/x.json missing; cache [runner path]; key [redacted]; "
@@ -124,29 +127,30 @@ class RecordTests(Fixture):
 
     def test_a_frame_whose_file_is_not_found_keeps_the_file_name_only(self):
         quiet = self.fake(gradle=1, suites={"core": [failing_report("x")], "playground": [junit(5)],
-                                            "production": [junit(2)]})
+                                            "production": [junit(2)], "production-release": [junit(1)]})
         _, _, failed = self.record(quiet)
         self.assertEqual(failed["failures"][0]["at"], "PrivateScreenTest.kt:42")
 
     def test_an_error_is_recorded_as_an_error(self):
         quiet = self.fake(gradle=1, suites={"core": [failing_report("x", kind="error")], "playground": [junit(5)],
-                                            "production": [junit(2)]})
+                                            "production": [junit(2)], "production-release": [junit(1)]})
         _, _, failed = self.record(quiet)
         self.assertEqual(failed["failures"][0]["kind"], "error")
 
     def test_a_doctype_or_oversized_report_is_counted_unreadable_not_parsed(self):
         bomb = ('<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aaaa">]>\n<testsuite name="x" tests="1" skipped="0" '
                 'failures="1" errors="0"><testcase name="m" classname="x"><failure message="&a;"/></testcase></testsuite>')
-        quiet = self.fake(gradle=1, suites={"core": [bomb], "playground": [junit(5)], "production": [junit(2)]})
+        quiet = self.fake(gradle=1, suites={"core": [bomb], "playground": [junit(5)], "production": [junit(2)],
+                                            "production-release": [junit(1)]})
         with patch.object(android_unit, "MAX_REPORT_BYTES", 10 ** 9):
             _, _, failed = self.record(quiet)
         self.assertEqual((failed["failures"], failed["total"], failed["unreadable"]), ([], 0, 1))
         self.fresh_private()
         quiet = self.fake(gradle=1, suites={"core": [failing_report("x")], "playground": [junit(5)],
-                                            "production": [junit(2)]})
+                                            "production": [junit(2)], "production-release": [junit(1)]})
         with patch.object(android_unit, "MAX_REPORT_BYTES", 10):
             _, _, failed = self.record(quiet)
-        self.assertEqual((failed["total"], failed["unreadable"]), (0, 3))
+        self.assertEqual((failed["total"], failed["unreadable"]), (0, 4), "one report per suite")
 
     def fresh_private(self):
         for name in android_unit.SUITES.values():
@@ -154,7 +158,7 @@ class RecordTests(Fixture):
 
     def test_at_most_max_failures_are_kept_and_all_counted(self):
         reports = [failing_report("x", method=f"m{n}") for n in range(5)]
-        quiet = self.fake(gradle=1, suites={"core": reports, "playground": [junit(5)], "production": [junit(2)]})
+        quiet = self.fake(gradle=1, suites={"core": reports, "playground": [junit(5)], "production": [junit(2)], "production-release": [junit(1)]})
         with patch.object(android_unit, "MAX_FAILURES", 3):
             _, _, failed = self.record(quiet)
         self.assertEqual((len(failed["failures"]), failed["total"]), (3, 5))
@@ -173,7 +177,7 @@ class BreakdownTests(Fixture):
         return out.getvalue(), None
 
     def core(self, *reports):
-        return self.fake(gradle=1, suites={"core": list(reports), "playground": [junit(5)], "production": [junit(2)]})
+        return self.fake(gradle=1, suites={"core": list(reports), "playground": [junit(5)], "production": [junit(2)], "production-release": [junit(1)]})
 
     def test_failing_core_cases_are_located_by_numbers_alone(self):
         lines = self.located({"TEST-io.x.core.CTest.xml": junit(3, name="io.x.core.CTest"),
@@ -271,7 +275,8 @@ def recorded(result="failed", failures=None, total=None, gradle="ok", unreadable
         {"suite": "core", "test": PRIVATE + " > shows", "kind": "failure", "message": SECRET_TEXT,
          "at": "android/core/src/test/kotlin/io/github/mayassistant/may/PrivateScreenTest.kt:42"}]
     outcome = {"result": result, "gradle": gradle,
-               "suites": {"core": [2, 1 if result == "failed" else 0, 0], "playground": [5, 0, 0], "production": [2, 0, 0]}}
+               "suites": {"core": [2, 1 if result == "failed" else 0, 0], "playground": [5, 0, 0], "production": [2, 0, 0],
+                                   "production-release": [1, 0, 0]}}
     return outcome, {"failures": entries, "total": len(entries) if total is None else total, "unreadable": unreadable}
 
 
@@ -380,7 +385,7 @@ class PostTests(unittest.TestCase):
                 self.post(self.api(), token=token, extra={"GITHUB_STEP_SUMMARY": str(summary)})
                 self.assertEqual(summary.read_text(), "\n".join([
                     "### May Android unit suites: failed", "", "| Suite | Tests | Failed | Skipped |", "|---|---|---|---|",
-                    "| core | 2 | 1 | 0 |", "| playground | 5 | 0 | 0 |", "| production | 2 | 0 | 0 |", "",
+                    "| core | 2 | 1 | 0 |", "| playground | 5 | 0 | 0 |", "| production | 2 | 0 | 0 |", "| production-release | 1 | 0 | 0 |", "",
                     "1 failing tests and 2 unreadable reports. Which tests failed goes only to the may-app pull request, "
                     "never here."]) + "\n")
                 self.assertNotIn(PRIVATE, summary.read_text())

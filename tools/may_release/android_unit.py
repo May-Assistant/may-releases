@@ -1,8 +1,9 @@
 """May's Android unit suites at an open may-app pull request head: pass or fail, and counts.
 
-Runs may-app's three Android unit suites (SUITES: the client core's JVM tests, and the app's Robolectric tests for
-May Playground and for May production, both debug) on a free public Linux runner, at the head prepare.py fetched
-(--pr-number), with the pinned JDK (toolchain.py) and the Android SDK packages the app builds with (SDK_PACKAGES).
+Runs may-app's four Android unit suites (SUITES: the client core's JVM tests, and the app's Robolectric tests for
+May Playground and for May production, both debug, and for May production in release) on a free public Linux runner,
+at the head prepare.py fetched (--pr-number), with the pinned JDK (toolchain.py) and the Android SDK packages the app
+builds with (SDK_PACKAGES).
 android/scripts/fetch-design-system.sh runs first, as on a developer's machine: it rechecks that the design system
 prepare.py placed is exactly design-system.lock's revision, clean, and points its build at the runner's SDK.
 
@@ -52,6 +53,9 @@ SUITES = {
     "core": (":core:test", "core/build/test-results/test"),
     "playground": (":app:testPlaygroundDebugUnitTest", "app/build/test-results/testPlaygroundDebugUnitTest"),
     "production": (":app:testProductionDebugUnitTest", "app/build/test-results/testProductionDebugUnitTest"),
+    # Coordinator, 2 Nov: M's NoDebugPushInReleaseTest (the debug push hook stays out of release) runs in the
+    # release unit tests alone.
+    "production-release": (":app:testProductionReleaseUnitTest", "app/build/test-results/testProductionReleaseUnitTest"),
 }
 # platforms;android-37.0 is the app's compileSdk 37 and build-tools 36.0.0 what its Android Gradle Plugin builds
 # with: the same pins as flows.py, without the emulator or a system image (unit tests need neither).
@@ -68,7 +72,8 @@ COUNTS = ("tests", "failures", "errors", "skipped")
 # --record-outcome's private files, under may-private, for android_unit_post.py.
 OUTCOME, FAILURES = "android-unit-result.json", "android-unit-failures.json"
 # Each suite's Gradle module, for a failing test's source path.
-MODULES = {"core": "android/core", "playground": "android/app", "production": "android/app"}
+MODULES = {"core": "android/core", "playground": "android/app", "production": "android/app",
+           "production-release": "android/app"}
 # Failing tests recorded (the rest are counted), and the longest name, message and path kept.
 MAX_FAILURES = 100
 # Failing core test cases located by --core-breakdown.
