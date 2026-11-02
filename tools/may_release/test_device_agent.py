@@ -129,7 +129,10 @@ class AgentRunTests(unittest.TestCase):
         def judge(cli, goal, tag, agent_record, work, token, model):
             seen.setdefault("judged", []).append((goal, tag, token, model))
             seen.setdefault("evidence", []).append(agent_record)
-            return judged.pop(0)
+            answer = judged.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
 
         environ = dict(self.env, **(env or {}))
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
@@ -245,6 +248,18 @@ class AgentRunTests(unittest.TestCase):
             [record(), record(), record()], [("pass", ""), ("error", ""), ("pass", "")], truth=(200, False)))
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("pass", None), ("fail", device_tests.NOT_JUDGED), ("fail", device_tests.NO_TRUTH)])
+
+    def test_a_judge_that_cannot_fill_its_goal_marks_that_row_alone(self):
+        """Independent review of #176: a stored tag without its platform letter makes device_agent.filled raise; that
+        row is not judged, and the step still judges the rest."""
+        try:
+            _, _, _, report, _, _ = self.run_and_judge(
+                [record(), record(), record()], [("pass", ""), ValueError("The tag holds no platform letter"),
+                                                 ("pass", "")])
+        except ValueError:
+            self.fail("one row's goal stopped the whole judge step")
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("pass", None), ("fail", device_tests.NOT_JUDGED), ("pass", None)])
 
     def test_each_chat_scenario_talks_in_a_chat_of_its_own_made_before_the_app_starts(self):
         """Coordinator, 26 Oct: every run wrote to the shared May chat, so one run's cards and replies met the next's.

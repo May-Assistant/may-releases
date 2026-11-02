@@ -484,10 +484,10 @@ class Diagnostics:
         """The scenario's start, in the log's own local time."""
         self.start = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    def keep(self, folder, scenario, token, driver=None, onboarding=b""):
+    def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
         """Writes <scenario>.diag.txt when there is anything to keep; never an error. driver: the agent's DRIVER_FILE,
         each refused act's Maestro lines (device_mcp.refused); onboarding: the subflow's last lines when it did not
-        pass."""
+        pass; flow: a scripted flow's last Maestro lines when it did not pass (a scripted row runs no subflow)."""
         found = []
         for path in self.crash_reports():
             if path not in self.seen:
@@ -522,6 +522,8 @@ class Diagnostics:
         refused, from_driver = kept_lines(refused, token)
         onboarding, from_onboarding = kept_lines(onboarding, token)
         onboarding = whole_lines(onboarding, DIAG_RESERVE // 2 - 64, newest=True)
+        flow, from_flow = kept_lines(flow, token)
+        flow = whole_lines(flow, DIAG_RESERVE // 2 - 64, newest=True)
         self.drivers += bool(refused)
         # Counted from what kept_lines kept, so a span line it dropped is neither published nor counted.
         spans = [line for line in watchdog.splitlines(keepends=True) if SPAN.search(line)]
@@ -545,9 +547,10 @@ class Diagnostics:
         watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
         # Counted from what is published, after the trim.
         self.loops += sum(1 for line in watchdog.splitlines(keepends=True) if LOOPS.search(line))
-        if not (crashes or refused or watchdog or onboarding):
+        if not (crashes or refused or watchdog or onboarding or flow):
             return
         text = (crashes + (b"== onboarding ==\n" + onboarding if onboarding else b"") +
+                (b"== maestro flow ==\n" + flow if flow else b"") +
                 (b"== driver ==\n" + refused if refused else b"") +
                 (b"== spans ==\n" + section if section else b"") +
                 (b"== watchdog ==\n" + watchdog if watchdog else b"")).decode("utf-8", "replace").encode()
@@ -557,7 +560,7 @@ class Diagnostics:
         except OSError:
             return
         self.kept += 1
-        self.dropped[scenario] = from_crashes + from_driver + from_log + from_onboarding
+        self.dropped[scenario] = from_crashes + from_driver + from_log + from_onboarding + from_flow
 
     def recording(self, folder, scenario, token, notes):
         """The recording's notes (Recorder.notes: each failed conversion and avconvert's error class), added to the
@@ -588,6 +591,18 @@ def whole_lines(data, limit, newest=False):
         kept.append(line)
         size += len(line)
     return b"".join(reversed(kept) if newest else kept)
+
+
+def run_flow(launcher, udid, flow, result, log, env):
+    """One `maestro test` of a scripted flow on the simulator, its JUnit result at result and its output in log:
+    (passed, timed out), timed out when it ran out of FLOW_SECONDS and was stopped."""
+    try:
+        return not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format", "junit", "--output",
+                                  str(result)], log, env=env, timeout=device_tests.FLOW_SECONDS).returncode, False
+    except subprocess.TimeoutExpired:
+        return False, True
+    except subprocess.SubprocessError:
+        return False, False
 
 
 def last_lines(path, log):
@@ -809,14 +824,25 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             started = time.monotonic()
             if flow is not None:
                 at(f"{row['id']}: Maestro")
-                try:
-                    passed = not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format",
-                                                "junit", "--output", str(folder / (row["id"] + ".xml"))], log,
-                                               env=device_tests.with_session(
-                                                   maestro_env, token),
-                                               timeout=device_tests.FLOW_SECONDS).returncode
-                except subprocess.SubprocessError:
-                    passed = False
+                # Run 41358220544: sign-in's Maestro never ran its flow (no result file, a still recording 129 s
+                # long: its runner did not start). Such a flow alone is tried once more, after the runner is swept;
+                # one that ran and failed never is. Its output goes to its own private log, whose last lines a
+                # failed flow keeps in its private diagnostics.
+                flow_log = private / f"{row['id']}-flow.log"
+                passed, timed_out = run_flow(launcher, udid, flow, folder / (row["id"] + ".xml"), flow_log,
+                                             device_tests.with_session(maestro_env, token))
+                # Only a Maestro that ended by itself with no result is retried: one stopped at FLOW_SECONDS may have
+                # run (independent review of #177), and its retry would go past the budget its cap was admitted at.
+                if not passed and not timed_out and not device_tests.flow_ran(folder, row):
+                    sweep_driver(udid, env, log)
+                    scenario = row["id"]
+                    print(f"May device tests (ios): {scenario}: Maestro never ran its flow; it was tried once more")
+                    passed, timed_out = run_flow(launcher, udid, flow, folder / (row["id"] + ".xml"), flow_log,
+                                                 device_tests.with_session(maestro_env, token))
+                flow_lines = last_lines(flow_log, log)
+                flow_lines = b"" if passed else flow_lines
+            else:
+                flow_lines, timed_out = b"", False
             onboarding_log = private / f"{row['id']}-onboarding.log"
             onboarded = device_tests.finish_onboarding(row, source, "ios", lambda path: not renders.quiet(
                 [str(launcher), "--device", udid, "test", str(path)], onboarding_log,
@@ -843,7 +869,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             device_tests.server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
             # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
             diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE,
-                             onboarding=onboarding)
+                             onboarding=onboarding, flow=flow_lines)
             accounts.finish(row, base, token)
             token = ""
             entry["videos"] = recorder.stop(folder)
@@ -854,7 +880,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if recorder.kept:
                 scenario, why = row["id"], recorder.kept
                 print(f"May device tests (ios): {scenario}: its recording was kept {why}")
-            device_tests.settle(entry, row, passed if flow is not None else None)
+            device_tests.settle(entry, row, passed if flow is not None else None, ran=device_tests.flow_ran(folder, row),
+                                timed_out=timed_out)
     finally:
         cleaned_count = device_tests.tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)
         accounts.abandon(base)

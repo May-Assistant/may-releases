@@ -206,10 +206,10 @@ class RunTests(Workspace):
                 events.append("begin")
                 super().begin()
 
-            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
+            def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
                 drivers.append(driver)
                 events.append(("keep", scenario, token, list(test.signed_out)))
-                super().keep(folder, scenario, token, driver, onboarding)
+                super().keep(folder, scenario, token, driver, onboarding, flow)
 
         calls, minted, report, out, run = self.run_it(diagnosed=Keeping, env={device_ios.DIAGNOSTICS: "true"})
         self.assertEqual(events, ["begin", ("keep", "sign-in", TOKEN + "1", []),
@@ -283,8 +283,8 @@ class RunTests(Workspace):
             def __init__(self, udid, env):
                 super().__init__(udid, env, reports=test.root / "no-reports", shown=lambda *a: b"")
 
-            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
-                super().keep(folder, scenario, token, driver, b"onboarding line\n")
+            def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
+                super().keep(folder, scenario, token, driver, b"onboarding line\n", flow)
 
         calls, minted, report, out, run = self.run_it(diagnosed=Keeping, env={device_ios.DIAGNOSTICS: "false"})
         self.assertIn("May device tests (ios): diagnostics kept for 2 scenarios (main-thread stalls not collected: "
@@ -377,9 +377,71 @@ class RunTests(Workspace):
         self.assertEqual(len(minted), 1, "no session for a scenario that never started")
 
     def test_a_missing_flow_or_failing_maestro_fails(self):
-        _, _, report, _, _ = self.run_it(maestro_fails=True)
+        calls, _, report, out, _ = self.run_it(maestro_fails=True)
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
-            ("fail", None), ("fail", "may-app has no Maestro flow for this scenario")])
+            ("fail", device_tests.FLOW_NOT_RUN), ("fail", "may-app has no Maestro flow for this scenario")])
+        flows = [argv for argv, _ in calls if "test" in argv and "--device" in argv]
+        self.assertEqual(len(flows), 2, "a flow Maestro never ran is tried once more, and only once")
+        self.assertIn("May device tests (ios): sign-in: Maestro never ran its flow; it was tried once more", out)
+
+    def flow_hook(self, attempts):
+        """quiet_hook: each `maestro test` of a scripted flow takes the next of attempts: "ran" writes its JUnit result
+        and fails, "not run" writes none and fails, "pass" writes one and passes, "late" writes none and is stopped at its time; its output names
+        the session."""
+        def hook(argv, log, timeout):
+            if "--output" in argv:
+                if not attempts:
+                    self.fail("the flow was run once more than it should be")
+                kind = attempts.pop(0)
+                with Path(log).open("ab") as output:
+                    output.write(b"Launch app... COMPLETED\nAssert that id: chats is visible... FAILED\n"
+                                 b"token " + TOKEN.encode() + b"\n")
+                if kind not in ("not run", "late"):
+                    Path(argv[argv.index("--output") + 1]).write_text("<testsuites/>")
+                if kind == "late":
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                if kind != "pass":
+                    raise subprocess.CalledProcessError(1, argv)
+        return hook
+
+    def test_a_flow_that_ran_and_failed_is_never_tried_again_and_keeps_its_last_lines_privately(self):
+        """Run 41358220544's follow-up: a failed scripted flow says why, and its last Maestro lines go to its private
+        diagnostics alone, through the redaction."""
+        self.quiet_hook = self.flow_hook(["ran"])
+        calls, _, report, out, run = self.run_it(selection="sign-in")
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("fail", device_tests.FLOW_FAILED)])
+        self.assertEqual(len([argv for argv, _ in calls if "test" in argv and "--device" in argv]), 1)
+        self.assertNotIn("tried once more", out)
+        self.assertTrue((run / "ios" / ("sign-in" + device_tests.DIAG)).is_file(), "the failed flow kept a diag")
+        diag = (run / "ios" / ("sign-in" + device_tests.DIAG)).read_bytes()
+        self.assertIn(b"== maestro flow ==\nLaunch app... COMPLETED\nAssert that id: chats is visible... FAILED\n", diag)
+        self.assertNotIn(TOKEN.encode(), diag)
+        self.assertNotIn("FAILED", out, "the flow's lines never reach the public log")
+        self.assertFalse((self.private / "sign-in-flow.log").exists(), "the flow's own log is folded into the run's")
+
+    def test_a_flow_stopped_at_its_time_is_never_tried_again(self):
+        """Independent review of #177: a flow stopped at FLOW_SECONDS has no result file yet may have run, and a retry
+        would take it past the budget its cap was admitted at."""
+        self.quiet_hook = self.flow_hook(["late"])
+        calls, _, report, out, _ = self.run_it(selection="sign-in")
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("fail", device_tests.FLOW_TIMED_OUT)])
+        self.assertEqual(len([argv for argv, _ in calls if "test" in argv and "--device" in argv]), 1)
+        self.assertNotIn("tried once more", out)
+
+    def test_a_flow_maestro_never_ran_is_swept_then_passes_on_its_one_retry(self):
+        self.quiet_hook = self.flow_hook(["not run", "pass"])
+        swept = []
+        real = device_ios.sweep_driver
+        with patch("device_ios.sweep_driver", side_effect=lambda udid, env, log, **k: swept.append(udid) or
+                   real(udid, env, log, listed="", **k)):
+            calls, _, report, out, run = self.run_it(selection="sign-in")
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("ui-pass", device_tests.UNCONFIGURED)])
+        self.assertEqual(len([argv for argv, _ in calls if "test" in argv and "--device" in argv]), 2)
+        self.assertEqual(swept, [UDID, UDID], "swept before the scenario, and again before its retry")
+        self.assertFalse((run / "ios" / ("sign-in" + device_tests.DIAG)).exists(), "a flow that passed keeps no lines")
 
     def test_a_flow_tagged_android_alone_is_skipped_on_ios(self):
         """connections.yaml was tagged android alone and ran on iOS (the coordinator, 24 Oct)."""
@@ -502,9 +564,9 @@ class RunTests(Workspace):
                 return super().stop(folder)
 
         class Diagnosed(device_ios.Diagnostics):
-            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
+            def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
                 order.append(("diagnostics", scenario))
-                return super().keep(folder, scenario, token, driver, onboarding)
+                return super().keep(folder, scenario, token, driver, onboarding, flow)
 
             def recording(self, folder, scenario, token, notes):
                 order.append(("recording notes", scenario, list(notes)))
@@ -658,9 +720,9 @@ class RunTests(Workspace):
         kept = []
 
         class Diagnosed(device_ios.Diagnostics):
-            def keep(self, folder, scenario, token, driver=None, onboarding=b""):
+            def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
                 kept.append(onboarding)
-                return super().keep(folder, scenario, token, driver, onboarding)
+                return super().keep(folder, scenario, token, driver, onboarding, flow)
 
         def agent(cli, goal, tag, device, work, token, model, seconds):
             return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}
