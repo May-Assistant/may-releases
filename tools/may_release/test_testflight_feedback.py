@@ -269,6 +269,23 @@ class StoreAndFileTests(Case):
         self.assertIn("(cut to fit)", body)
         self.assertLessEqual(len(body), tool.MAX_BODY)
 
+    def test_a_crash_is_also_labelled_crash_and_a_screenshot_is_not(self):
+        """Coordinator, 2 Nov: crashes are listed apart; the known submissions still come from the one label."""
+        folder = self.root / tool.STATE
+        folder.mkdir()
+        self.records(folder, count=2, images=False, log=LOG)
+        records = json.loads((folder / "records.json").read_text())
+        records[1]["kind"] = "crash"
+        (folder / "records.json").write_text(json.dumps(records))
+        posted = []
+        os.environ.update({tool.ISSUES_TOKEN: TOKEN, "GITHUB_RUN_ID": "4242"})
+        self.quiet(tool.file_issues, lambda m, p, payload, t: posted.append(payload) or (201, {}))
+        self.assertEqual([(payload["title"], payload["labels"]) for payload in posted], [
+            ("TestFlight feedback: screenshot in May Playground", ["testflight-feedback"]),
+            ("TestFlight feedback: crash in May Playground", ["testflight-feedback", "crash"])])
+        self.assertTrue(all(payload["labels"][0] == tool.LABEL for payload in posted),
+                        "every issue keeps the label the known submissions are read from")
+
     def test_a_step_refuses_another_steps_credential(self):
         folder = self.root / tool.STATE
         folder.mkdir()
