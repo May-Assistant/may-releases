@@ -654,6 +654,248 @@ def loop_census_wanted():
     return os.environ.get(LOOP_CENSUS, "").strip() == "true"
 
 
+# Coordinator, 2 Nov: build 12 crashed when a notification was tapped, and no device test opens May from one. Before the
+# notification scenarios, a one-off spike (dispatched with ios_notif_spike, instead of the scenarios) finds whether
+# Maestro can tap a notification on the simulator at all. May asks for permission in its own UI alone, so may-app's
+# subflow ALLOW_FLOW allows it; the push is Apple's generic alert alone (no May key), its title SPIKE_TITLE; it is
+# tapped as a banner, else in Notification Centre, with May in the background and then not running. Only fixed lines
+# reach the public log; Maestro's output stays in the private log.
+NOTIF_SPIKE = "MAY_IOS_NOTIF_SPIKE"
+ALLOW_FLOW = "subflows/allow-notifications.yaml"
+SPIKE_TITLE = "May device test spike"
+SPIKE_PAYLOAD = {"Simulator Target Bundle": BUNDLE, "aps": {"alert": {"title": SPIKE_TITLE, "body": "Open May"}}}
+SPIKE_WAIT_MS, SPIKE_FRONT_IDS = 15000, "chats|onboarding|signin"
+# Coordinator, 2 Nov: the spike is the crash's repro too (N cannot run a simulator). After the generic tap, a chat reply
+# and a brief, shaped as may-app's server sends them, are pushed and tapped, warm then cold. Their keys are read at run
+# time from the fetched commit's PUSH_SOURCE (its data union: the members naming kind 'chat_reply' and brief_id), never
+# kept here; the ids are placeholders (the route only opens a chat or the Agenda). A May crash report that appears is
+# "crash on notification open: yes" in the log; the report itself, its faulting thread's frames and their file:line
+# (atos, on May's own binary) go to the scenario's private diagnostics alone.
+PUSH_SOURCE = "backend/src/effects/push.ts"
+PUSH_FIELD = re.compile(r"\b([a-z_]{1,40})\s*:\s*('[a-z_]{1,40}'|string \| null|string)\s*[;}]")
+PUSH_MEMBER = re.compile(r"\{[^{}]{1,400}\}")
+PUSH_KEY = re.compile(r"\b\w+\??\s*:")
+SPIKE_KINDS = (("chat reply", "kind: 'chat_reply'"), ("brief", "brief_id:"))
+SPIKE_DIAG = "notification-spike"
+SPIKE_SETTLE_SECONDS = 8
+SIMCTL_SECONDS = 60
+# The private marker a crash leaves: device_tests.py verdict, after the seal, fails the job on it.
+SPIKE_CRASHED = device_tests.SPIKE_CRASHED
+SPIKE_IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}")
+
+
+def push_payloads(source, today):
+    """(name, payload) for each SPIKE_KINDS member of may-app's push data, from PUSH_SOURCE at run time: its keys with a
+    placeholder value each (null where the server may send null, today for a date); [] when the file or a member is
+    not found, so no shape is guessed."""
+    path = source / PUSH_SOURCE
+    try:
+        text = path.read_text() if path.is_file() and not path.is_symlink() else ""
+    except (OSError, UnicodeDecodeError):
+        text = ""
+    found = []
+    for name, marker in SPIKE_KINDS:
+        member = next((m.group(0) for m in PUSH_MEMBER.finditer(text) if marker in m.group(0)), None)
+        fields = PUSH_FIELD.findall(member or "")
+        # Every key the member names must be one PUSH_FIELD reads (an optional, number or boolean member is not), so
+        # a payload is never built with some of its keys alone (coordinator's review of #181).
+        if not fields or len(fields) != len(PUSH_KEY.findall(member)):
+            return []
+        data = {key: (kind.strip("'") if kind.startswith("'") else None if kind.endswith("null") else
+                      today if key.endswith("_date") else "device-test-" + key.replace("_", "-"))
+                for key, kind in fields}
+        found.append((name, dict(SPIKE_PAYLOAD, **data)))
+    return found
+
+
+def own_reports(diagnostics, before):
+    """May's own crash reports that were not there before."""
+    found = []
+    for path in diagnostics.crash_reports():
+        if path in before:
+            continue
+        try:
+            with path.open("rb") as stream:
+                head = stream.read(REPORT_HEAD)
+        except OSError:
+            continue
+        if OWN_REPORT.search(head):
+            found.append(path)
+    return found
+
+
+def spike_symbols(data, app, env):
+    """file:line for the faulting thread's top frames in May's own code (atos, against the build on this runner), one
+    "frame <n> <line>" line each, numbered as crash_frames numbers them; b"" when the report or atos gives none. Every
+    image of the report that is a file of its own in the app folder counts (a Debug build has the stub MayPlayground
+    and MayPlayground.debug.dylib), each symbolicated at its own base (review of #181). Symbol names and source paths
+    alone, never a line of source."""
+    try:
+        report = json.loads(data.partition(b"\n")[2])
+        thread = report["threads"][report["faultingThread"]]
+        frames, images = thread["frames"][:CRASH_FRAMES], report.get("usedImages") or []
+    except (ValueError, KeyError, IndexError, TypeError):
+        return b""
+    if not isinstance(frames, list) or not isinstance(images, list):
+        return b""
+    wanted = {}  # imageIndex: (binary, base, [(frame number, address)])
+    for number, frame in enumerate(frames):
+        frame = frame if isinstance(frame, dict) else {}
+        index, offset = frame.get("imageIndex"), frame.get("imageOffset")
+        if not (type(index) is int and type(offset) is int and 0 <= index < len(images) and offset >= 0):
+            continue
+        image = images[index] if isinstance(images[index], dict) else {}
+        name, base = image.get("name"), image.get("base")
+        if not (isinstance(name, str) and SPIKE_IMAGE.fullmatch(name) and type(base) is int and base >= 0):
+            continue
+        binary = app / name
+        if binary.is_file() and not binary.is_symlink():
+            wanted.setdefault(index, (binary, base, []))[2].append((number, hex(base + offset)))
+    found = {}
+    for binary, base, addresses in wanted.values():
+        done = device_tests.bounded_output(["xcrun", "atos", "-o", str(binary), "-l", hex(base),
+                                            *[address for _, address in addresses]], env)
+        if done is None or done[0]:
+            continue
+        lines = done[1].decode("utf-8", "replace").splitlines()
+        if len(lines) == len(addresses):  # one line per address, in order, or none of them is trusted
+            found.update((number, line) for (number, _), line in zip(addresses, lines))
+    return b"".join(f"frame {number} {FRAME_NAME.sub('?', found[number])[:2 * MAX_FRAME_NAME]}\n".encode()
+                    for number in sorted(found))
+
+
+def notif_spike_wanted():
+    return os.environ.get(NOTIF_SPIKE, "").strip() == "true"
+
+
+def spike_flow(steps):
+    """A spike step's Maestro flow: May's app id and steps this server wrote, never a may-app line."""
+    return f"appId: {BUNDLE}\n---\n{steps}"
+
+
+SPIKE_HOME = "- pressKey: Home\n"
+SPIKE_BANNER = (f'- extendedWaitUntil:\n    visible: "{SPIKE_TITLE}"\n    timeout: {SPIKE_WAIT_MS}\n'
+                f'- tapOn: "{SPIKE_TITLE}"\n')
+SPIKE_CENTRE = f'- swipe:\n    start: "50%,1%"\n    end: "50%,70%"\n    duration: 600\n{SPIKE_BANNER}'
+SPIKE_FRONT = f'- extendedWaitUntil:\n    visible:\n      id: "{SPIKE_FRONT_IDS}"\n    timeout: 20000\n'
+
+
+def notification_spike(udid, env, maestro_env, launcher, source, private, log, token, diagnostics=None, folder=None,
+                       app=None):
+    """The spike: fixed lines, one for each step, in the public log; nothing it reads is kept there. Returns how many
+    May crash reports came in (each tied to its variant, or found late)."""
+    def say(why):
+        # why is made of this function's fixed words alone (never Maestro's output or anything the device said).
+        print(f"May device tests (ios): notification spike: {why}")
+
+    def flow(name, text, run_env):
+        path = private / f"spike-{name}.yaml"
+        path.write_text(text)
+        try:
+            return not renders.quiet([str(launcher), "--device", udid, "test", str(path)], log, env=run_env,
+                                     timeout=device_tests.FLOW_SECONDS).returncode
+        except subprocess.SubprocessError:
+            return False
+
+    def simctl(*argv):
+        try:
+            return not renders.quiet(["xcrun", "simctl", *argv], log, env=env, timeout=SIMCTL_SECONDS).returncode
+        except subprocess.SubprocessError:
+            return False
+
+    # Review of #181: a report is tied to the variant it came in during (after the tap, and again after the front
+    # check, so a slow ReportCrash still counts); one that came in between variants, or after the last, is "found
+    # late", never given to the next variant. seen holds every report already looked at.
+    seen = set(diagnostics.crash_reports()) if diagnostics is not None else set()
+    found, late = [], []
+
+    def fresh():
+        if diagnostics is None:
+            return []
+        new = own_reports(diagnostics, seen)
+        seen.update(diagnostics.crash_reports())
+        found.extend(new)
+        return new
+
+    payload = private / "spike.apns"
+
+    def tap(variant, shaped):
+        if variant == "warm":
+            ready = flow("home", spike_flow(SPIKE_HOME), maestro_env)
+        else:
+            ready = simctl("terminate", udid, BUNDLE)
+        payload.write_text(json.dumps(shaped))
+        late.extend(fresh())
+        pushed = simctl("push", udid, BUNDLE, str(payload))
+        banner = flow(f"{variant}-banner", spike_flow(SPIKE_BANNER), maestro_env)
+        centre = False if banner else flow(f"{variant}-centre", spike_flow(SPIKE_CENTRE), maestro_env)
+        time.sleep(SPIKE_SETTLE_SECONDS)
+        crashed = fresh()
+        front = flow(f"{variant}-front", spike_flow(SPIKE_FRONT), maestro_env) if banner or centre else False
+        crashed += fresh()
+        return ready, pushed, banner, centre, crashed, front
+
+    def variants():
+        launch(udid, env, token, log)
+        try:
+            allowed = not renders.quiet([str(launcher), "--device", udid, "test", str(allow)], log,
+                                        env=device_tests.with_session(maestro_env, token),
+                                        timeout=device_tests.FLOW_SECONDS).returncode
+        except subprocess.SubprocessError:
+            allowed = False
+        say("notifications allowed: " + ("passed" if allowed else "failed"))
+        for variant in ("warm", "cold"):
+            ready, pushed, banner, centre, crashed, front = tap(variant, SPIKE_PAYLOAD)
+            say(f"{variant}: May {'sent to the background' if variant == 'warm' else 'stopped'} "
+                f"{'yes' if ready else 'no'}, pushed {'yes' if pushed else 'no'}, banner tap "
+                f"{'passed' if banner else 'failed'}, Notification Centre tap "
+                f"{'not tried' if banner else 'passed' if centre else 'failed'}, crash on notification open "
+                f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}")
+        if diagnostics is None:
+            return
+        payloads = push_payloads(source, datetime.date.today().isoformat())
+        if not payloads:
+            say("may-app's push data was not found, so no chat reply or brief was pushed")
+            return
+        for name, shaped in payloads:
+            for variant in ("warm", "cold"):
+                launch(udid, env, token, log)
+                ready, pushed, banner, centre, crashed, front = tap(variant, shaped)
+                say(f"{name} {variant}: pushed {'yes' if pushed else 'no'}, tap "
+                    f"{'passed' if banner or centre else 'failed'}, crash on notification open "
+                    f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}")
+
+    allow = source / device_tests.FLOWS_DIR / ALLOW_FLOW
+    if not allow.is_file() or allow.is_symlink():
+        say("may-app has no subflow allow-notifications.yaml, so nothing was pushed")
+        return 0
+    try:
+        variants()
+    finally:
+        if diagnostics is not None:
+            # A crash in the last variant's front check, or a slow report, has one more settle to come in.
+            time.sleep(SPIKE_SETTLE_SECONDS)
+            late.extend(fresh())
+            if late:
+                say("a May crash report came in outside any variant, found late: yes")
+            symbols = []
+            for path in found:
+                try:
+                    data = path.read_bytes()[:MAX_REPORT]
+                except OSError:
+                    continue
+                symbols.append(spike_symbols(data, app, env) if app else b"")
+            # The crash reports themselves, each with its faulting thread's frames, as every scenario's diagnostics
+            # keep them; then the file:line of May's own frames. Private alone (the run's may-renders release).
+            diagnostics.keep(folder, SPIKE_DIAG, token)
+            lines, _ = kept_lines(b"".join(symbols), token)
+            path = folder / (SPIKE_DIAG + device_tests.DIAG)
+            if lines and path.is_file():
+                kept = path.read_bytes()
+                path.write_bytes((kept + b"== May's frames, file:line ==\n" + lines)[:device_tests.MAX_DIAG])
+    return len(found)
+
+
 # Run 41281021335 (coordinator, 1 Nov): a runner left by one scenario (the agent's long-lived Maestro driver, or a
 # scripted flow's), or a half-started one a killed call left, must not reach the next. Before each scenario the runner
 # app is terminated on the simulator and any of this user's `xcodebuild test-without-building` for this simulator is
@@ -726,6 +968,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     # Run 40203481816: chat ran second and wedged for 19 minutes, so poll and poll-skip found no budget left. The
     # scenarios most likely to wedge run last on iOS (coordinator, 25 Oct); the rest keep the list's order.
     chosen.sort(key=lambda row: IOS_LAST.index(row["id"]) + 1 if row["id"] in IOS_LAST else 0)
+    if notif_spike_wanted():
+        chosen = []  # the spike runs instead: no scenario's agent, account or chat is set up (review of #181)
     agents, staged = device_tests.uses(chosen)
     require_step_secrets((device_tests.SIGNIN_SECRET, device_agent.OAUTH))
     secret = os.environ.pop(device_tests.SIGNIN_SECRET, "")
@@ -735,7 +979,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     literals = device_tests.app_sources(root, "ios")
     if not (root / APP / "Info.plist").is_file():
         raise DeviceTestsError("The Playground app is not built")
-    base = device_tests.staging(secret, staged)
+    base = device_tests.staging(secret, staged or notif_spike_wanted())
     outward = os.environ.get(device_tests.OUTWARD, "").strip() != "off"
     skipped, accounts = device_tests.switched_off(), device_tests.Accounts(chosen, minted, deleted_by, "ios", revoked_by)
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
@@ -776,6 +1020,20 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
         if renders.quiet(["xcrun", "simctl", "install", udid, str(root / APP)], log, env=env).returncode:
             raise DeviceTestsError("May Playground did not install on the simulator; no scenario ran")
         budget = (budgeted or device_tests.Budget)()
+        if notif_spike_wanted():
+            # The spike, instead of the scenarios: one session on the shared test account, signed out at the end.
+            print("May device tests (ios): the notification spike runs instead of the scenarios")
+            (private / SPIKE_CRASHED).unlink(missing_ok=True)
+            token = minted(base, secret)
+            try:
+                diagnostics.begin()
+                crashes = notification_spike(udid, env, maestro_env, launcher, source, private, log, token,
+                                             diagnostics, folder, root / APP)
+            finally:
+                revoked_by(base, token)
+                token = ""
+            if crashes:
+                write_private(private / SPIKE_CRASHED, b"true")
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
                      "server": []}

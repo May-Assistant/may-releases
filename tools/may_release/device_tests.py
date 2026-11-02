@@ -200,6 +200,8 @@ RECORD = "record"
 RUN_BUDGET_SECONDS = 90 * 60
 BUDGET = "skipped: the run's time budget left no room for it (RUN_BUDGET_SECONDS)"
 OUT, SEALED, VERDICTS = "may-device-out", "may-device-sealed", "device-verdicts.json"
+# iOS's notification spike (device_ios.py) leaves this private marker when a May crash report came in.
+SPIKE_CRASHED = "device-spike-crashed"
 AGENTS = "device-agents.json"
 SERIAL = "emulator-5554"
 # The fixed reasons a report may give (publish.py accepts these words alone).
@@ -2333,6 +2335,8 @@ def verdict(platform="android"):
         raise DeviceTestsError("No scenario verdicts are recorded") from None
     if not isinstance(verdicts, list) or "fail" in verdicts:
         raise DeviceTestsError("A scenario failed")
+    if (runner_root() / "may-private" / SPIKE_CRASHED).exists():
+        raise DeviceTestsError("May crashed on opening a notification in the spike")
     print(f"May device tests ({platform}): no scenario failed")
 
 

@@ -430,6 +430,241 @@ class RunTests(Workspace):
         self.assertEqual(len([argv for argv, _ in calls if "test" in argv and "--device" in argv]), 1)
         self.assertNotIn("tried once more", out)
 
+    # Made-up keys around the two markers the spike looks for: may-app's own push data is read on the runner alone.
+    PUSH_TS = ("export interface Sent {\n  data: { item_ref: string } | { brief_id: string; issued_date: string }\n"
+               "    | { kind: 'chat_reply'; room_ref: string; parent_ref: string | null; note_ref: string };\n}\n")
+    ATOS = "ChatRoute.open(_:) (in MayPlayground.debug.dylib) (ChatRoute.swift:42)"
+
+    STUB, DYLIB = 4294934528, 4294967296
+
+    def report(self):
+        """A Debug build's .ips report (its header line, then its JSON body): the faulting thread runs through
+        Swift's runtime, May's debug dylib twice and the stub executable, each at its own base."""
+        images = [{"base": self.STUB, "name": "MayPlayground"}, {"base": self.DYLIB, "name": "MayPlayground.debug.dylib"},
+                  {"base": 6442450944, "name": "libswift_Concurrency.dylib"}]
+        frames = [{"imageOffset": 16, "imageIndex": 2, "symbol": "swift_unexpectedError"},
+                  {"imageOffset": 4096, "imageIndex": 1, "symbol": "$s3May9ChatRouteV4openyyF"},
+                  {"imageOffset": 8192, "imageIndex": 1, "symbol": "leak"},
+                  {"imageOffset": 1024, "imageIndex": 0, "symbol": "main"}]
+        body = {"app_name": "MayPlayground", "exception": {"type": "EXC_BREAKPOINT", "signal": "SIGTRAP"},
+                "faultingThread": 0, "threads": [{"triggered": True, "frames": frames}], "usedImages": images}
+        return (b'{"app_name":"MayPlayground","bug_type":"309","bundleID":"io.github.mayassistant.may.playground"}\n' +
+                json.dumps(body, indent=1).encode())
+
+    def spike(self, allow=True, banner=True, centre=True, push=True, crash=(), atos=None, at="tap"):
+        """A dispatch with ios_notif_spike: (calls, minted, report, out, pushed, run). The spike's own flows pass or fail
+        as asked; a push carrying one of crash's keys leaves a May crash report, as build 12 did: at its tap, during
+        the front check after it, or (between) only once the next variant has begun."""
+        if allow:
+            (self.source / device_tests.FLOWS_DIR / "subflows").mkdir(parents=True, exist_ok=True)
+            (self.source / device_tests.FLOWS_DIR / device_ios.ALLOW_FLOW).write_text("appId: x\n---\n- tapOn: Allow\n")
+        if push:
+            (self.source / device_ios.PUSH_SOURCE).parent.mkdir(parents=True, exist_ok=True)
+            (self.source / device_ios.PUSH_SOURCE).write_text(self.PUSH_TS)
+        reports = self.root / "reports"
+        reports.mkdir(exist_ok=True)
+        pushed, self.atos, self.simctl_timeouts, written = [], [], [], []
+
+        def leave_report():
+            if at == "tap" or not written:  # a crash per tap; else one report per dispatch, the crash under test
+                written.append(True)
+                (reports / f"MayPlayground-2026-11-02-1200{len(pushed):02d}.ips").write_bytes(self.report())
+
+        def hook(argv, log, timeout):
+            with Path(log).open("ab") as output:
+                output.write(b"maestro said " + TOKEN.encode() + b"\n")
+            if argv[:3] in (["xcrun", "simctl", "push"], ["xcrun", "simctl", "terminate"]):
+                self.simctl_timeouts.append((argv[2], timeout))
+            if argv[:3] == ["xcrun", "simctl", "push"]:
+                pushed.append(json.loads(Path(argv[-1]).read_text()))
+            name = Path(argv[-1]).name
+            if (name.endswith("-banner.yaml") and not banner) or (name.endswith("-centre.yaml") and not centre):
+                raise subprocess.CalledProcessError(1, argv)
+            crashing = bool(pushed) and bool(set(crash) & set(pushed[-1]))
+            tapped = name.endswith(("-banner.yaml", "-centre.yaml"))
+            between = name == "spike-home.yaml" or argv[:3] == ["xcrun", "simctl", "terminate"]
+            if crashing and ((at == "tap" and tapped) or (at == "front" and name.endswith("-front.yaml")) or
+                             (at == "between" and between)):
+                leave_report()
+
+        def bounded(argv, env, **kwargs):
+            if argv[:2] == ["xcrun", "atos"]:
+                self.atos.append(argv)
+                if atos is not None:
+                    return atos
+                lines = {"MayPlayground.debug.dylib": [self.ATOS, "leak " + TOKEN],
+                         "MayPlayground": ["main (in MayPlayground) (MayPlaygroundApp.swift:7)"]}[Path(argv[3]).name]
+                return 0, ("\n".join(lines) + "\n").encode()
+            return None
+
+        self.quiet_hook = hook
+        (self.private / device_tests.AGENTS).unlink(missing_ok=True)
+        self.built()
+        (self.root / device_ios.APP / "MayPlayground").write_bytes(b"stub")
+        (self.root / device_ios.APP / "MayPlayground.debug.dylib").write_bytes(b"binary")
+        self.uses = []
+        real_uses = device_tests.uses
+        with patch.object(device_ios, "SPIKE_SETTLE_SECONDS", 0), patch("device_tests.bounded_output", bounded), \
+                patch("device_tests.uses", side_effect=lambda chosen: self.uses.append(list(chosen)) or
+                      real_uses(chosen)):
+            calls, minted, report, out, run = self.run_it(
+                env={device_ios.NOTIF_SPIKE: "true"},
+                diagnosed=lambda udid, env: device_ios.Diagnostics(udid, env, reports=reports, shown=lambda *a: b"",
+                                                                   demangle=lambda symbols, env: {}))
+        return calls, minted, report, out, pushed, run
+
+    def spike_lines(self, out):
+        return [line for line in out.splitlines() if "notification spike" in line]
+
+    def spike_diag(self, run):
+        found = list(run.glob("ios/**/" + device_ios.SPIKE_DIAG + device_tests.DIAG))
+        return found[0].read_bytes() if found else None
+
+    SAID = "May device tests (ios): notification spike: "
+    GENERIC = [
+        "May device tests (ios): the notification spike runs instead of the scenarios",
+        SAID + "notifications allowed: passed",
+        SAID + "warm: May sent to the background yes, pushed yes, banner tap passed, Notification Centre tap not tried, "
+        "crash on notification open no, May in front yes",
+        SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, crash on "
+        "notification open no, May in front yes"]
+
+    def test_the_spike_taps_a_pushed_notification_warm_then_cold_instead_of_the_scenarios(self):
+        """Coordinator, 2 Nov: build 12 crashed on a notification tap; first find whether one can be tapped at all."""
+        calls, minted, report, out, pushed, run = self.spike()
+        self.assertEqual(report["scenarios"], [], "the spike runs instead of the scenarios")
+        self.assertEqual(self.spike_lines(out), self.GENERIC + [
+            self.SAID + f"{name} {variant}: pushed yes, tap passed, crash on notification open no, May in front yes"
+            for name in ("chat reply", "brief") for variant in ("warm", "cold")])
+        self.assertEqual(pushed[:2], [device_ios.SPIKE_PAYLOAD] * 2)
+        self.assertEqual(set(device_ios.SPIKE_PAYLOAD["aps"]), {"alert"}, "Apple's generic alert alone, no May key")
+        self.assertEqual(len(minted), 1)
+        self.assertEqual(self.signed_out, [TOKEN + "1"], "the spike's one session is signed out")
+        self.assertIn(["xcrun", "simctl", "terminate", UDID, device_ios.BUNDLE], [argv for argv, _ in calls])
+        self.assertNotIn(TOKEN, out)
+        self.assertNotIn("maestro said", out, "Maestro's output never reaches the public log")
+        self.assertEqual(self.atos, [], "no crash, so nothing was symbolicated")
+        self.assertFalse((self.private / device_tests.SPIKE_CRASHED).exists())
+        self.assertEqual(self.uses, [[]], "no scenario's agent, account or chat is set up (review of #181)")
+        pushes = [timeout for verb, timeout in self.simctl_timeouts if verb == "push"]
+        self.assertEqual(pushes, [device_ios.SIMCTL_SECONDS] * 6, "every push is bounded (review of #181)")
+        self.assertIn(("terminate", device_ios.SIMCTL_SECONDS), self.simctl_timeouts, "the cold stop is bounded")
+
+    def test_a_chat_reply_and_a_brief_are_pushed_with_may_apps_own_keys_read_at_run_time(self):
+        """Coordinator, 2 Nov: the spike is the crash's repro too; the shapes come from the fetched commit, never from
+        here."""
+        _, _, _, _, pushed, _ = self.spike()
+        today = device_ios.datetime.date.today().isoformat()
+        chat = dict(device_ios.SPIKE_PAYLOAD, kind="chat_reply", room_ref="device-test-room-ref", parent_ref=None,
+                    note_ref="device-test-note-ref")
+        brief = dict(device_ios.SPIKE_PAYLOAD, brief_id="device-test-brief-id", issued_date=today)
+        self.assertEqual(pushed[2:], [chat, chat, brief, brief])
+        self.assertEqual(device_ios.push_payloads(self.source, today), [("chat reply", chat), ("brief", brief)])
+        for text in ("", "{ kind: 'chat_reply'; room_ref: string }", "{ brief_id: string }",
+                     self.PUSH_TS.replace("note_ref: string", "note_ref?: string"),
+                     self.PUSH_TS.replace("issued_date: string", "issued_date: string; count: number")):
+            (self.source / device_ios.PUSH_SOURCE).write_text(text)
+            self.assertEqual(device_ios.push_payloads(self.source, today), [], "both or none: no shape is guessed")
+
+    def test_a_crash_on_opening_a_notification_is_yes_in_the_log_and_its_frames_go_to_the_private_diag(self):
+        _, _, _, out, _, run = self.spike(crash=["kind"])
+        self.assertEqual(self.spike_lines(out)[4:], [
+            self.SAID + "chat reply warm: pushed yes, tap passed, crash on notification open yes, May in front yes",
+            self.SAID + "chat reply cold: pushed yes, tap passed, crash on notification open yes, May in front yes",
+            self.SAID + "brief warm: pushed yes, tap passed, crash on notification open no, May in front yes",
+            self.SAID + "brief cold: pushed yes, tap passed, crash on notification open no, May in front yes"])
+        for absent in ("ChatRoute", "swift_unexpectedError", ".swift", "room_ref", "chat_reply"):
+            self.assertNotIn(absent, out, "the public log says yes or no alone")
+        text = self.spike_diag(run)
+        self.assertIsNotNone(text, "the crash's private diag was kept")
+        self.assertEqual(text.count(b"== crash ==\n"), 2, "each crash report, kept once")
+        self.assertIn(b"faulting thread, top frames:\nframe 0 libswift_Concurrency.dylib swift_unexpectedError\n"
+                      b"frame 1 MayPlayground.debug.dylib $s3May9ChatRouteV4openyyF\n", text, "frame 0 included")
+        self.assertIn(b"== May's frames, file:line ==\nframe 1 " + self.ATOS.encode() + b"\nframe 3 main (in "
+                      b"MayPlayground) (MayPlaygroundApp.swift:7)\n", text, "frame 2's line held the session")
+        app = self.root / device_ios.APP
+        self.assertEqual(self.atos, [
+            ["xcrun", "atos", "-o", str(app / "MayPlayground.debug.dylib"), "-l", hex(self.DYLIB),
+             hex(self.DYLIB + 4096), hex(self.DYLIB + 8192)],
+            ["xcrun", "atos", "-o", str(app / "MayPlayground"), "-l", hex(self.STUB), hex(self.STUB + 1024)]] * 2,
+            "each crash's images at their own bases, the Debug stub's too (review of #181)")
+        self.assertTrue((self.private / device_tests.SPIKE_CRASHED).exists())
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
+                self.assertRaisesRegex(DeviceTestsError, "^May crashed on opening a notification in the spike$"):
+            device_tests.verdict("ios")
+        self.assertNotIn(TOKEN.encode(), text, "atos's lines go through the same redaction")
+        self.assertTrue(publish.diagnostics_ok(text))
+
+    def test_a_crash_that_comes_in_during_the_front_check_is_still_its_variants(self):
+        """Review of #181: one look 8 s after the tap missed a report written later, and gave it to the next variant."""
+        _, _, _, out, _, run = self.spike(crash=["brief_id"], at="front")
+        self.assertIn(self.SAID + "brief warm: pushed yes, tap passed, crash on notification open yes, May in front yes",
+                      out)
+        self.assertIn(self.SAID + "brief cold: pushed yes, tap passed, crash on notification open no, May in front yes",
+                      out)
+        self.assertNotIn("found late", out)
+        self.assertIsNotNone(self.spike_diag(run))
+
+    def test_a_crash_that_comes_in_between_variants_is_found_late_never_given_to_the_next(self):
+        _, _, _, out, _, run = self.spike(crash=["kind"], at="between")
+        self.assertNotIn("crash on notification open yes", out)
+        self.assertEqual(self.spike_lines(out)[-1], self.SAID + "a May crash report came in outside any variant, found "
+                                                                "late: yes")
+        self.assertIn(b"== crash ==\n", self.spike_diag(run))
+        self.assertTrue((self.private / device_tests.SPIKE_CRASHED).exists(), "a late crash fails the job too")
+
+    def test_without_push_data_the_generic_taps_crash_is_still_said_and_kept(self):
+        """Review of #181: the early return skipped keep, so the generic tap's crash was lost."""
+        _, _, _, out, pushed, run = self.spike(push=False, crash=["aps"])
+        self.assertEqual(self.spike_lines(out)[2:], [
+            self.SAID + "warm: May sent to the background yes, pushed yes, banner tap passed, Notification Centre tap not "
+            "tried, crash on notification open yes, May in front yes",
+            self.SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, crash on "
+            "notification open yes, May in front yes",
+            self.SAID + "may-app's push data was not found, so no chat reply or brief was pushed"])
+        self.assertIn(b"frame 0 libswift_Concurrency.dylib swift_unexpectedError\n", self.spike_diag(run))
+        self.assertTrue((self.private / device_tests.SPIKE_CRASHED).exists())
+
+    def test_a_crash_atos_cannot_read_still_keeps_its_report_and_frames(self):
+        _, _, _, out, _, run = self.spike(crash=["brief_id"], atos=(1, b"atos: no such file\n"))
+        self.assertIn(self.SAID + "brief cold: pushed yes, tap passed, crash on notification open yes, May in front yes",
+                      out)
+        text = self.spike_diag(run)
+        self.assertIn(b"frame 0 libswift_Concurrency.dylib swift_unexpectedError\n", text)
+        self.assertNotIn(b"== May's frames", text)
+        self.assertNotIn(b"atos:", text)
+
+    def test_without_may_apps_push_data_only_the_generic_notification_is_pushed(self):
+        _, _, _, out, pushed, run = self.spike(push=False)
+        self.assertEqual(self.spike_lines(out), self.GENERIC + [
+            self.SAID + "may-app's push data was not found, so no chat reply or brief was pushed"])
+        self.assertEqual(pushed, [device_ios.SPIKE_PAYLOAD] * 2)
+        self.assertEqual(self.signed_out, [TOKEN + "1"])
+
+    def test_a_banner_maestro_cannot_tap_is_tried_in_notification_centre(self):
+        _, _, _, out, _, _ = self.spike(banner=False)
+        self.assertIn(self.SAID + "warm: May sent to the background yes, pushed yes, banner tap failed, Notification "
+                      "Centre tap passed, crash on notification open no, May in front yes", out)
+        _, _, _, out, _, _ = self.spike(banner=False, centre=False)
+        self.assertIn(self.SAID + "cold: May stopped yes, pushed yes, banner tap failed, Notification Centre tap failed, "
+                      "crash on notification open no, May in front no", out)
+        self.assertIn(self.SAID + "brief cold: pushed yes, tap failed, crash on notification open no, May in front no",
+                      out)
+
+    def test_without_may_apps_allow_subflow_nothing_is_pushed(self):
+        _, minted, report, out, pushed, _ = self.spike(allow=False)
+        self.assertEqual(self.spike_lines(out), [
+            "May device tests (ios): the notification spike runs instead of the scenarios",
+            self.SAID + "may-app has no subflow allow-notifications.yaml, so nothing was pushed"])
+        self.assertEqual((pushed, report["scenarios"]), ([], []))
+        self.assertEqual(self.signed_out, [TOKEN + "1"], "its session is signed out all the same")
+
+    def test_without_the_spike_the_scenarios_run_and_nothing_is_pushed(self):
+        calls, _, report, out, _ = self.run_it()
+        self.assertNotIn("notification spike", out)
+        self.assertTrue(report["scenarios"])
+        self.assertFalse([argv for argv, _ in calls if argv[:3] == ["xcrun", "simctl", "push"]])
+
     def test_a_flow_maestro_never_ran_is_swept_then_passes_on_its_one_retry(self):
         self.quiet_hook = self.flow_hook(["not run", "pass"])
         swept = []
