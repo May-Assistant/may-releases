@@ -269,7 +269,7 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual(seen.get("chats"), [(TOKEN + "1", "qa-39557415738-a-chat", []),
                                          (TOKEN + "3", "qa-39557415738-a-routines", [TOKEN + "1", TOKEN + "2"])],
                          "chat and routines alone, each with its own session and tag, each before its app starts")
-        self.assertTrue(seen["cleanup"][2] in "Android test chat qa-39557415738-a-chat",
+        self.assertTrue(seen["cleanup"][2] in "Android chat qa-39557415738-a-chat",
                         "the run's cleanup tag covers the chat")
         self.assertNotIn("qa-39557415738", run_out)
         refused = []
@@ -721,15 +721,15 @@ class ServerTruthTests(unittest.TestCase):
                                      ("qa-41358220544-a-poll", "Android", "iOS")):
             with self.subTest(tag=tag):
                 filled = device_agent.filled(goal, tag)
-                self.assertIn(f"open the chat named {platform} test chat {tag},", filled)
-                self.assertNotIn(f"{other} test chat", filled)
+                self.assertIn(f"open the chat named {platform} chat {tag},", filled)
+                self.assertNotIn(f"{other} chat", filled)
                 self.assertNotIn("{", filled)
         self.assertEqual(device_agent.filled("{tag} task", "anything"), "anything task",
                          "a text without {platform} needs no platform letter")
         for tag in ("qa-1-x-poll", "qa--a-poll", "xqa-1-a-poll", "qa-1-ab-poll", "poll"):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 device_agent.filled(device_tests.CHAT_NAME, tag)
-        self.assertEqual(device_agent.filled(device_tests.CHAT_NAME, "qa-1700000000-i"), "iOS test chat qa-1700000000-i")
+        self.assertEqual(device_agent.filled(device_tests.CHAT_NAME, "qa-1700000000-i"), "iOS chat qa-1700000000-i")
 
     def test_the_agent_and_the_judge_read_the_filled_goal(self):
         seen = []
@@ -741,8 +741,8 @@ class ServerTruthTests(unittest.TestCase):
                                        "m")
             with tempfile.TemporaryDirectory() as work:
                 device_agent.judge(Path("/cli"), device_tests.CHAT_GOAL, "qa-5-a-poll", {}, Path(work) / "j", "t", "m")
-        self.assertEqual(seen[0], "open the chat named iOS test chat qa-5-i-poll")
-        self.assertIn("open the chat named Android test chat qa-5-a-poll", seen[1], "the judge reads the goal as given")
+        self.assertEqual(seen[0], "open the chat named iOS chat qa-5-i-poll")
+        self.assertIn("open the chat named Android chat qa-5-a-poll", seen[1], "the judge reads the goal as given")
 
     def test_make_chat_posts_the_tagged_name_with_the_session_and_reads_its_id(self):
         seen = []
@@ -760,11 +760,11 @@ class ServerTruthTests(unittest.TestCase):
 
         tag = "qa-39557415738-a-chat"
         self.assertEqual(device_tests.make_chat("https://s", TOKEN, tag, post(201, {"agent": {"id": "a7"}})), "a7")
-        self.assertEqual(seen, [("https://s/v1/agents", "POST", {"client_key": tag, "name": "Android test chat " + tag},
+        self.assertEqual(seen, [("https://s/v1/agents", "POST", {"client_key": tag, "name": "Android chat " + tag},
                                  "Bearer " + TOKEN)], "the platform first, in words (run 41358220544)")
         seen.clear()
         device_tests.make_chat("https://s", TOKEN, "qa-39557415738-i-poll", post(201, {"agent": {"id": "a7"}}))
-        self.assertEqual(seen[0][2]["name"], "iOS test chat qa-39557415738-i-poll")
+        self.assertEqual(seen[0][2]["name"], "iOS chat qa-39557415738-i-poll")
         self.assertTrue(device_tests.make_chat("https://s", TOKEN, tag, post(200, {"agent": {"id": "a7"}})),
                         "a repeat with the same key is the same chat")
         for status, body in ((201, {"agent": {}}), (201, {"agent": {"id": "../x"}}), (201, []), (403, {}),
@@ -802,7 +802,7 @@ class ServerTruthTests(unittest.TestCase):
         self.assertIs(device_tests.open_chat("https://s", TOKEN, tag, post([(201, {"agent": {"id": chat}}),
                                                                              (200, {"replayed": True})])), True,
                       "a repeat with the same key is the same message")
-        for answers, reason in (([(403, {})], device_tests.NO_CHAT),
+        for answers, reason in (([(403, {})], (device_tests.NO_CHAT, 403)),
                                 ([(201, {"agent": {"id": chat}}), (429, {})], device_tests.NO_FIRST),
                                 ([(201, {"agent": {"id": chat}}), (201, {})], device_tests.NO_FIRST)):
             with self.subTest(answers=answers):
@@ -816,13 +816,58 @@ class ServerTruthTests(unittest.TestCase):
                 self.assertIs(inspect.signature(run).parameters["made"].default, device_tests.open_chat)
 
     def test_a_chat_without_its_first_message_skips_its_scenario_with_that_reason(self):
-        for opened, reason in ((device_tests.NO_FIRST, device_tests.NO_FIRST), (False, device_tests.NO_CHAT),
-                               (device_tests.NO_CHAT, device_tests.NO_CHAT)):
+        for opened, reason, status in ((device_tests.NO_FIRST, device_tests.NO_FIRST, None),
+                                       (False, device_tests.NO_CHAT, None),
+                                       (device_tests.NO_CHAT, device_tests.NO_CHAT, None),
+                                       ((device_tests.NO_CHAT, 400), device_tests.NO_CHAT, 400),
+                                       ((device_tests.NO_CHAT, 0), device_tests.NO_CHAT, 0),
+                                       ((device_tests.NO_CHAT, "x"), device_tests.NO_CHAT, 0),
+                                       ((device_tests.NO_CHAT, 9999), device_tests.NO_CHAT, 0)):
             with self.subTest(opened=opened), patch("sys.stdout", io.StringIO()):
                 entry = {}
                 self.assertFalse(device_tests.own_chat({"chat": True, "id": "poll"}, entry, "https://s", TOKEN, "qa-1",
                                                        lambda base, token, tag: opened))
-                self.assertEqual(entry["reason"], reason)
+                self.assertEqual((entry["reason"], entry.get("chat_status")), (reason, status))
+
+    def test_a_chat_staging_did_not_make_keeps_its_status_privately(self):
+        """Run 41373739501: staging refused a 44-character chat name with a 400, and nothing said so."""
+        def refused(status):
+            def answer(request, timeout):
+                if status == 0:
+                    raise urllib.error.URLError("down")
+                raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+            return answer
+        for status in (400, 403, 0):
+            with self.subTest(status=status):
+                said = []
+                self.assertIsNone(device_tests.make_chat("https://s", TOKEN, "qa-1-a-poll", refused(status), said))
+                self.assertEqual(said, [status])
+                self.assertEqual(device_tests.open_chat("https://s", TOKEN, "qa-1-a-poll", refused(status)),
+                                 (device_tests.NO_CHAT, status))
+        row = {"id": "poll", "title": "x", "verdict": "skipped", "reason": device_tests.NO_CHAT, "videos": [],
+               "screenshots": [], "server": [], "chat_status": 400}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps({"device": "android", "scenarios": [row]}))
+            _, rows = publish.device_report(path, set(), {"poll": "Poll"})
+        self.assertNotIn("chat_status", rows[0], "the status stays in the private report alone")
+        self.assertNotIn("400", json.dumps(rows))
+
+    def test_every_chat_name_fits_stagings_forty_characters(self):
+        """Run 41373739501: "Android test chat qa-41373739501-a-poll-skip" was 44 characters; staging takes 40 at most
+        (may-app NAME_MAX_CHARS). Every chat row's name fits on both platforms, with a run id of 12 digits."""
+        self.assertEqual(device_tests.CHAT_NAME_MAX, 40)
+        rows = [row for row in device_tests.scenarios("all") if row.get("chat")]
+        self.assertTrue(rows)
+        longest = 0
+        for row in rows:
+            for letter in ("a", "i"):
+                with self.subTest(row=row["id"], letter=letter):
+                    name = device_agent.filled(device_tests.CHAT_NAME,
+                                               device_tests.scenario_tag(f"qa-{'9' * 12}-{letter}", row))
+                    longest = max(longest, len(name))
+                    self.assertLessEqual(len(name), device_tests.CHAT_NAME_MAX, name)
+        self.assertEqual(longest, 40, "Android's poll-skip, the longest, is at the limit")
 
     def test_a_card_row_seeds_a_line_in_mays_chat_then_one_for_you_card(self):
         """N, 30 Oct: the blank-chat test opens May's chat from a For you card, so staging gives that chat a message and
