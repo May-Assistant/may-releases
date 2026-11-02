@@ -209,7 +209,7 @@ class RunTests(Workspace):
             def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
                 drivers.append(driver)
                 events.append(("keep", scenario, token, list(test.signed_out)))
-                super().keep(folder, scenario, token, driver, onboarding)
+                super().keep(folder, scenario, token, driver, onboarding, flow)
 
         calls, minted, report, out, run = self.run_it(diagnosed=Keeping, env={device_ios.DIAGNOSTICS: "true"})
         self.assertEqual(events, ["begin", ("keep", "sign-in", TOKEN + "1", []),
@@ -284,7 +284,7 @@ class RunTests(Workspace):
                 super().__init__(udid, env, reports=test.root / "no-reports", shown=lambda *a: b"")
 
             def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
-                super().keep(folder, scenario, token, driver, b"onboarding line\n")
+                super().keep(folder, scenario, token, driver, b"onboarding line\n", flow)
 
         calls, minted, report, out, run = self.run_it(diagnosed=Keeping, env={device_ios.DIAGNOSTICS: "false"})
         self.assertIn("May device tests (ios): diagnostics kept for 2 scenarios (main-thread stalls not collected: "
@@ -386,7 +386,8 @@ class RunTests(Workspace):
 
     def flow_hook(self, attempts):
         """quiet_hook: each `maestro test` of a scripted flow takes the next of attempts: "ran" writes its JUnit result
-        and fails, "not run" writes none and fails, "pass" writes one and passes; its output names the session."""
+        and fails, "not run" writes none and fails, "pass" writes one and passes, "late" writes none and is stopped at its time; its output names
+        the session."""
         def hook(argv, log, timeout):
             if "--output" in argv:
                 if not attempts:
@@ -395,8 +396,10 @@ class RunTests(Workspace):
                 with Path(log).open("ab") as output:
                     output.write(b"Launch app... COMPLETED\nAssert that id: chats is visible... FAILED\n"
                                  b"token " + TOKEN.encode() + b"\n")
-                if kind != "not run":
+                if kind not in ("not run", "late"):
                     Path(argv[argv.index("--output") + 1]).write_text("<testsuites/>")
+                if kind == "late":
+                    raise subprocess.TimeoutExpired(argv, timeout)
                 if kind != "pass":
                     raise subprocess.CalledProcessError(1, argv)
         return hook
@@ -416,6 +419,16 @@ class RunTests(Workspace):
         self.assertNotIn(TOKEN.encode(), diag)
         self.assertNotIn("FAILED", out, "the flow's lines never reach the public log")
         self.assertFalse((self.private / "sign-in-flow.log").exists(), "the flow's own log is folded into the run's")
+
+    def test_a_flow_stopped_at_its_time_is_never_tried_again(self):
+        """Independent review of #177: a flow stopped at FLOW_SECONDS has no result file yet may have run, and a retry
+        would take it past the budget its cap was admitted at."""
+        self.quiet_hook = self.flow_hook(["late"])
+        calls, _, report, out, _ = self.run_it(selection="sign-in")
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("fail", device_tests.FLOW_TIMED_OUT)])
+        self.assertEqual(len([argv for argv, _ in calls if "test" in argv and "--device" in argv]), 1)
+        self.assertNotIn("tried once more", out)
 
     def test_a_flow_maestro_never_ran_is_swept_then_passes_on_its_one_retry(self):
         self.quiet_hook = self.flow_hook(["not run", "pass"])
@@ -553,7 +566,7 @@ class RunTests(Workspace):
         class Diagnosed(device_ios.Diagnostics):
             def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
                 order.append(("diagnostics", scenario))
-                return super().keep(folder, scenario, token, driver, onboarding)
+                return super().keep(folder, scenario, token, driver, onboarding, flow)
 
             def recording(self, folder, scenario, token, notes):
                 order.append(("recording notes", scenario, list(notes)))
@@ -709,7 +722,7 @@ class RunTests(Workspace):
         class Diagnosed(device_ios.Diagnostics):
             def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
                 kept.append(onboarding)
-                return super().keep(folder, scenario, token, driver, onboarding)
+                return super().keep(folder, scenario, token, driver, onboarding, flow)
 
         def agent(cli, goal, tag, device, work, token, model, seconds):
             return {"state": "ok", "outcome": "completed", "summary": "ok", "hierarchy": "h", "actions": 3}

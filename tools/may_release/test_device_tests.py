@@ -979,7 +979,7 @@ class RunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None, diagnosed=None,
-               start_fails=False, adb_said=None, exited=None, kernel=None):
+               start_fails=False, adb_said=None, exited=None, kernel=None, late=()):
         calls, self.maestro_envs = [], []
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
@@ -1008,6 +1008,8 @@ class RunTests(unittest.TestCase):
             calls.append(list(argv))
             if argv[0] == "/fake/maestro":
                 self.maestro_envs.append(dict(env or {}))
+            if argv[-1].endswith(".xml") and any(f"/{name}.xml" in argv[-1] for name in late):
+                raise subprocess.TimeoutExpired(argv, timeout)
             return 1 if argv[-1].endswith(".xml") and any(f"/{name}.xml" in argv[-1] for name in fail) else 0
 
         def screenshot(adb, env, path, log):
@@ -1269,6 +1271,15 @@ class RunTests(unittest.TestCase):
             self.assertEqual(report["scenarios"][1]["server"], [{"get": "/v1/connections", "status": 200, "pass": True}])
             _, report, _, _ = self.run_it(status=500)
             self.assertEqual(report["scenarios"][1]["verdict"], "fail", "a failed server check fails the scenario")
+
+    def test_a_flow_that_ran_out_of_time_says_so_never_that_it_never_ran(self):
+        """Independent review of #177: a flow stopped at FLOW_SECONDS wrote no result, yet it may have run."""
+        _, report, _, _ = self.run_it(selection="sign-in", late=("sign-in",))
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("fail", device_tests.FLOW_TIMED_OUT)])
+        _, report, _, _ = self.run_it(selection="sign-in", fail=("sign-in",))
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]],
+                         [("fail", device_tests.FLOW_NOT_RUN)], "a Maestro that ended by itself with no result")
 
     def test_outward_scenarios_are_skipped_when_switched_off(self):
         listed = json.loads(device_tests.SCENARIOS.read_text())
@@ -1634,6 +1645,9 @@ class ReasonTests(unittest.TestCase):
     def test_a_failed_maestro_row_says_why_in_fixed_words(self):
         """Run 41358220544: iOS's sign-in failed with no reason given."""
         row = {"driver": "maestro", "server": [{"get": "/v1/me"}]}
+        entry = {"server": [{"pass": True}]}
+        device_tests.settle(entry, row, False, ran=False, timed_out=True)
+        self.assertEqual(entry.get("reason"), device_tests.FLOW_TIMED_OUT)
         for passed, ran, server, reason in ((False, False, True, device_tests.FLOW_NOT_RUN),
                                             (False, True, True, device_tests.FLOW_FAILED),
                                             (True, True, False, device_tests.SERVER_FAILED),
@@ -1657,7 +1671,8 @@ class ReasonTests(unittest.TestCase):
 
     def test_every_reason_a_device_job_writes_is_one_publish_accepts(self):
         written = self.written_reasons()
-        self.assertTrue({device_tests.FLOW_NOT_RUN, device_tests.FLOW_FAILED, device_tests.SERVER_FAILED} <= written)
+        self.assertTrue({device_tests.FLOW_NOT_RUN, device_tests.FLOW_FAILED, device_tests.SERVER_FAILED,
+                         device_tests.FLOW_TIMED_OUT} <= written)
         self.assertIn(device_tests.BUDGET, written)
         self.assertIn(device_tests.UNTAGGED["android"], written)
         self.assertEqual(written - set(publish.REASONS), set())

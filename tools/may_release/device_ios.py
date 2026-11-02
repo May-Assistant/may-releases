@@ -594,13 +594,15 @@ def whole_lines(data, limit, newest=False):
 
 
 def run_flow(launcher, udid, flow, result, log, env):
-    """One `maestro test` of a scripted flow on the simulator, its JUnit result at result and its output in log: True
-    when it passed."""
+    """One `maestro test` of a scripted flow on the simulator, its JUnit result at result and its output in log:
+    (passed, timed out), timed out when it ran out of FLOW_SECONDS and was stopped."""
     try:
         return not renders.quiet([str(launcher), "--device", udid, "test", str(flow), "--format", "junit", "--output",
-                                  str(result)], log, env=env, timeout=device_tests.FLOW_SECONDS).returncode
+                                  str(result)], log, env=env, timeout=device_tests.FLOW_SECONDS).returncode, False
+    except subprocess.TimeoutExpired:
+        return False, True
     except subprocess.SubprocessError:
-        return False
+        return False, False
 
 
 def last_lines(path, log):
@@ -827,18 +829,20 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 # one that ran and failed never is. Its output goes to its own private log, whose last lines a
                 # failed flow keeps in its private diagnostics.
                 flow_log = private / f"{row['id']}-flow.log"
-                passed = run_flow(launcher, udid, flow, folder / (row["id"] + ".xml"), flow_log,
-                                  device_tests.with_session(maestro_env, token))
-                if not passed and not device_tests.flow_ran(folder, row):
+                passed, timed_out = run_flow(launcher, udid, flow, folder / (row["id"] + ".xml"), flow_log,
+                                             device_tests.with_session(maestro_env, token))
+                # Only a Maestro that ended by itself with no result is retried: one stopped at FLOW_SECONDS may have
+                # run (independent review of #177), and its retry would go past the budget its cap was admitted at.
+                if not passed and not timed_out and not device_tests.flow_ran(folder, row):
                     sweep_driver(udid, env, log)
                     scenario = row["id"]
                     print(f"May device tests (ios): {scenario}: Maestro never ran its flow; it was tried once more")
-                    passed = run_flow(launcher, udid, flow, folder / (row["id"] + ".xml"), flow_log,
-                                      device_tests.with_session(maestro_env, token))
+                    passed, timed_out = run_flow(launcher, udid, flow, folder / (row["id"] + ".xml"), flow_log,
+                                                 device_tests.with_session(maestro_env, token))
                 flow_lines = last_lines(flow_log, log)
                 flow_lines = b"" if passed else flow_lines
             else:
-                flow_lines = b""
+                flow_lines, timed_out = b"", False
             onboarding_log = private / f"{row['id']}-onboarding.log"
             onboarded = device_tests.finish_onboarding(row, source, "ios", lambda path: not renders.quiet(
                 [str(launcher), "--device", udid, "test", str(path)], onboarding_log,
@@ -876,7 +880,8 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if recorder.kept:
                 scenario, why = row["id"], recorder.kept
                 print(f"May device tests (ios): {scenario}: its recording was kept {why}")
-            device_tests.settle(entry, row, passed if flow is not None else None, ran=device_tests.flow_ran(folder, row))
+            device_tests.settle(entry, row, passed if flow is not None else None, ran=device_tests.flow_ran(folder, row),
+                                timed_out=timed_out)
     finally:
         cleaned_count = device_tests.tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)
         accounts.abandon(base)

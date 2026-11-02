@@ -1667,9 +1667,11 @@ def finish_onboarding(row, source, platform, drive):
 
 # Run 41358220544: iOS's sign-in failed with no reason given, and no result file: Maestro never ran the flow. A
 # Maestro row that fails says why in fixed words: the flow never ran (no JUnit result file, flow_ran), it ran and
-# failed, or it passed and a server check failed.
+# failed, or it passed and a server check failed. One that ran out of FLOW_SECONDS is "the flow timed out", whether or
+# not it wrote its result (independent review of #177).
 FLOW_NOT_RUN, FLOW_FAILED, SERVER_FAILED = ("Maestro never ran the flow (no result file)", "the flow failed",
                                             "a server check failed")
+FLOW_TIMED_OUT = "the flow timed out"
 
 
 def flow_ran(folder, row):
@@ -1678,9 +1680,9 @@ def flow_ran(folder, row):
     return result.is_file() and not result.is_symlink()
 
 
-def settle(entry, row, passed, ran=True):
+def settle(entry, row, passed, ran=True, timed_out=False):
     """A scenario's verdict after its run: a Maestro row's from its flow and server checks, and when it fails, why
-    (ran: whether Maestro wrote its result, flow_ran); an agent or smoke row waits for the judge (a smoke row keeps
+    (ran: whether Maestro wrote its result, flow_ran; timed_out: whether it ran out of FLOW_SECONDS); an agent or smoke row waits for the judge (a smoke row keeps
     whether Maestro drove the app)."""
     if row["driver"] == "maestro":
         server_ok = all(check["pass"] for check in entry["server"])
@@ -1688,7 +1690,8 @@ def settle(entry, row, passed, ran=True):
         if entry["verdict"] == "ui-pass":
             entry["reason"] = UNCONFIGURED
         elif entry["verdict"] == "fail":
-            entry["reason"] = SERVER_FAILED if passed else FLOW_FAILED if ran else FLOW_NOT_RUN
+            entry["reason"] = (SERVER_FAILED if passed else FLOW_TIMED_OUT if timed_out else FLOW_FAILED if ran
+                               else FLOW_NOT_RUN)
         return
     entry.update(verdict="fail", reason=NOT_JUDGED)
     if row["driver"] == SMOKE:
@@ -1811,6 +1814,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             recorder = Recorder(adb, env, row["id"], log)
             recorder.start()
             started = time.monotonic()
+            timed_out = False
             if flow is not None:
                 at(f"{row['id']}: Maestro")
                 try:
@@ -1819,7 +1823,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                          str(folder / (row["id"] + ".xml"))], log, env=with_session(maestro_env, token), check=False,
                         timeout=FLOW_SECONDS)
                 except subprocess.TimeoutExpired:
-                    passed = False
+                    passed, timed_out = False, True
             finish_onboarding(row, source, "android", lambda path: not flows.run_private(
                 [str(launcher), "--device", SERIAL, "test", str(path)], log, env=maestro_env, check=False,
                 timeout=ONBOARDING_SECONDS))
@@ -1842,7 +1846,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             diagnostics.keep(folder, row["id"], token)
             accounts.finish(row, base, token)
             entry["videos"] = recorder.stop(folder)
-            settle(entry, row, passed if flow is not None else None, ran=flow_ran(folder, row))
+            settle(entry, row, passed if flow is not None else None, ran=flow_ran(folder, row), timed_out=timed_out)
             token = ""
     finally:
         cleaned_count = tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)
@@ -1983,7 +1987,8 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
                                 truth=truth_lines(rows.get(entry["id"]), entry))
                 judged = judged_by(cli, goals[entry["id"]], scenario_tag(stored.get("tag", ""), entry), evidence,
                                    private / "judge" / entry["id"], token, model)
-            except (OSError, subprocess.SubprocessError, KeyError):
+            # ValueError: a stored tag without its platform letter (device_agent.filled) marks that row alone.
+            except (OSError, subprocess.SubprocessError, KeyError, ValueError):
                 judged = ("error", "")
         verdict_reason = combined(entry, record, judged, entry["id"] in sending, entry["id"] in looking)
         entry["agent"] = sealed_agent(record)
