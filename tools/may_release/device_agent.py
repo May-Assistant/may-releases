@@ -139,6 +139,24 @@ def finished(stdout_path):
     return "error" if not found or found.get("is_error") else "ok"
 
 
+# Run 41358220544: both platforms run at once on one staging account, so each agent's Chats list also holds the other
+# platform's chats, whose names differed from its own by one letter mid-tag; iOS's poll opened Android's. A goal (and a
+# chat's name, device_tests.make_chat) says the platform in words first: {platform}, from the tag's own platform
+# letter (device_tests.run_tag).
+PLATFORM_NAMES, TAG_PLATFORM = {"a": "Android", "i": "iOS"}, re.compile(r"qa-[0-9]+-([ai])(?:-|$)")
+
+
+def filled(text, tag):
+    """text with {tag} and {platform} filled in for the scenario's tag. A text naming {platform} needs a tag with the
+    platform's letter (ValueError otherwise), so no chat name or goal is ever written with the wrong platform."""
+    if "{platform}" in text:
+        found = TAG_PLATFORM.match(tag)
+        if found is None:
+            raise ValueError("The tag holds no platform letter")
+        text = text.replace("{platform}", PLATFORM_NAMES[found.group(1)])
+    return text.replace("{tag}", tag)
+
+
 def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS):
     """One scenario's agent run: {"state": ok|rate_limited|error|timeout, and the device server's record}. device is the
     device server's settings (MAY_DEVICE_PLATFORM and the emulator's or the simulator's handles), never a secret."""
@@ -148,7 +166,7 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
                                         "args": ["-I", "-S", "-B", str(SERVER)],
                                         "env": dict(device, MAY_DEVICE_AGENT_RESULT=str(result))}}}
     (work / "mcp.json").write_text(json.dumps(config))
-    command = base_command(cli, goal.replace("{tag}", tag), model) + [
+    command = base_command(cli, filled(goal, tag), model) + [
         "--mcp-config", str(work / "mcp.json"), "--allowedTools", "mcp__device",
         "--append-system-prompt", AGENT_PROMPT.format(tag=tag)]
     try:
@@ -212,7 +230,7 @@ def truth_text(agent):
 def judge(cli, goal, tag, agent, work, token, model):
     """The judge's verdict on one agent run: ("pass" | "fail" | "rate_limited" | "error", note)."""
     work = fresh(work)
-    prompt = JUDGE_PROMPT.format(goal=goal.replace("{tag}", tag), outcome=agent.get("outcome") or "none",
+    prompt = JUDGE_PROMPT.format(goal=filled(goal, tag), outcome=agent.get("outcome") or "none",
                                  actions=agent.get("actions", 0), summary=redacted(agent.get("summary")) or "(none)",
                                  hierarchy=agent.get("hierarchy") or "(none)",
                                  delivery=delivery_text(agent), truth=truth_text(agent))

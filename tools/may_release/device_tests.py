@@ -98,7 +98,10 @@ NOTE_END = "check that the note is shown on it."
 # A row with "chat": true talks to May in a chat of its own, made for it before its agent starts (make_chat: POST
 # /v1/agents, named CHAT_NAME with its tag, removed by the test session's cleanup with the tag), never in the shared
 # May chat that every earlier run wrote to (coordinator, 26 Oct). Its goal opens that chat by name.
-CHAT_NAME, CHAT_GOAL = "{tag} chat", "open the chat named {tag} chat"
+# Run 41358220544: the name says the platform first, in words (device_agent.filled), and the goal says the other
+# platform's chats are listed too and are never opened; the judge's truth stays the tag's.
+CHAT_NAME, CHAT_GOAL = "{platform} test chat {tag}", "open the chat named {platform} test chat {tag}"
+OTHER_CHATS = "Chats named for the other platform (Android or iOS) are also listed; never open them."
 # Run 40290647340: on the new chat's empty state the iOS driver refused every act, so the chat gets its first message
 # over the API (first_message) and the device never lands on it empty (coordinator, 26 Oct). The message holds no tag,
 # so no truth, delivery code or question card ever counts it or May's reply to it (run_messages starts at the tag).
@@ -328,7 +331,7 @@ def scenarios(selection="all", platform="android"):
                                                  len(c["note"]) <= MAX_NOTE and c["note"][6:] in row["goal"])
                         for c in row["truth"]) and
                     ("Send this message" in row["goal"]) == (row.get("chat") is True) and
-                    ("chat" not in row or CHAT_GOAL in row["goal"]) and
+                    ("chat" not in row or CHAT_GOAL in row["goal"] and OTHER_CHATS in row["goal"]) and
                     ("card" not in row or row["card"] is True and row.get("fresh") is True and "chat" not in row and
                      row["truth"] == [] and row.get("platforms") == ["ios"] and CARD_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
@@ -722,7 +725,7 @@ def make_chat(base, token, tag, post=urllib.request.urlopen):
     {client_key, name}, keyed by the tag so a repeat makes no second one. The chat's id when staging answered 200 or
     201 with one, else None. Nothing else from the reply is kept, and nothing is printed."""
     request = urllib.request.Request(base + "/v1/agents", method="POST",
-                                     data=json.dumps({"client_key": tag, "name": CHAT_NAME.replace("{tag}", tag)})
+                                     data=json.dumps({"client_key": tag, "name": device_agent.filled(CHAT_NAME, tag)})
                                      .encode(),
                                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
     try:

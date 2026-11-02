@@ -229,8 +229,9 @@ class ScenarioTests(unittest.TestCase):
         for scenario in ("chat", "poll", "poll-skip", "routines"):
             row = device_tests.scenarios(scenario)[0]
             self.assertIs(row["chat"], True)
-            self.assertIn("open the chat named {tag} chat, made for this test; do not open the chat named May or any "
-                          "other chat, and do not use the + button.", row["goal"])
+            self.assertIn("open the chat named {platform} test chat {tag}, made for this test; do not open the chat "
+                          "named May or any other chat, and do not use the + button. Chats named for the other "
+                          "platform (Android or iOS) are also listed; never open them.", row["goal"])
             self.assertNotIn("start a new chat", row["goal"])
         self.assertEqual([row["id"] for row in device_tests.scenarios() if row.get("chat")],
                          ["chat", "poll", "poll-skip", "routines"])
@@ -324,7 +325,10 @@ class ScenarioTests(unittest.TestCase):
         chat = device_tests.scenarios("chat")[0]
         shared = {key: value for key, value in chat.items() if key != "chat"}
         # Independent review of #132: a row that sends May a message needs a chat of its own, never the shared one.
-        for change in ({"goal": chat["goal"].replace("open the chat named {tag} chat", "open the chat named May")},
+        # Run 41358220544: a chat row's goal also says the other platform's chats are never opened.
+        for change in ({"goal": chat["goal"].replace("open the chat named {platform} test chat {tag}",
+                                                     "open the chat named May")},
+                       {"goal": chat["goal"].replace(" " + device_tests.OTHER_CHATS, "")},
                        {"chat": False}, {"_without_chat": True}):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "s.json"
@@ -385,7 +389,7 @@ class ScenarioTests(unittest.TestCase):
         for scenario in ("poll", "poll-skip"):
             with self.subTest(scenario=scenario):
                 goal = device_tests.scenarios(scenario)[0]["goal"]
-                self.assertIn("open the chat named {tag} chat", goal)
+                self.assertIn("open the chat named {platform} test chat {tag}", goal)
                 self.assertNotIn("Earlier question cards", goal)
         self.assertIn("check that the same question card now shows as skipped", device_tests.scenarios("poll-skip")[0]
                       ["goal"])
