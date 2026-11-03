@@ -37,8 +37,8 @@ hands over only that; a fresh post job opens both and posts (the split of may-re
            suite on the pull request, after it is read again and is still open at that head; a comment of the comment
            app's own that already carries this head's marker is edited in place instead, so a re-run's result wins.
            A suite whose record never arrived is reported from its job's result alone (MAY_SWIFT_RESULT,
-           MAY_ANDROID_RESULT, MAY_TOKENS_RESULT, MAY_WEB_RESULT, MAY_PROTOTYPE_RESULT: success, failure, or cancelled,
-           which is infra: no runner was acquired, or the job was cancelled). It fails when a suite did not pass.
+           MAY_ANDROID_RESULT, MAY_TOKENS_RESULT, MAY_WEB_RESULT, MAY_PROTOTYPE_RESULT: success, failure, or cancelled
+           or abandoned, which is infra: no runner was acquired, or the job was cancelled). It fails when a suite did not pass.
 """
 
 import argparse
@@ -73,6 +73,10 @@ RECIPIENT, DECRYPT_KEY = "MAY_RENDERS_RECIPIENT", "MAY_RENDERS_DECRYPT_KEY"
 AGE_IDENTITY = re.compile(r"AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}")
 SHA = re.compile(r"[0-9a-f]{40}")
 SUITES = ("swift", "android", "tokens", "web", "prototype")
+# A job that never finished: run 41624718553's Swift job ended "cancelled" with no macOS runner, and run 41660051862's
+# reached the post job as "abandoned" (coordinator, 3 Nov). Either is infra, in the comment and the status alike.
+NEVER_FINISHED = ("cancelled", "abandoned")
+INFRA = "infra: the job did not finish (no runner was acquired, or it was cancelled)"
 RESULT_ENV = {"swift": "MAY_SWIFT_RESULT", "android": "MAY_ANDROID_RESULT", "tokens": "MAY_TOKENS_RESULT",
               "web": "MAY_WEB_RESULT", "prototype": "MAY_PROTOTYPE_RESULT"}
 DERIVED = "may-ds-tests-derived"
@@ -564,9 +568,8 @@ def comment_body(sha, url, records, results):
         record = records.get(suite)
         if record is None:
             # Run 41624718553: the Swift job never got a macOS runner and ended "cancelled", which read "no result".
-            state = {"success": "passed", "failure": "failed",
-                     "cancelled": "infra: the job did not finish (no runner was acquired, or it was cancelled)"}.get(
-                results.get(suite), "no result")
+            state = INFRA if results.get(suite) in NEVER_FINISHED else \
+                {"success": "passed", "failure": "failed"}.get(results.get(suite), "no result")
             lines.append(f"| {TITLES[suite]} | {state} (no detail reached the post job) | | | |")
             continue
         if absent(record):
@@ -620,7 +623,9 @@ def status_description(records, results):
     for suite in SUITES:
         record = records.get(suite)
         if record is None:
-            parts.append(f"{suite} {'passed' if results.get(suite) == 'success' else 'failed'}")
+            result = results.get(suite)
+            parts.append(f"{suite} " + ("infra (did not finish)" if result in NEVER_FINISHED else
+                                        "passed" if result == "success" else "failed"))
         elif absent(record):
             parts.append(f"{suite} skipped")
         elif not record["ran"]:

@@ -563,6 +563,21 @@ class SealOpenPostTests(Case):
                       "cancelled) (no detail reached the post job) |", body)
         self.assertIn("no result", tool.comment_body(SHA, "", {}, {}))
 
+    def test_an_abandoned_job_is_infra_in_the_comment_and_the_status_alike(self):
+        """Run 41660051862: the Swift job got no runner and reached the post job as "abandoned", which read "no result"
+        in the comment and "swift failed" in the status (coordinator, 3 Nov)."""
+        others = {suite: "success" for suite in tool.SUITES if suite != "swift"}
+        for result in ("cancelled", "abandoned"):
+            with self.subTest(result=result):
+                results = {"swift": result, **others}
+                self.assertIn(f"| {tool.TITLES['swift']} | {tool.INFRA} (no detail reached the post job) |",
+                              tool.comment_body(SHA, "", {}, results))
+                description = tool.status_description({}, results)
+                self.assertTrue(description.startswith("swift infra (did not finish)"), description)
+                self.assertNotIn("swift failed", description)
+        self.assertTrue(tool.status_description({}, {"swift": "failure", **others}).startswith("swift failed"))
+        self.assertTrue(tool.status_description({}, {"swift": "success", **others}).startswith("swift passed"))
+
     def test_a_hundred_long_non_ascii_failures_still_seal(self):
         """Coordinator, 31 Oct (#65): ensure_ascii made a hundred long non-ASCII failures too large to seal."""
         failures = [{"name": "ü" * tool.MAX_NAME, "message": "é" * tool.MAX_MESSAGE}] * tool.MAX_FAILURES
