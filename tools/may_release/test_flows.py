@@ -159,6 +159,15 @@ class InstallEmulatorTest(unittest.TestCase):
         self.home = Path(self.directory.name) / "sdk"
         (self.home / "emulator").mkdir(parents=True)
         (self.home / "emulator" / "source.properties").write_text("Pkg.Revision=37.2.13\nPkg.BuildId=16740729\n")
+        (self.home / "emulator" / "package.xml").write_text(self.LISTING)
+
+    # The shape of the package.xml sdkmanager writes for its emulator (its license text left out).
+    LISTING = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><ns2:repository xmlns:ns2="x">'
+               '<license id="android-sdk-license" type="text">terms</license>'
+               '<localPackage path="emulator" obsolete="false"><type-details/>'
+               '<revision><major>37</major><minor>2</minor><micro>13</micro></revision>'
+               '<display-name>Android Emulator</display-name><uses-license ref="android-sdk-license"/>'
+               '</localPackage></ns2:repository>')
 
     def tearDown(self):
         self.directory.cleanup()
@@ -199,6 +208,32 @@ class InstallEmulatorTest(unittest.TestCase):
         self.assertEqual(flows.EMULATOR_GPU, "swiftshader_indirect")
         self.assertEqual([p.name for p in self.home.parent.iterdir() if p.name.startswith("may-emulator-")], [],
                          "the download and its unpacked copy are removed")
+
+    def test_the_pinned_emulator_keeps_sdkmanagers_package_listing_at_its_own_revision(self):
+        """Run 41623657138: without package.xml avdmanager said "emulator" package must be installed."""
+        self.install(self.zipped())
+        self.assertTrue((self.home / "emulator" / "package.xml").is_file(), "the pinned emulator has a listing")
+        listing = (self.home / "emulator" / "package.xml").read_text()
+        self.assertEqual(listing, self.LISTING.replace("<major>37</major><minor>2</minor><micro>13</micro>",
+                                                       "<major>36</major><minor>1</minor><micro>9</micro>"))
+
+    def test_no_listing_or_an_odd_one_stops_before_any_flow_and_leaves_the_emulator(self):
+        for case, listing in (("none", None),
+                              ("two revisions", self.LISTING.replace("</revision>", "</revision><revision><major>1"
+                                                                    "</major><minor>0</minor><micro>0</micro>"
+                                                                    "</revision>", 1)),
+                              ("no revision", self.LISTING.replace("<major>37</major>", "")),
+                              ("another package", self.LISTING.replace('path="emulator"', 'path="platform-tools"'))):
+            with self.subTest(case=case):
+                path = self.home / "emulator" / "package.xml"
+                path.unlink(missing_ok=True)
+                if listing is not None:
+                    path.write_text(listing)
+                with self.assertRaises(FlowsError):
+                    self.install(self.zipped())
+                self.assertEqual(flows.properties(self.home / "emulator" / "source.properties")["Pkg.Revision"],
+                                 "37.2.13", "the installed emulator is left as it was")
+        (self.home / "emulator" / "package.xml").write_text(self.LISTING)
 
     def test_another_hash_or_another_build_inside_stops_before_any_flow(self):
         for case, data, sha in (("hash", self.zipped(), "0" * 64),

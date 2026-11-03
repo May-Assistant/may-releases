@@ -263,6 +263,20 @@ def properties(path):
     return dict(line.strip().split("=", 1) for line in text.splitlines() if "=" in line)
 
 
+PACKAGE_REVISION = re.compile(r"<revision><major>[0-9]+</major><minor>[0-9]+</minor><micro>[0-9]+</micro></revision>")
+
+
+def pinned_package_xml(text):
+    """sdkmanager's package.xml for its emulator with the one revision rewritten to EMULATOR_REVISION; FlowsError
+    unless the text is an emulator package listing with exactly one revision."""
+    major, minor, micro = EMULATOR_REVISION.split(".")
+    pinned, count = PACKAGE_REVISION.subn(f"<revision><major>{major}</major><minor>{minor}</minor><micro>{micro}"
+                                          "</micro></revision>", text)
+    if count != 1 or 'path="emulator"' not in text:
+        raise FlowsError("The Android emulator's package listing is not as expected; no flow ran")
+    return pinned
+
+
 def install_emulator(home, log, env, download=None):
     """The pinned emulator (EMULATOR_BUILD) in place of the one sdkmanager installed: downloaded, its SHA-256 checked,
     unpacked beside it and swapped in, then its own source.properties checked. Any mismatch stops before a flow runs."""
@@ -281,6 +295,11 @@ def install_emulator(home, log, env, download=None):
         found = properties(work / "unpacked" / "emulator" / "source.properties")
         if (found.get("Pkg.Revision"), found.get("Pkg.BuildId")) != (EMULATOR_REVISION, EMULATOR_BUILD):
             raise FlowsError("The pinned Android emulator is not the build it should be; no flow ran")
+        # Run 41623657138: the zip holds source.properties alone, and avdmanager's local repository reads package.xml,
+        # so with sdkmanager's gone it said "emulator" package must be installed and no device was created. The
+        # package.xml sdkmanager wrote is kept, its revision rewritten to the pinned one.
+        listing = pinned_package_xml((home / "emulator" / "package.xml").read_text())
+        (work / "unpacked" / "emulator" / "package.xml").write_text(listing)
         shutil.rmtree(home / "emulator", ignore_errors=True)
         shutil.move(str(work / "unpacked" / "emulator"), str(home / "emulator"))
     except OSError:
