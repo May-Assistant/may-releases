@@ -137,6 +137,7 @@ class AgentRunTests(unittest.TestCase):
         environ = dict(self.env, **(env or {}))
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.emulator_down", return_value=False), \
                 patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
@@ -212,7 +213,8 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([row.get("delivery") for row in report["scenarios"]],
                          [["succeeded"], None, ["succeeded"]])
         self.assertEqual(run_out.splitlines(), [
-            "May device tests (android): emulator unknown, system image revision unknown",
+            "May device tests (android): emulator unknown (build unknown, graphics unknown), system image "
+        "revision unknown",
             "May device tests (android): network ready after 4 s",
             # This may-app fixture has no onboarding subflow, so each agent starts from launch and the log says so.
             *[f"May device tests (android): {scenario}: may-app has no onboarding subflow; the agent starts from launch"

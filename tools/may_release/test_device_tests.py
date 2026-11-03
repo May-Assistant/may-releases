@@ -917,27 +917,50 @@ class EmulatorEvidenceTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def versions(self, said, properties):
+    def versions(self, said, properties, own=None, package=None, banner=None):
         self.image.write_bytes(properties)
+        for name, text in (("source.properties", own), ("package.xml", package)):
+            path = self.home / "emulator" / name
+            path.unlink(missing_ok=True)
+            if text is not None:
+                path.write_bytes(text)
+        log = self.home / "private" / "device-run.log"
+        log.parent.mkdir(exist_ok=True)
+        (log.parent / device_tests.EMULATOR_LOG).unlink(missing_ok=True)
+        if banner is not None:
+            (log.parent / device_tests.EMULATOR_LOG).write_bytes(banner)
         with patch("device_tests.bounded_output", return_value=said) as ran:
-            found = device_tests.emulator_versions(self.home, {})
+            found = device_tests.emulator_versions(self.home, {}, log)
         return found, ran
 
-    def test_the_versions_are_digits_and_dots_or_unknown(self):
-        found, ran = self.versions((0, b"INFO | Android emulator version 35.3.11.0 (build_id 13149407) (CL:N/A)\n"),
-                                   b"Pkg.Desc=Google APIs Intel x86_64 Atom System Image\nPkg.Revision=9\n")
-        self.assertEqual(found, ("35.3.11.0", "9"))
+    BANNER = (b"INFO         | Android emulator version 37.2.13.0 (build_id 16740729) (CL:N/A)\n"
+              b"INFO         | Graphics backend: gfxstream\n")
+
+    def test_the_version_comes_from_the_emulators_own_files_then_its_banner_then_its_output(self):
+        """Coordinator, 3 Nov: "unknown" in every run, while run 41555424833's banner named 37.2.13.0 and gfxstream."""
+        image = b"Pkg.Desc=Google APIs Intel x86_64 Atom System Image\nPkg.Revision=9\n"
+        found, ran = self.versions(None, image, own=b"Pkg.Revision=36.1.9\nPkg.BuildId=13823996\n", banner=self.BANNER)
+        self.assertEqual(found, ("36.1.9", "13823996", "gfxstream", "9"), "its own source.properties first")
+        self.assertFalse(ran.called, "nothing is run when its files say")
+        package = b"<revision><major>36</major><minor>1</minor><micro>9</micro></revision>"
+        self.assertEqual(self.versions(None, image, package=package)[0], ("36.1.9", "unknown", "unknown", "9"))
+        self.assertEqual(self.versions(None, image, banner=self.BANNER)[0], ("37.2.13.0", "16740729", "gfxstream", "9"),
+                         "run 41555424833's banner")
+        found, ran = self.versions((1, b"INFO | Android emulator version 35.3.11.0 (build_id 13149407)\n"), image)
+        self.assertEqual(found, ("35.3.11.0", "unknown", "unknown", "9"), "-version, its stderr read, any exit")
         self.assertEqual(ran.call_args[0][0], [str(self.home / "emulator" / "emulator"), "-version"])
-        for said, properties, expected in (
-                ((0, b"emulator version 35.1;curl evil\n"), b"Pkg.Revision=9 extra\n", ("35.1", "unknown")),
-                ((1, b"version 35.3.11.0\n"), b"Pkg.Revision=12.1\n", ("unknown", "12.1")),
-                (None, b"", ("unknown", "unknown")),
-                ((0, b"version abc\n"), b"Pkg.Revision=$(id)\n", ("unknown", "unknown"))):
+        self.assertEqual(ran.call_args[1], {"stderr": True})
+        for said, properties, own, expected in (
+                ((0, b"emulator version 35.1;curl evil\n"), b"Pkg.Revision=9 extra\n", None,
+                 ("35.1", "unknown", "unknown", "unknown")),
+                (None, b"", b"Pkg.Revision=$(id)\nPkg.BuildId=1;x\n", ("unknown", "unknown", "unknown", "unknown")),
+                ((0, b"version abc\n"), b"Pkg.Revision=$(id)\n", None, ("unknown", "unknown", "unknown", "unknown"))):
             with self.subTest(said=said, properties=properties):
-                self.assertEqual(self.versions(said, properties)[0], expected)
+                self.assertEqual(self.versions(said, properties, own=own)[0], expected)
+        self.assertEqual(self.versions(None, image, banner=b"Graphics backend: Evil;rm\n")[0][2], "unknown")
         (self.home / "emulator" / "emulator").unlink()
-        self.assertEqual(self.versions((0, b"version 1.2\n"), b"Pkg.Revision=9\n")[0], ("unknown", "9"),
-                         "no emulator binary is unknown, never an error")
+        self.assertEqual(self.versions((0, b"version 1.2\n"), b"Pkg.Revision=9\n")[0],
+                         ("unknown", "unknown", "unknown", "9"), "no emulator binary is unknown, never an error")
 
     def test_the_emulators_output_has_its_own_private_file(self):
         root = self.home / "runner"
@@ -979,8 +1002,11 @@ class RunTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_it(self, env=None, selection="sign-in,connections", fail=(), status=200, budgeted=None, diagnosed=None,
-               start_fails=False, adb_said=None, exited=None, kernel=None, late=()):
-        calls, self.maestro_envs = [], []
+               start_fails=False, adb_said=None, exited=None, kernel=None, late=(), crash_in=(), reboot_fails=False):
+        """crash_in: scenarios whose Maestro run leaves the emulator dead (exit status -11), once for each time named;
+        reboot_fails: the emulator's restart does not come up."""
+        calls, self.maestro_envs, self.boots = [], [], 0
+        down, crashes = [], list(crash_in)
         shutil.rmtree(self.root / device_tests.OUT, ignore_errors=True)
         (self.private / device_tests.VERDICTS).unlink(missing_ok=True)
         (self.private / device_tests.AGENTS).unlink(missing_ok=True)
@@ -993,7 +1019,17 @@ class RunTests(unittest.TestCase):
                 return 0
 
             def poll(self):
-                return exited
+                return -11 if down else exited
+
+            def kill(self):
+                calls.append(["kill"])
+
+        def booted(root, log):
+            self.boots += 1
+            if self.boots > 1 and reboot_fails:
+                raise device_tests.DeviceTestsError("The emulator did not boot; no scenario ran")
+            down.clear()
+            return "/sdk/adb", Process(), {}
 
         (self.root / "vmstat").write_text("oom_kill 2\n")
         (self.root / "meminfo").write_text("MemTotal: 16384000 kB\nMemAvailable:    1048576 kB\n")
@@ -1012,6 +1048,11 @@ class RunTests(unittest.TestCase):
                 with Path(log).open("ab") as output:
                     output.write(b"Launch app... COMPLETED\nAssert that id: chats is visible... FAILED\n"
                                  b"session " + TOKEN.encode() + b"\n")
+            for name in crashes:
+                if argv[-1].endswith(f"/{name}.xml"):
+                    crashes.remove(name)
+                    down.append(True)
+                    break
             if argv[-1].endswith(".xml") and any(f"/{name}.xml" in argv[-1] for name in late):
                 raise subprocess.TimeoutExpired(argv, timeout)
             return 1 if argv[-1].endswith(".xml") and any(f"/{name}.xml" in argv[-1] for name in fail) else 0
@@ -1032,13 +1073,14 @@ class RunTests(unittest.TestCase):
 
         environ = dict(self.env, **(env or {}))
         with patch.dict(os.environ, {k: v for k, v in environ.items() if v is not None}, clear=True), \
-                patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.boot", side_effect=booted), \
                 patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
                 patch("device_tests.adb_shell", side_effect=shell), \
                 patch("device_tests.adb_output", side_effect=lambda adb, env, argv: calls.append(["adb_output", *argv])
-                      or (adb_said or {}).get(argv[-1])), \
+                      or (b"" if down and argv[-1] == "get-state" else
+                          dict({"get-state": b"device\n"}, **(adb_said or {})).get(argv[-1]))), \
                 patch("device_tests.flows.sdk", return_value=Path("/sdk")), \
                 patch("device_tests.bounded_output", side_effect=bounded), \
                 patch("device_tests.VMSTAT", self.root / "vmstat"), patch("device_tests.MEMINFO", self.root / "meminfo"), \
@@ -1068,7 +1110,7 @@ class RunTests(unittest.TestCase):
         kernel = b"".join(b"[%d.0] usb line\n" % n for n in range(80)) + b"[99.0] Out of memory: Killed process 123 (qemu)\n"
         try:
             with patch("device_tests.flows.sleep") as slept:
-                calls, report, out, run = self.run_it(start_fails=True, adb_said=said, exited=-9, kernel=kernel)
+                calls, report, out, run = self.run_it(start_fails=True, adb_said=said, kernel=kernel)
             slept.assert_called_once_with(device_tests.LAUNCH_RETRY_SECONDS)
         except device_tests.DeviceTestsError as error:
             self.fail("a launch failure stopped the run with no report or diagnostics: " + error.args[0])
@@ -1080,15 +1122,16 @@ class RunTests(unittest.TestCase):
         path = run / "android" / ("sign-in" + device_tests.DIAG)
         self.assertTrue(path.is_file(), "the launch failure's diagnostics are in the sealed run folder")
         diag = path.read_bytes()
-        self.assertTrue(diag.startswith(b"== emulator ==\nexit status: -9\nadb state: none\n"
+        self.assertTrue(diag.startswith(b"== emulator ==\nexit status: running\nadb state: device\n"
                                         b"host memory available: 1024 MB\nhost OOM kills since boot: 1\n"
                                         b"-- emulator output --\nINFO | boot line 102\n"), diag[:240])
         self.assertIn(b"FATAL | qemu: out of memory\n-- kernel --\n[31.0] usb line\n", diag,
                       "the emulator's last 200 lines, then the kernel's last 50")
         self.assertIn(b"Out of memory: Killed process 123 (qemu)\n== am start ==", diag)
-        self.assertIn("May device tests (android): the emulator then: exit status -9, adb none, 1024 MB available on "
-                      "the host, 1 OOM kills since boot", out)
-        self.assertIn("May device tests (android): emulator unknown, system image revision unknown", out)
+        self.assertIn("May device tests (android): the emulator then: exit status running, adb device, 1024 MB "
+                      "available on the host, 1 OOM kills since boot", out)
+        self.assertIn("May device tests (android): emulator unknown (build unknown, graphics unknown), system image "
+                      "revision unknown", out)
         self.assertIn(["adb_output", "-s", device_tests.SERIAL, "get-state"], calls)
         for section in (b"== am start ==\nError: Activity class does not exist", b"== logcat crash,main ==\nE "
                         b"AndroidRuntime: FATAL EXCEPTION: main", b"== dumpsys activity top ==\nACTIVITY "):
@@ -1103,6 +1146,65 @@ class RunTests(unittest.TestCase):
         self.assertNotIn(b"qemu", out.encode())
         for reason in (device_tests.NOT_STARTED, device_tests.HALTED):
             self.assertIn(reason, publish.REASONS)
+
+    def test_an_emulator_crash_restarts_it_once_and_reruns_only_that_scenario(self):
+        """Coordinator, 3 Nov (run 41555424833: exit status -11 mid-notes, every scenario after it lost)."""
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        calls, report, out, _ = self.run_it(crash_in=("sign-in",))
+        self.assertEqual([(row["id"], row["verdict"]) for row in report["scenarios"]],
+                         [("sign-in", "ui-pass"), ("connections", "ui-pass")], "the rerun's result alone is reported")
+        self.assertEqual(self.boots, 2, "one restart")
+        maestro = [argv for argv in calls if argv[0] == "/fake/maestro"]
+        self.assertEqual([Path(argv[-1]).stem for argv in maestro], ["sign-in", "sign-in", "connections"],
+                         "only the crashed scenario runs again")
+        self.assertEqual(sum(1 for argv in calls if argv[:2] == ["/sdk/adb", "install"]), 2, "the app installed again")
+        self.assertIn("May device tests (android): sign-in: the emulator crashed (exit status -11, adb none, 1024 MB "
+                      "available on the host, 0 OOM kills since boot)", out)
+        self.assertIn("May device tests (android): the emulator was restarted once; sign-in runs again", out)
+        self.assertNotIn("infra", out)
+
+    def test_a_second_crash_or_a_restart_that_fails_makes_the_rest_infra_and_an_all_infra_run_fails(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        calls, report, out, _ = self.run_it(crash_in=("sign-in", "sign-in"))
+        self.assertEqual([(row["id"], row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            ("sign-in", device_tests.INFRA, device_tests.INFRA_AGAIN),
+            ("connections", device_tests.INFRA, device_tests.INFRA_GONE)])
+        self.assertEqual(self.boots, 2, "never a second restart")
+        self.assertEqual([Path(argv[-1]).stem for argv in calls if argv[0] == "/fake/maestro"], ["sign-in", "sign-in"])
+        self.assertIn("May device tests (android): 0 passed, 0 passed on screen alone (server checks not configured), "
+                      "0 failed, 0 skipped", out)
+        self.assertIn("May device tests (android): 2 had no working emulator (infra, the harness's failure, never "
+                      "May's)", out)
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
+                self.assertRaisesRegex(DeviceTestsError, "^No scenario had a working emulator$"):
+            device_tests.verdict()
+        try:
+            _, report, _, _ = self.run_it(crash_in=("sign-in",), reboot_fails=True)
+        except device_tests.DeviceTestsError as error:
+            self.fail("a restart that did not boot stopped the run: " + error.args[0])
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            (device_tests.INFRA, device_tests.INFRA_NO_RESTART), (device_tests.INFRA, device_tests.INFRA_GONE)])
+        _, report, out, _ = self.run_it(crash_in=("connections", "connections"))
+        self.assertEqual([row["verdict"] for row in report["scenarios"]], ["ui-pass", device_tests.INFRA])
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            device_tests.verdict()  # an infra scenario beside a passed one fails nothing
+        for reason in (device_tests.INFRA_AGAIN, device_tests.INFRA_NO_RESTART, device_tests.INFRA_GONE):
+            self.assertIn(reason, publish.REASONS)
+        self.assertIn(device_tests.INFRA, publish.VERDICT_WORDS)
+
+    def test_a_launch_failure_on_a_dead_emulator_restarts_it_never_stops_the_run(self):
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        try:
+            with patch("device_tests.flows.sleep"):
+                calls, report, out, _ = self.run_it(start_fails=True, exited=-11)
+        except device_tests.DeviceTestsError as error:
+            self.fail(error.args[0])
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
+            (device_tests.INFRA, device_tests.INFRA_AGAIN), (device_tests.INFRA, device_tests.INFRA_GONE)],
+            "the restarted emulator is still down (exited), so its rerun is infra too")
+        self.assertNotIn("the run stopped there", out)
+        self.assertEqual(self.boots, 2)
 
     def test_a_scenario_the_budget_cannot_fit_is_not_started_and_the_rest_is_still_reported(self):
         """Run 40035089599: iOS agent scenarios could outlast the job, losing every report."""
@@ -1147,7 +1249,8 @@ class RunTests(unittest.TestCase):
         self.assertEqual((connections["verdict"], connections["reason"]),
                          ("fail", "may-app has no Maestro flow for this scenario"))
         self.assertEqual(out.splitlines(), [
-            "May device tests (android): emulator unknown, system image revision unknown",
+            "May device tests (android): emulator unknown (build unknown, graphics unknown), system image revision "
+            "unknown",
             "May device tests (android): network ready after 4 s",
             "May device tests (android): 2 scenarios ran; verdicts follow the judge step",
             "May device tests (android): 1 test sessions were signed out at their end",
@@ -1342,6 +1445,7 @@ class RunTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.env, clear=True), \
                 patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.emulator_down", return_value=False), \
                 patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \

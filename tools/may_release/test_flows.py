@@ -1,7 +1,10 @@
+import hashlib
+import io
 import os
 import re
 import sys
 import unittest
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -148,6 +151,65 @@ class OverlayTest(unittest.TestCase):
             self.run_overlay("false", {"MAY_APP_READ_KEY": "k", "MAY_DS_READ_KEY": "d"})
 
 
+class InstallEmulatorTest(unittest.TestCase):
+    """Coordinator, 3 Nov (run 41555424833): the newest emulator, 37.2.13, crashed mid-run; the emulator is pinned."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.home = Path(self.directory.name) / "sdk"
+        (self.home / "emulator").mkdir(parents=True)
+        (self.home / "emulator" / "source.properties").write_text("Pkg.Revision=37.2.13\nPkg.BuildId=16740729\n")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def zipped(self, revision=flows.EMULATOR_REVISION, build=flows.EMULATOR_BUILD):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("emulator/source.properties", f"Pkg.Revision={revision}\nPkg.BuildId={build}\n")
+            archive.writestr("emulator/emulator", "binary")
+        return buffer.getvalue()
+
+    def install(self, data, sha=None):
+        urls = []
+
+        def download(url, path):
+            urls.append(url)
+            path.write_bytes(data)
+
+        def run(argv, log, **kwargs):
+            if argv[0] == "unzip":
+                with zipfile.ZipFile(argv[2]) as archive:
+                    archive.extractall(argv[4])
+            return 0
+
+        with mock.patch.object(flows, "run_private", side_effect=run), \
+                mock.patch.object(flows, "EMULATOR_SHA256", sha or hashlib.sha256(data).hexdigest()), \
+                mock.patch.dict(flows.os.environ, {"RUNNER_TEMP": str(self.home.parent)}):
+            flows.install_emulator(self.home, self.home.parent / "log", {}, download=download)
+        return urls
+
+    def test_the_pinned_build_replaces_sdkmanagers_after_its_hash_and_revision_are_checked(self):
+        self.assertEqual(self.install(self.zipped()), [flows.EMULATOR_URL])
+        self.assertEqual(flows.properties(self.home / "emulator" / "source.properties"),
+                         {"Pkg.Revision": "36.1.9", "Pkg.BuildId": "13823996"})
+        self.assertEqual((self.home / "emulator" / "emulator").read_text(), "binary")
+        self.assertEqual(flows.EMULATOR_URL, "https://dl.google.com/android/repository/emulator-linux_x64-13823996.zip")
+        self.assertEqual(flows.EMULATOR_SHA256, "5a580b0169e3fd26c99a67b86720f367f78828b1733d748cbe566e001b517024")
+        self.assertEqual(flows.EMULATOR_GPU, "swiftshader_indirect")
+        self.assertEqual([p.name for p in self.home.parent.iterdir() if p.name.startswith("may-emulator-")], [],
+                         "the download and its unpacked copy are removed")
+
+    def test_another_hash_or_another_build_inside_stops_before_any_flow(self):
+        for case, data, sha in (("hash", self.zipped(), "0" * 64),
+                                ("revision", self.zipped(revision="37.2.13"), None),
+                                ("build", self.zipped(build="16740729"), None)):
+            with self.subTest(case=case), self.assertRaisesRegex(FlowsError, "pinned Android emulator"):
+                self.install(data, sha)
+            self.assertEqual(flows.properties(self.home / "emulator" / "source.properties")["Pkg.Revision"], "37.2.13",
+                             "the installed emulator is left as it was")
+
+
 class InstallSdkTest(unittest.TestCase):
     def install(self, outcomes):
         calls, waits = [], []
@@ -167,11 +229,14 @@ class InstallSdkTest(unittest.TestCase):
             (home / "cmdline-tools/latest/bin/sdkmanager").write_text("")
             with mock.patch.object(flows, "run_private", side_effect=fake_run), \
                     mock.patch.object(flows, "sleep", side_effect=waits.append), \
+                    mock.patch.object(flows, "install_emulator") as pinned, \
                     mock.patch.object(flows.subprocess, "run"):
                 try:
                     flows.install_sdk(home, home / "log", {})
+                    self.assertEqual(pinned.call_count, 1, "the pinned emulator after sdkmanager, every time")
                     return len(calls), waits, None
                 except FlowsError as error:
+                    self.assertEqual(pinned.call_count, 0, "no pinned emulator without the SDK")
                     return len(calls), waits, error
 
     def test_a_first_install_failure_is_retried_once(self):
@@ -184,7 +249,8 @@ class InstallSdkTest(unittest.TestCase):
         self.assertEqual(self.install(["timeout", 0]), (2, [flows.SDK_RETRY_SECONDS], None))
         calls = []
         with mock.patch.object(flows, "run_private", side_effect=lambda argv, log, **kw: calls.append(kw.get("timeout")) or 0), \
-                tempfile.TemporaryDirectory() as temp, mock.patch.object(flows.subprocess, "run"):
+                tempfile.TemporaryDirectory() as temp, mock.patch.object(flows.subprocess, "run"), \
+                mock.patch.object(flows, "install_emulator"):
             home = Path(temp)
             (home / "cmdline-tools/latest/bin").mkdir(parents=True)
             (home / "cmdline-tools/latest/bin/sdkmanager").write_text("")

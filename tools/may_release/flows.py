@@ -31,6 +31,7 @@ Subcommands, one per workflow step:
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
@@ -99,6 +101,20 @@ RUNNER = TEST_ID + "/androidx.test.runner.AndroidJUnitRunner"
 # real, full-height one.
 SYSTEM_IMAGE = "system-images;android-35;google_apis;x86_64"
 SDK_PACKAGES = ("platform-tools", "emulator", "platforms;android-37.0", "build-tools;36.0.0", SYSTEM_IMAGE)
+# Coordinator, 3 Nov (run 41555424833): the emulator sdkmanager installs is always the newest, and 37.2.13 (build
+# 16740729) crashed mid-run (exit status -11, nothing logged after boot, its banner naming gfxstream although
+# -gpu swiftshader_indirect was asked for). sdkmanager cannot pin an emulator version, so after it runs the emulator is
+# replaced with EMULATOR_BUILD, downloaded from Google's repository and checked against EMULATOR_SHA256 and its own
+# source.properties. 36.1.9 is the newest 36-series stable whose checksum can be verified: Google's index now lists only
+# 37.x, and its index of the time, as Debian's google-android-installers 1755725555 keeps it (snapshot.debian.org,
+# checked against Debian's own sha1), lists emulator-linux_x64-13823996.zip, sha1 6640cd1d6ca5cf306cfe51d4957ace7e5f3c1d8c,
+# 319203216 bytes, which the download matched; EMULATOR_SHA256 is that file's. (36.6.11, the last 36-series stable, is
+# in no index this runner can reach, and users report it failing to start.) Both lanes (emulator flows and device tests)
+# install it through install_sdk.
+EMULATOR_REVISION, EMULATOR_BUILD = "36.1.9", "13823996"
+EMULATOR_URL = f"https://dl.google.com/android/repository/emulator-linux_x64-{EMULATOR_BUILD}.zip"
+EMULATOR_SHA256 = "5a580b0169e3fd26c99a67b86720f367f78828b1733d748cbe566e001b517024"
+EMULATOR_GPU = "swiftshader_indirect"
 SDK_INSTALL_ATTEMPTS = 2
 SDK_RETRY_SECONDS = 30
 SDK_INSTALL_SECONDS = 900
@@ -228,12 +244,52 @@ def install_sdk(home, log, env):
         try:
             if not run_private([manager, "--install", *SDK_PACKAGES], log, env=env, check=False,
                                timeout=SDK_INSTALL_SECONDS):
-                return
+                break
         except subprocess.TimeoutExpired:
             pass
         if attempt + 1 < SDK_INSTALL_ATTEMPTS:
             sleep(SDK_RETRY_SECONDS)
-    raise FlowsError("The Android SDK did not install after one retry; no flow ran")
+    else:
+        raise FlowsError("The Android SDK did not install after one retry; no flow ran")
+    install_emulator(home, log, env)
+
+
+def properties(path):
+    """A source.properties file's keys and values; {} when it cannot be read."""
+    try:
+        text = path.read_text(errors="replace")[:65536]
+    except OSError:
+        return {}
+    return dict(line.strip().split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def install_emulator(home, log, env, download=None):
+    """The pinned emulator (EMULATOR_BUILD) in place of the one sdkmanager installed: downloaded, its SHA-256 checked,
+    unpacked beside it and swapped in, then its own source.properties checked. Any mismatch stops before a flow runs."""
+    work = Path(tempfile.mkdtemp(prefix="may-emulator-", dir=os.environ.get("RUNNER_TEMP") or None))
+    try:
+        archive = work / "emulator.zip"
+        (download or (lambda url, path: run_private(["curl", "-fsSL", "--retry", "2", "-o", str(path), url], log,
+                                                    env=env)))(EMULATOR_URL, archive)
+        digest = hashlib.sha256()
+        with archive.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != EMULATOR_SHA256:
+            raise FlowsError("The pinned Android emulator's download hash differs; no flow ran")
+        run_private(["unzip", "-q", str(archive), "-d", str(work / "unpacked")], log, env=env)
+        found = properties(work / "unpacked" / "emulator" / "source.properties")
+        if (found.get("Pkg.Revision"), found.get("Pkg.BuildId")) != (EMULATOR_REVISION, EMULATOR_BUILD):
+            raise FlowsError("The pinned Android emulator is not the build it should be; no flow ran")
+        shutil.rmtree(home / "emulator", ignore_errors=True)
+        shutil.move(str(work / "unpacked" / "emulator"), str(home / "emulator"))
+    except OSError:
+        raise FlowsError("The pinned Android emulator could not be installed; no flow ran") from None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    found = properties(home / "emulator" / "source.properties")
+    if (found.get("Pkg.Revision"), found.get("Pkg.BuildId")) != (EMULATOR_REVISION, EMULATOR_BUILD):
+        raise FlowsError("The pinned Android emulator is not the build it should be; no flow ran")
 
 
 def build(source_sha):
@@ -376,7 +432,7 @@ def run(source_sha, flows, from_branch):
         subprocess.run([avdmanager, "create", "avd", "--force", "-n", AVD, "-k", SYSTEM_IMAGE, "-d", DEVICE],
                        input=b"no\n", stdout=output, stderr=subprocess.STDOUT, env=env, check=True)
         emulator = subprocess.Popen([emulator_bin, "-avd", AVD, "-no-window", "-no-audio", "-no-boot-anim",
-                                     "-no-snapshot", "-gpu", "swiftshader_indirect", "-camera-back", "none"],
+                                     "-no-snapshot", "-gpu", EMULATOR_GPU, "-camera-back", "none"],
                                     stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
     try:
         run_private([adb, "wait-for-device"], log, env=env, timeout=BOOT_SECONDS)

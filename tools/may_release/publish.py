@@ -74,7 +74,8 @@ DEVICE_FILE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-end\.png|-look-[1-4]\.png|
                          + "|".join(re.escape(name) for name in BOARD_INPUTS) + "|" + board.PATH_FILE.pattern + "|" +
                          board.SHOT_FILE.pattern)
 DEVICE_DOWNLOAD, DEVICE_PREFIX = "may-device-download", "device-tests/"
-VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS, device_tests.UNVERIFIED)
+VERDICT_WORDS = ("pass", "ui-pass", "fail", "skipped", device_tests.SMOKE_PASS, device_tests.UNVERIFIED,
+                 device_tests.INFRA)
 REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no Maestro flow for this scenario",
            device_tests.UNCONFIGURED, device_tests.RATE_LIMITED, device_tests.UNFINISHED, device_tests.BLOCKED,
            device_tests.NO_TRUTH, device_tests.NOT_JUDGED, device_tests.SWITCHED_OFF, device_tests.SMOKE_MAESTRO,
@@ -84,7 +85,7 @@ REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no
            device_tests.NO_FIRST, device_tests.NOT_STARTED, device_tests.HALTED, device_tests.NO_LINE,
            device_tests.NO_CARD, device_tests.LOOK_SCROLLED, device_tests.LOOK_EMPTY, device_tests.LOOK_UNREAD,
            device_tests.FLOW_NOT_RUN, device_tests.FLOW_FAILED, device_tests.SERVER_FAILED,
-           device_tests.FLOW_TIMED_OUT)
+           device_tests.FLOW_TIMED_OUT, device_tests.INFRA_AGAIN, device_tests.INFRA_NO_RESTART, device_tests.INFRA_GONE)
 MAX_NOTES = 600
 # A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
 DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)

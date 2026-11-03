@@ -97,6 +97,7 @@ class Workspace(unittest.TestCase):
             return path.name
 
         with self.environ(env), patch("device_tests.boot", return_value=("/sdk/adb", Process(), {})), \
+                patch("device_tests.emulator_down", return_value=False), \
                 patch("device_tests.network_ready", return_value=4), \
                 patch("device_tests.maestro", return_value=Path("/fake/maestro")), \
                 patch("device_tests.flows.run_private", side_effect=private), \
@@ -138,7 +139,8 @@ class AndroidSmokeTests(Workspace):
         self.assertEqual((row["id"], row["verdict"], row.get("reason"), row["videos"], row["screenshots"]),
                          ("smoke", "smoke-pass", None, ["smoke.mp4"], ["smoke-end.png"]))
         self.assertEqual(out.splitlines(), [
-            "May device tests (android): emulator unknown, system image revision unknown",
+            "May device tests (android): emulator unknown (build unknown, graphics unknown), system image revision "
+            "unknown",
             "May device tests (android): 1 scenarios ran; verdicts follow the judge step",
             "May device tests (android): smoke: smoke-pass",
             "May device tests (android): 0 passed, 0 passed on screen alone (server checks not configured), 0 failed, "

@@ -245,6 +245,16 @@ NO_CHAT = "skipped: staging did not make the scenario's own chat"
 NO_FIRST = "skipped: staging did not take the first message of the scenario's own chat"
 NOT_STARTED = "May Playground did not start on the emulator after one retry (its diagnostics are sealed)"
 HALTED = "skipped: the run stopped after May Playground did not start"
+# Coordinator, 3 Nov (run 41555424833: the emulator died mid-notes, exit status -11, and every scenario after it failed
+# or was skipped as if May had): after each scenario, and when the app did not start, the emulator is checked. One that
+# exited, or that adb no longer sees, is restarted once (booted, the app installed again) and the scenario it crashed in
+# runs again; a second crash, or a restart that does not come up, makes that scenario and every one after it `infra`:
+# the harness's failure, never May's. `infra` counts apart, is never judged, and fails the job only when every scenario
+# that was not skipped is `infra` (a run with no working emulator never reads green).
+INFRA = "infra"
+INFRA_AGAIN = "the emulator crashed during it, and again after its one restart"
+INFRA_NO_RESTART = "the emulator crashed during it and did not come back after a restart"
+INFRA_GONE = "the emulator was not running: it had crashed and was not restarted again"
 
 
 def fresh_switch():
@@ -1163,15 +1173,15 @@ MAX_NETWORK_LINES = 200
 MAX_COMMAND_OUTPUT = 16 * 1024 * 1024
 
 
-def bounded_output(argv, env, seconds=DIAG_SECONDS, limit=MAX_COMMAND_OUTPUT):
+def bounded_output(argv, env, seconds=DIAG_SECONDS, limit=MAX_COMMAND_OUTPUT, stderr=False):
     """(exit status, at most limit bytes of its output) for one diagnostics command, or None when it could not start
     or did not finish within seconds. The output goes to a file, never a pipe, in a session of its own: after
     subprocess.run's kill a pipe is read to its end, which waits on any child still holding it (the simulator's own
     log, adb's), while a file is never waited on (the security read of #115)."""
     with tempfile.TemporaryFile() as output:
         try:
-            done = subprocess.run(argv, stdout=output, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env,
-                                  start_new_session=True, timeout=seconds)
+            done = subprocess.run(argv, stdout=output, stderr=output if stderr else subprocess.DEVNULL,
+                                  stdin=subprocess.DEVNULL, env=env, start_new_session=True, timeout=seconds)
         except (OSError, subprocess.SubprocessError):
             return None
         output.seek(0)
@@ -1216,6 +1226,11 @@ class Diagnostics:
         self.seen = {tag: set(self.entries(tag)) for tag in (ANR, CRASH)}
         self.kept = self.anrs = self.crashes = self.network = 0
         self.dropped = {}  # scenario: lines dropped, for the public log's counts
+
+    def moved(self, adb, env):
+        """The emulator was restarted: its adb, and the new dropbox's entries counted as already there."""
+        self.adb, self.env = adb, env
+        self.seen = {tag: set(self.entries(tag)) for tag in (ANR, CRASH)}
 
     def entries(self, tag):
         """{header line: entry} for the dropbox's entries of tag now; {} when it could not be read. Each entry is known
@@ -1321,23 +1336,57 @@ ANIMATION_SCALE = "1"
 EMULATOR_LOG, EMULATOR_LINES, KERNEL_LINES = "emulator.log", 200, 50
 MEMINFO, VMSTAT = Path("/proc/meminfo"), Path("/proc/vmstat")
 EMULATOR_VERSION = re.compile(rb"version ([0-9]{1,3}(?:\.[0-9]{1,6}){1,3})")
+# Coordinator, 3 Nov: the version read "unknown" in every run (`emulator -version`'s exit status and stdout alone were
+# read, and it writes to stderr), while run 41555424833's sealed banner said "Android emulator version 37.2.13.0
+# (build_id 16740729)" and "Graphics backend: gfxstream". The version and build are read from the emulator's own
+# source.properties, else its package.xml, else that banner in EMULATOR_LOG, else -version with stderr; the graphics
+# backend from the banner. Digits and dots, or a short lowercase word, alone; else "unknown".
+VERSION_SHAPE, BUILD_SHAPE = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,6}){1,3}"), re.compile(r"[0-9]{1,12}")
+BANNER = re.compile(rb"emulator version ([0-9]{1,3}(?:\.[0-9]{1,6}){1,3}) \(build_id ([0-9]{1,12})\)")
+BACKEND = re.compile(rb"Graphics backend: ([a-z][a-z0-9_]{0,23})\b")
+PACKAGE_REVISION = re.compile(rb"<revision>\s*<major>([0-9]{1,3})</major>\s*<minor>([0-9]{1,6})</minor>\s*"
+                              rb"<micro>([0-9]{1,6})</micro>")
 IMAGE_REVISION = re.compile(rb"^Pkg\.Revision=([0-9]{1,4}(?:\.[0-9]{1,4}){0,2})[ \t\r]*$", re.MULTILINE)
 ADB_STATES = ("device", "offline", "unauthorized", "bootloader", "recovery")
 
 
-def emulator_versions(home, env):
-    """(the emulator's version, its system image's revision), each digits and dots alone, or "unknown"."""
+def emulator_versions(home, env, log=None):
+    """(the emulator's version, its build, its graphics backend, its system image's revision), each in its shape alone
+    or "unknown". log: the run's private log, beside which EMULATOR_LOG holds the emulator's banner."""
     try:
-        done = bounded_output([flows.sdk_tool(home, "emulator/emulator"), "-version"], env)
-    except flows.FlowsError:
-        done = None
-    found = EMULATOR_VERSION.search(done[1]) if done is not None and done[0] == 0 else None
+        banner = (log.parent / EMULATOR_LOG).read_bytes()[:256 * 1024] if log is not None else b""
+    except OSError:
+        banner = b""
+    found = flows.properties(home / "emulator" / "source.properties")
+    version, build = found.get("Pkg.Revision", "").strip(), found.get("Pkg.BuildId", "").strip()
+    if not VERSION_SHAPE.fullmatch(version):
+        try:
+            package = (home / "emulator" / "package.xml").read_bytes()[:65536]
+        except OSError:
+            package = b""
+        revision = PACKAGE_REVISION.search(package)
+        version = ".".join(part.decode() for part in revision.groups()) if revision else ""
+    said = BANNER.search(banner)
+    if not VERSION_SHAPE.fullmatch(version) and said:
+        version = said[1].decode()
+    if not VERSION_SHAPE.fullmatch(version):
+        try:
+            done = bounded_output([flows.sdk_tool(home, "emulator/emulator"), "-version"], env, stderr=True)
+        except flows.FlowsError:
+            done = None
+        printed = EMULATOR_VERSION.search(done[1]) if done is not None else None
+        version = printed[1].decode() if printed else ""
+    if not BUILD_SHAPE.fullmatch(build):
+        build = said[2].decode() if said else ""
+    backend = BACKEND.search(banner)
     try:
         image = home.joinpath(*flows.SYSTEM_IMAGE.split(";"), "source.properties").read_bytes()[:65536]
     except OSError:
         image = b""
     revision = IMAGE_REVISION.search(image)
-    return (found[1].decode() if found else "unknown"), (revision[1].decode() if revision else "unknown")
+    return (version if VERSION_SHAPE.fullmatch(version) else "unknown",
+            build if BUILD_SHAPE.fullmatch(build) else "unknown", backend[1].decode() if backend else "unknown",
+            revision[1].decode() if revision else "unknown")
 
 
 def host_number(path, key):
@@ -1381,6 +1430,27 @@ def emulator_section(state, log):
         b"-- emulator output --\n" + output + b"-- kernel --\n" + kernel
 
 
+def emulator_down(adb, env, emulator):
+    """Whether the emulator process exited or adb no longer sees a device."""
+    if emulator.poll() is not None:
+        return True
+    said = (adb_output(adb, env, ["-s", SERIAL, "get-state"]) or b"").strip().decode("ascii", "replace")
+    return said not in ADB_STATES
+
+
+def ready_device(adb, env, log, source, base):
+    """After a boot: the app installed, Android's touch dots on, and (against staging) the network waited for."""
+    flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
+    show_touches(adb, env, log, True)
+    if base:
+        at("waiting for the emulator's network")
+        waited = network_ready(adb, env)
+        if waited is None:
+            print("May device tests (android): network not ready within a minute; going on")
+        else:
+            print(f"May device tests (android): network ready after {waited} s")
+
+
 def boot(root, log):
     """The emulator, as flows.run starts it (API 35 image, KVM, no window), with animations at ANIMATION_SCALE: (adb,
     process, env)."""
@@ -1395,7 +1465,7 @@ def boot(root, log):
             raise DeviceTestsError("The emulator's virtual device could not be created; no scenario ran")
     with (log.parent / EMULATOR_LOG).open("ab") as output:
         emulator = subprocess.Popen([flows.sdk_tool(home, "emulator/emulator"), "-avd", AVD, "-no-window", "-no-audio",
-                                     "-no-boot-anim", "-no-snapshot", "-gpu", "swiftshader_indirect"],
+                                     "-no-boot-anim", "-no-snapshot", "-gpu", flows.EMULATOR_GPU],
                                     stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=env)
     flows.run_private([adb, "wait-for-device"], log, env=env, timeout=flows.BOOT_SECONDS)
     deadline = time.monotonic() + flows.BOOT_SECONDS
@@ -1785,29 +1855,63 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     at("booting the emulator")
     adb, emulator, env = boot(root, log)
     kills_at_boot = host_number(VMSTAT, "oom_kill")
-    version, revision = emulator_versions(flows.sdk(), env)
-    print(f"May device tests (android): emulator {version}, system image revision {revision}")
+    version, build, backend, revision = emulator_versions(flows.sdk(), env, log)
+    print(f"May device tests (android): emulator {version} (build {build}, graphics {backend}), system image revision "
+          f"{revision}")
     results, records, cleaned_count = [], {}, None
     try:
         at("installing the app")
-        flows.run_private([adb, "install", "-r", "-t", str(source / APK)], log, env=env)
-        show_touches(adb, env, log, True)
-        if base:
-            at("waiting for the emulator's network")
-            waited = network_ready(adb, env)
-            if waited is None:
-                print("May device tests (android): network not ready within a minute; going on")
-            else:
-                print(f"May device tests (android): network ready after {waited} s")
+        ready_device(adb, env, log, source, base)
         diagnostics = (diagnosed or Diagnostics)(adb, env)
         maestro_env = child_env(MAESTRO_CLI_NO_ANALYTICS="1", MAESTRO_DISABLE_UPDATE_CHECK="true",
                                 ANDROID_HOME=str(flows.sdk()), **maestro_isolation(maestro_home(root)))
         budget = (budgeted or Budget)()
-        halted = False
-        for row in chosen:
+        halted = gone = False
+        restarts = 0
+        queue = list(chosen)
+
+        def crashed(row, entry):
+            """The emulator is down after row: restarted once and row queued to run again (True), or row is `infra`
+            and so is every scenario after it (False)."""
+            nonlocal adb, emulator, env, kills_at_boot, restarts, gone
+            state = emulator_state(adb, env, emulator, kills_at_boot)
+            scenario = row["id"]
+            exited, adb_state = ("running" if state[0] is None else state[0]), state[1]
+            available, kills = ("unknown" if state[2] is None else state[2]), ("unknown" if state[3] is None else state[3])
+            print(f"May device tests (android): {scenario}: the emulator crashed (exit status {exited}, adb {adb_state}, "
+                  f"{available} MB available on the host, {kills} OOM kills since boot)")
+            if restarts:
+                entry.update(verdict=INFRA, reason=INFRA_AGAIN)
+                gone = True
+                return False
+            restarts += 1
+            try:
+                emulator.kill()
+            except OSError:
+                pass
+            try:
+                at("restarting the emulator")
+                adb, emulator, env = boot(root, log)
+                kills_at_boot = host_number(VMSTAT, "oom_kill")
+                ready_device(adb, env, log, source, base)
+            except (DeviceTestsError, flows.FlowsError, OSError, subprocess.SubprocessError):
+                entry.update(verdict=INFRA, reason=INFRA_NO_RESTART)
+                gone = True
+                return False
+            diagnostics.moved(adb, env)
+            print(f"May device tests (android): the emulator was restarted once; {scenario} runs again")
+            results.remove(entry)
+            queue.insert(0, row)
+            return True
+
+        while queue:
+            row = queue.pop(0)
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
                      "server": []}
             results.append(entry)
+            if gone:
+                entry.update(verdict=INFRA, reason=INFRA_GONE)
+                continue
             if halted:
                 entry["reason"] = HALTED
                 continue
@@ -1848,6 +1952,12 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             try:
                 launch(adb, env, token, log)
             except LaunchFailed as failed:
+                if emulator_down(adb, env, emulator):
+                    # Not May's: the emulator itself is gone (run 41555424833's poll).
+                    accounts.finish(row, base, token)
+                    token = ""
+                    crashed(row, entry)
+                    continue
                 # The report and the diagnostics are kept and sealed; the scenarios after it are not started.
                 state = emulator_state(adb, env, emulator, kills_at_boot)
                 dropped = launch_diagnostics(adb, env, folder, row["id"], token, failed.said,
@@ -1908,6 +2018,8 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             entry["videos"] = recorder.stop(folder)
             settle(entry, row, passed if flow is not None else None, ran=flow_ran(folder, row), timed_out=timed_out)
             token = ""
+            if emulator_down(adb, env, emulator):
+                crashed(row, entry)
     finally:
         cleaned_count = tag_cleanup(accounts, base, secret, since, tag, minted, cleaned)
         accounts.abandon(base)
@@ -1924,7 +2036,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     (folder / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     write_private(private / AGENTS, json.dumps({"tag": tag, "agents": records}).encode())
     write_private(private / VERDICTS, json.dumps([entry["verdict"] for entry in results]).encode())
-    ran = sum(1 for entry in results if entry["verdict"] != "skipped")
+    ran = sum(1 for entry in results if entry["verdict"] not in ("skipped", INFRA))
     print(f"May device tests (android): {ran} scenarios ran; verdicts follow the judge step")
     kept, anrs, crashes, network = diagnostics.kept, diagnostics.anrs, diagnostics.crashes, diagnostics.network
     if kept:
@@ -2067,10 +2179,14 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
         scenario, word = entry["id"], entry["verdict"]
         print(f"May device tests ({platform}): {scenario}: {word}")
     counts = {word: sum(1 for entry in report["scenarios"] if entry["verdict"] == word)
-              for word in ("pass", "ui-pass", "fail", "skipped", SMOKE_PASS, UNVERIFIED)}
+              for word in ("pass", "ui-pass", "fail", "skipped", SMOKE_PASS, UNVERIFIED, INFRA)}
     passed, ui_passed, failed, skipped = counts["pass"], counts["ui-pass"], counts["fail"], counts["skipped"]
     print(f"May device tests ({platform}): {passed} passed, {ui_passed} passed on screen alone (server checks not "
           f"configured), {failed} failed, {skipped} skipped")
+    infra = counts[INFRA]
+    if infra:
+        print(f"May device tests ({platform}): {infra} had no working emulator (infra, the harness's failure, never "
+              "May's)")
     unverified = counts[UNVERIFIED]
     if unverified:
         print(f"May device tests ({platform}): {unverified} could not be checked on the server (unverified, never a "
@@ -2367,6 +2483,9 @@ def verdict(platform="android"):
         raise DeviceTestsError("No scenario verdicts are recorded") from None
     if not isinstance(verdicts, list) or "fail" in verdicts:
         raise DeviceTestsError("A scenario failed")
+    ran = [word for word in verdicts if word != "skipped"]
+    if ran and all(word == INFRA for word in ran):
+        raise DeviceTestsError("No scenario had a working emulator")
     if (runner_root() / "may-private" / SPIKE_CRASHED).exists():
         raise DeviceTestsError("May crashed on opening a notification in the spike")
     print(f"May device tests ({platform}): no scenario failed")
