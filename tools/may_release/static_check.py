@@ -300,6 +300,8 @@ COMMENT_SLUG_POSTS = {
     ("native-compile-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
     ("ios-renders.yml", "publish"): ("ci-comment", "publish.py comment "),
     ("ds-swift-compile.yml", "post"): ("ci-ds-comment", "ds_compile.py post "),
+    # Coordinator, 3 Nov: a re-run at the same head edits that head's comment, so only this bot's own counts.
+    ("ds-tests-pr.yml", "post"): ("ci-ds-comment", "ds_tests.py post "),
 }
 
 
@@ -2645,9 +2647,15 @@ def ds_tests_print_problems(root):
                      "workflow runs")
     tree = ast.parse(path.read_text())
     post = function_source(tree, "post")
-    if post is None or "post_once(call_api, DS_REPO" not in ast.unparse(post) or \
-            "validate_ds_pull_request" not in ast.unparse(post):
-        found.append(DS_TESTS_TOOL + ": post does not read the pull request again before posting once on it")
+    # Coordinator, 3 Nov: the head's comment is posted or edited in place, an edit only of a comment this pull
+    # request's own pages listed (editing), and only the comment app's own comments count (comment_author).
+    if post is None or "post_or_update(editing(call_api, edit), DS_REPO" not in ast.unparse(post) or \
+            "comment_author(os.environ)" not in ast.unparse(post) or \
+            "validate_ds_pull_request" not in ast.unparse(post) or \
+            (editing := function_source(tree, "editing")) is None or \
+            "EDIT.fullmatch(path)" not in ast.unparse(editing) or "not in listed" not in ast.unparse(editing):
+        found.append(DS_TESTS_TOOL + ": post does not read the pull request again before posting or editing this "
+                     "head's own comment on it")
     if assigned_literal(path, "STATUS_CALL") != r"/repos/May-Assistant/may-design-system/statuses/[0-9a-f]{40}" or \
             assigned_literal(path, "CONTEXT") != "may-ds-tests":
         found.append(DS_TESTS_TOOL + ": its status call or context is not as pinned")

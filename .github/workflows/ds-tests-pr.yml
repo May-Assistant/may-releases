@@ -383,6 +383,7 @@ jobs:
           MAY_TOKENS_RESULT: ${{ needs.tokens.result }}
           MAY_WEB_RESULT: ${{ needs.web.result }}
           MAY_PROTOTYPE_RESULT: ${{ needs.prototype.result }}
+          MAY_CI_APP_SLUG: ${{ steps.ci-ds-comment.outputs.app-slug }}
         run: python3 -I -S -B tools/may_release/ds_tests.py post --ds-sha "$MAY_DS_SHA" --pr-number "$MAY_DS_PR"
       - name: Remove the decrypted records
         if: always()
