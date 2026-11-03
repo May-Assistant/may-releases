@@ -796,10 +796,36 @@ def spike_flow(steps):
 
 
 SPIKE_HOME = "- pressKey: Home\n"
-SPIKE_BANNER = (f'- extendedWaitUntil:\n    visible: "{SPIKE_TITLE}"\n    timeout: {SPIKE_WAIT_MS}\n'
-                f'- tapOn: "{SPIKE_TITLE}"\n')
-SPIKE_CENTRE = f'- swipe:\n    start: "50%,1%"\n    end: "50%,70%"\n    duration: 600\n{SPIKE_BANNER}'
+SPIKE_DOWN = '- swipe:\n    start: "50%,1%"\n    end: "50%,70%"\n    duration: 600\n'
 SPIKE_FRONT = f'- extendedWaitUntil:\n    visible:\n      id: "{SPIKE_FRONT_IDS}"\n    timeout: 20000\n'
+# Run 41533029958's shots: every variant ended on Notification Centre with all the spike's notifications still there,
+# grouped under May (a tap on a group expands it, never opens May), so no tap ever opened May. Each variant now has a
+# title of its own, starts from the home screen with Notification Centre cleared as far as it will clear (best effort:
+# its clear buttons are optional), and counts as opened only when May is in front and that title has left
+# Notification Centre.
+SPIKE_CLEAR = (SPIKE_HOME + SPIKE_DOWN + '- tapOn:\n    text: "Clear"\n    optional: true\n'
+               '- tapOn:\n    text: "Clear"\n    optional: true\n' + SPIKE_HOME)
+
+
+def spike_title(number):
+    """Variant number's own alert title: no two variants' notifications are ever the same element."""
+    return f"{SPIKE_TITLE} {number}"
+
+
+def spike_banner(title):
+    return (f'- extendedWaitUntil:\n    visible: "{title}"\n    timeout: {SPIKE_WAIT_MS}\n'
+            f'- tapOn: "{title}"\n')
+
+
+def spike_centre(title):
+    """Notification Centre's entry: a second tap when the first only expanded a group (the title still shows)."""
+    return (SPIKE_DOWN + spike_banner(title) +
+            f'- runFlow:\n    when:\n      visible: "{title}"\n    commands:\n      - tapOn: "{title}"\n')
+
+
+def spike_gone(title):
+    """The variant's notification is no longer in Notification Centre (opening it consumes it)."""
+    return (SPIKE_DOWN + f'- extendedWaitUntil:\n    notVisible: "{title}"\n    timeout: 5000\n' + SPIKE_HOME)
 
 
 def notification_spike(udid, env, maestro_env, launcher, source, private, log, token, diagnostics=None, folder=None,
@@ -841,16 +867,23 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
 
     payload = private / "spike.apns"
 
+    numbers = iter(range(1, 100))
+
     def tap(label, variant, shaped):
+        title = spike_title(next(numbers))
+        shaped = json.loads(json.dumps(shaped))  # a copy: the fixture's own alert keeps its other keys
+        alert = shaped["aps"].get("alert")
+        shaped["aps"]["alert"] = dict(alert if isinstance(alert, dict) else {}, title=title)
+        flow(f"{variant}-clear", spike_flow(SPIKE_CLEAR), maestro_env)  # best effort; never decides the variant
         if variant == "warm":
             ready = flow("home", spike_flow(SPIKE_HOME), maestro_env)
         else:
-            ready = simctl("terminate", udid, BUNDLE)
+            ready = simctl("terminate", udid, BUNDLE) and flow("home", spike_flow(SPIKE_HOME), maestro_env)
         payload.write_text(json.dumps(shaped))
         late.extend(fresh())
         pushed = simctl("push", udid, BUNDLE, str(payload))
-        banner = flow(f"{variant}-banner", spike_flow(SPIKE_BANNER), maestro_env)
-        centre = False if banner else flow(f"{variant}-centre", spike_flow(SPIKE_CENTRE), maestro_env)
+        banner = flow(f"{variant}-banner", spike_flow(spike_banner(title)), maestro_env)
+        centre = False if banner else flow(f"{variant}-centre", spike_flow(spike_centre(title)), maestro_env)
         time.sleep(SPIKE_SETTLE_SECONDS)
         crashed = fresh()
         front = flow(f"{variant}-front", spike_flow(SPIKE_FRONT), maestro_env) if banner or centre else False
@@ -859,7 +892,8 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
         # screen after the front check is kept beside the report, in the private run folder alone (never the log).
         if folder is not None:
             screenshot(udid, env, folder / f"spike-{label}-{variant}-end.png", log)
-        return ready, pushed, banner, centre, crashed, front
+        gone = flow(f"{variant}-gone", spike_flow(spike_gone(title)), maestro_env) if front else False
+        return ready, pushed, banner, centre, crashed, front, front and gone
 
     def variants():
         launch(udid, env, token, log)
@@ -871,12 +905,13 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
             allowed = False
         say("notifications allowed: " + ("passed" if allowed else "failed"))
         for variant in ("warm", "cold"):
-            ready, pushed, banner, centre, crashed, front = tap("generic", variant, SPIKE_PAYLOAD)
+            ready, pushed, banner, centre, crashed, front, opened = tap("generic", variant, SPIKE_PAYLOAD)
             say(f"{variant}: May {'sent to the background' if variant == 'warm' else 'stopped'} "
                 f"{'yes' if ready else 'no'}, pushed {'yes' if pushed else 'no'}, banner tap "
                 f"{'passed' if banner else 'failed'}, Notification Centre tap "
                 f"{'not tried' if banner else 'passed' if centre else 'failed'}, crash on notification open "
-                f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}")
+                f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}, "
+                f"opened {'yes' if opened else 'no'}")
         if diagnostics is None:
             return
         payloads = push_payloads(source, datetime.date.today().isoformat())
@@ -886,10 +921,12 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
         for name, shaped in payloads:
             for variant in ("warm", "cold"):
                 launch(udid, env, token, log)
-                ready, pushed, banner, centre, crashed, front = tap(name.replace(" ", "-"), variant, shaped)
+                ready, pushed, banner, centre, crashed, front, opened = tap(name.replace(" ", "-"), variant,
+                                                                            shaped)
                 say(f"{name} {variant}: pushed {'yes' if pushed else 'no'}, tap "
                     f"{'passed' if banner or centre else 'failed'}, crash on notification open "
-                    f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}")
+                    f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}, "
+                    f"opened {'yes' if opened else 'no'}")
 
     allow = source / device_tests.FLOWS_DIR / ALLOW_FLOW
     if not allow.is_file() or allow.is_symlink():
