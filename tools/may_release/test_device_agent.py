@@ -428,12 +428,15 @@ class AgentRunTests(unittest.TestCase):
                                                        selection="poll,poll-skip", asked=ask)
         except (KeyError, TypeError) as error:
             self.fail("a question truth row was not read as a question: " + type(error).__name__)
-        self.assertEqual(asked, [("answered", "qa-39557415738-a-poll"), ("closed", "qa-39557415738-a-poll-skip")])
+        self.assertEqual(asked, [("answered", "qa-39557415738-a-poll"), ("closed", "qa-39557415738-a-poll-skip"),
+                                 ("answered", "qa-39557415738-a-poll-skip")])
         self.assertEqual([device.get("MAY_DEVICE_STEPS") for device in self.last_seen["devices"]], ["120", "120"],
                          "both have 120 to type slowly (run 40232904242: poll ran out at 80)")
         self.assertEqual([(row["verdict"], row.get("reason"), row["server"]) for row in report["scenarios"]], [
             ("pass", None, [{"get": "/v1/agents", "status": 200, "pass": True}]),
-            ("fail", device_tests.NO_TRUTH, [{"get": "/v1/agents", "status": 200, "pass": False}])])
+            (device_tests.INFRA, device_tests.STRAY_ANSWER,
+             [{"get": "/v1/agents", "status": 200, "pass": False, "stray": True}])],
+            "poll-skip's card answered, not skipped: the agent's stray answer (run 41358220544), never May's fail")
 
     def reset_and(self, again):
         import shutil
@@ -1077,6 +1080,41 @@ class ServerTruthTests(unittest.TestCase):
                 self.assertEqual(entry["server"], [{"get": "/v1/agents", "status": expected[0], "pass": expected[1]}])
                 self.assertEqual(entry.get("delivery"), codes)
 
+    def test_a_skipped_card_the_agent_answered_itself_is_a_stray_answer_never_mays_fail(self):
+        """M and the coordinator, 3 Nov (run 41358220544): poll-skip's agent tapped a choice, so nothing was checked."""
+        row = {"driver": "agent", "goal": "x {tag}", "server": [], "truth": [{"question": "closed"}]}
+        for states, expected in ((("answered",), [{"get": "/v1/agents", "status": 200, "pass": False, "stray": True}]),
+                                 (("closed",), [{"get": "/v1/agents", "status": 200, "pass": True}]),
+                                 ((), [{"get": "/v1/agents", "status": 200, "pass": False}])):
+            with self.subTest(states=states):
+                entry, asked = {"server": []}, []
+                device_tests.server_reads(row, entry, "https://s", TOKEN, "qa-1-poll-skip", None, None,
+                                          lambda base, token, state, tag: asked.append(state) or (200, state in states),
+                                          lambda base, token, tag: None, None)
+                self.assertEqual(entry["server"], expected)
+        self.assertEqual(asked, ["closed", "answered"], "answered is asked only when closed was not found")
+        verdict = device_tests.combined({"server": expected[:0] + [{"get": "/v1/agents", "status": 200, "pass": False,
+                                                                     "stray": True}]},
+                                        {"outcome": "completed"}, ("fail", ""))
+        self.assertEqual(verdict, {"verdict": device_tests.INFRA, "reason": device_tests.STRAY_ANSWER})
+        row = {"driver": "agent", "goal": "x {tag}", "server": [], "truth": [{"question": "answered"}]}
+        entry = {"server": []}
+        device_tests.server_reads(row, entry, "https://s", TOKEN, "qa-1-poll", None, None,
+                                  lambda base, token, state, tag: (200, False), lambda base, token, tag: None, None)
+        self.assertNotIn("stray", entry["server"][0], "poll's own card has no stray answer to find")
+        goal = next(row["goal"] for row in device_tests.scenarios("all", "android") if row["id"] == "poll-skip")
+        self.assertIn("never tap the card or any of its choices", goal)
+        self.assertIn("the only things you tap from here on are the message field and the send button", goal)
+
+    def test_a_typing_failure_is_infra_whatever_the_judge_said(self):
+        for judged in (("pass", ""), ("fail", "the message was cut")):
+            with self.subTest(judged=judged):
+                self.assertEqual(device_tests.combined({"server": [], "delivery": ["succeeded"]},
+                                                       {"outcome": "blocked", "typing_failed": True}, judged, sends=True),
+                                 {"verdict": device_tests.INFRA, "reason": device_tests.TYPING_FAILED})
+        for reason in (device_tests.TYPING_FAILED, device_tests.STRAY_ANSWER):
+            self.assertIn(reason, publish.REASONS)
+
     def test_tagged_finds_the_tag_anywhere_in_the_reply_case_insensitively(self):
         def get(body):
             return lambda request, timeout: FakeReply(json.dumps(body).encode())
@@ -1555,17 +1593,59 @@ class DeviceServerTests(unittest.TestCase):
         failed, content = self.call("hierarchy")
         self.assertEqual(content[0]["text"], "text='Chats' | id=tab | clickable | (50, 30)")
 
-    def answer_type(self, field):
-        """The type tool's answer when the focused field holds field after the input."""
-        xml = (b'<hierarchy><node text="Ask May" focused="false" bounds="[0,0][9,9]"/><node text="' + field +
-               b'" focused="true" bounds="[0,0][9,9]"/></hierarchy>')
+    def answer_type(self, field, text=None, then=None):
+        """The type tool's answer when the focused field holds field after the input (and then, when given, after the
+        input of what did not land); text: what is typed, the field's own end by default."""
+        fields = [field] + ([then] if then is not None else [])
 
         def run(argv, capture_output, stdin, timeout):
             self.adb.append(argv)
-            return subprocess.CompletedProcess(argv, 0, xml if "uiautomator" in argv else b"", b"")
+            if "uiautomator" in argv:
+                shown = fields.pop(0) if len(fields) > 1 else fields[0]
+                return subprocess.CompletedProcess(argv, 0, (
+                    b'<hierarchy><node text="Ask May" focused="false" bounds="[0,0][9,9]"/><node text="' + shown +
+                    b'" focused="true" bounds="[0,0][9,9]"/></hierarchy>'), b"")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
 
         with patch("device_mcp.subprocess.run", side_effect=run):
-            return device_mcp.call("type", {"text": "hello"}, self.config)
+            end = field.decode()[-60:].strip()
+            return device_mcp.call("type", {"text": text if text is not None else
+                                            end if device_mcp.TEXT.fullmatch(end) else "hello"}, self.config)
+
+    def test_a_cut_text_is_typed_once_more_from_where_it_stopped(self):
+        """M and the coordinator, 3 Nov (run 41504861439's poll): adb cut the sentence at "with three cho" and the cut
+        message was sent."""
+        typed = "Ask me about a snack, with three choices, tag qa-1-a-poll"
+        failed, content = self.answer_type(b"Ask me about a snack, with three cho", typed,
+                                           then=typed.encode())
+        self.assertFalse(failed)
+        self.assertEqual(content[0]["text"], f"Done. The focused field now reads: {typed!r}")
+        inputs = [argv[-1] for argv in self.adb if argv[-3:-1] == ["input", "text"]]
+        self.assertEqual(inputs, [typed.replace(" ", "%s"), "ices,%stag%sqa-1-a-poll"], "only what did not land, once")
+        self.assertNotIn("typing_failed", self.config)
+
+    def test_a_text_still_cut_after_its_one_retry_is_a_typing_failure_the_judge_calls_infra(self):
+        typed = "Ask me about a snack, with three choices, tag qa-1-a-poll"
+        failed, content = self.answer_type(b"Ask me about a snack, with three cho", typed,
+                                           then=b"Ask me about a snack, with three choices, t")
+        self.assertTrue(failed)
+        self.assertEqual(content[0]["text"], "The text did not land whole, even typed again: the field reads "
+                                             "'Ask me about a snack, with three choices, t'. Do not send it; call done "
+                                             "now with outcome blocked")
+        self.assertEqual(len([argv for argv in self.adb if argv[-3:-1] == ["input", "text"]]), 2, "one retry alone")
+        self.assertIs(self.config.get("typing_failed"), True)
+        with open(self.config["result"]) as stream:
+            self.assertIs(json.load(stream).get("typing_failed"), True, "the record carries it to the judge")
+        _, content = self.answer_type(b"Bearer abc", "hello")
+        self.assertEqual(content[0]["text"], "Done. The focused field now reads: '(hidden)'",
+                         "a field hidden from the agent is never typed into again")
+
+    def test_a_long_field_is_compared_whole_not_as_the_agent_was_shown_it(self):
+        field = "word " * 80 + "end"
+        self.adb = []
+        failed, _ = self.answer_type(field.encode(), "end")
+        self.assertFalse(failed)
+        self.assertEqual(len([argv for argv in self.adb if argv[-3:-1] == ["input", "text"]]), 1)
 
     def test_type_says_what_landed_so_the_agent_never_types_it_again(self):
         """Run 40119835677: Android chat typed one sentence in pieces for three minutes and never tapped send."""

@@ -774,6 +774,7 @@ def record(config, outcome, summary):
                        "hierarchy_failure": config.get("hierarchy_failure"),
                        "hierarchy_cause": config.get("hierarchy_cause"), "refusal_cause": config.get("refusal_cause"),
                        **({"wedged": True} if config.get("wedged") else {}),
+                       **({"typing_failed": True} if config.get("typing_failed") else {}),
                        **({"looks": config["looks"]} if config.get("look") else {})}, output)
         os.replace(partial, config["result"])
     finally:
@@ -865,12 +866,40 @@ def act(name, args, config):
     landed = None if xml is None else focused_text(xml)
     if landed is None:
         return False, [{"type": "text", "text": "Done; the focused field could not be read, so take a hierarchy"}]
+    # M and the coordinator, 3 Nov (runs 41504861439 and 41435985226): adb's input text cut a sentence short ("with
+    # three cho") and the cut message was sent. The field is read back: when it does not end with the whole text, the
+    # part that did not land is typed once more, and the field read again; still short, the run is marked a typing
+    # failure (the harness's, never May's: the judge reports it infra) and the agent is told to stop.
+    rest = untyped(args["text"], focused_text(xml, raw=True), landed)
+    if rest:
+        status, _ = adb(config, "shell", "input", "text", rest.replace(" ", "%s"))
+        xml, _ = android_dump(config)
+        landed = None if status or xml is None else focused_text(xml)
+        if landed is None or untyped(args["text"], focused_text(xml, raw=True), landed):
+            config["typing_failed"] = True
+            shown = "could not be read" if landed is None else f"reads {landed!r}"
+            return True, [{"type": "text", "text": f"The text did not land whole, even typed again: the field {shown}. "
+                                                   "Do not send it; call done now with outcome blocked"}]
     return False, [{"type": "text", "text": f"Done. The focused field now reads: {landed!r}"}]
 
 
-def focused_text(xml):
+def untyped(text, field, shown):
+    """The end of text that did not land in the field (the field's whole text, field, ends with the part that did),
+    "" when the field ends with the whole text, or when it is not compared: the agent was shown it hidden as a
+    credential (shown), so nothing of it is typed again."""
+    field, text = field.rstrip(), text.rstrip()  # a trailing space is the field's, or the next word's, never a cut
+    if shown == "(hidden)" or not text or field.endswith(text):
+        return ""
+    for cut in range(len(text) - 1, 0, -1):
+        if field.endswith(text[:cut]):
+            return text[cut:]
+    return text
+
+
+def focused_text(xml, raw=False):
     """The focused field's text as the agent may see it: through kept_lines (a field that could hold a credential is
-    "(hidden)", an email address keeps its domain alone), at most MAX_FIELD characters; None when no field is focused."""
+    "(hidden)", an email address keeps its domain alone), at most MAX_FIELD characters; None when no field is focused.
+    raw: the field's whole text, for comparing with what was typed alone, never shown to the agent or kept."""
     try:
         root = ElementTree.fromstring(xml)
     except ElementTree.ParseError:
@@ -878,7 +907,7 @@ def focused_text(xml):
     field = next((node for node in root.iter("node") if node.get("focused") == "true"), None)
     if field is None:
         return None
-    return shown_field(field.get("text", ""))
+    return field.get("text", "") if raw else shown_field(field.get("text", ""))
 
 
 def shown_field(text):

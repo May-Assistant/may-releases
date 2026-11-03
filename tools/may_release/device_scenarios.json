@@ -113,7 +113,7 @@
     "title": "Skip May's question with a free reply",
     "driver": "agent",
     "steps": 120,
-    "goal": "In May Playground, on the Chats screen, open the chat named {platform} chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, do not tap any choice. Instead type and send this message: I will answer myself: apples, {tag}. Then check that the same question card now shows as skipped, with its choices dimmed.",
+    "goal": "In May Playground, on the Chats screen, open the chat named {platform} chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Ask me one multiple-choice question about which fruit I would like as a snack, with three choices, tag {tag}. When May shows a question card with choices, never tap the card or any of its choices, not even to look closer: the only things you tap from here on are the message field and the send button. Instead type and send this message: I will answer myself: apples, {tag}. Then check that the same question card now shows as skipped, with its choices dimmed.",
     "chat": true,
     "platforms": [
       "android",

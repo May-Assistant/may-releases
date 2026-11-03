@@ -255,6 +255,11 @@ INFRA = "infra"
 INFRA_AGAIN = "the emulator crashed during it, and again after its one restart"
 INFRA_NO_RESTART = "the emulator crashed during it and did not come back after a restart"
 INFRA_GONE = "the emulator was not running: it had crashed and was not restarted again"
+# M and the coordinator, 3 Nov: two more of the harness's own failures are infra, never May's. The typing tool's text
+# did not land whole even typed again (device_mcp: runs 41504861439's poll and 41435985226's chat sent cut messages),
+# and the agent answered poll-skip's card itself, which leaves nothing to check (run 41358220544): a setup failure.
+TYPING_FAILED = "the typing tool's text did not land whole, even typed again (the harness's failure)"
+STRAY_ANSWER = "the agent answered the question card itself, so its skip could not be checked (a setup failure)"
 
 
 def fresh_switch():
@@ -676,6 +681,12 @@ def server_reads(row, entry, base, token, own, checked, truth, asked, delivered,
     for check in row.get("truth", []):
         if "question" in check:
             path, (status, found) = "/v1/agents", asked(base, token, check["question"], own)
+            # A card that should be skipped (closed) but was answered: the agent tapped a choice (run 41358220544).
+            if check["question"] == "closed" and status == 200 and not found:
+                stray_status, stray = asked(base, token, "answered", own)
+                if stray_status == 200 and stray:
+                    entry["server"].append({"get": path, "status": status, "pass": False, "stray": True})
+                    continue
         elif check == DELIVERY_TRUTH:
             path, status = "/v1/agents", 0 if codes is None else 200
             found = bool(codes) and all(code == "succeeded" for code in codes)
@@ -2027,6 +2038,10 @@ def combined(entry, record, judged, sends=False, look=False):
         return {"verdict": "fail", "reason": SMOKE_MAESTRO}
     if record.get("state") == "rate_limited" or judged[0] == "rate_limited":
         return {"verdict": "skipped", "reason": RATE_LIMITED}
+    if record.get("typing_failed") is True:
+        return {"verdict": INFRA, "reason": TYPING_FAILED}
+    if any(check.get("stray") for check in entry.get("server", [])):
+        return {"verdict": INFRA, "reason": STRAY_ANSWER}
     if record.get("wedged") is True:
         return {"verdict": "fail", "reason": WEDGED}
     if record.get("outcome") == "blocked":
