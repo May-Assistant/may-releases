@@ -1088,6 +1088,12 @@ class RunTests(unittest.TestCase):
                 with Path(log).open("ab") as output:
                     output.write(b"Launch app... COMPLETED\nAssert that id: chats is visible... FAILED\n"
                                  b"session " + TOKEN.encode() + b"\n")
+                if "--debug-output" in argv:  # Maestro's own per-command list, as 2.8.0 writes it
+                    debug = Path(argv[argv.index("--debug-output") + 1]) / "2026-11-03_145036"
+                    debug.mkdir(parents=True)
+                    (debug / "commands-(flow).json").write_text(json.dumps(
+                        [{"command": {"launchAppCommand": {}}, "metadata": {"status": "COMPLETED"}},
+                         {"command": {"assertConditionCommand": {}}, "metadata": {"status": "FAILED"}}]))
             for name in crashes:
                 if argv[-1].endswith(f"/{name}.xml"):
                     crashes.remove(name)
@@ -1342,7 +1348,11 @@ class RunTests(unittest.TestCase):
         _, report, out, _ = self.run_it(fail=("sign-in",), diagnosed=Fake)
         self.assertEqual([row["verdict"] for row in report["scenarios"]][:1], ["fail"])
         self.assertEqual(flows_kept["sign-in"], b"Launch app... COMPLETED\nAssert that id: chats is visible... FAILED\n"
-                                                b"session " + TOKEN.encode() + b"\n", "the failed flow's own lines")
+                                                b"session " + TOKEN.encode() + b"\n"
+                                                b"maestro commands: 1 completed, 1 failed\n"
+                                                b"maestro command 2: assertConditionCommand FAILED\n",
+                         "the failed flow's own lines, then its command list in fixed words")
+        self.assertFalse(list(self.private.glob("*-maestro-debug")), "Maestro's debug output is removed")
         self.assertEqual(flows_kept["connections"], b"", "a passed flow keeps none")
         self.assertEqual(self.flow_logs, ["sign-in-flow.log", "connections-flow.log"], "each flow its own log")
         self.assertFalse(list(self.private.glob("*-flow.log")), "folded into the run's private log and removed")
@@ -2311,6 +2321,31 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(clears), 2)
         self.assertTrue(all(dump < clear for dump, clear in zip(dumps, clears)), "the log is cleared once read")
         self.assertIn(["logcat", "-d", "-t", "2000", "-b", "main,system,crash"], emulator.calls)
+
+    def test_a_failed_flows_maestro_commands_are_kept_in_fixed_words_alone(self):
+        """Run 41656192676: four flows ended in Maestro's "Unknown error" with no step named (M, 3 Nov)."""
+        debug = self.folder / "sign-in-maestro-debug" / "2026-11-03_145036"
+        debug.mkdir(parents=True)
+        commands = [{"command": {"launchAppCommand": {"appId": "secret.app"}}, "metadata": {"status": "COMPLETED"}},
+                    {"command": {"tapOnElement": {"selector": {"idRegex": "chat.header"}}},
+                     "metadata": {"status": "FAILED", "error": {"message": "Element chat.header " + TOKEN}}},
+                    {"command": {"inputTextCommand": {"text": TOKEN}}, "metadata": {"status": "SKIPPED"}},
+                    {"command": {"<b>": {}}, "metadata": {"status": "FAILED"}},
+                    {"command": {}, "metadata": {"status": "odd"}}]
+        (debug / "commands-(Sign in with a test session).json").write_text(json.dumps(commands))
+        (debug / "maestro.log").write_bytes(b"x java.lang.IllegalStateException: " + TOKEN.encode() + b"\n"
+                                            b"y dev.mobile.maestro.DriverError again\nz java.lang.IllegalStateException\n")
+        found = device_tests.maestro_commands(self.folder / "sign-in-maestro-debug")
+        self.assertEqual(found, b"maestro commands: 1 completed, 2 failed, 1 skipped, 1 unknown\n"
+                                b"maestro command 2: tapOnElement FAILED\n"
+                                b"maestro command 4: unknown FAILED\n"
+                                b"maestro exceptions: java.lang.IllegalStateException, dev.mobile.maestro.DriverError\n")
+        for secret in (TOKEN.encode(), b"chat.header", b"secret.app", b"<b>"):
+            self.assertNotIn(secret, found, "no selector, text, message or odd name is kept")
+        (debug / "commands-(Sign in with a test session).json").write_text("{not json")
+        self.assertEqual(device_tests.maestro_commands(self.folder / "sign-in-maestro-debug").splitlines()[0],
+                         b"maestro commands: unreadable")
+        self.assertEqual(device_tests.maestro_commands(self.folder / "none"), b"", "no debug output: nothing")
 
     def test_a_failed_flows_maestro_lines_come_first_redacted_and_capped(self):
         emulator = FakeEmulator()

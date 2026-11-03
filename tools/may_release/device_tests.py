@@ -1219,6 +1219,53 @@ def adb_output(adb, env, argv):
 FLOW_LINES = 40
 
 
+# Run 41656192676 (M and the coordinator, 3 Nov): four scripted flows ended in 5 to 7 s with Maestro's own "Unknown
+# error" (JUnit status ERROR) and no step named. Each flow now writes Maestro's debug output to a private folder; for a
+# failed flow, its per-command list gives, in fixed words alone, how many commands ran in each state, the index and
+# type of each failed one, and the exception class names maestro.log raised. No selector, text or message is kept,
+# and the folder is removed whatever happens.
+COMMAND_STATES = ("COMPLETED", "FAILED", "SKIPPED", "WARNED", "PENDING", "RUNNING")
+COMMAND_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,47}")
+EXCEPTION_CLASS = re.compile(rb"\b(?:[a-z][a-z0-9_]*\.){1,8}[A-Z][A-Za-z0-9$]{0,63}(?:Exception|Error)\b")
+MAX_FAILED_COMMANDS, MAX_EXCEPTIONS = 5, 5
+
+
+def maestro_commands(folder):
+    """A failed flow's Maestro debug output (folder) as fixed-shape lines, b"" when it holds no command list."""
+    lines = []
+    try:
+        lists = sorted(path for path in folder.rglob("commands-*.json") if path.is_file() and not path.is_symlink())
+        for path in lists[:1]:
+            commands = json.loads(path.read_bytes()[:4 * 1024 * 1024])
+            if not isinstance(commands, list):
+                continue
+            states, failed = {}, []
+            for index, item in enumerate(commands, 1):
+                command = item.get("command") if isinstance(item, dict) else None
+                metadata = item.get("metadata") if isinstance(item, dict) else None
+                state = metadata.get("status") if isinstance(metadata, dict) else None
+                state = state if state in COMMAND_STATES else "UNKNOWN"
+                states[state] = states.get(state, 0) + 1
+                names = list(command) if isinstance(command, dict) else []
+                kind = names[0] if len(names) == 1 and COMMAND_TYPE.fullmatch(str(names[0])) else "unknown"
+                if state == "FAILED":
+                    failed.append(f"maestro command {index}: {kind} FAILED")
+            lines.append("maestro commands: " + ", ".join(f"{count} {state.lower()}" for state, count in
+                                                         sorted(states.items())) if states else "maestro commands: none")
+            lines += failed[:MAX_FAILED_COMMANDS]
+        logs = [path for path in folder.rglob("maestro.log") if path.is_file() and not path.is_symlink()]
+        found = []
+        for path in logs[:1]:
+            for name in EXCEPTION_CLASS.findall(path.read_bytes()[-1024 * 1024:]):
+                if name.decode() not in found:
+                    found.append(name.decode())
+        if found:
+            lines.append("maestro exceptions: " + ", ".join(found[:MAX_EXCEPTIONS]))
+    except (OSError, ValueError, RecursionError):
+        lines.append("maestro commands: unreadable")
+    return "".join(line + "\n" for line in lines).encode()
+
+
 def last_lines(path, log):
     """The last FLOW_LINES of a private Maestro log, which is then added to the run's private log and removed: b"" when
     there is none (or it is a link)."""
@@ -2003,15 +2050,17 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             if flow is not None:
                 at(f"{row['id']}: Maestro")
                 flow_log = private / f"{row['id']}-flow.log"
+                debug = private / f"{row['id']}-maestro-debug"
                 try:
                     passed = not flows.run_private(
-                        [str(launcher), "--device", SERIAL, "test", str(flow), "--format", "junit", "--output",
-                         str(folder / (row["id"] + ".xml"))], flow_log, env=with_session(maestro_env, token),
-                        check=False, timeout=FLOW_SECONDS)
+                        [str(launcher), "--device", SERIAL, "test", str(flow), "--debug-output", str(debug),
+                         "--format", "junit", "--output", str(folder / (row["id"] + ".xml"))], flow_log,
+                        env=with_session(maestro_env, token), check=False, timeout=FLOW_SECONDS)
                 except subprocess.TimeoutExpired:
                     passed, timed_out = False, True
                 flow_lines = last_lines(flow_log, log)
-                flow_lines = b"" if passed else flow_lines
+                flow_lines = b"" if passed else flow_lines + maestro_commands(debug)
+                shutil.rmtree(debug, ignore_errors=True)
             finish_onboarding(row, source, "android", lambda path: not flows.run_private(
                 [str(launcher), "--device", SERIAL, "test", str(path)], log, env=maestro_env, check=False,
                 timeout=ONBOARDING_SECONDS))
