@@ -1441,7 +1441,27 @@ class DiagnosticsTests(Workspace):
                          [b"stall 900 ms", b"stall-after sync-publish", b"stall 400 ms", b"stall-after view-chat",
                           b"stall 3800 ms", b"stall-after sync-publish", b"stall 300 ms", b"stall-after not-agreed"],
                          "each after its own stall, in the log's order")
-        self.assertEqual(len(device_ios.STALL_AFTER_NAMES), 13, "N's twelve and may-app #1318's view-chat-row")
+        self.assertEqual(len(device_ios.STALL_AFTER_NAMES), 14,
+                         "N's twelve, may-app #1318's view-chat-row and #1686's agents-publish")
+        self.assertIn("agents-publish", device_ios.STALL_AFTER_NAMES)
+
+    def test_each_stalls_evaluation_counts_are_kept_beside_it_privately_and_counted_nowhere(self):
+        """may-app #1686 (N, 3 Nov): how often the root view and the tab shell evaluated since launch, per stall."""
+        shown = b"".join(b"2026-11-03 13:00:%02d.000 Df MayPlayground[1:2] [io.github.mayassistant.may.playground:watchdog] "
+                         b"main-thread %s\n" % (second, line) for second, line in enumerate([
+                             b"stall 900 ms", b"stall-after agents-publish", b"stall-evals root 1 shell 3",
+                             b"stall-evals root x shell 3", b"stall-evals root 1 shell 3 and more", b"stall 300 ms"]))
+        diagnostics = self.diagnostics(shown=shown)
+        folder = self.root / "out"
+        folder.mkdir()
+        diagnostics.begin()
+        diagnostics.keep(folder, "chat", TOKEN)
+        text = (folder / ("chat" + device_tests.DIAG)).read_bytes()
+        self.assertEqual([line.split(b"main-thread ")[-1] for line in text.split(b"== watchdog ==\n")[1].splitlines()],
+                         [b"stall 900 ms", b"stall-after agents-publish", b"stall-evals root 1 shell 3", b"stall 300 ms"],
+                         "digits alone, in the log's order; any other shape is dropped")
+        self.assertEqual(diagnostics.after, {"agents-publish": 1}, "an agreed name, never other")
+        self.assertEqual((diagnostics.stalls, diagnostics.longest), (2, 900), "an evals line is never a stall")
 
     def test_the_loop_census_lines_are_kept_among_the_stalls_and_counted_alone(self):
         """Run 41197247993: the census's "may-loops:" lines were read but dropped; they are kept in the log's order, in
