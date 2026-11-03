@@ -73,6 +73,7 @@ may-device-tests, with no required reviewer (NO_REVIEWER_ACTIONS), which Samuel 
 """
 
 import argparse
+import datetime
 import json
 import os
 from pathlib import Path
@@ -129,6 +130,21 @@ OPTIONAL_PULL_ACTIONS = ("renders",)
 OWN_ENVIRONMENT_ACTIONS = ("compile", "compile-pr", "ds-compile", "renders", "device-tests")
 # The one action a schedule may start (device-tests.yml's nightly run), and then on may-app main's head ("main").
 SCHEDULED_ACTIONS = ("device-tests",)
+# Coordinator, 3 Nov: no device test starts between 10:00 and 11:30 UTC (QUIET_WINDOW, minutes after midnight). GitHub
+# starts the nightly schedule hours late (runs 40176915345 to 41623657138 began between 08:30 and 11:20 UTC, and
+# 41623657138 at 10:58), so a scheduled run that would start inside the window is denied at admission, before any
+# device job; a dispatch is its dispatcher's own call.
+QUIET_WINDOW = (10 * 60, 11 * 60 + 30)
+
+
+def validate_window(action, event, now=None):
+    """Denies a scheduled device-tests run that would start inside QUIET_WINDOW (UTC)."""
+    if action not in SCHEDULED_ACTIONS or event != "schedule":
+        return
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if QUIET_WINDOW[0] <= now.hour * 60 + now.minute < QUIET_WINDOW[1]:
+        raise GateDenial("A scheduled device-tests run does not start between 10:00 and 11:30 UTC, the no-device-test "
+                         "window; the next nightly run will")
 LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?")
 AGE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 
@@ -362,6 +378,7 @@ def main():
     env = validate_run(os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF"),
                        os.environ.get("GITHUB_EVENT_NAME"), args.source_sha, args.action,
                        args.build_number, args.target)
+    validate_window(args.action, os.environ.get("GITHUB_EVENT_NAME"))
     validate_dry_run(args.action, args.dry_run, args.target)
     validate_sign_only(args.action, args.sign_only, args.dry_run, args.target)
     # A pull-request compile, the renders and the device tests build in their own environment alone, never

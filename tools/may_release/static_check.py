@@ -1505,7 +1505,7 @@ def device_tests_workflow_problems(text):
             not re.search(DEVICE_NOTIF_SPIKE_INPUT, trigger) or \
             not re.search(DEVICE_PUSH_TAP_INPUT, trigger) or \
             not re.search(DEVICE_TIDY_INPUT, trigger) or \
-            re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
+            re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 21 * * *"']:
         found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion, "
                      "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans, plus one "
                      "nightly schedule")

