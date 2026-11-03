@@ -399,7 +399,13 @@ STALL_AFTER = re.compile(rb"main-thread stall-after ([a-z-]{1,40})[ \t]*\r?\n?$"
 LOOP_NAME = rb"[A-Za-z][A-Za-z0-9_.-]{0,47}"
 LOOPS = re.compile(rb"may-loops:(?: " + LOOP_NAME + rb"(?:, " + LOOP_NAME + rb"){0,31})?[ \t]*\r?\n?$")
 STALL_AFTER_NAMES = ("launch", "sync-start", "sync-transcript", "sync-publish", "sync-inbox", "sync-end", "agenda-load",
-                     "connections-load", "pill-read", "view-root", "view-shell", "view-chat", "view-chat-row")
+                     "connections-load", "pill-read", "view-root", "view-shell", "view-chat", "view-chat-row",
+                     # may-app #1686 (N, 3 Nov): set when the agents list is written.
+                     "agents-publish")
+# may-app #1686 (N, 3 Nov): after each stall-after line, "main-thread stall-evals root <n> shell <m>", how often the root
+# view and the tab shell evaluated since launch, digits alone, so a launch stall after one evaluation (a first render) is
+# told from one after many (redraws). Kept in the private diag beside its stall; the public log counts nothing new.
+STALL_EVALS = re.compile(rb"main-thread stall-evals root ([0-9]{1,9}) shell ([0-9]{1,9})[ \t]*\r?\n?$")
 # Run 40181517145: chat's and notes' onboarding subflow did not pass, with nothing to say where it stopped. Its last
 # ONBOARDING_LINES of Maestro output go to the scenario's private diag when it does not pass. The private diag keeps
 # DIAG_RESERVE for them and for the recording's notes, written after the conversion.
@@ -527,7 +533,8 @@ class Diagnostics:
         self.crashes += bool(found)
         lines = body_changes([line for line in (self.shown(self.udid, self.env, self.start) if self.start else b"")
                               .splitlines(keepends=True) if STALL.search(line) or SPAN.search(line) or
-                              STALL_AFTER.search(line) or BODY_CHANGE.search(line) or LOOPS.search(line)])
+                              STALL_AFTER.search(line) or STALL_EVALS.search(line) or BODY_CHANGE.search(line) or
+                              LOOPS.search(line)])
         stalls = [int(STALL.search(line).group(1)) for line in lines if STALL.search(line)]
         self.stalls += len(stalls)
         self.longest = max([self.longest, *stalls])
