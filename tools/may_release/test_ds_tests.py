@@ -460,9 +460,8 @@ class SealOpenPostTests(Case):
         code, out = self.quiet(tool.post, SHA, "40", call)
         self.assertEqual((code, out), (1, "May DS tests failed; result posted to may-design-system #40\n"))
         body = calls[-1][2]["body"]
+        # No comment app's slug here (the PAT fallback): nothing is read for an edit, and the comment is posted anew.
         self.assertEqual([c[:2] for c in calls], [("GET", "/repos/May-Assistant/may-design-system/pulls/40"),
-                                                   ("GET", "/repos/May-Assistant/may-design-system/issues/40/comments"
-                                                           "?per_page=100&page=1"),
                                                    ("POST", "/repos/May-Assistant/may-design-system/issues/40/comments")])
         self.assertIn("### May design-system tests: failed", body)
         self.assertIn(f"T > {MARKER}: boom", body)
@@ -486,18 +485,83 @@ class SealOpenPostTests(Case):
         code, out = self.quiet(tool.post, SHA, "40", self.api()[0])
         self.assertEqual((code, out), (1, "May DS tests: neither suite finished (cancelled or skipped); nothing posted\n"))
 
-    def test_a_moved_head_or_an_earlier_comment_posts_nothing(self):
+    def test_a_moved_head_posts_nothing(self):
         for suite in tool.SUITES:
             self.record(suite)
         os.environ.update({tool.COMMENT_TOKEN: TOKEN})
         call, calls = self.api(pull=ds_pull(head__sha=OTHER))
         with self.assertRaises(DsTestsError):
             self.quiet(tool.post, SHA, "40", call)
-        os.environ.update({tool.COMMENT_TOKEN: TOKEN})
-        call, calls = self.api(comments=[{"body": f"<!-- may-ds-tests head={SHA} -->"}])
-        code, out = self.quiet(tool.post, SHA, "40", call)
+
+    BOT = "may-ci[bot]"
+
+    def ours(self, body, number=901):
+        return {"id": number, "body": body, "user": {"login": self.BOT, "type": "Bot"}}
+
+    def test_a_re_run_edits_this_heads_own_comment_with_the_newest_result(self):
+        """Coordinator, 3 Nov: run 41627215058 passed at #267's head, but the first run's "failed" comment stayed."""
+        for suite in tool.SUITES:
+            self.record(suite)
+        marker = f"<!-- may-ds-tests head={SHA} -->"
+        os.environ.update({tool.COMMENT_TOKEN: TOKEN, "MAY_CI_APP_SLUG": "may-ci"})
+        call, calls = self.api(comments=[self.ours("### May design-system tests: failed\n\n" + marker)])
+        edits = []
+        code, out = self.quiet(tool.post, SHA, "40", call,
+                               lambda method, path, payload, token: edits.append((method, path, payload)) or (200, {}))
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "May DS tests passed; this head's comment on may-design-system #40 is updated with "
+                              "this run's result\n")
+        self.assertEqual([(m, p) for m, p, _ in edits],
+                         [("PATCH", "/repos/May-Assistant/may-design-system/issues/comments/901")])
+        self.assertIn("### May design-system tests: passed", edits[0][2]["body"])
+        self.assertNotIn("POST", [c[0] for c in calls], "edited, never a second comment")
+
+    def test_the_same_result_again_posts_nothing(self):
+        for suite in tool.SUITES:
+            self.record(suite)
+        os.environ.update({tool.COMMENT_TOKEN: TOKEN, "MAY_CI_APP_SLUG": "may-ci"})
+        body = tool.comment_body(SHA, tool.run_url(os.environ), tool.gathered(SHA)[0], {})
+        call, calls = self.api(comments=[self.ours(body)])
+        code, out = self.quiet(tool.post, SHA, "40", call, lambda *a: self.fail("nothing to edit"))
         self.assertEqual((code, [c[0] for c in calls]), (0, ["GET", "GET"]))
         self.assertIn("already posted", out)
+
+    def test_only_the_comment_apps_own_comment_is_edited(self):
+        for suite in tool.SUITES:
+            self.record(suite)
+        marker = f"<!-- may-ds-tests head={SHA} -->"
+        os.environ.update({tool.COMMENT_TOKEN: TOKEN, "MAY_CI_APP_SLUG": "may-ci"})
+        for case, comment in (("a person's", {"id": 7, "body": marker, "user": {"login": "someone", "type": "User"}}),
+                              ("another app's", {"id": 8, "body": marker, "user": {"login": "other[bot]", "type": "Bot"}})):
+            with self.subTest(case=case):
+                os.environ[tool.COMMENT_TOKEN] = TOKEN
+                call, calls = self.api(comments=[comment])
+                code, _ = self.quiet(tool.post, SHA, "40", call, lambda *a: self.fail("someone else's comment edited"))
+                self.assertEqual(calls[-1][0], "POST", "a new comment of its own")
+        os.environ.pop("MAY_CI_APP_SLUG")
+        os.environ[tool.COMMENT_TOKEN] = TOKEN
+        call, calls = self.api(comments=[self.ours(marker)])
+        self.quiet(tool.post, SHA, "40", call, lambda *a: self.fail("no slug: nothing is edited"))
+        self.assertEqual(calls[-1][0], "POST")
+
+    def test_an_edit_reaches_only_a_comment_this_pull_request_listed(self):
+        edits = []
+        call = tool.editing(lambda method, path, payload, token: (200, [{"id": 901}]),
+                            lambda *a: edits.append(a) or (200, {}))
+        call("GET", "/repos/May-Assistant/may-design-system/issues/40/comments?per_page=100&page=1", None, TOKEN)
+        call("PATCH", "/repos/May-Assistant/may-design-system/issues/comments/901", {"body": "x"}, TOKEN)
+        for path in ("/repos/May-Assistant/may-design-system/issues/comments/902",
+                     "/repos/May-Assistant/may-app/issues/comments/901"):
+            with self.subTest(path=path), self.assertRaises(DsTestsError):
+                call("PATCH", path, {"body": "x"}, TOKEN)
+        self.assertEqual(len(edits), 1)
+
+    def test_a_job_that_never_finished_is_infra_not_no_result(self):
+        """Run 41624718553: the Swift job got no macOS runner and ended cancelled."""
+        body = tool.comment_body(SHA, "", {}, {"swift": "cancelled"})
+        self.assertIn(f"| {tool.TITLES['swift']} | infra: the job did not finish (no runner was acquired, or it was "
+                      "cancelled) (no detail reached the post job) |", body)
+        self.assertIn("no result", tool.comment_body(SHA, "", {}, {}))
 
     def test_a_hundred_long_non_ascii_failures_still_seal(self):
         """Coordinator, 31 Oct (#65): ensure_ascii made a hundred long non-ASCII failures too large to seal."""
@@ -640,7 +704,12 @@ class ShapeTests(unittest.TestCase):
         for old, new in (('    print(f"May DS tests {suite}: {verdict}, {total} tests, {failed} failed, {skipped} skipped")',
                           '    print(f"May DS tests {suite}: {verdict}, {record}")'),
                          ('MARKER = "may-ds-tests"', 'MARKER = "may-ds"'),
-                         ("validate_ds_pull_request(pull, number, sha)", "pull")):
+                         ("validate_ds_pull_request(pull, number, sha)", "pull"),
+                         # Coordinator, 3 Nov: the head's own comment is edited, only this app's, only one listed.
+                         ("                          comment_author(os.environ))", '                          "")'),
+                         ("post_or_update(editing(call_api, edit), DS_REPO", "post_or_update(call_api, DS_REPO"),
+                         ('path.rsplit("/", 1)[-1] not in listed', "False"),
+                         ("not EDIT.fullmatch(path) or ", "")):
             with self.subTest(new=new[:60]):
                 self.assertIn(old, source)
                 root = Path(tempfile.mkdtemp())

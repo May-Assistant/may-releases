@@ -34,10 +34,11 @@ hands over only that; a fresh post job opens both and posts (the split of may-re
            when every suite passed, failure otherwise (error when none finished), with counts alone, so a merge can
            gate on one check (coordinator, 28 Oct).
   post     (post job, MAY_DS_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts one comment for every
-           suite on the pull request, after it is read again and is still open at that head, unless a comment already
-           carries this head's marker. A suite whose record never arrived is reported from its job's result alone
-           (MAY_SWIFT_RESULT, MAY_ANDROID_RESULT, MAY_TOKENS_RESULT, MAY_WEB_RESULT,
-           MAY_PROTOTYPE_RESULT: success, failure). It fails when a suite did not pass.
+           suite on the pull request, after it is read again and is still open at that head; a comment of the comment
+           app's own that already carries this head's marker is edited in place instead, so a re-run's result wins.
+           A suite whose record never arrived is reported from its job's result alone (MAY_SWIFT_RESULT,
+           MAY_ANDROID_RESULT, MAY_TOKENS_RESULT, MAY_WEB_RESULT, MAY_PROTOTYPE_RESULT: success, failure, or cancelled,
+           which is infra: no runner was acquired, or the job was cancelled). It fails when a suite did not pass.
 """
 
 import argparse
@@ -54,8 +55,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from android_unit import ANSI, UnitTestsError, clean, install_sdk, parsed_report, pinned_java_home, sdk_home
 from compile import credentials_left
-from ds_compile import (DEVELOPER, PACKAGES, PRIVATE, SOURCE, XCODE, DsCompileError, build_env, fence_for, github,
-                        post_once, request, run_url, runner_root, schemes_of)
+from ds_compile import (DEVELOPER, PACKAGES, PRIVATE, SOURCE, XCODE, DsCompileError, build_env, comment_author,
+                        fence_for, github, post_or_update, request, run_url, runner_root, schemes_of)
 from gate import AGE_RECIPIENT, DS_REPO, GateDenial, pull_number, validate_ds_pull_request
 from prepare import PrepareError, head_revision
 from renders import DEVICE, RendersError, quiet, simulator
@@ -562,7 +563,10 @@ def comment_body(sha, url, records, results):
     for suite in SUITES:
         record = records.get(suite)
         if record is None:
-            state = {"success": "passed", "failure": "failed"}.get(results.get(suite), "no result")
+            # Run 41624718553: the Swift job never got a macOS runner and ended "cancelled", which read "no result".
+            state = {"success": "passed", "failure": "failed",
+                     "cancelled": "infra: the job did not finish (no runner was acquired, or it was cancelled)"}.get(
+                results.get(suite), "no result")
             lines.append(f"| {TITLES[suite]} | {state} (no detail reached the post job) | | | |")
             continue
         if absent(record):
@@ -650,7 +654,31 @@ def set_status(sha, call_api=status_api):
     return 0
 
 
-def post(sha, pr, call_api=github):
+# Coordinator, 3 Nov: run 41627215058 re-ran may-design-system #267's head and passed, but post_once found the first
+# run's "failed" comment by its marker and posted nothing, so the pull request still read "failed" under a success
+# status. The head's comment is now posted or edited in place (ds_compile.post_or_update), the newest run winning: only
+# the comment app's own comments count, and an edit reaches only a comment this pull request's pages listed.
+EDIT = re.compile(r"/repos/" + re.escape(DS_REPO) + r"/issues/comments/[1-9][0-9]{0,19}")
+
+
+def editing(call_api, edit=request):
+    """call_api (github: the pull request, its comment pages, a new comment), plus the edit of a comment the pull
+    request's own comment pages listed, through edit (ds_compile.request); any other edit is refused."""
+    listed = set()
+
+    def call(method, path, payload, token):
+        if method == "PATCH":
+            if not EDIT.fullmatch(path) or path.rsplit("/", 1)[-1] not in listed:
+                raise DsTestsError("Only this pull request's own comments can be edited")
+            return edit(method, path, payload, token)
+        status, data = call_api(method, path, payload, token)
+        if method == "GET" and "/comments?" in path and isinstance(data, list):
+            listed.update(str(c["id"]) for c in data if isinstance(c, dict) and type(c.get("id")) is int)
+        return status, data
+    return call
+
+
+def post(sha, pr, call_api=github, edit=request):
     require_step_secrets((COMMENT_TOKEN,))
     # Held in memory alone from here: never in a child's environment, a file, an argument or a printed line.
     token = os.environ.pop(COMMENT_TOKEN, "")
@@ -675,8 +703,14 @@ def post(sha, pr, call_api=github):
         validate_ds_pull_request(pull, number, sha)
     except GateDenial:
         raise DsTestsError("The pull request is no longer open at the tested head; nothing was posted") from None
-    if not post_once(call_api, DS_REPO, number, sha, body, token, MARKER):
+    done = post_or_update(editing(call_api, edit), DS_REPO, number, sha, body, token, MARKER,
+                          comment_author(os.environ))
+    if done == "same":
         print(f"May DS tests: the result is already posted for this head on may-design-system #{number}")
+        return 0 if passed else 1
+    if done == "updated":
+        print(f"May DS tests {'passed' if passed else 'failed'}; this head's comment on may-design-system #{number} "
+              "is updated with this run's result")
         return 0 if passed else 1
     print(f"May DS tests {'passed' if passed else 'failed'}; result posted to may-design-system #{number}")
     return 0 if passed else 1
