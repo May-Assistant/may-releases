@@ -19,6 +19,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shutil
 import signal
@@ -107,6 +108,27 @@ def build(tool=renders.build):
     if not (root / APP / "Info.plist").is_file():
         raise DeviceTestsError("The Playground app did not build for the simulator; no scenario ran")
     print("May device tests: Playground debug app built for the iOS simulator")
+    if notif_spike_wanted() and build_tapper(root, env, generator, log, tool):
+        print("May device tests: the springboard tapper built")
+    elif notif_spike_wanted():
+        print("May device tests: the springboard tapper did not build; the spike says so")
+
+
+def build_tapper(root, env, generator, log, tool=renders.build):
+    """The spike's springboard tapper (TAPPER_SOURCE: this repository's project alone, never may-app's), generated and
+    built for testing with the pinned Xcode and XcodeGen, ad-hoc signed as the app is; True when its test products
+    are there. Never an error: without it the spike says so and taps nothing."""
+    work = root / TAPPER_WORK
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        shutil.copytree(TAPPER_SOURCE, work, symlinks=False)
+        tool([str(generator), "generate"], log, cwd=work, env=env)
+        tool(["xcodebuild", "-project", str(work / "MaySpikeTap.xcodeproj"), "-scheme", TAPPER_SCHEME,
+              "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", str(root / TAPPER_DERIVED), *ADHOC,
+              "build-for-testing"], log, env=env)
+    except (renders.RendersError, OSError):
+        return False
+    return tapper_run(root) is not None
 
 
 def preview_encoder(log, tool=renders.quiet):
@@ -796,15 +818,27 @@ def spike_flow(steps):
 
 
 SPIKE_HOME = "- pressKey: Home\n"
-SPIKE_DOWN = '- swipe:\n    start: "50%,1%"\n    end: "50%,70%"\n    duration: 600\n'
 SPIKE_FRONT = f'- extendedWaitUntil:\n    visible:\n      id: "{SPIKE_FRONT_IDS}"\n    timeout: 20000\n'
-# Run 41533029958's shots: every variant ended on Notification Centre with all the spike's notifications still there,
-# grouped under May (a tap on a group expands it, never opens May), so no tap ever opened May. Each variant now has a
-# title of its own, starts from the home screen with Notification Centre cleared as far as it will clear (best effort:
-# its clear buttons are optional), and counts as opened only when May is in front and that title has left
-# Notification Centre.
-SPIKE_CLEAR = (SPIKE_HOME + SPIKE_DOWN + '- tapOn:\n    text: "Clear"\n    optional: true\n'
-               '- tapOn:\n    text: "Clear"\n    optional: true\n' + SPIKE_HOME)
+# Run 41555424833 (coordinator, 3 Nov): Maestro found each variant's own title in Notification Centre ("tap passed"),
+# but no tap ever reached May; every shot ended with that title still listed, and Notification Centre's Clear buttons
+# cleared nothing. The taps now go through XCUITest on the springboard itself: the tapper (spike_tap/, this repository's
+# own project, built in the build step with no secret) finds the notification whose label holds the variant's own title
+# (no clearing: the title alone picks it), as a banner, else in Notification Centre. Maestro's runner is swept first, so
+# only one XCTest session drives the simulator at a time.
+TAPPER_SOURCE = Path(__file__).resolve().parent / "spike_tap"
+TAPPER_SCHEME, TAPPER_TEST = "MaySpikeTap", "MaySpikeTapUITests/SpikeTap/testTap"
+TAPPER_WORK, TAPPER_DERIVED = "may-private/spike-tap", "may-private/spike-tap-derived"
+TAP_SECONDS = 240
+# Three answers for each tap that do not hang on May's own screen (coordinator, 3 Nov). "response delivered": the
+# simulator's log has UserNotifications, in May's own process, speaking of a notification response in the tap's window,
+# so iOS handed the tap to May (didReceive was reached); those lines, redacted, go to the private diag alone, so a run
+# shows what they say. "May exited": May's process before the tap is gone or changed after it, or May started from a
+# delivered tap and is gone. "crash on notification open": a new May crash report, as before. A tap whose response was
+# never delivered and that left no crash report is "not tested", never "no".
+PROCESS = Path(APP).stem
+NOTIFICATION_PREDICATE = f'subsystem == "com.apple.UserNotifications" AND process == "{PROCESS}"'
+RESPONSE = re.compile(rb"(?i)response")
+NOTIFICATION_LINES = 4096
 
 
 def spike_title(number):
@@ -812,20 +846,73 @@ def spike_title(number):
     return f"{SPIKE_TITLE} {number}"
 
 
-def spike_banner(title):
-    return (f'- extendedWaitUntil:\n    visible: "{title}"\n    timeout: {SPIKE_WAIT_MS}\n'
-            f'- tapOn: "{title}"\n')
+def tapper_run(root):
+    """The tapper's own .xctestrun from build-for-testing, or None unless exactly one is there."""
+    try:
+        runs = [path for path in (root / TAPPER_DERIVED / "Build" / "Products").glob("*.xctestrun")
+                if path.is_file() and not path.is_symlink() and not path.name.startswith("spike-")]
+    except OSError:
+        return None
+    return runs[0] if len(runs) == 1 else None
 
 
-def spike_centre(title):
-    """Notification Centre's entry: a second tap when the first only expanded a group (the title still shows)."""
-    return (SPIKE_DOWN + spike_banner(title) +
-            f'- runFlow:\n    when:\n      visible: "{title}"\n    commands:\n      - tapOn: "{title}"\n')
+def tapper_file(xctestrun, title, where, name):
+    """A copy of the tapper's .xctestrun beside it (its paths are relative to its folder) whose test bundle is given
+    the title and where to look for it; None when it cannot be read or written."""
+    try:
+        plist = plistlib.loads(xctestrun.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    given = {"MAY_SPIKE_TITLE": title, "MAY_SPIKE_WHERE": where}
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "TestBundlePath" in node:
+                for key in ("EnvironmentVariables", "TestingEnvironmentVariables"):
+                    variables = node.get(key) if isinstance(node.get(key), dict) else {}
+                    node[key] = dict(variables, **given)
+            for value in list(node.values()):
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(plist)
+    path = xctestrun.parent / name
+    try:
+        path.write_bytes(plistlib.dumps(plist))
+    except (OSError, TypeError, OverflowError):
+        return None
+    return path
 
 
-def spike_gone(title):
-    """The variant's notification is no longer in Notification Centre (opening it consumes it)."""
-    return (SPIKE_DOWN + f'- extendedWaitUntil:\n    notVisible: "{title}"\n    timeout: 5000\n' + SPIKE_HOME)
+def may_pid(udid, env):
+    """May's process id on the simulator (launchctl's UIKitApplication job), or None when it is not running."""
+    done = device_tests.bounded_output(["xcrun", "simctl", "spawn", udid, "launchctl", "list"], env)
+    if done is None or done[0]:
+        return None
+    for line in done[1].decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0].isdigit() and fields[2].startswith(f"UIKitApplication:{BUNDLE}["):
+            return int(fields[0])
+    return None
+
+
+def notification_lines(udid, env, start):
+    """UserNotifications' lines in May's own process since start; b"" when the log could not be read."""
+    done = device_tests.bounded_output(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
+                                        "--info", "--debug", "--start", start, "--predicate",
+                                        NOTIFICATION_PREDICATE], env, limit=device_tests.MAX_DIAG)
+    return b"" if done is None else done[1]
+
+
+def exited(before, after, delivered):
+    """May's process was there before the tap and is gone or another after it, or a delivered tap started May (cold)
+    and it is gone."""
+    return (before is not None and after != before) or (before is None and delivered and after is None)
+
+
+def crash_word(crashed, delivered):
+    return "yes" if crashed else "no" if delivered else "not tested"
 
 
 def notification_spike(udid, env, maestro_env, launcher, source, private, log, token, diagnostics=None, folder=None,
@@ -868,32 +955,51 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
     payload = private / "spike.apns"
 
     numbers = iter(range(1, 100))
+    notified = []  # (label, variant, UserNotifications' lines), for the private diag alone
+
+    def tapped(label, variant, title, where):
+        xctestrun = tapper_run(private.parent)
+        path = xctestrun and tapper_file(xctestrun, title, where, f"spike-{label}-{variant}-{where}.xctestrun")
+        if path is None:
+            return False
+        sweep_driver(udid, env, log)  # one XCTest session on the simulator at a time
+        try:
+            return not renders.quiet(["xcodebuild", "test-without-building", "-xctestrun", str(path), "-destination",
+                                      "id=" + udid, "-only-testing:" + TAPPER_TEST], log,
+                                     env=dict(env, TEST_RUNNER_MAY_SPIKE_TITLE=title, TEST_RUNNER_MAY_SPIKE_WHERE=where),
+                                     timeout=TAP_SECONDS).returncode
+        except subprocess.SubprocessError:
+            return False
 
     def tap(label, variant, shaped):
         title = spike_title(next(numbers))
         shaped = json.loads(json.dumps(shaped))  # a copy: the fixture's own alert keeps its other keys
         alert = shaped["aps"].get("alert")
         shaped["aps"]["alert"] = dict(alert if isinstance(alert, dict) else {}, title=title)
-        flow(f"{variant}-clear", spike_flow(SPIKE_CLEAR), maestro_env)  # best effort; never decides the variant
         if variant == "warm":
             ready = flow("home", spike_flow(SPIKE_HOME), maestro_env)
         else:
             ready = simctl("terminate", udid, BUNDLE) and flow("home", spike_flow(SPIKE_HOME), maestro_env)
+        before = may_pid(udid, env)
         payload.write_text(json.dumps(shaped))
         late.extend(fresh())
         pushed = simctl("push", udid, BUNDLE, str(payload))
-        banner = flow(f"{variant}-banner", spike_flow(spike_banner(title)), maestro_env)
-        centre = False if banner else flow(f"{variant}-centre", spike_flow(spike_centre(title)), maestro_env)
+        start = time.strftime("%Y-%m-%d %H:%M:%S")
+        banner = tapped(label, variant, title, "banner")
+        centre = False if banner else tapped(label, variant, title, "centre")
         time.sleep(SPIKE_SETTLE_SECONDS)
         crashed = fresh()
+        after = may_pid(udid, env)
+        lines = notification_lines(udid, env, start)
+        notified.append((label, variant, lines))
+        delivered = bool(RESPONSE.search(lines))
         front = flow(f"{variant}-front", spike_flow(SPIKE_FRONT), maestro_env) if banner or centre else False
         crashed += fresh()
         # Run 41504861439: May was "in front: no" after every tap, with nothing to say what the screen showed. The
         # screen after the front check is kept beside the report, in the private run folder alone (never the log).
         if folder is not None:
             screenshot(udid, env, folder / f"spike-{label}-{variant}-end.png", log)
-        gone = flow(f"{variant}-gone", spike_flow(spike_gone(title)), maestro_env) if front else False
-        return ready, pushed, banner, centre, crashed, front, front and gone
+        return ready, pushed, banner, centre, delivered, exited(before, after, delivered), crashed, front
 
     def variants():
         launch(udid, env, token, log)
@@ -905,13 +1011,13 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
             allowed = False
         say("notifications allowed: " + ("passed" if allowed else "failed"))
         for variant in ("warm", "cold"):
-            ready, pushed, banner, centre, crashed, front, opened = tap("generic", variant, SPIKE_PAYLOAD)
+            ready, pushed, banner, centre, delivered, gone, crashed, front = tap("generic", variant, SPIKE_PAYLOAD)
             say(f"{variant}: May {'sent to the background' if variant == 'warm' else 'stopped'} "
                 f"{'yes' if ready else 'no'}, pushed {'yes' if pushed else 'no'}, banner tap "
                 f"{'passed' if banner else 'failed'}, Notification Centre tap "
-                f"{'not tried' if banner else 'passed' if centre else 'failed'}, crash on notification open "
-                f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}, "
-                f"opened {'yes' if opened else 'no'}")
+                f"{'not tried' if banner else 'passed' if centre else 'failed'}, response delivered "
+                f"{'yes' if delivered else 'no'}, May exited {'yes' if gone else 'no'}, crash on notification open "
+                f"{crash_word(crashed, delivered)}, May in front {'yes' if front else 'no'}")
         if diagnostics is None:
             return
         payloads = push_payloads(source, datetime.date.today().isoformat())
@@ -921,16 +1027,19 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
         for name, shaped in payloads:
             for variant in ("warm", "cold"):
                 launch(udid, env, token, log)
-                ready, pushed, banner, centre, crashed, front, opened = tap(name.replace(" ", "-"), variant,
-                                                                            shaped)
+                ready, pushed, banner, centre, delivered, gone, crashed, front = tap(name.replace(" ", "-"),
+                                                                                     variant, shaped)
                 say(f"{name} {variant}: pushed {'yes' if pushed else 'no'}, tap "
-                    f"{'passed' if banner or centre else 'failed'}, crash on notification open "
-                    f"{'yes' if crashed else 'no'}, May in front {'yes' if front else 'no'}, "
-                    f"opened {'yes' if opened else 'no'}")
+                    f"{'passed' if banner or centre else 'failed'}, response delivered "
+                    f"{'yes' if delivered else 'no'}, May exited {'yes' if gone else 'no'}, crash on notification "
+                    f"open {crash_word(crashed, delivered)}, May in front {'yes' if front else 'no'}")
 
     allow = source / device_tests.FLOWS_DIR / ALLOW_FLOW
     if not allow.is_file() or allow.is_symlink():
         say("may-app has no subflow allow-notifications.yaml, so nothing was pushed")
+        return 0
+    if tapper_run(private.parent) is None:
+        say("the springboard tapper was not built, so nothing was pushed")
         return 0
     try:
         variants()
@@ -956,6 +1065,13 @@ def notification_spike(udid, env, maestro_env, launcher, source, private, log, t
             if lines and path.is_file():
                 kept = path.read_bytes()
                 path.write_bytes((kept + b"== May's frames, file:line ==\n" + lines)[:device_tests.MAX_DIAG])
+            # What UserNotifications said in May for each tap (what "response delivered" read), newest lines of each.
+            said = b"".join(f"{label} {variant}:\n".encode() + whole_lines(kept_lines(lines, token)[0],
+                                                                            NOTIFICATION_LINES, newest=True)
+                            for label, variant, lines in notified)
+            if notified:
+                kept = path.read_bytes() if path.is_file() else b""
+                path.write_bytes((kept + b"== UserNotifications in May, per tap ==\n" + said)[:device_tests.MAX_DIAG])
     return len(found)
 
 

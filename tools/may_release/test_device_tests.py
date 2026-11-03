@@ -2662,7 +2662,7 @@ class WorkflowPinTests(unittest.TestCase):
         """Coordinator, 2 Nov: the spike runs instead of the iOS scenarios, so only a dispatch that asks for it."""
         message = "ios_loop_census, ios_notif_spike and tidy_file_taxes booleans"
         line = "          MAY_IOS_NOTIF_SPIKE: ${{ inputs.ios_notif_spike }}\n"
-        self.assertEqual(self.text.count(line), 1)
+        self.assertEqual(self.text.count(line), 2, "the iOS build step (the tapper) and the iOS scenarios step")
         android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
         self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
@@ -2671,6 +2671,28 @@ class WorkflowPinTests(unittest.TestCase):
         self.assertTrue(block.endswith("        type: boolean\n        default: false\n"), "off unless dispatched on")
         self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
         self.flagged(self.text.replace(block, ""), message)
+
+    def test_the_ios_build_step_reads_the_spike_input_alone(self):
+        """Coordinator, 3 Nov: the build step builds the spike's springboard tapper, with no secret, only for the spike."""
+        step = ("      - name: Build May Playground for the simulator without secrets\n        env:\n"
+                "          MAY_IOS_NOTIF_SPIKE: ${{ inputs.ios_notif_spike }}\n        run: ")
+        self.assertEqual(self.text.count(step), 1)
+        bare = "      - name: Build May Playground for the simulator without secrets\n        run: "
+        spike = "          MAY_IOS_NOTIF_SPIKE: ${{ inputs.ios_notif_spike }}\n"
+        message = "a secret, variable or env entry"
+        self.flagged(self.text.replace(step, bare), message)
+        self.flagged(self.text.replace(step, step.replace(spike, spike + "          MAY_IOS_DIAGNOSTICS: ${{ inputs.ios_diagnostics }}\n")),
+                     message)
+        self.flagged(self.text.replace(step, step.replace(spike, spike + "          MAY_APP_READ_KEY: ${{ secrets.MAY_APP_READ_KEY }}\n")),
+                     message)
+        judge = "      - name: Judge the agent scenarios\n        env:\n"
+        self.assertEqual(self.text.count(judge), 2)
+        self.flagged(self.text.replace(step, bare).replace(judge, "@@", 1).replace(judge, judge + spike).replace(
+            "@@", judge), message)  # moved from the build step into the iOS judge step
+        android = "      - name: Build May Playground for the emulator without secrets\n        run: "
+        self.assertEqual(self.text.count(android), 1)
+        self.flagged(self.text.replace(step, bare).replace(android, android.replace("        run: ", "        env:\n" + spike + "        run: ")),
+                     message)
 
     def test_the_sign_in_secret_stays_in_the_scenarios_step(self):
         line = "          MAY_TEST_SIGNIN_SECRET: ${{ secrets.MAY_TEST_SIGNIN_SECRET }}\n"

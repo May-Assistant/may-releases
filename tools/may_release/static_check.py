@@ -1471,7 +1471,9 @@ DEVICE_LOG_CHANGES_INPUT = ("      ios_log_changes:\n        description: [^\n]+
 DEVICE_LOOP_CENSUS = ("MAY_IOS_LOOP_CENSUS", "${{ inputs.ios_loop_census }}")
 DEVICE_LOOP_CENSUS_INPUT = ("      ios_loop_census:\n        description: [^\n]+\n        required: false\n"
                             "        type: boolean\n        default: false\n")
-# The notification spike (coordinator, 2 Nov): off unless dispatched true, in the iOS scenarios step alone.
+# The notification spike (coordinator, 2 Nov): off unless dispatched true, in the iOS scenarios step, and in the iOS
+# build step alone besides (3 Nov: the build step builds the spike's springboard tapper, with no secret, only then).
+DEVICE_IOS_BUILD_STEP = "Build May Playground for the simulator without secrets"
 DEVICE_NOTIF_SPIKE = ("MAY_IOS_NOTIF_SPIKE", "${{ inputs.ios_notif_spike }}")
 DEVICE_NOTIF_SPIKE_INPUT = ("      ios_notif_spike:\n        description: [^\n]+\n        required: false\n"
                             "        type: boolean\n        default: false\n")
@@ -1576,7 +1578,9 @@ def device_tests_workflow_problems(text):
             text.count("inputs.ios_diagnostics") != 1 or DEVICE_LOG_CHANGES not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_log_changes") != 1 or DEVICE_LOOP_CENSUS not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_loop_census") != 1 or DEVICE_NOTIF_SPIKE not in env_entries(ios_scenarios) or \
-            text.count("inputs.ios_notif_spike") != 1 or \
+            text.count("inputs.ios_notif_spike") != 2 or \
+            env_entries(steps["ios"].get(DEVICE_IOS_BUILD_STEP, "")) != [DEVICE_NOTIF_SPIKE] or \
+            any(env_entries(steps["android"].get(step, "")) for step in steps["android"] if step.startswith("Build")) or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
             any(secrets_in(seal) or recipient not in env_entries(seal) for seal in seals) or \
             any(secrets_in(chunk) or "vars." in chunk for chunk in others) or recipient not in env_entries(decrypt) or \

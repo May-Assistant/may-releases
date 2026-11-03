@@ -192,6 +192,8 @@ jobs:
           MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}
         run: python3 -I -S -B tools/may_release/prepare.py --platform ios --target playground --source-sha "$MAY_SOURCE_SHA"
       - name: Build May Playground for the simulator without secrets
+        env:
+          MAY_IOS_NOTIF_SPIKE: ${{ inputs.ios_notif_spike }}
         run: python3 -I -S -B tools/may_release/device_tests.py build --platform ios
       - name: Run the scenarios against staging and record them
         env:

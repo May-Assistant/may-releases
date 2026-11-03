@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import signal
 import subprocess
@@ -33,6 +34,12 @@ def tearDownModule():
     TRIPWIRE.stop()
 
 UDID = "0A1B2C3D-0000-4000-8000-000000000001"
+# The shape build-for-testing writes (format 2), one UI test bundle.
+XCTESTRUN = plistlib.dumps({
+    "TestConfigurations": [{"Name": "Test Scheme Action", "TestTargets": [{
+        "BlueprintName": "MaySpikeTapUITests", "TestBundlePath": "__TESTHOST__/PlugIns/MaySpikeTapUITests.xctest",
+        "IsUITestBundle": True, "EnvironmentVariables": {}, "TestingEnvironmentVariables": {}}]}],
+    "__xctestrun_metadata__": {"FormatVersion": 2}})
 
 
 def ticking_budget():
@@ -66,17 +73,26 @@ class Workspace(unittest.TestCase):
 
 
 class BuildTests(Workspace):
-    def build(self, products=True, fail=False):
+    def build(self, products=True, fail=False, spike=None, tapper=True):
         calls = []
 
         def tool(argv, log, cwd=None, env=None):
             calls.append((argv, cwd))
             if fail:
                 raise renders.RendersError("x")
-            if products and argv[0] == "xcodebuild":
+            if "build-for-testing" in argv and not tapper:
+                raise renders.RendersError("x")
+            if "build-for-testing" in argv:
+                products_dir = Path(argv[argv.index("-derivedDataPath") + 1]) / "Build" / "Products"
+                products_dir.mkdir(parents=True)
+                (products_dir / "MaySpikeTap_iphonesimulator26.2-arm64.xctestrun").write_bytes(XCTESTRUN)
+            elif products and argv[0] == "xcodebuild":
                 self.built()
 
-        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin"}, clear=True), \
+        env = {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin"}
+        if spike is not None:
+            env[device_ios.NOTIF_SPIKE] = spike
+        with patch.dict(os.environ, env, clear=True), \
                 patch("renders.xcode_env", return_value=({"DEVELOPER_DIR": "/X"}, Path("/x/xcodegen"))), \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             device_ios.build(tool=tool)
@@ -94,6 +110,88 @@ class BuildTests(Workspace):
                                            "build"])
         self.assertNotIn("CODE_SIGNING_ALLOWED=NO", xcodebuild)
         self.assertEqual(out.strip(), "May device tests: Playground debug app built for the iOS simulator")
+
+    def test_the_spike_alone_builds_the_springboard_tapper_from_this_repositorys_own_project(self):
+        """Coordinator, 3 Nov (run 41555424833): Maestro's taps never reached May; the spike taps through XCUITest."""
+        for spike in (None, "false"):
+            with self.subTest(spike=spike):
+                calls, out = self.build(spike=spike)
+                self.assertEqual(len(calls), 2, "the app alone")
+                self.assertNotIn("tapper", out)
+        calls, out = self.build(spike="true")
+        work = self.root / device_ios.TAPPER_WORK
+        self.assertEqual(len(calls), 4, "the app, then the tapper's generate and build-for-testing")
+        self.assertEqual(calls[2], (["/x/xcodegen", "generate"], work))
+        tapper = calls[3][0]
+        self.assertEqual(tapper[:3], ["xcodebuild", "-project", str(work / "MaySpikeTap.xcodeproj")])
+        for flag, value in (("-scheme", "MaySpikeTap"), ("-destination", "generic/platform=iOS Simulator"),
+                            ("-derivedDataPath", str(self.root / device_ios.TAPPER_DERIVED))):
+            self.assertEqual(tapper[tapper.index(flag) + 1], value)
+        self.assertEqual(tapper[-4:], ["CODE_SIGN_IDENTITY=-", "CODE_SIGN_STYLE=Manual", "DEVELOPMENT_TEAM=",
+                                       "build-for-testing"])
+        self.assertEqual(sorted(path.relative_to(work).as_posix() for path in work.rglob("*") if path.is_file()),
+                         ["Host/SpikeTapHost.swift", "Tap/SpikeTap.swift", "project.yml"],
+                         "this repository's tapper alone, never a may-app file")
+        self.assertTrue(str(work).startswith(str(self.private)), "removed with the private folder")
+        self.assertEqual(out.splitlines()[-1], "May device tests: the springboard tapper built")
+        self.assertIsNotNone(device_ios.tapper_run(self.root))
+
+    def test_a_tapper_that_does_not_build_leaves_the_app_built_and_says_so(self):
+        calls, out = self.build(spike="true", tapper=False)
+        self.assertEqual(out.splitlines(), ["May device tests: Playground debug app built for the iOS simulator",
+                                            "May device tests: the springboard tapper did not build; the spike says so"])
+        self.assertIsNone(device_ios.tapper_run(self.root))
+
+    def test_the_tapper_asks_springboard_for_the_title_it_is_given(self):
+        """The Swift side, read as text: springboard, the title from the environment, banner or Notification Centre."""
+        tap = (device_ios.TAPPER_SOURCE / "Tap" / "SpikeTap.swift").read_text()
+        for needed in ('XCUIApplication(bundleIdentifier: "com.apple.springboard")', 'environment["MAY_SPIKE_TITLE"]',
+                       'environment["MAY_SPIKE_WHERE"] == "centre"', '"label CONTAINS %@", title', "entry.tap()"):
+            self.assertIn(needed, tap)
+        self.assertEqual(device_ios.TAPPER_TEST, "MaySpikeTapUITests/SpikeTap/testTap")
+        self.assertIn("func testTap()", tap)
+        project = (device_ios.TAPPER_SOURCE / "project.yml").read_text()
+        self.assertIn("name: MaySpikeTap\n", project)
+        self.assertIn("  MaySpikeTapUITests:\n    type: bundle.ui-testing\n", project)
+        self.assertIn("  MaySpikeTap:\n    build:\n", project, "the scheme the build names")
+
+    def test_each_taps_xctestrun_gives_the_test_bundle_its_title_and_where(self):
+        products = self.root / device_ios.TAPPER_DERIVED / "Build" / "Products"
+        products.mkdir(parents=True)
+        for case, body in (("format 2", XCTESTRUN), ("format 1", plistlib.dumps({
+                "MaySpikeTapUITests": {"TestBundlePath": "__TESTHOST__/PlugIns/MaySpikeTapUITests.xctest",
+                                       "EnvironmentVariables": {"KEPT": "1"}},
+                "__xctestrun_metadata__": {"FormatVersion": 1}}))):
+            with self.subTest(case=case):
+                run = products / "MaySpikeTap.xctestrun"
+                run.write_bytes(body)
+                path = device_ios.tapper_file(run, "May device test spike 3", "centre", "spike-brief-warm-centre.xctestrun")
+                self.assertEqual(path.parent, products, "beside it: its paths are relative to its folder")
+                bundles = []
+
+                def walk(node):
+                    if isinstance(node, dict):
+                        if "TestBundlePath" in node:
+                            bundles.append(node)
+                        for value in node.values():
+                            walk(value)
+                    elif isinstance(node, list):
+                        for value in node:
+                            walk(value)
+                walk(plistlib.loads(path.read_bytes()))
+                self.assertEqual(len(bundles), 1)
+                for key in ("EnvironmentVariables", "TestingEnvironmentVariables"):
+                    given = bundles[0].get(key, {})
+                    self.assertEqual((given.get("MAY_SPIKE_TITLE"), given.get("MAY_SPIKE_WHERE")),
+                                     ("May device test spike 3", "centre"), key)
+                if case == "format 1":
+                    self.assertEqual(bundles[0]["EnvironmentVariables"]["KEPT"], "1", "its own entries are kept")
+                self.assertEqual(device_ios.tapper_run(self.root), run, "a tap's copy is never taken for the tapper's")
+                path.unlink()
+        (products / "MaySpikeTap.xctestrun").write_bytes(b"not a plist")
+        self.assertIsNone(device_ios.tapper_file(products / "MaySpikeTap.xctestrun", "t", "banner", "spike-x.xctestrun"))
+        (products / "Other.xctestrun").write_bytes(XCTESTRUN)
+        self.assertIsNone(device_ios.tapper_run(self.root), "exactly one, or none is trusted")
 
     def test_a_failed_or_missing_build_stops(self):
         for kwargs in ({"fail": True}, {"products": False}):
@@ -473,10 +571,13 @@ class RunTests(Workspace):
         payload["aps"]["alert"]["title"] = f"May device test spike {number}"
         return payload
 
-    def spike(self, allow=True, banner=True, centre=True, push=True, crash=(), atos=None, at="tap", gone=True):
+    def spike(self, allow=True, banner=True, centre=True, push=True, crash=(), atos=None, at="tap", delivered=True,
+              exits=False, tapper=True, notified=b""):
         """A dispatch with ios_notif_spike: (calls, minted, report, out, pushed, run). The spike's own flows pass or fail
-        as asked; a push carrying one of crash's keys leaves a May crash report, as build 12 did: at its tap, during
-        the front check after it, or (between) only once the next variant has begun."""
+        as asked, and so do the tapper's taps (banner, centre); a push carrying one of crash's keys leaves a May crash
+        report, as build 12 did: at its tap, during the front check after it, or (between) only once the next variant
+        has begun. delivered: UserNotifications speaks of a response in May after each tap; exits: May's process is
+        gone after each tap; notified: more of UserNotifications' lines after each tap."""
         if allow:
             (self.source / device_tests.FLOWS_DIR / "subflows").mkdir(parents=True, exist_ok=True)
             (self.source / device_tests.FLOWS_DIR / device_ios.ALLOW_FLOW).write_text("appId: x\n---\n- tapOn: Allow\n")
@@ -485,6 +586,12 @@ class RunTests(Workspace):
         reports = self.root / "reports"
         reports.mkdir(exist_ok=True)
         pushed, self.atos, self.simctl_timeouts, written, self.flow_texts = [], [], [], [], []
+        self.taps, self.tap_envs, self.tap_timeouts, self.order, self.pids, after = [], [], [], [], [], []
+        products = self.root / device_ios.TAPPER_DERIVED / "Build" / "Products"
+        shutil.rmtree(products, ignore_errors=True)
+        if tapper:
+            products.mkdir(parents=True)
+            (products / "MaySpikeTap_iphonesimulator26.2-arm64.xctestrun").write_bytes(XCTESTRUN)
 
         def leave_report():
             if at == "tap" or not written:  # a crash per tap; else one report per dispatch, the crash under test
@@ -498,20 +605,41 @@ class RunTests(Workspace):
                 self.simctl_timeouts.append((argv[2], timeout))
             if argv[:3] == ["xcrun", "simctl", "push"]:
                 pushed.append(json.loads(Path(argv[-1]).read_text()))
+                after.clear()
+            if argv[:3] == ["xcrun", "simctl", "terminate"] and argv[-1] == device_ios.DRIVER_BUNDLE:
+                self.order.append("sweep")
+            if argv[:2] == ["xcodebuild", "test-without-building"]:
+                plist = plistlib.loads(Path(argv[argv.index("-xctestrun") + 1]).read_bytes())
+                given = plist["TestConfigurations"][0]["TestTargets"][0]["EnvironmentVariables"]
+                self.taps.append((given["MAY_SPIKE_TITLE"], given["MAY_SPIKE_WHERE"]))
+                self.tap_timeouts.append(timeout)
+                self.order.append("tap")
+                after.append(True)
+                if (given["MAY_SPIKE_WHERE"] == "banner" and not banner) or \
+                        (given["MAY_SPIKE_WHERE"] == "centre" and not centre):
+                    raise subprocess.CalledProcessError(65, argv)
             name = Path(argv[-1]).name
             if name.startswith("spike-") and name.endswith(".yaml"):
                 self.flow_texts.append((name, Path(argv[-1]).read_text()))
-            if (name.endswith("-banner.yaml") and not banner) or (name.endswith("-centre.yaml") and not centre) or \
-                    (name.endswith("-gone.yaml") and not gone):
-                raise subprocess.CalledProcessError(1, argv)
             crashing = bool(pushed) and bool(set(crash) & set(pushed[-1]))
-            tapped = name.endswith(("-banner.yaml", "-centre.yaml"))
-            between = name == "spike-home.yaml" or argv[:3] == ["xcrun", "simctl", "terminate"]
+            tapped = argv[:2] == ["xcodebuild", "test-without-building"]
+            between = name == "spike-home.yaml" or argv[:3] == ["xcrun", "simctl", "terminate"] and \
+                argv[-1] == device_ios.BUNDLE
             if crashing and ((at == "tap" and tapped) or (at == "front" and name.endswith("-front.yaml")) or
                              (at == "between" and between)):
                 leave_report()
 
         def bounded(argv, env, **kwargs):
+            if argv[4:] == ["launchctl", "list"]:
+                gone = exits and bool(after)
+                self.pids.append(None if gone else 4242)
+                return 0, (b"PID\tStatus\tLabel\n17\t0\tcom.apple.springboard\n" +
+                           (b"" if gone else f"4242\t0\tUIKitApplication:{device_ios.BUNDLE}[ab12][rb-legacy]\n".encode()))
+            if argv[4:6] == ["log", "show"] and device_ios.NOTIFICATION_PREDICATE in argv:
+                self.order.append("delivered")
+                said = b"2026-11-03 01:02:03.004 Df MayPlayground[4242:c8a8] [com.apple.UserNotifications:Service] "
+                return 0, (said + b"Received notification response\n" + said + b"session " + TOKEN.encode() + b"\n"
+                           if delivered else b"") + notified
             if argv[:2] == ["xcrun", "atos"]:
                 self.atos.append(argv)
                 if atos is not None:
@@ -549,17 +677,33 @@ class RunTests(Workspace):
         "May device tests (ios): the notification spike runs instead of the scenarios",
         SAID + "notifications allowed: passed",
         SAID + "warm: May sent to the background yes, pushed yes, banner tap passed, Notification Centre tap not tried, "
-        "crash on notification open no, May in front yes, opened yes",
-        SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, crash on "
-        "notification open no, May in front yes, opened yes"]
+        "response delivered yes, May exited no, crash on notification open no, May in front yes",
+        SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, response "
+        "delivered yes, May exited no, crash on notification open no, May in front yes"]
+
+    def phase_2(self, crash="no", tap="passed", delivered="yes", exited="no", front="yes"):
+        return [self.SAID + f"{name} {variant}: pushed yes, tap {tap}, response delivered {delivered}, May exited "
+                f"{exited}, crash on notification open {crash(name) if callable(crash) else crash}, May in front {front}"
+                for name in self.PHASE_2 for variant in ("warm", "cold")]
 
     def test_the_spike_taps_a_pushed_notification_warm_then_cold_instead_of_the_scenarios(self):
         """Coordinator, 2 Nov: build 12 crashed on a notification tap; first find whether one can be tapped at all."""
         calls, minted, report, out, pushed, run = self.spike()
         self.assertEqual(report["scenarios"], [], "the spike runs instead of the scenarios")
-        self.assertEqual(self.spike_lines(out), self.GENERIC + [
-            self.SAID + f"{name} {variant}: pushed yes, tap passed, crash on notification open no, May in front yes, opened yes"
-            for name in self.PHASE_2 for variant in ("warm", "cold")])
+        self.assertEqual(self.spike_lines(out), self.GENERIC + self.phase_2())
+        self.assertEqual(self.taps, [(f"May device test spike {n}", "banner") for n in range(1, 9)],
+                         "each tap through the springboard tapper, by its variant's own title (run 41555424833)")
+        self.assertEqual(self.tap_timeouts, [device_ios.TAP_SECONDS] * 8, "every tap is bounded")
+        self.assertTrue(all(self.order[i - 1] == "sweep" for i, step in enumerate(self.order) if step == "tap"),
+                        "Maestro's runner is swept before each tap: one XCTest session at a time")
+        taps = [(argv, env) for argv, env in calls if argv[:2] == ["xcodebuild", "test-without-building"]]
+        self.assertEqual(taps[0][0][-3:], ["-destination", "id=" + UDID, "-only-testing:" + device_ios.TAPPER_TEST])
+        self.assertEqual((taps[0][1]["TEST_RUNNER_MAY_SPIKE_TITLE"], taps[0][1]["TEST_RUNNER_MAY_SPIKE_WHERE"]),
+                         ("May device test spike 1", "banner"))
+        names = [name for name, _ in self.flow_texts]
+        self.assertFalse([name for name in names if name.endswith(("-banner.yaml", "-centre.yaml", "-clear.yaml",
+                                                                   "-gone.yaml"))], "Maestro taps no notification")
+        self.assertEqual(names.count("spike-home.yaml"), 8, "every variant pushes onto the home screen, the cold too")
         self.assertEqual(pushed[:2], [self.titled(device_ios.SPIKE_PAYLOAD, 1), self.titled(device_ios.SPIKE_PAYLOAD, 2)],
                          "each variant's own title (run 41533029958)")
         self.assertEqual(set(device_ios.SPIKE_PAYLOAD["aps"]), {"alert"}, "Apple's generic alert alone, no May key")
@@ -617,9 +761,7 @@ class RunTests(Workspace):
 
     def test_a_crash_on_opening_a_notification_is_yes_in_the_log_and_its_frames_go_to_the_private_diag(self):
         _, _, _, out, _, run = self.spike(crash=["kind"])
-        self.assertEqual(self.spike_lines(out)[4:], [
-            self.SAID + f"{name} {variant}: pushed yes, tap passed, crash on notification open "
-            f"{'no' if name == 'brief' else 'yes'}, May in front yes, opened yes" for name in self.PHASE_2 for variant in ("warm", "cold")])
+        self.assertEqual(self.spike_lines(out)[4:], self.phase_2(crash=lambda name: "no" if name == "brief" else "yes"))
         for absent in ("ChatRoute", "swift_unexpectedError", ".swift", "room_ref", "chat_reply"):
             self.assertNotIn(absent, out, "the public log says yes or no alone")
         text = self.spike_diag(run)
@@ -645,10 +787,10 @@ class RunTests(Workspace):
     def test_a_crash_that_comes_in_during_the_front_check_is_still_its_variants(self):
         """Review of #181: one look 8 s after the tap missed a report written later, and gave it to the next variant."""
         _, _, _, out, _, run = self.spike(crash=["brief_id"], at="front")
-        self.assertIn(self.SAID + "brief warm: pushed yes, tap passed, crash on notification open yes, May in front yes, opened yes",
-                      out)
-        self.assertIn(self.SAID + "brief cold: pushed yes, tap passed, crash on notification open no, May in front yes, opened yes",
-                      out)
+        self.assertIn(self.SAID + "brief warm: pushed yes, tap passed, response delivered yes, May exited no, crash on "
+                      "notification open yes, May in front yes", out)
+        self.assertIn(self.SAID + "brief cold: pushed yes, tap passed, response delivered yes, May exited no, crash on "
+                      "notification open no, May in front yes", out)
         self.assertNotIn("found late", out)
         self.assertIsNotNone(self.spike_diag(run))
 
@@ -665,17 +807,17 @@ class RunTests(Workspace):
         _, _, _, out, pushed, run = self.spike(push=False, crash=["aps"])
         self.assertEqual(self.spike_lines(out)[2:], [
             self.SAID + "warm: May sent to the background yes, pushed yes, banner tap passed, Notification Centre tap not "
-            "tried, crash on notification open yes, May in front yes, opened yes",
-            self.SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, crash on "
-            "notification open yes, May in front yes, opened yes",
+            "tried, response delivered yes, May exited no, crash on notification open yes, May in front yes",
+            self.SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, response "
+            "delivered yes, May exited no, crash on notification open yes, May in front yes",
             self.SAID + "may-app's push fixtures were not found, so no chat reply or brief was pushed"])
         self.assertIn(b"frame 0 libswift_Concurrency.dylib swift_unexpectedError\n", self.spike_diag(run))
         self.assertTrue((self.private / device_tests.SPIKE_CRASHED).exists())
 
     def test_a_crash_atos_cannot_read_still_keeps_its_report_and_frames(self):
         _, _, _, out, _, run = self.spike(crash=["brief_id"], atos=(1, b"atos: no such file\n"))
-        self.assertIn(self.SAID + "brief cold: pushed yes, tap passed, crash on notification open yes, May in front yes, opened yes",
-                      out)
+        self.assertIn(self.SAID + "brief cold: pushed yes, tap passed, response delivered yes, May exited no, crash on "
+                      "notification open yes, May in front yes", out)
         text = self.spike_diag(run)
         self.assertIn(b"frame 0 libswift_Concurrency.dylib swift_unexpectedError\n", text)
         self.assertNotIn(b"== May's frames", text)
@@ -688,33 +830,68 @@ class RunTests(Workspace):
         self.assertEqual(pushed, [self.titled(device_ios.SPIKE_PAYLOAD, 1), self.titled(device_ios.SPIKE_PAYLOAD, 2)])
         self.assertEqual(self.signed_out, [TOKEN + "1"])
 
-    def test_a_notification_still_in_notification_centre_was_not_opened_even_with_may_in_front(self):
-        """Run 41533029958: every shot showed Notification Centre with all the spike's notifications still there, so
-        none had been opened; "opened" now needs May in front and the variant's own title gone."""
-        calls, _, _, out, _, _ = self.spike(gone=False)
-        self.assertIn(self.SAID + "warm: May sent to the background yes, pushed yes, banner tap passed, Notification "
-                      "Centre tap not tried, crash on notification open no, May in front yes, opened no", out)
-        self.assertNotIn("opened yes", out)
-        gone = [text for _, text in self.flow_texts if "notVisible" in text]
-        self.assertEqual(len(gone), 8, "one Notification Centre check per variant")
-        self.assertEqual(sorted({text.split('notVisible: "')[1].split('"')[0] for text in gone}),
-                         sorted(f"May device test spike {n}" for n in range(1, 9)), "each its own title")
-        names = [name for name, _ in self.flow_texts]
-        self.assertEqual(names.count("spike-warm-clear.yaml") + names.count("spike-cold-clear.yaml"), 8,
-                         "Notification Centre cleared before every push")
-        self.assertEqual(names.count("spike-home.yaml"), 8, "every variant pushes onto the home screen, the cold too")
-        self.assertIn('runFlow:\n    when:\n      visible: "May device test spike', device_ios.spike_centre(
-            device_ios.spike_title(1)), "a second tap when the first only expanded a group")
+    def test_a_tap_whose_response_never_reached_may_is_not_tested_never_no_crash(self):
+        """Run 41555424833: every tap "passed" yet none reached May, so its "crash no" said nothing (coordinator, 3 Nov)."""
+        _, _, _, out, _, _ = self.spike(delivered=False)
+        self.assertEqual(self.spike_lines(out)[2:4], [
+            self.SAID + "warm: May sent to the background yes, pushed yes, banner tap passed, Notification Centre tap not "
+            "tried, response delivered no, May exited no, crash on notification open not tested, May in front yes",
+            self.SAID + "cold: May stopped yes, pushed yes, banner tap passed, Notification Centre tap not tried, response "
+            "delivered no, May exited no, crash on notification open not tested, May in front yes"])
+        self.assertEqual(self.spike_lines(out)[4:], self.phase_2(crash="not tested", delivered="no"))
+        self.assertNotIn("crash on notification open no,", out)
+        _, _, _, out, _, _ = self.spike(delivered=False, crash=["kind"])
+        self.assertEqual(self.spike_lines(out)[4:], self.phase_2(
+            crash=lambda name: "not tested" if name == "brief" else "yes", delivered="no"),
+            "a crash report is a crash, delivered or not")
+        _, _, _, out, _, _ = self.spike(notified=b"x MayPlayground[1:2] [com.apple.UserNotifications:Service] "
+                                                 b"Registered for push\n", delivered=False)
+        self.assertNotIn("response delivered yes", out, "only a line about a response counts")
 
-    def test_a_banner_maestro_cannot_tap_is_tried_in_notification_centre(self):
+    def test_mays_process_gone_after_a_tap_is_may_exited_yes(self):
+        _, _, _, out, _, _ = self.spike(exits=True)
+        self.assertIn(self.SAID + "warm: May sent to the background yes, pushed yes, banner tap passed, Notification "
+                      "Centre tap not tried, response delivered yes, May exited yes, crash on notification open no, May "
+                      "in front yes", out)
+        self.assertEqual(self.spike_lines(out)[4:], self.phase_2(exited="yes"))
+        self.assertEqual(self.pids[:2], [4242, None], "May's process looked up before the push and after the tap")
+        self.assertTrue(device_ios.exited(None, None, True), "cold: a delivered tap started May, and it is gone")
+        self.assertFalse(device_ios.exited(None, None, False), "cold: never started, so never exited")
+        self.assertFalse(device_ios.exited(None, 7, True))
+        self.assertTrue(device_ios.exited(7, 8, False), "another process: the first one exited")
+
+    def test_what_user_notifications_said_in_may_goes_to_the_private_diag_alone_redacted(self):
+        _, _, _, out, _, run = self.spike()
+        text = self.spike_diag(run)
+        self.assertIsNotNone(text, "kept with no crash too")
+        section = text.partition(b"== UserNotifications in May, per tap ==\n")[2]
+        self.assertEqual(section.count(b"Received notification response\n"), 8, "each tap's own lines")
+        self.assertTrue(section.startswith(b"generic warm:\n"))
+        self.assertIn(b"brief cold:\n", section)
+        self.assertNotIn(TOKEN.encode(), text, "through the same redaction")
+        self.assertNotIn("Received notification", out, "never in the public log")
+        self.assertTrue(publish.diagnostics_ok(text))
+        self.assertEqual(self.order.index("delivered") - self.order.index("tap"), 1, "read after the tap")
+
+    def test_without_the_springboard_tapper_nothing_is_pushed(self):
+        _, _, _, out, pushed, _ = self.spike(tapper=False)
+        self.assertEqual(self.spike_lines(out), [
+            "May device tests (ios): the notification spike runs instead of the scenarios",
+            self.SAID + "the springboard tapper was not built, so nothing was pushed"])
+        self.assertEqual(pushed, [])
+        self.assertEqual(self.signed_out, [TOKEN + "1"], "its session is signed out all the same")
+
+    def test_a_banner_the_tapper_cannot_find_is_tried_in_notification_centre(self):
         _, _, _, out, _, _ = self.spike(banner=False)
         self.assertIn(self.SAID + "warm: May sent to the background yes, pushed yes, banner tap failed, Notification "
-                      "Centre tap passed, crash on notification open no, May in front yes, opened yes", out)
-        _, _, _, out, _, _ = self.spike(banner=False, centre=False)
+                      "Centre tap passed, response delivered yes, May exited no, crash on notification open no, May in "
+                      "front yes", out)
+        self.assertEqual(self.taps[:2], [("May device test spike 1", "banner"), ("May device test spike 1", "centre")])
+        _, _, _, out, _, _ = self.spike(banner=False, centre=False, delivered=False)
         self.assertIn(self.SAID + "cold: May stopped yes, pushed yes, banner tap failed, Notification Centre tap failed, "
-                      "crash on notification open no, May in front no, opened no", out)
-        self.assertIn(self.SAID + "brief cold: pushed yes, tap failed, crash on notification open no, May in front no, opened no",
-                      out)
+                      "response delivered no, May exited no, crash on notification open not tested, May in front no", out)
+        self.assertIn(self.SAID + "brief cold: pushed yes, tap failed, response delivered no, May exited no, crash on "
+                      "notification open not tested, May in front no", out)
 
     def test_without_may_apps_allow_subflow_nothing_is_pushed(self):
         _, minted, report, out, pushed, _ = self.spike(allow=False)
