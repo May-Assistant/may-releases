@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import device_agent
 import device_ios
+import ios_push_tap
 import device_tests
 from device_tests import DeviceTestsError
 import publish
@@ -906,6 +907,48 @@ class RunTests(Workspace):
         self.assertNotIn("notification spike", out)
         self.assertTrue(report["scenarios"])
         self.assertFalse([argv for argv, _ in calls if argv[:3] == ["xcrun", "simctl", "push"]])
+
+    def test_the_push_tap_spike_runs_instead_of_the_scenarios_on_one_session_signed_out_at_the_end(self):
+        """Coordinator, 3 Nov: may-app #1652's hook taps each listed fixture; no scenario is set up."""
+        seen = []
+
+        def tapped(udid, env, source, private, folder, log, token, diagnostics, pid, reports, symbols):
+            seen.append((udid, source, private, token, list(self.signed_out), pid))
+            return ["pass"]
+        self.uses = []
+        real_uses = device_tests.uses
+        with patch("ios_push_tap.tap_fixtures", side_effect=tapped), \
+                patch("device_tests.uses", side_effect=lambda chosen: self.uses.append(list(chosen)) or
+                      real_uses(chosen)):
+            calls, minted, report, out, run = self.run_it(env={ios_push_tap.PUSH_TAP: "true"})
+        self.assertEqual(report["scenarios"], [], "the spike runs instead of the scenarios")
+        self.assertEqual(self.uses, [[]], "no scenario's agent, account or chat is set up")
+        self.assertEqual(seen, [(UDID, self.source, self.private, TOKEN + "1", [], device_ios.may_pid)],
+                         "one session, still signed in while the fixtures run")
+        self.assertEqual(len(minted), 1)
+        self.assertEqual(self.signed_out, [TOKEN + "1"], "and signed out at the end")
+        self.assertIn("May device tests (ios): the push-tap spike runs instead of the scenarios", out)
+        self.assertNotIn("notification spike", out)
+
+    def test_the_push_tap_spike_signs_out_even_when_it_raises(self):
+        with patch("ios_push_tap.tap_fixtures", side_effect=OSError("disk")), self.assertRaises(OSError):
+            self.run_it(env={ios_push_tap.PUSH_TAP: "true"})
+        self.assertEqual(self.signed_out, [TOKEN + "1"])
+
+    def test_the_two_spikes_are_never_dispatched_together(self):
+        with patch("ios_push_tap.tap_fixtures") as tapped, \
+                self.assertRaises(device_tests.DeviceTestsError) as raised:
+            self.run_it(env={ios_push_tap.PUSH_TAP: "true", device_ios.NOTIF_SPIKE: "true"})
+        self.assertEqual(str(raised.exception),
+                         "The notification spike and the push-tap spike are dispatched one at a time")
+        tapped.assert_not_called()
+
+    def test_without_the_push_tap_input_no_fixture_is_tapped(self):
+        with patch("ios_push_tap.tap_fixtures") as tapped:
+            calls, _, report, out, _ = self.run_it()
+        tapped.assert_not_called()
+        self.assertNotIn("push-tap", out)
+        self.assertTrue(report["scenarios"])
 
     def test_a_flow_maestro_never_ran_is_swept_then_passes_on_its_one_retry(self):
         self.quiet_hook = self.flow_hook(["not run", "pass"])
