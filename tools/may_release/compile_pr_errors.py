@@ -17,8 +17,9 @@ its own, on a fresh Linux runner, after it.
            ds-swift-compile.yml reports that), and age-encrypts that record ({sha, passed, errors, total}) to
            MAY_RENDERS_RECIPIENT, the environment's own key pair (never device tests' or renders'), for the one
            upload. Without the recipient nothing is sealed, and one fixed line says nothing will be posted.
-  verdict  (native job, no secret) fails the job when the compile failed, so a failure shows whether or not the
-           post job can post it.
+  verdict  (native job, no secret) fails the job when the compile failed, or may-app's gating tests (ios_gating.py,
+           sealed in the same record) failed or their list is malformed, so a failure shows whether or not the post job
+           can post it. The log gets the gating tests' counts alone; their failing names go to the pull request.
   open     (post job, MAY_RENDERS_DECRYPT_KEY alone) decrypts the record after checking the key against the
            recipient, and checks its shape and its commit before anything reads it.
   post     (post job, MAY_APP_PR_COMMENT_TOKEN alone, taken out of the environment at once) posts it as one comment on
@@ -46,6 +47,7 @@ from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
 from store import StoreError, child_env, require_step_secrets, runner_root, write_private
+import ios_gating
 import mac_sandbox
 import toolchain
 
@@ -86,8 +88,35 @@ def result_body(sha, url, passed):
     return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
 
 
-def comment_body(sha, url, passed, errors, total):
-    """The one comment posted on the pull request. sha is the compiled head; url this run, or None."""
+def gating_lines(tests):
+    """The comment's lines for may-app's gating tests (ios_gating.py's record); none when nothing is listed."""
+    state, listed, ran = tests["state"], tests["listed"], tests["ran"]
+    if state == "none":
+        return []
+    head = ["", "### May iOS gating tests: " + {"malformed": "failed", "not run": "not run"}.get(state, state), ""]
+    if state == "malformed":
+        return head + [f"`{ios_gating.LIST}` is malformed (a link, too long, not ASCII, a line that is not "
+                       "`Bundle/Class` or `Bundle/Class/method`, more than "
+                       f"{ios_gating.MAX_SELECTORS} selectors, or one twice), so no gating test ran."]
+    if state == "not run":
+        return head + ["Not run: the compile failed, or it ran sandboxed."]
+    if state == "passed":
+        return head + [f"{listed} selector{'s' if listed != 1 else ''} from `{ios_gating.LIST}`, {ran} "
+                       f"test{'s' if ran != 1 else ''} ran, none failed."]
+    failed, total = tests["failed"], tests["total"]
+    lines = head + [f"{listed} selector{'s' if listed != 1 else ''} from `{ios_gating.LIST}`, {ran} "
+                    f"test{'s' if ran != 1 else ''} ran, **{total} failed**." if ran else
+                    f"{listed} selector{'s' if listed != 1 else ''} from `{ios_gating.LIST}`; no test ran (the "
+                    "build for testing failed, or no selector matched a test)."]
+    if failed:
+        fence = fence_for(failed)
+        lines += ["", fence + "text", *failed, fence]
+    return lines
+
+
+def comment_body(sha, url, passed, errors, total, tests=None):
+    """The one comment posted on the pull request. sha is the compiled head; url this run, or None; tests the gating
+    tests' record (ios_gating.py), none listed when None."""
     if not SHA.fullmatch(sha or ""):
         raise CompilePrError("The compiled commit is not an exact SHA")
     how = f"Xcode {XCODE} (`xcodebuild`, scheme `{SCHEME}`, {DESTINATION}, Release, no signing)"
@@ -105,6 +134,7 @@ def comment_body(sha, url, passed, errors, total):
             lines += ["", "The build failed, but its output holds no error located in a file of this repository (for "
                       "example a project generation, package resolution, design-system or link failure). Nothing "
                       "else from the log is posted."]
+    lines += gating_lines(tests or ios_gating.record("none"))
     if url:
         lines += ["", f"Run: {url}"]
     body = "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
@@ -157,10 +187,11 @@ def outcome(private):
 
 
 def checked_record(data, sha):
-    """The record seal wrote, checked whole: {sha, passed, errors, total}, its commit the dispatched one, its errors
-    single lines of a bounded length; refuses otherwise."""
+    """The record seal wrote, checked whole: {sha, passed, errors, total, tests}, its commit the dispatched one, its
+    errors single lines of a bounded length, tests the gating tests' record (ios_gating.checked); refuses otherwise."""
     count = lambda v: type(v) is int and 0 <= v <= MAX_TOTAL
-    if not (isinstance(data, dict) and set(data) == {"sha", "passed", "errors", "total"} and data["sha"] == sha and
+    if not (isinstance(data, dict) and set(data) == {"sha", "passed", "errors", "total", "tests"} and
+            data["sha"] == sha and ios_gating.checked(data["tests"]) is not None and
             type(data["passed"]) is bool and isinstance(data["errors"], list) and len(data["errors"]) <= MAX_ERRORS and
             all(isinstance(e, str) and 0 < len(e) <= MAX_ERROR_LINE and "\n" not in e and "\r" not in e
                 for e in data["errors"]) and count(data["total"]) and data["total"] >= len(data["errors"]) and
@@ -198,7 +229,8 @@ def compile_record(sha, root):
         copies = [mac_sandbox.ROOT / "src", Path("/var") / mac_sandbox.ROOT.relative_to("/private/var") / "src"]
         errors, total = diagnostics(text, [checkout, checkout.resolve(), *copies], exclude=EXCLUDED)
         errors = [e for e in errors if 0 < len(e) <= MAX_ERROR_LINE and "\n" not in e and "\r" not in e]
-    return checked_record({"sha": sha, "passed": passed, "errors": errors, "total": total}, sha)
+    return checked_record({"sha": sha, "passed": passed, "errors": errors, "total": total,
+                           "tests": ios_gating.read(private)}, sha)
 
 
 def sealed_bytes(record):
@@ -247,11 +279,19 @@ def seal(sha):
 def verdict():
     """The native job's last word: it fails when the compile failed, whether or not the post job can post."""
     require_step_secrets(())
-    if outcome(private_root() / PRIVATE):
-        print(f"May iOS compile passed with Xcode {XCODE}")
-        return 0
-    print("May iOS compile failed; its errors go to the may-app pull request only")
-    return 1
+    private = private_root() / PRIVATE
+    tests = ios_gating.read(private)
+    listed, failed = tests["listed"], tests["total"]
+    if tests["state"] in ("passed", "failed"):
+        print(f"May iOS gating tests: {int(listed)} selectors listed, {int(failed)} tests failed; their names go to "
+              "the may-app pull request only")
+    elif tests["state"] == "malformed":
+        print("May iOS gating tests: may-app's list is malformed, so none ran")
+    if not outcome(private):
+        print("May iOS compile failed; its errors go to the may-app pull request only")
+        return 1
+    print(f"May iOS compile passed with Xcode {XCODE}")
+    return 1 if tests["state"] in ios_gating.FAILING else 0
 
 
 def open_record(sha):
@@ -311,18 +351,19 @@ def post(sha, pr, call_api=github):
         except (OSError, ValueError, RecursionError):
             raise CompilePrError("The compile record is malformed or for another commit; nothing was posted") from None
         passed, errors, total = record["passed"], record["errors"], record["total"]
+        gated = record["tests"]["state"] not in ios_gating.FAILING
     else:
-        passed = RESULTS.get(os.environ.get(NATIVE_RESULT, ""))
+        passed, gated = RESULTS.get(os.environ.get(NATIVE_RESULT, "")), True
         if passed is None:
             print("May iOS compile: no record and no native result to post; nothing posted")
             return 0
     if not token:
         print("May iOS compile: MAY_APP_PR_COMMENT_TOKEN is not set in may-native-compile-pr; no comment posted")
-        return 0 if passed else 1
+        return 0 if passed and gated else 1
     if len(token) < 20:
         raise CompilePrError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")
     url = run_url(os.environ)
-    body = comment_body(sha, url, passed, errors, total) if sealed else result_body(sha, url, passed)
+    body = comment_body(sha, url, passed, errors, total, record["tests"]) if sealed else result_body(sha, url, passed)
     if holds(body, token):
         raise CompilePrError("The comment holds a credential; nothing was posted")
     status, pull = call_api("GET", f"/repos/{APP_REPO}/pulls/{number}", None, token)
@@ -337,7 +378,7 @@ def post(sha, pr, call_api=github):
     done = post_or_update(listed_only(call_api), APP_REPO, number, sha, body, token, MARKER, author)
     if done == "same":
         print(f"May iOS compile result already posted for this head on may-app #{number}; nothing posted again")
-        return 0 if passed else 1
+        return 0 if passed and gated else 1
     if done == "updated":
         print(f"May iOS compile: this head's comment on may-app #{number} is updated with this run's result")
     if not sealed and passed:
@@ -345,6 +386,9 @@ def post(sha, pr, call_api=github):
         return 0
     if not sealed:
         print(f"May iOS compile failed; the result alone posted to may-app #{number} (no sealed record: no details)")
+        return 1
+    if passed and not gated:
+        print(f"May iOS compile passed but its gating tests did not; their result posted to may-app #{number}")
         return 1
     if passed:
         print(f"May iOS compile passed with Xcode {XCODE}; result posted to may-app #{number}")

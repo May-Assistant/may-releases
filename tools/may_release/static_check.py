@@ -2777,7 +2777,7 @@ DS_EXIT_CLASSES = {"GateDenial", "DsCompileError", "StoreError"}
 # compile_pr_errors.py (native-compile-pr.yml's post) is held to the same rules: it prints only the pull request
 # number, int(total) and the pinned Xcode version, and exits with its own, ds_compile's or the store's fixed messages.
 COMPILE_PR_ERRORS = "compile_pr_errors.py"
-COMPILE_PR_PRINT_VALUES = {"number", "int(total)", "XCODE"}
+COMPILE_PR_PRINT_VALUES = {"number", "int(total)", "XCODE", "int(listed)", "int(failed)"}
 COMPILE_PR_EXIT_CLASSES = {"GateDenial", "CompilePrError", "DsCompileError", "StoreError"}
 
 

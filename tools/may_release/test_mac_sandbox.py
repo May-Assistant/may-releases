@@ -400,11 +400,23 @@ class SandboxedCompileTests(unittest.TestCase):
                               (SandboxError("The unprivileged user could not be set up; nothing ran"), None)):
             with self.subTest(build=build):
                 (self.private / compile_tool.OUTCOME).unlink(missing_ok=True)
+                # An earlier run's gating record never outlives a sandbox that failed (it would read as this run's).
+                (self.private / compile_tool.ios_gating.RESULT).write_text(
+                    '{"state": "passed", "listed": 1, "ran": 1, "failed": [], "total": 0}')
                 ran, sandboxed, teardowns, error, outcome = self.native(sandbox=True, build=build)
                 self.assertEqual(ran, ["curl"], "nothing but the download ran as the runner user")
                 self.assertEqual((sandboxed, teardowns), (["playground"], 1))
                 self.assertEqual(outcome, result, "a sandbox that fails records no outcome; the step ends red")
                 self.assertEqual(error is not None, isinstance(build, Exception))
+                if not result:
+                    self.assertFalse((self.private / compile_tool.ios_gating.RESULT).exists(),
+                                     "no earlier gating record is left")
+                if result:
+                    # Coordinator, 3 Nov: no gating test runs sandboxed yet (the simulator as its user is unproven).
+                    gating = self.private / compile_tool.ios_gating.RESULT
+                    self.assertTrue(gating.is_file(), "the gating tests are recorded as not run")
+                    self.assertEqual(gating.read_text(),
+                                     '{"state": "not run", "listed": 0, "ran": 0, "failed": [], "total": 0}')
 
     def test_a_failed_stage_line_names_its_class_in_fixed_words_alone(self):
         out = io.StringIO()
