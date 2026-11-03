@@ -1477,9 +1477,13 @@ DEVICE_IOS_BUILD_STEP = "Build May Playground for the simulator without secrets"
 DEVICE_NOTIF_SPIKE = ("MAY_IOS_NOTIF_SPIKE", "${{ inputs.ios_notif_spike }}")
 DEVICE_NOTIF_SPIKE_INPUT = ("      ios_notif_spike:\n        description: [^\n]+\n        required: false\n"
                             "        type: boolean\n        default: false\n")
+# The push-tap spike (coordinator, 3 Nov): off unless dispatched true, in the iOS scenarios step alone.
+DEVICE_PUSH_TAP = ("MAY_IOS_PUSH_TAP", "${{ inputs.ios_push_tap }}")
+DEVICE_PUSH_TAP_INPUT = ("      ios_push_tap:\n        description: [^\n]+\n        required: false\n"
+                         "        type: boolean\n        default: false\n")
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
               ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS,
-              DEVICE_LOG_CHANGES, DEVICE_LOOP_CENSUS, DEVICE_NOTIF_SPIKE} | DEVICE_VARS | \
+              DEVICE_LOG_CHANGES, DEVICE_LOOP_CENSUS, DEVICE_NOTIF_SPIKE, DEVICE_PUSH_TAP} | DEVICE_VARS | \
     {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
 
 
@@ -1493,16 +1497,17 @@ def device_tests_workflow_problems(text):
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion",
                                                              "ios_diagnostics", "ios_log_changes", "ios_loop_census",
-                                                             "ios_notif_spike", "tidy_file_taxes"] or \
+                                                             "ios_notif_spike", "ios_push_tap", "tidy_file_taxes"] or \
             re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean",
-                                                                 "boolean", "boolean", "boolean"] or \
+                                                                 "boolean", "boolean", "boolean", "boolean"] or \
             not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or not re.search(DEVICE_DIAGNOSTICS_INPUT, trigger) or \
             not re.search(DEVICE_LOG_CHANGES_INPUT, trigger) or not re.search(DEVICE_LOOP_CENSUS_INPUT, trigger) or \
             not re.search(DEVICE_NOTIF_SPIKE_INPUT, trigger) or \
+            not re.search(DEVICE_PUSH_TAP_INPUT, trigger) or \
             not re.search(DEVICE_TIDY_INPUT, trigger) or \
             re.findall(r"(?m)^    - cron: (.+)$", trigger) != ['"17 3 * * *"']:
         found.append(name + "is not dispatched with exactly source_sha, scenarios and optional ios_reduce_motion, "
-                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans, plus one "
+                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans, plus one "
                      "nightly schedule")
     if "\nconcurrency:\n  group: may-device-tests\n  cancel-in-progress: false\n" not in text:
         found.append(name + "does not run one at a time in its own concurrency group")
@@ -1579,6 +1584,7 @@ def device_tests_workflow_problems(text):
             text.count("inputs.ios_log_changes") != 1 or DEVICE_LOOP_CENSUS not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_loop_census") != 1 or DEVICE_NOTIF_SPIKE not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_notif_spike") != 2 or \
+            DEVICE_PUSH_TAP not in env_entries(ios_scenarios) or text.count("inputs.ios_push_tap") != 1 or \
             env_entries(steps["ios"].get(DEVICE_IOS_BUILD_STEP, "")) != [DEVICE_NOTIF_SPIKE] or \
             any(env_entries(steps["android"].get(step, "")) for step in steps["android"] if step.startswith("Build")) or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
@@ -1612,7 +1618,8 @@ def device_tests_print_problems(root):
         quiet_tool_problems(root, "device_prototypes.py", set(), set()) + \
         quiet_tool_problems(root, "device_ios.py", {"ran", "cleaned_count", "scenario", "why", "kept", "stalls",
                                                           "longest", "crashes", "dropped", "drivers", "name",
-                                                          "count", "wedged", "loops"}, set())
+                                                          "count", "wedged", "loops"}, set()) + \
+        quiet_tool_problems(root, "ios_push_tap.py", {"why"}, set())
 
 
 # May's Android unit suites at an open may-app pull request head (android-unit-pr.yml, android_unit.py). The same

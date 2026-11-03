@@ -2755,13 +2755,13 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, line + line.replace("MAY_IOS", "MAY_ALSO")), "a secret, variable")
         self.flagged(self.text.replace("        type: boolean\n        default: false\n", "        type: string\n"
-                                       "        default: \"\"\n"), "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans")
+                                       "        default: \"\"\n"), "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans")
         self.flagged(self.text.replace("      ios_reduce_motion:\n", "      reduce_motion:\n"),
-                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans")
+                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans")
         block = self.text[self.text.index("      ios_reduce_motion:\n"):self.text.index("      ios_diagnostics:\n")]
         self.assertTrue(block.endswith("        type: boolean\n        default: true\n"), "on unless dispatched off")
         self.flagged(self.text.replace(block, block.replace("default: true", "default: false")),
-                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans")
+                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans")
 
     def test_diagnostics_is_an_optional_boolean_read_by_the_ios_scenarios_step_alone(self):
         line = "          MAY_IOS_DIAGNOSTICS: ${{ inputs.ios_diagnostics }}\n"
@@ -2770,18 +2770,18 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
         self.flagged(self.text.replace("      ios_diagnostics:\n", "      diagnostics:\n"),
-                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans")
+                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans")
         block = self.text[self.text.index("      ios_diagnostics:\n"):self.text.index("      ios_log_changes:\n")]
         self.assertTrue(block.endswith("        type: boolean\n        default: true\n"), "on unless dispatched off")
         self.flagged(self.text.replace(block, block.replace("type: boolean", "type: string").replace(
-            "default: true", 'default: ""')), "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans")
+            "default: true", 'default: ""')), "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans")
         self.flagged(self.text.replace(block, block.replace("default: true", "default: false")),
-                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans")
+                     "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans")
 
     def test_the_change_log_is_its_own_boolean_off_unless_dispatched_read_by_the_ios_scenarios_step_alone(self):
         """may-app #1302: SwiftUI's change log brought the idle hang back, so it is apart from the watchdog and off
         unless dispatched true (coordinator, 26 Oct)."""
-        message = "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans"
+        message = "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans"
         line = "          MAY_IOS_LOG_CHANGES: ${{ inputs.ios_log_changes }}\n"
         self.assertEqual(self.text.count(line), 1)
         android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
@@ -2795,7 +2795,7 @@ class WorkflowPinTests(unittest.TestCase):
 
     def test_the_loop_census_is_its_own_boolean_off_unless_dispatched_read_by_the_ios_scenarios_step_alone(self):
         """N, 31 Oct: the debug Playground's loop census is asked for only on an evidence run."""
-        message = "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike and tidy_file_taxes booleans"
+        message = "ios_diagnostics, ios_log_changes, ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans"
         line = "          MAY_IOS_LOOP_CENSUS: ${{ inputs.ios_loop_census }}\n"
         self.assertEqual(self.text.count(line), 1)
         android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
@@ -2809,14 +2809,31 @@ class WorkflowPinTests(unittest.TestCase):
 
     def test_the_notification_spike_is_its_own_boolean_off_unless_dispatched_read_by_the_ios_scenarios_step_alone(self):
         """Coordinator, 2 Nov: the spike runs instead of the iOS scenarios, so only a dispatch that asks for it."""
-        message = "ios_loop_census, ios_notif_spike and tidy_file_taxes booleans"
+        message = "ios_loop_census, ios_notif_spike, ios_push_tap and tidy_file_taxes booleans"
         line = "          MAY_IOS_NOTIF_SPIKE: ${{ inputs.ios_notif_spike }}\n"
         self.assertEqual(self.text.count(line), 2, "the iOS build step (the tapper) and the iOS scenarios step")
         android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
         self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
         self.flagged(self.text.replace(line, line.replace("ios_notif_spike", "ios_loop_census")), "a secret, variable")
-        block = self.text[self.text.index("      ios_notif_spike:\n"):self.text.index("      tidy_file_taxes:\n")]
+        block = self.text[self.text.index("      ios_notif_spike:\n"):self.text.index("      ios_push_tap:\n")]
+        self.assertTrue(block.endswith("        type: boolean\n        default: false\n"), "off unless dispatched on")
+        self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
+        self.flagged(self.text.replace(block, ""), message)
+
+    def test_the_push_tap_spike_is_its_own_boolean_off_unless_dispatched_read_by_the_ios_scenarios_step_alone(self):
+        """Coordinator, 3 Nov: the push-tap spike runs instead of the iOS scenarios, so only a dispatch that asks."""
+        message = "ios_notif_spike, ios_push_tap and tidy_file_taxes booleans"
+        line = "          MAY_IOS_PUSH_TAP: ${{ inputs.ios_push_tap }}\n"
+        self.assertEqual(self.text.count(line), 1, "the iOS scenarios step alone")
+        android = '        run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"\n'
+        self.flagged(self.text.replace(line, "").replace(android, line + android), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
+        self.flagged(self.text.replace(line, line.replace("ios_push_tap", "ios_notif_spike")), "a secret, variable")
+        build = "          MAY_IOS_NOTIF_SPIKE: ${{ inputs.ios_notif_spike }}\n        run: python3 -I -S -B tools/may_release/device_tests.py build"
+        self.assertEqual(self.text.count(build), 1)
+        self.flagged(self.text.replace(build, line + build), "a secret, variable or env entry")
+        block = self.text[self.text.index("      ios_push_tap:\n"):self.text.index("      tidy_file_taxes:\n")]
         self.assertTrue(block.endswith("        type: boolean\n        default: false\n"), "off unless dispatched on")
         self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
         self.flagged(self.text.replace(block, ""), message)

@@ -202,6 +202,8 @@ BUDGET = "skipped: the run's time budget left no room for it (RUN_BUDGET_SECONDS
 OUT, SEALED, VERDICTS = "may-device-out", "may-device-sealed", "device-verdicts.json"
 # iOS's notification spike (device_ios.py) leaves this private marker when a May crash report came in.
 SPIKE_CRASHED = "device-spike-crashed"
+# The push-tap spike (ios_push_tap.py) leaves this private marker when it failed (a fixture failed, or none ran).
+PUSH_TAP_FAILED = "device-push-tap-failed"
 AGENTS = "device-agents.json"
 SERIAL = "emulator-5554"
 # The fixed reasons a report may give (publish.py accepts these words alone).
@@ -2503,6 +2505,8 @@ def verdict(platform="android"):
         raise DeviceTestsError("No scenario had a working emulator")
     if (runner_root() / "may-private" / SPIKE_CRASHED).exists():
         raise DeviceTestsError("May crashed on opening a notification in the spike")
+    if (runner_root() / "may-private" / PUSH_TAP_FAILED).exists():
+        raise DeviceTestsError("The push-tap spike failed")
     print(f"May device tests ({platform}): no scenario failed")
 
 

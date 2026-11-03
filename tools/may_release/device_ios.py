@@ -31,6 +31,7 @@ import time
 import device_agent
 import device_tests
 from device_tests import DeviceTestsError, at, kept_lines
+import ios_push_tap
 import renders
 from store import child_env, require_step_secrets, runner_root, write_private
 
@@ -1147,8 +1148,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     # Run 40203481816: chat ran second and wedged for 19 minutes, so poll and poll-skip found no budget left. The
     # scenarios most likely to wedge run last on iOS (coordinator, 25 Oct); the rest keep the list's order.
     chosen.sort(key=lambda row: IOS_LAST.index(row["id"]) + 1 if row["id"] in IOS_LAST else 0)
-    if notif_spike_wanted():
-        chosen = []  # the spike runs instead: no scenario's agent, account or chat is set up (review of #181)
+    if notif_spike_wanted() and ios_push_tap.wanted():
+        raise DeviceTestsError("The notification spike and the push-tap spike are dispatched one at a time")
+    if notif_spike_wanted() or ios_push_tap.wanted():
+        chosen = []  # a spike runs instead: no scenario's agent, account or chat is set up (review of #181)
     agents, staged = device_tests.uses(chosen)
     require_step_secrets((device_tests.SIGNIN_SECRET, device_agent.OAUTH))
     secret = os.environ.pop(device_tests.SIGNIN_SECRET, "")
@@ -1158,7 +1161,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
     literals = device_tests.app_sources(root, "ios")
     if not (root / APP / "Info.plist").is_file():
         raise DeviceTestsError("The Playground app is not built")
-    base = device_tests.staging(secret, staged or notif_spike_wanted())
+    base = device_tests.staging(secret, staged or notif_spike_wanted() or ios_push_tap.wanted())
     outward = os.environ.get(device_tests.OUTWARD, "").strip() != "off"
     skipped, accounts = device_tests.switched_off(), device_tests.Accounts(chosen, minted, deleted_by, "ios", revoked_by)
     folder = root / device_tests.OUT / device_tests.run_folder(source) / "ios"
@@ -1213,6 +1216,19 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 token = ""
             if crashes:
                 write_private(private / SPIKE_CRASHED, b"true")
+        if ios_push_tap.wanted():
+            # The push-tap spike (may-app #1652's hook), instead of the scenarios: one session on the shared test
+            # account for every fixture's launch, signed out at the end.
+            print("May device tests (ios): the push-tap spike runs instead of the scenarios")
+            token = minted(base, secret)
+            try:
+                diagnostics.begin()
+                ios_push_tap.tap_fixtures(udid, env, source, private, folder, log, token, diagnostics, may_pid,
+                                          lambda seen: own_reports(diagnostics, seen),
+                                          lambda data: spike_symbols(data, root / APP, env))
+            finally:
+                revoked_by(base, token)
+                token = ""
         for row in chosen:
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
                      "server": []}
