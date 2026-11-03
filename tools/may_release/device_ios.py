@@ -1225,7 +1225,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 diagnostics.begin()
                 ios_push_tap.tap_fixtures(udid, env, source, private, folder, log, token, diagnostics, may_pid,
                                           lambda seen: own_reports(diagnostics, seen),
-                                          lambda data: spike_symbols(data, root / APP, env))
+                                          lambda data: spike_symbols(data, root / APP, env), shoot=screenshot)
             finally:
                 revoked_by(base, token)
                 token = ""

@@ -53,6 +53,8 @@ MAX_HOOK_LINES = 20  # the hook's newest lines kept for each fixture (it writes 
 DIAG = "push-tap"
 # The private marker a failed spike leaves: device_tests.py verdict, after the seal, fails the job on it.
 FAILED = device_tests.PUSH_TAP_FAILED
+# Each fixture's screen after its settle, in the private run folder (a name publish's DEVICE_FILE takes).
+SHOT = "push-tap-{}-end.png"
 PASS, FAIL, INFRA = "pass", "fail", "infra"
 
 
@@ -124,7 +126,7 @@ def read_lines(udid, env, start, bounded=device_tests.bounded_output):
 
 
 def tap_fixtures(udid, env, source, private, folder, log, token, diagnostics, pid, reports, symbols=None,
-                 launch=renders.quiet, lines=read_lines, clock=time.monotonic, sleep=time.sleep):
+                 launch=renders.quiet, lines=read_lines, clock=time.monotonic, sleep=time.sleep, shoot=None):
     """The spike: each listed fixture once, on a cold launch. Writes the private diag and, when the run fails, the
     FAILED marker; returns the verdicts. pid(udid, env): May's process id or None; reports(before): May's crash
     reports that came in since; symbols(data): file:line lines for a report."""
@@ -165,6 +167,9 @@ def tap_fixtures(udid, env, source, private, folder, log, token, diagnostics, pi
                 sleep(POLL_SECONDS)
             sleep(SETTLE_SECONDS)
             after = pid(udid, env)
+            # Coordinator, 3 Nov (run 41632669712): the hook's line says the tap was delivered, never which screen its
+            # route opened. The screen after the settle is kept as SHOT in the private run folder alone (never the log).
+            shot = shoot(udid, env, folder / SHOT.format(name), log) if shoot and launched else None
             alive = after is not None and (before is None or after == before)
             new = reports(seen)
             seen.update(diagnostics.crash_reports())
@@ -173,7 +178,7 @@ def tap_fixtures(udid, env, source, private, folder, log, token, diagnostics, pi
             verdicts.append(verdict)
             kept.append(f"{name}: {verdict}; launched {'yes' if launched else 'no'}, hook said "
                         f"{words or 'nothing'}, May running {'yes' if alive else 'no'}, crash report "
-                        f"{'yes' if new else 'no'}\n".encode() + b"".join(
+                        f"{'yes' if new else 'no'}, screen {'kept' if shot else 'not kept'}\n".encode() + b"".join(
                             line + b"\n" for line in read.splitlines()[-MAX_HOOK_LINES:] if LINE.search(line)))
         try:
             launch(["xcrun", "simctl", "terminate", udid, device_tests.APP_ID], log, env=env, timeout=LAUNCH_SECONDS)

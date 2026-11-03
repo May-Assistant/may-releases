@@ -180,12 +180,20 @@ class RunTests(Workspace):
         def sleep(seconds):
             self.now[0] += seconds
 
+        self.shots = []
+
+        def shoot(udid, env, path, log):
+            self.shots.append((current["name"], path.name))
+            path.write_bytes(b"\x89PNG fake")
+            return path.name
+
         out = io.StringIO()
         with contextlib.redirect_stdout(out), patch("ios_push_tap.hooked", lambda source: hooked):
             verdicts = ios_push_tap.tap_fixtures(UDID, {"DEVELOPER_DIR": "/X"}, self.source, self.private, self.folder,
                                                  self.private / "log", TOKEN, diagnostics, pid, came,
                                                  lambda data: b"frame 0 main (in MayPlayground) (App.swift:7)\n",
-                                                 launch=launch, lines=lines, clock=lambda: self.now[0], sleep=sleep)
+                                                 launch=launch, lines=lines, clock=lambda: self.now[0], sleep=sleep,
+                                                 shoot=shoot)
         self.diagnostics = diagnostics
         return verdicts, out.getvalue()
 
@@ -222,10 +230,11 @@ class RunTests(Workspace):
         diag = self.diag()
         self.assertIn(b"== push tap, per fixture ==\n", diag)
         self.assertIn(b"nothing: pass; launched yes, hook said delivered completion_on_main=true, May running yes, "
-                      b"crash report no\n", diag)
+                      b"crash report no, screen kept\n", diag)
         self.assertIn(b"chat: fail; launched yes, hook said delivered completion_on_main=false", diag)
         self.assertIn(b"push-tap fixture=chat delivered completion_on_main=false\n", diag)
-        self.assertIn(b"brief: fail; launched yes, hook said nothing, May running yes, crash report yes\n", diag)
+        self.assertIn(b"brief: fail; launched yes, hook said nothing, May running yes, crash report yes, screen kept\n",
+                      diag)
         self.assertIn(b"== May's frames, file:line ==\nframe 0 main", diag)
         self.assertNotIn(TOKEN.encode(), diag)
         self.assertNotIn(b"another line May logged", diag, "only the hook's own lines are kept")
@@ -233,6 +242,20 @@ class RunTests(Workspace):
         self.assertEqual(self.diagnostics.kept, [(ios_push_tap.DIAG, TOKEN)])
         self.assertTrue(publish.DEVICE_FILE.fullmatch(ios_push_tap.DIAG + device_tests.DIAG), "a name publish takes")
         self.assertTrue(publish.diagnostics_ok(diag), "publish keeps it")
+
+    def test_each_launched_fixture_keeps_its_end_screen_in_the_private_folder_alone(self):
+        """Coordinator, 3 Nov (run 41632669712): the hook says delivered, never which screen the route opened."""
+        verdicts, out = self.tap(launch_fails=("chat",))
+        self.assertEqual(self.shots, [("nothing", "push-tap-nothing-end.png"), ("brief", "push-tap-brief-end.png")],
+                         "after each launched fixture's settle; a launch that failed has no screen")
+        for _, name in self.shots:
+            self.assertTrue((self.folder / name).is_file())
+            self.assertTrue(publish.DEVICE_FILE.fullmatch(name), "a name publish takes")
+            self.assertNotIn(name, out)
+        self.assertIn(b"chat: infra; launched no, hook said nothing, May running yes, crash report no, screen not kept",
+                      self.diag())
+        self.assertTrue(publish.DEVICE_FILE.fullmatch(ios_push_tap.SHOT.format("a" * 32)), "the longest name fits")
+        self.assertNotIn("screen", out, "the log is unchanged")
 
     def test_a_failure_fails_the_run(self):
         for case, kwargs in (("off the main thread", {"said": {"nothing": TRUE, "chat": FALSE, "brief": TRUE}}),
