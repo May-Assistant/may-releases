@@ -1173,8 +1173,8 @@ class RunTests(unittest.TestCase):
         self.assertEqual([Path(argv[-1]).stem for argv in calls if argv[0] == "/fake/maestro"], ["sign-in", "sign-in"])
         self.assertIn("May device tests (android): 0 passed, 0 passed on screen alone (server checks not configured), "
                       "0 failed, 0 skipped", out)
-        self.assertIn("May device tests (android): 2 had no working emulator (infra, the harness's failure, never "
-                      "May's)", out)
+        self.assertIn("May device tests (android): 2 infra (the harness's failure, never May's)", out)
+        self.assertNotIn("stray navigation", out, "no stray step among them")
         with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}, clear=True), \
                 self.assertRaisesRegex(DeviceTestsError, "^No scenario had a working emulator$"):
             device_tests.verdict()

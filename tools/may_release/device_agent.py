@@ -61,10 +61,16 @@ JUDGE_PROMPT = (
     "text and can be wrong about what the app did, and any guess about how the app works. A choice tapped on May's "
     "question card shows in the chat as a reply quoting the card. The screen must still not contradict a confirmed "
     "read: an error on screen, or the goal's own state missing from it, is a fail. note says why in at most three "
-    "sentences.")
-JUDGE_SCHEMA = json.dumps({"type": "object", "additionalProperties": False, "required": ["verdict", "note"],
+    "sentences. stray says whose step left the goal's path, if one did: agent when the agent's own report says it "
+    "tapped, typed or opened something the goal forbids or does not ask for; app when the app went somewhere the goal "
+    "did not lead with no such step of the agent's; none when nothing left the goal's path.")
+# Coordinator, 3 Nov (run 41623657138's iOS poll-skip): who left the goal's path, so a stray step of the agent's own
+# is told from the app's (device_tests.combined).
+STRAYS = ("none", "agent", "app")
+JUDGE_SCHEMA = json.dumps({"type": "object", "additionalProperties": False, "required": ["verdict", "note", "stray"],
                            "properties": {"verdict": {"type": "string", "enum": ["pass", "fail"]},
-                                          "note": {"type": "string", "maxLength": 600}}})
+                                          "note": {"type": "string", "maxLength": 600},
+                                          "stray": {"type": "string", "enum": list(STRAYS)}}})
 
 
 class AgentError(ValueError):
@@ -228,7 +234,8 @@ def truth_text(agent):
 
 
 def judge(cli, goal, tag, agent, work, token, model):
-    """The judge's verdict on one agent run: ("pass" | "fail" | "rate_limited" | "error", note)."""
+    """The judge's verdict on one agent run: ("pass" | "fail" | "rate_limited" | "error", note, stray), stray one of
+    STRAYS ("none" unless the judge said otherwise)."""
     work = fresh(work)
     prompt = JUDGE_PROMPT.format(goal=filled(goal, tag), outcome=agent.get("outcome") or "none",
                                  actions=agent.get("actions", 0), summary=redacted(agent.get("summary")) or "(none)",
@@ -253,4 +260,5 @@ def judge(cli, goal, tag, agent, work, token, model):
         return "error", ""
     if not isinstance(answer, dict) or answer.get("verdict") not in ("pass", "fail"):
         return "error", ""
-    return answer["verdict"], str(answer.get("note", ""))[:600]
+    stray = answer.get("stray") if answer.get("stray") in STRAYS else "none"
+    return answer["verdict"], str(answer.get("note", ""))[:600], stray

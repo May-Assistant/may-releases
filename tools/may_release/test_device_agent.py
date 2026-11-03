@@ -251,6 +251,18 @@ class AgentRunTests(unittest.TestCase):
         self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]], [
             ("pass", None), ("fail", device_tests.NOT_JUDGED), ("fail", device_tests.NO_TRUTH)])
 
+    def test_a_stray_step_of_the_agents_is_infra_and_counted_in_the_log(self):
+        """Coordinator, 3 Nov: infra never counts as a pass, and the stray navigations are counted, for a trend."""
+        _, _, _, report, _, judge_out = self.run_and_judge(
+            [record(), record(), record()], [("fail", "a stray tap", "agent"), ("fail", "it moved", "app"),
+                                             ("pass", "")])
+        self.assertEqual([(row["verdict"], row.get("reason")) for row in report["scenarios"]][:2], [
+            (device_tests.INFRA, device_tests.STRAY_NAVIGATION), ("fail", None)])
+        self.assertIn("May device tests (android): 1 infra (the harness's failure, never May's)", judge_out)
+        self.assertIn("May device tests (android): 1 of them agent stray navigation, every server check passed",
+                      judge_out)
+        self.assertNotIn("a stray tap", judge_out, "the judge's note stays in the sealed report")
+
     def test_a_judge_that_cannot_fill_its_goal_marks_that_row_alone(self):
         """Independent review of #176: a stored tag without its platform letter makes device_agent.filled raise; that
         row is not judged, and the step still judges the rest."""
@@ -1106,6 +1118,36 @@ class ServerTruthTests(unittest.TestCase):
         self.assertIn("never tap the card or any of its choices", goal)
         self.assertIn("the only things you tap from here on are the message field and the send button", goal)
 
+    def test_an_agents_own_stray_step_with_every_server_check_passed_is_infra_on_either_platform(self):
+        """Coordinator, 3 Nov (run 41623657138's iOS poll-skip): the agent's stray tap opened another chat."""
+        record = {"outcome": "completed", "actions": 25}
+        passed = {"server": [{"get": "/v1/agents", "status": 200, "pass": True},
+                             {"truth": "closed", "pass": True}], "delivery": ["succeeded", "succeeded"]}
+        verdict = device_tests.combined(passed, record, ("fail", "a stray tap opened another chat", "agent"), sends=True)
+        self.assertEqual(verdict, {"verdict": device_tests.INFRA, "reason": device_tests.STRAY_NAVIGATION})
+        self.assertTrue(device_tests.STRAY_NAVIGATION.startswith("agent stray navigation"))
+        self.assertIn(device_tests.STRAY_NAVIGATION, publish.REASONS)
+        self.assertNotEqual(verdict["verdict"], "pass", "never a pass")
+
+    def test_an_app_caused_navigation_or_a_failed_check_still_fails(self):
+        record = {"outcome": "completed", "actions": 25}
+        passed = {"server": [{"get": "/v1/agents", "status": 200, "pass": True}], "delivery": ["succeeded"]}
+        for case, entry, judged, run in (
+                ("the app navigated on its own", passed, ("fail", "it opened by itself", "app"), record),
+                ("nothing strayed", passed, ("fail", "wrong", "none"), record),
+                ("no stray word", passed, ("fail", "wrong"), record),
+                ("a server check failed", {"server": [{"get": "/v1/agents", "status": 500, "pass": False}],
+                                           "delivery": ["succeeded"]}, ("fail", "x", "agent"), record),
+                ("an unverified check", {"server": [{"truth": "t", "pass": False, "unverified": True}],
+                                         "delivery": ["succeeded"]}, ("fail", "x", "agent"), record),
+                ("no server check", {"server": [], "delivery": ["succeeded"]}, ("fail", "x", "agent"), record),
+                ("no action taken", passed, ("fail", "x", "agent"), dict(record, actions=0))):
+            with self.subTest(case=case):
+                self.assertEqual(device_tests.combined(entry, run, judged)["verdict"], "fail")
+        failed_delivery = {"server": [{"get": "/v1/agents", "status": 200, "pass": True}], "delivery": ["failed"]}
+        self.assertEqual(device_tests.combined(failed_delivery, record, ("fail", "x", "agent"), sends=True),
+                         {"verdict": "fail", "reason": device_tests.DELIVERY_FAILED}, "a reply that failed stays a fail")
+
     def test_a_typing_failure_is_infra_whatever_the_judge_said(self):
         for judged in (("pass", ""), ("fail", "the message was cut")):
             with self.subTest(judged=judged):
@@ -1540,8 +1582,12 @@ class AgentRunnerTests(unittest.TestCase):
             stdout.write(json.dumps(answer).encode())
 
         for answer, expected in (
-                ({"is_error": False, "structured_output": {"verdict": "pass", "note": "ok"}}, ("pass", "ok")),
-                ({"is_error": False, "result": json.dumps({"verdict": "fail", "note": "no"})}, ("fail", "no")),
+                ({"is_error": False, "structured_output": {"verdict": "pass", "note": "ok"}}, ("pass", "ok", "none")),
+                ({"is_error": False, "result": json.dumps({"verdict": "fail", "note": "no"})}, ("fail", "no", "none")),
+                ({"is_error": False, "structured_output": {"verdict": "fail", "note": "x", "stray": "agent"}},
+                 ("fail", "x", "agent")),
+                ({"is_error": False, "structured_output": {"verdict": "fail", "note": "x", "stray": "maybe"}},
+                 ("fail", "x", "none")),
                 ({"is_error": False, "result": "pass"}, ("error", "")),
                 ({"is_error": False, "structured_output": {"verdict": "great"}}, ("error", "")),
                 ({"is_error": True, "api_error_status": 429}, ("rate_limited", ""))):
@@ -1555,6 +1601,12 @@ class AgentRunnerTests(unittest.TestCase):
         self.assertIn("--strict-mcp-config", command)
         self.assertEqual(json.loads(command[command.index("--json-schema") + 1])["properties"]["verdict"]["enum"],
                          ["pass", "fail"])
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertEqual(schema["properties"]["stray"]["enum"], ["none", "agent", "app"])
+        self.assertIn("stray", schema["required"])
+        self.assertIn("agent when the agent's own report says it tapped", device_agent.JUDGE_PROMPT)
+        self.assertIn("app when the app went somewhere the goal did not lead with no such step of the agent's",
+                      device_agent.JUDGE_PROMPT)
 
 
 class DeviceServerTests(unittest.TestCase):
