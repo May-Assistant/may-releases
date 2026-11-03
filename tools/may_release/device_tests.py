@@ -262,6 +262,11 @@ INFRA_GONE = "the emulator was not running: it had crashed and was not restarted
 # and the agent answered poll-skip's card itself, which leaves nothing to check (run 41358220544): a setup failure.
 TYPING_FAILED = "the typing tool's text did not land whole, even typed again (the harness's failure)"
 STRAY_ANSWER = "the agent answered the question card itself, so its skip could not be checked (a setup failure)"
+# Coordinator, 3 Nov: run 41623657138's iOS poll-skip reached the goal (every server check passed) but the agent's own
+# stray tap opened another chat, and the judge failed it. Only then, on both platforms alike: the judge says the agent's
+# own step strayed (never the app on its own) and every server read passed; infra, never a pass, and counted.
+STRAY_NAVIGATION = ("agent stray navigation: the agent's own step left the goal's path while every server check "
+                    "passed (the harness's failure)")
 
 
 def fresh_switch():
@@ -2064,6 +2069,11 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
     accounts.report("android")
 
 
+def stray_of(judged):
+    """The judge's stray word (device_agent.STRAYS), "none" when it gave none."""
+    return judged[2] if len(judged) > 2 and judged[2] in device_agent.STRAYS else "none"
+
+
 def combined(entry, record, judged, sends=False, look=False):
     """An agent scenario's verdict from its run, the judge and the server truth; the smoke scenario's from Maestro, its
     agent run and the judge, never "pass". For one that sends May a message (sends), the server's delivery codes
@@ -2090,6 +2100,11 @@ def combined(entry, record, judged, sends=False, look=False):
             return {"verdict": "fail", "reason": NOT_JUDGED}
         if not codes or any(code != "succeeded" for code in codes):
             return {"verdict": "fail", "reason": DELIVERY_FAILED}
+    # The agent's record has no act log (its action count and summary alone), so its own step is the judge's reading of
+    # its own summary, and it must have acted at all.
+    if judged[0] == "fail" and stray_of(judged) == "agent" and type(record.get("actions")) is int and \
+            record["actions"] > 0 and entry.get("server") and all(check.get("pass") is True for check in entry["server"]):
+        return {"verdict": INFRA, "reason": STRAY_NAVIGATION}
     if judged[0] != "pass":
         return {"verdict": "fail", "reason": None if judged[0] == "fail" else NOT_JUDGED}
     if "maestro" in entry:
@@ -2202,8 +2217,10 @@ def judge_scenarios(judged_by=device_agent.judge, platform="android"):
           f"configured), {failed} failed, {skipped} skipped")
     infra = counts[INFRA]
     if infra:
-        print(f"May device tests ({platform}): {infra} had no working emulator (infra, the harness's failure, never "
-              "May's)")
+        print(f"May device tests ({platform}): {infra} infra (the harness's failure, never May's)")
+    strays = sum(1 for entry in report["scenarios"] if entry.get("reason") == STRAY_NAVIGATION)
+    if strays:
+        print(f"May device tests ({platform}): {strays} of them agent stray navigation, every server check passed")
     unverified = counts[UNVERIFIED]
     if unverified:
         print(f"May device tests ({platform}): {unverified} could not be checked on the server (unverified, never a "

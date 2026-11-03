@@ -1608,7 +1608,9 @@ DEVICE_PRINT_VALUES = {"scenario", "word", "passed", "ui_passed", "failed", "ski
                        "unrevoked", "waited", "network", "unverified", "tasks", "lines", "mixed", "saved",
                        # The emulator's version and its image's revision (digits and dots, or "unknown"), and, after a
                        # launch failure, its exit status, adb's state word, the host's MB available and OOM kills.
-                       "version", "revision", "exited", "adb_state", "available", "kills", "build", "backend", "infra"}
+                       "version", "revision", "exited", "adb_state", "available", "kills", "build", "backend", "infra",
+                       # Agent stray navigations among the infra verdicts (coordinator, 3 Nov).
+                       "strays"}
 
 
 def device_tests_print_problems(root):
