@@ -1,0 +1,39 @@
+# May device tests' springboard tapper (device_ios.py, the notification spike): a host app that does nothing and one UI
+# test that taps the notification with a given title on the simulator's springboard. Built with the pinned Xcode and
+# XcodeGen in the build step, with no secret, only when the run asks for the spike. May's code is never part of it.
+name: MaySpikeTap
+options:
+  bundleIdPrefix: io.github.mayassistant.devicetests
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    GENERATE_INFOPLIST_FILE: YES
+targets:
+  MaySpikeTapHost:
+    type: application
+    platform: iOS
+    sources: [Host]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.mayassistant.devicetests.spiketap
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+  MaySpikeTapUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [Tap]
+    dependencies:
+      - target: MaySpikeTapHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.mayassistant.devicetests.spiketap.uitests
+        TEST_TARGET_NAME: MaySpikeTapHost
+schemes:
+  MaySpikeTap:
+    build:
+      targets:
+        MaySpikeTapHost: all
+        MaySpikeTapUITests: [test]
+    test:
+      targets: [MaySpikeTapUITests]
