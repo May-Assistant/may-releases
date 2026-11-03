@@ -42,7 +42,8 @@ VIDEO = re.compile(r"[a-z0-9][a-z0-9-]{0,47}(?:-part[0-9]{1,2})?\.mp4")
 LINK = re.compile(r"https://github\.com/May-Assistant/[a-z0-9-]{1,40}/(?:pull|issues)/[1-9][0-9]{0,6}")
 # A result the server could not check (unverified) is never shown as a pass: the board keeps it with the skipped ones,
 # its reason saying why.
-VERDICTS = {"pass": "pass", "ui-pass": "pass", "fail": "fail", "skipped": "skipped", "unverified": "skipped"}
+VERDICTS = {"pass": "pass", "ui-pass": "pass", "fail": "fail", "skipped": "skipped", "unverified": "skipped",
+            "infra": "skipped"}
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 MAX_TEXT, MAX_LINE, MAX_ITEMS, MAX_INPUT = 600, 160, 12, 256 * 1024
 
