@@ -912,8 +912,9 @@ class RunTests(Workspace):
         """Coordinator, 3 Nov: may-app #1652's hook taps each listed fixture; no scenario is set up."""
         seen = []
 
-        def tapped(udid, env, source, private, folder, log, token, diagnostics, pid, reports, symbols):
+        def tapped(udid, env, source, private, folder, log, token, diagnostics, pid, reports, symbols, shoot=None):
             seen.append((udid, source, private, token, list(self.signed_out), pid))
+            self.assertIs(shoot, device_ios.screenshot, "each fixture's end screen is kept")
             return ["pass"]
         self.uses = []
         real_uses = device_tests.uses
