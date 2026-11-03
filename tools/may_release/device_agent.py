@@ -196,6 +196,9 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
             **{key: record.get(key) if record.get(key) in DRIVER_CAUSES else None
                for key in ("hierarchy_cause", "refusal_cause")},
             **({"wedged": True} if record.get("wedged") is True else {}),
+            # Run 41656192676: the device server marked Android chat, poll and poll-skip typing failures, but this
+            # copy dropped the mark, so device_tests.combined read "blocked" (a fail) instead of infra.
+            **({"typing_failed": True} if record.get("typing_failed") is True else {}),
             **({"looks": looks(record["looks"])} if "looks" in record else {})}
 
 

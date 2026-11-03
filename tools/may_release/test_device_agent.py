@@ -1453,6 +1453,15 @@ class AgentRunnerTests(unittest.TestCase):
                 found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
                                           {"outcome": "blocked", "summary": "x", "actions": 3, "wedged": stored})
                 self.assertEqual(found.get("wedged"), kept, "the fail-fast's mark, true alone")
+        # Run 41656192676: the typing failure's mark never reached the verdict, so three harness failures read as May's.
+        for stored, kept in ((True, True), ("yes", None), (1, None)):
+            with self.subTest(typing_failed=stored):
+                found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
+                                          {"outcome": "blocked", "summary": "x", "actions": 8, "typing_failed": stored})
+                self.assertEqual(found.get("typing_failed"), kept, "the typing failure's mark, true alone")
+                verdict = device_tests.combined({"id": "chat", "server": []}, found, ("fail", "blocked"), sends=True)
+                self.assertEqual(verdict["verdict"] == device_tests.INFRA, kept is True,
+                                 "a typing failure is infra, never May's fail; anything else stays a fail")
         found, _ = self.run_agent({"type": "result", "subtype": "success", "is_error": False},
                                   {"outcome": "unfinished", "summary": "", "hierarchy": "h", "actions": 9})
         self.assertEqual((found["outcome"], found["actions"], found["hierarchy"]), (None, 9, "h"),
