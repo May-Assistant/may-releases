@@ -28,6 +28,7 @@ import zipfile
 # after the standard library. A file planted here cannot shadow a stdlib import.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import ios_gating
 import mac_sandbox
 from mac_sandbox import SandboxError, stop_all
 from store import StoreError, require_step_secrets
@@ -193,6 +194,7 @@ def compile_native(platform, target=None, record=False, sandbox=False):
         env["PATH"] = str(binary.parent) + os.pathsep + env.get("PATH", "")
         if record:
             (private / OUTCOME).unlink(missing_ok=True)
+            (private / ios_gating.RESULT).unlink(missing_ok=True)
         if sandbox:
             try:
                 passed = build_sandboxed(source, private, binary.parents[2], developer, target, log)
@@ -202,6 +204,7 @@ def compile_native(platform, target=None, record=False, sandbox=False):
                     print("May iOS compile: the build user's files could not all be removed from "
                           + ", ".join(name for name in left if name in mac_sandbox.TEARDOWN_NAMES))
             (private / OUTCOME).write_text(json.dumps({"result": "passed" if passed else "failed"}))
+            ios_gating.not_run(private)  # the simulator as the sandbox's user is not proven yet
             print("Protected May iOS compile finished; its outcome and log stay in this runner's private files")
             return
         try:
@@ -219,6 +222,11 @@ def compile_native(platform, target=None, record=False, sandbox=False):
             passed = False
         if record:
             (private / OUTCOME).write_text(json.dumps({"result": "passed" if passed else "failed"}))
+            # May-app's gating tests (ios_gating.py), after a passed compile alone; compile_pr_errors.py seals them.
+            if passed:
+                ios_gating.run(source, root, private, env, log)
+            else:
+                ios_gating.not_run(private)
             print("Protected May iOS compile finished; its outcome and log stay in this runner's private files")
             return
     elif platform == "android":

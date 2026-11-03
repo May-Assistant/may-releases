@@ -18,6 +18,7 @@ import urllib.error
 
 import compile as compile_tool
 import compile_pr_errors as tool
+import ios_gating
 from compile_pr_errors import CompilePrError, comment_body
 from ds_compile import DsCompileError, diagnostics
 from gate import GateDenial
@@ -51,6 +52,9 @@ def app_pull(**changes):
         node[leaf] = new
     return value
 
+
+# A record's gating tests when the native job wrote none (ios_gating.py).
+NOT_RUN = {"state": "not run", "listed": 0, "ran": 0, "failed": [], "total": 0}
 
 class FakeResponse(io.BytesIO):
     def __init__(self, data, status=200):
@@ -194,6 +198,25 @@ class RecordOutcomeTests(unittest.TestCase):
         self.assertEqual((error, outcome), (None, {"result": "passed"}))
         self.assertIn("xcodebuild", calls)
 
+    def test_a_passed_compile_alone_runs_may_apps_gating_tests(self):
+        """Coordinator, 3 Nov: the gating tests run after a passed compile, recorded beside its outcome."""
+        ran = []
+
+        def run(source, root, private, env, log):
+            ran.append((source, root, private))
+            return ios_gating.write(private, ios_gating.record("passed", 1, 1))
+        with patch("compile.ios_gating.run", side_effect=run):
+            error, outcome, out, _ = self.compile(True)
+        self.assertEqual((error, outcome), (None, {"result": "passed"}))
+        self.assertEqual(ran, [(self.root / "may-source", self.root, self.root / "may-private")])
+        self.assertEqual(ios_gating.read(self.root / "may-private")["state"], "passed")
+        self.assertEqual(out, "Protected May iOS compile finished; its outcome and log stay in this runner's private files\n")
+        with patch("compile.ios_gating.run", side_effect=run):
+            error, outcome, _, _ = self.compile(True, "xcodebuild")
+        self.assertEqual((outcome, len(ran)), ({"result": "failed"}, 1), "a failed compile runs no gating test")
+        self.assertEqual(ios_gating.read(self.root / "may-private"), ios_gating.record("not run"),
+                         "and the last run's record is gone")
+
     def test_without_the_flag_a_failed_build_still_fails_and_records_nothing(self):
         error, outcome, out, _ = self.compile(False, "xcodebuild")
         self.assertIsInstance(error, compile_tool.CompileError)
@@ -314,6 +337,65 @@ class PostTests(PostCase):
         self.assertEqual((code, error), (0, None))
         self.assertEqual(out, "May iOS compile passed with Xcode 26.3; result posted to may-app #42\n")
         self.assertNotIn(MARKER, self.calls[-1][2]["body"])
+
+    def gated(self, state, result="passed"):
+        """The native job's outcome and a gating record in state, sealed into the record the post job opens."""
+        tests = {"none": ios_gating.record("none"), "malformed": ios_gating.record("malformed"),
+                 "passed": ios_gating.record("passed", 1, 3),
+                 "failed": ios_gating.record("failed", 1, 3, ["MayPlaygroundSnapshots/PushDelegateThreadTests/testTap"], 2),
+                 "not run": ios_gating.record("not run")}[state]
+        (self.private / ios_gating.RESULT).write_text(json.dumps(tests))
+        self.write(result, log=f"{CK}/ios/A.swift:1:1: error: {MARKER}")
+        return tests
+
+    def test_failing_gating_tests_are_posted_by_name_and_fail_the_post_with_counts_alone_in_the_log(self):
+        """Coordinator, 3 Nov: a failure in may-app's gating tests (ios_gating.py) blocks the merge like the compile."""
+        self.gated("failed")
+        code, error, out, _ = self.post()
+        self.assertEqual((code, error), (1, None))
+        self.assertEqual(out, "May iOS compile passed but its gating tests did not; their result posted to may-app #42\n")
+        self.assertNotIn("PushDelegateThreadTests", out)
+        body = self.calls[-1][2]["body"]
+        self.assertIn("### May iOS compile: passed", body)
+        self.assertIn("### May iOS gating tests: failed\n\n1 selector from `ios/gating-tests.txt`, 3 tests ran, **2 "
+                      "failed**.\n\n```text\nMayPlaygroundSnapshots/PushDelegateThreadTests/testTap\n```", body)
+
+    def test_each_gating_state_reads_as_itself_on_the_pull_request_and_in_the_exit(self):
+        for state, code, says in (("none", 0, None), ("passed", 0, "1 selector from `ios/gating-tests.txt`, 3 tests ran, "
+                                                                    "none failed."),
+                                  ("malformed", 1, "is malformed"), ("not run", 0, "Not run: the compile failed")):
+            with self.subTest(state=state):
+                self.calls = []
+                self.gated(state)
+                value, error, _, _ = self.post()
+                self.assertEqual((value, error), (code, None))
+                body = self.calls[-1][2]["body"]
+                if says is None:
+                    self.assertNotIn("gating tests", body)
+                else:
+                    self.assertIn(says, body)
+        self.calls = []
+        self.gated("failed", result="failed")
+        value, _, out, _ = self.post()
+        self.assertEqual(value, 1)
+        self.assertIn("errors posted to may-app #42", out)
+
+    def test_the_verdict_fails_the_native_job_on_failing_gating_tests_and_logs_counts_alone(self):
+        for state, code, lines in (
+                ("failed", 1, ["May iOS gating tests: 1 selectors listed, 2 tests failed; their names go to the may-app "
+                               "pull request only", "May iOS compile passed with Xcode 26.3"]),
+                ("malformed", 1, ["May iOS gating tests: may-app's list is malformed, so none ran",
+                                  "May iOS compile passed with Xcode 26.3"]),
+                ("passed", 0, ["May iOS gating tests: 1 selectors listed, 0 tests failed; their names go to the may-app "
+                               "pull request only", "May iOS compile passed with Xcode 26.3"]),
+                ("none", 0, ["May iOS compile passed with Xcode 26.3"])):
+            with self.subTest(state=state):
+                self.gated(state)
+                out = io.StringIO()
+                with patch.dict(os.environ, self.environ(), clear=True), contextlib.redirect_stdout(out):
+                    self.assertEqual(tool.verdict(), code)
+                self.assertEqual(out.getvalue().splitlines(), lines)
+                self.assertNotIn("PushDelegate", out.getvalue())
 
     def test_the_token_leaves_the_environment_at_once_and_is_only_a_bearer(self):
         self.write()
@@ -604,7 +686,7 @@ class SealTests(PostCase):
             record = tool.compile_record(SHA, self.root)
         self.assertEqual(record, {"sha": SHA, "passed": False, "total": 2, "errors": [
             "ios/May/Home/HomeView.swift:12:5: error: cannot find 'Foo' in scope",
-            "ios/MayPlayground/App.swift:2:1: error: expected '}'"]})
+            "ios/MayPlayground/App.swift:2:1: error: expected '}'"], "tests": NOT_RUN})
         with patch("compile_pr_errors.head_revision", return_value=OTHER), self.assertRaisesRegex(
                 CompilePrError, "not the dispatched commit"):
             tool.compile_record(SHA, self.root)
@@ -656,14 +738,19 @@ class SealTests(PostCase):
             tool.verdict()
 
     def test_a_record_is_checked_whole(self):
-        good = {"sha": SHA, "passed": False, "errors": ["ios/A.swift:1:1: error: e"], "total": 3}
+        good = {"sha": SHA, "passed": False, "errors": ["ios/A.swift:1:1: error: e"], "total": 3, "tests": NOT_RUN}
         self.assertEqual(tool.checked_record(dict(good), SHA), good)
         for change in ({"sha": OTHER}, {"passed": "no"}, {"errors": "x"}, {"errors": ["a\nb"]}, {"errors": [""]},
                        {"errors": ["x" * 601]}, {"errors": ["e"] * 101, "total": 101}, {"total": 0}, {"total": -1},
-                       {"total": True}, {"passed": True}, {"extra": 1}):
+                       {"total": True}, {"passed": True}, {"extra": 1}, {"tests": None},
+                       {"tests": dict(NOT_RUN, state="maybe")}, {"tests": dict(NOT_RUN, failed=["a b"], total=1)}):
             with self.subTest(change=change), self.assertRaises(CompilePrError):
                 tool.checked_record(dict(good, **change), SHA)
-        self.assertEqual(tool.checked_record({"sha": SHA, "passed": True, "errors": [], "total": 0}, SHA)["passed"], True)
+        self.assertEqual(tool.checked_record({"sha": SHA, "passed": True, "errors": [], "total": 0, "tests": NOT_RUN},
+                                             SHA)["passed"], True)
+        missing = {"sha": SHA, "passed": True, "errors": [], "total": 0}
+        with self.assertRaises(CompilePrError):
+            tool.checked_record(missing, SHA)
 
     def test_opening_with_nothing_sealed_or_a_bad_key(self):
         def opened(env):
@@ -749,7 +836,7 @@ class SealedRoundTripTests(PostCase):
         self.assertEqual(len(set(sizes)), 1, sizes)
         # An unpadded record, sealed by anything but seal, is refused when opened.
         plain = self.root / "short.json"
-        plain.write_text(json.dumps({"sha": SHA, "passed": True, "errors": [], "total": 0}))
+        plain.write_text(json.dumps({"sha": SHA, "passed": True, "errors": [], "total": 0, "tests": NOT_RUN}))
         (self.root / tool.DOWNLOAD).mkdir()
         subprocess.run(["age", "-r", self.public, "-o", str(self.root / tool.DOWNLOAD / tool.SEALED_NAME), str(plain)],
                        check=True)
