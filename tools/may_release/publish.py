@@ -201,7 +201,7 @@ def diagnostics_ok(data):
 
 def extract(archive, members, destination):
     """The checked members, written under destination; returns the names of optional files it dropped: may-app board
-    files that are not JSON, and previews that are not small MP4s."""
+    files that are not JSON, and previews and recordings that are not MP4s (or, for a preview, not small)."""
     dropped = []
     for member in sorted(members, key=lambda m: m.name.count("/")):
         path = destination.joinpath(*member.name.split("/"))
@@ -232,7 +232,11 @@ def extract(archive, members, destination):
             dropped.append(path.name)
             continue
         if path.suffix == ".mp4" and data[4:8] != b"ftyp":
-            raise PublishError("A recording is not an MP4")
+            # Run 41638830849: one recording that was not an MP4 stopped publish, and the run lost every report. A
+            # recording is optional like a preview: a bad one is dropped (and leaves its row), never uploaded.
+            path.unlink()
+            dropped.append(path.name)
+            continue
         if path.name in ("screens.json", "report.json"):
             try:
                 json.loads(data)
@@ -487,9 +491,9 @@ def agent_ok(agent):
             device_tests.kept_lines(summary.encode(), "") == (summary.encode(), 0))
 
 
-def device_report(path, files, titles):
+def device_report(path, files, titles, dropped=frozenset()):
     """A device's report.json, every value checked against a fixed shape and the files actually extracted; titles come
-    from this repository's own scenario list, never the report."""
+    from this repository's own scenario list, never the report. A recording extract dropped leaves its row's videos."""
     try:
         report = json.loads(path.read_text())
     except (OSError, ValueError, RecursionError):
@@ -499,6 +503,8 @@ def device_report(path, files, titles):
         raise PublishError("A device report is malformed")
     checked = []
     for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("videos", []), list):
+            row["videos"] = [name for name in row.get("videos", []) if not (isinstance(name, str) and name in dropped)]
         if not (isinstance(row, dict) and row.get("id") in titles and row.get("verdict") in VERDICT_WORDS and
                 row.get("reason", REASONS[0]) in REASONS and
                 all(isinstance(name, str) and name in files for name in row.get("videos", []) + row.get("screenshots", []))
@@ -613,7 +619,8 @@ def open_device():
                     runs.add(run)
                     members = [m for m in checked_members(archive, run, device_layout, "report.json")
                                if not (m.isdir() and m.name == run and (tree / run).exists())]
-                    for name in extract(archive, members, tree):
+                    dropped = extract(archive, members, tree)
+                    for name in dropped:
                         # device-push reads this, so the log says the board went without the dropped file.
                         (private / BOARD).mkdir(mode=0o700, exist_ok=True)
                         (private / BOARD / f"{device}-{name}{DROPPED}").touch()
@@ -627,7 +634,8 @@ def open_device():
             for name in BOARD_INPUTS:
                 if (folder / name).is_file():
                     (folder / name).rename(private / BOARD / f"{device}-{name}")
-            reports[device] = device_report(folder / "report.json", {p.name for p in folder.iterdir()}, titles)[1]
+            reports[device] = device_report(folder / "report.json", {p.name for p in folder.iterdir()}, titles,
+                                            {name for name in dropped if name.endswith(".mp4")})[1]
         run = runs.pop()
         # Checked above, then moved out of the tree: recordings and Android's diagnostics never enter may-renders
         # history; device-release uploads them from here, to a release pruned after KEEP runs.
