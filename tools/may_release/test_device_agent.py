@@ -356,7 +356,7 @@ class AgentRunTests(unittest.TestCase):
                 self.kept = self.anrs = self.crashes = self.network = 0
                 self.dropped = {}
 
-            def keep(self, folder, scenario, token):
+            def keep(self, folder, scenario, token, flow=b""):
                 test.last_seen.setdefault("order", []).append(("diagnostics", token))
 
             def report(self, platform):
@@ -397,7 +397,7 @@ class AgentRunTests(unittest.TestCase):
                 self.kept = self.anrs = self.crashes = self.network = 0
                 self.dropped = {}
 
-            def keep(self, folder, scenario, token):
+            def keep(self, folder, scenario, token, flow=b""):
                 test.last_seen.setdefault("order", []).append(("diagnostics", token))
 
         with patch("device_tests.Diagnostics", Fake):
