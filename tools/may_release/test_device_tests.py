@@ -1044,6 +1044,10 @@ class RunTests(unittest.TestCase):
             calls.append(list(argv))
             if argv[0] == "/fake/maestro":
                 self.maestro_envs.append(dict(env or {}))
+                self.flow_logs = getattr(self, "flow_logs", []) + [Path(log).name]
+                with Path(log).open("ab") as output:
+                    output.write(b"Launch app... COMPLETED\nAssert that id: chats is visible... FAILED\n"
+                                 b"session " + TOKEN.encode() + b"\n")
             for name in crashes:
                 if argv[-1].endswith(f"/{name}.xml"):
                     crashes.remove(name)
@@ -1266,7 +1270,7 @@ class RunTests(unittest.TestCase):
             def __init__(self, adb, env):
                 self.kept, self.anrs, self.crashes, self.network, self.dropped = 0, 0, 0, 0, {}
 
-            def keep(self, folder, scenario, token):
+            def keep(self, folder, scenario, token, flow=b""):
                 kept.append((folder.name, scenario, token))
                 self.kept, self.anrs, self.network, self.dropped[scenario] = self.kept + 1, 1, self.network + 3, 2
 
@@ -1280,6 +1284,30 @@ class RunTests(unittest.TestCase):
         self.assertIn("May device tests (android): sign-in diagnostics: 2 lines dropped", out)
         self.assertIn("May device tests (android): connections diagnostics: 2 lines dropped", out)
         self.assertNotIn(TOKEN, out)
+
+    def test_a_failed_flows_last_maestro_lines_reach_its_diag_and_a_passed_flows_never_do(self):
+        """Coordinator, 3 Nov (M, run 41504861439): Android's JUnit says only "Unknown error"; Maestro's own lines
+        stayed in the run's private log, which is never sealed."""
+        flows_kept = {}
+
+        class Fake:
+            def __init__(self, adb, env):
+                self.kept, self.anrs, self.crashes, self.network, self.dropped = 0, 0, 0, 0, {}
+
+            def keep(self, folder, scenario, token, flow=b""):
+                flows_kept[scenario] = flow
+
+        (self.source / device_tests.FLOWS_DIR / "connections.yaml").write_text(FLOW)
+        self.flow_logs = []
+        _, report, out, _ = self.run_it(fail=("sign-in",), diagnosed=Fake)
+        self.assertEqual([row["verdict"] for row in report["scenarios"]][:1], ["fail"])
+        self.assertEqual(flows_kept["sign-in"], b"Launch app... COMPLETED\nAssert that id: chats is visible... FAILED\n"
+                                                b"session " + TOKEN.encode() + b"\n", "the failed flow's own lines")
+        self.assertEqual(flows_kept["connections"], b"", "a passed flow keeps none")
+        self.assertEqual(self.flow_logs, ["sign-in-flow.log", "connections-flow.log"], "each flow its own log")
+        self.assertFalse(list(self.private.glob("*-flow.log")), "folded into the run's private log and removed")
+        self.assertIn(b"Assert that id: chats is visible... FAILED", (self.private / "device-run.log").read_bytes())
+        self.assertNotIn("FAILED", out, "never in the public log")
 
     def test_the_flow_gets_the_session_in_maestros_environment_never_as_an_argument(self):
         """Run 40051935128: sign-in.yaml's own launchApp with the session got none, so it never signed in."""
@@ -2224,6 +2252,23 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(clears), 2)
         self.assertTrue(all(dump < clear for dump, clear in zip(dumps, clears)), "the log is cleared once read")
         self.assertIn(["logcat", "-d", "-t", "2000", "-b", "main,system,crash"], emulator.calls)
+
+    def test_a_failed_flows_maestro_lines_come_first_redacted_and_capped(self):
+        emulator = FakeEmulator()
+        flow = (b"Launch app... COMPLETED\n" + b"".join(b"Tap on id: step%d... COMPLETED\n" % i for i in range(60)) +
+                b"Assert that id: chats is visible... FAILED\n" + b"session " + TOKEN.encode() + b"\n")
+        with patch("device_tests.subprocess.run", side_effect=emulator):
+            diagnostics = device_tests.Diagnostics("/sdk/adb", {})
+            emulator.log = b""
+            diagnostics.keep(self.folder, "sign-in", TOKEN, flow=flow)
+        text = (self.folder / "sign-in.diag.txt").read_bytes()
+        self.assertTrue(text.startswith(b"== maestro flow ==\n"), "kept even with nothing else to keep")
+        self.assertIn(b"Assert that id: chats is visible... FAILED\n", text)
+        self.assertNotIn(TOKEN.encode(), text, "redacted like every diag")
+        self.assertNotIn(b"step0.", text, "its last FLOW_LINES alone")
+        self.assertLessEqual(len(text.partition(b"== maestro flow ==\n")[2]), device_tests.MAX_DIAG // 16 + 32)
+        self.assertEqual(diagnostics.dropped["sign-in"], 1, "the session's line is counted as dropped")
+        self.assertTrue(publish.diagnostics_ok(text))
 
     def test_mays_network_failures_get_a_section_the_log_trim_never_loses_and_a_count(self):
         """may-app #1279: the debug Playground logs each failed request under MayNetwork (no URL, no token)."""

@@ -1194,6 +1194,30 @@ def adb_output(adb, env, argv):
     return done[1] if done is not None and done[0] == 0 else None
 
 
+# Coordinator, 3 Nov (M's diagnosis of runs 41504861439 and others): a failed Android scripted flow's JUnit result says
+# only "Unknown error", and Maestro's own output (the step, the command, its error) stayed in the run's private log,
+# which is never sealed. Each flow's output now goes to a private log of its own, and a flow that did not pass keeps its
+# last FLOW_LINES, redacted like every diag, in its scenario's private diag as "== maestro flow ==", as iOS does.
+FLOW_LINES = 40
+
+
+def last_lines(path, log):
+    """The last FLOW_LINES of a private Maestro log, which is then added to the run's private log and removed: b"" when
+    there is none (or it is a link)."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return b""
+        with path.open("rb") as stream:
+            stream.seek(max(0, path.stat().st_size - 64 * 1024))
+            data = stream.read()
+        with log.open("ab") as output:
+            output.write(data)
+        path.unlink()
+    except OSError:
+        return b""
+    return b"".join(data.splitlines(keepends=True)[-FLOW_LINES:])
+
+
 class Diagnostics:
     """The dropbox's ANR and crash entries already there at the start are counted, so each scenario keeps its own."""
 
@@ -1220,8 +1244,9 @@ class Diagnostics:
                 found[match.group(0)] = entry.strip()
         return found
 
-    def keep(self, folder, scenario, token):
-        """Writes <scenario>.diag.txt when there is anything to keep; never an error."""
+    def keep(self, folder, scenario, token, flow=b""):
+        """Writes <scenario>.diag.txt when there is anything to keep; never an error. flow: a failed scripted flow's
+        last Maestro lines (last_lines), kept first, at most MAX_DIAG // 16."""
         found = []
         for tag in (ANR, CRASH):
             entries = self.entries(tag)
@@ -1234,15 +1259,18 @@ class Diagnostics:
         adb_output(self.adb, self.env, ["logcat", "-b", LOG_BUFFERS, "-c"])
         # The stacks first, at most half; the log's newest lines fill the rest.
         (stacks, from_stacks), (logcat, from_log) = kept_lines(b"".join(found), token), kept_lines(log or b"", token)
+        flow, from_flow = kept_lines(flow, token)
+        flow = b"".join(flow.splitlines(keepends=True)[-FLOW_LINES:])[-(MAX_DIAG // 16):]
         stacks = stacks[:MAX_DIAG // 2]
         failures = [line for line in logcat.splitlines(keepends=True) if NETWORK_TAG.search(line)]
         network = b"".join(failures[:MAX_NETWORK_LINES])[:MAX_DIAG // 8]
-        room = MAX_DIAG - len(stacks) - len(network) - 128  # the section headers' room
+        room = MAX_DIAG - len(flow) - len(stacks) - len(network) - 160  # the section headers' room
         logcat = logcat[len(logcat) - room:] if len(logcat) > room else logcat
-        if not (stacks or logcat):
+        if not (flow or stacks or logcat):
             return
         # UTF-8 throughout, still within MAX_DIAG once any stray byte is replaced.
-        text = (stacks + (b"== network ==\n" + network if network else b"") +
+        text = ((b"== maestro flow ==\n" + flow if flow else b"") + stacks +
+                (b"== network ==\n" + network if network else b"") +
                 (b"== logcat ==\n" + logcat if logcat else b"")).decode("utf-8", "replace").encode()
         text = text[:MAX_DIAG].decode("utf-8", "ignore").encode()
         try:
@@ -1251,7 +1279,7 @@ class Diagnostics:
             return
         self.kept += 1
         self.network += len(failures)
-        self.dropped[scenario] = from_stacks + from_log
+        self.dropped[scenario] = from_flow + from_stacks + from_log
 
 
 # Run 40290647340 (coordinator and M, 26 Oct): the app did not start, and the run removed everything, so the cause
@@ -1953,15 +1981,19 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             recorder.start()
             started = time.monotonic()
             timed_out = False
+            flow_lines = b""
             if flow is not None:
                 at(f"{row['id']}: Maestro")
+                flow_log = private / f"{row['id']}-flow.log"
                 try:
                     passed = not flows.run_private(
                         [str(launcher), "--device", SERIAL, "test", str(flow), "--format", "junit", "--output",
-                         str(folder / (row["id"] + ".xml"))], log, env=with_session(maestro_env, token), check=False,
-                        timeout=FLOW_SECONDS)
+                         str(folder / (row["id"] + ".xml"))], flow_log, env=with_session(maestro_env, token),
+                        check=False, timeout=FLOW_SECONDS)
                 except subprocess.TimeoutExpired:
                     passed, timed_out = False, True
+                flow_lines = last_lines(flow_log, log)
+                flow_lines = b"" if passed else flow_lines
             finish_onboarding(row, source, "android", lambda path: not flows.run_private(
                 [str(launcher), "--device", SERIAL, "test", str(path)], log, env=maestro_env, check=False,
                 timeout=ONBOARDING_SECONDS))
@@ -1981,7 +2013,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             # the recording's pull (and on iOS its conversion), on both platforms.
             server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
             # After the server reads, which need the session while it lasts: a slow dumpsys costs them nothing.
-            diagnostics.keep(folder, row["id"], token)
+            diagnostics.keep(folder, row["id"], token, flow=flow_lines)
             accounts.finish(row, base, token)
             entry["videos"] = recorder.stop(folder)
             settle(entry, row, passed if flow is not None else None, ran=flow_ran(folder, row), timed_out=timed_out)
