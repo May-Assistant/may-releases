@@ -2003,7 +2003,6 @@ class PublishDeviceTests(unittest.TestCase):
         cases = {
             "other device folder": self.GOOD + [(RUN + "/ios", None)],
             "unknown file": self.GOOD + [(RUN + "/android/run.sh", b"x")],
-            "not an mp4": self.GOOD[:3] + [(RUN + "/android/sign-in.mp4", b"not a video")] + self.GOOD[4:],
             "unknown scenario": self.GOOD[:2] + [report(id="elsewhere")] + self.GOOD[3:],
             "unknown verdict": self.GOOD[:2] + [report(verdict="great")] + self.GOOD[3:],
             "free-text reason": self.GOOD[:2] + [report(reason="<b>hi</b>")] + self.GOOD[3:],
@@ -2106,6 +2105,26 @@ class PublishDeviceTests(unittest.TestCase):
         data = json.loads(page.split('id="board-data">')[1].split("</script>")[0])
         self.assertEqual(data["results"][RUN]["android/sign-in"]["preview"], f"media/{RUN}/android-sign-in.preview.mp4")
         self.assertFalse(list((work / "device-tests").rglob("*.mp4")), "no video in may-renders' git")
+
+    def test_a_recording_that_is_not_an_mp4_is_dropped_from_its_row_and_never_costs_the_run_its_reports(self):
+        """Run 41638830849: one recording that was not an MP4 stopped device-open, so nothing was published."""
+        report = json.loads(json.dumps(REPORT))
+        report["scenarios"][1]["videos"] = ["connections.mp4"]
+        entries = [entry for entry in self.GOOD if not entry[0].endswith("/report.json")]
+        try:
+            tree, out = self.open_with(entries + [(RUN + "/android/report.json", json.dumps(report).encode()),
+                                                  (RUN + "/android/connections.mp4", b"\0\0\0\x08wide" + bytes(64))])
+        except publish.PublishError as error:
+            self.fail(f"a recording that is not an MP4 stopped device-open: {error}")
+        self.assertEqual(out.strip(), f"May device tests decrypted and checked: run folder device-tests/{RUN}/ with 2 "
+                                      "scenario reports from 1 devices")
+        videos = self.root / "may-private" / publish.VIDEOS / RUN / "android"
+        self.assertEqual(sorted(p.name for p in videos.iterdir()), ["sign-in.mp4"],
+                         "the bad recording is dropped, never set aside for upload; the good one is kept")
+        readme = (tree / "README.md").read_text()
+        self.assertIn("[Recording: sign-in.mp4]", readme)
+        self.assertNotIn("connections.mp4", readme, "the dropped recording leaves its row, so no link points at it")
+        self.assertIn("## connections:", readme, "its scenario's report is still published")
 
     def test_android_diagnostics_are_checked_and_kept_apart_never_committed(self):
         try:
