@@ -279,6 +279,7 @@ WORKFLOW_MINTS = {
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
+    "android-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
     # ds-swift-compile.yml splits like ds-tests-pr.yml: native runs the design system's code and mints nothing.
     "ds-swift-compile.yml": {"pull": ("ci-ds-read",), "post": ("ci-ds-comment",)},
     "may-app-review.yml": {"review": ("ci-review",)},
@@ -306,6 +307,7 @@ COMMENT_SLUG_POSTS = {
     ("ios-core-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
     ("native-compile-pr.yml", "core"): ("ci-comment", "ios_core.py post "),
     ("ios-renders.yml", "publish"): ("ci-comment", "publish.py comment "),
+    ("android-renders.yml", "publish"): ("ci-comment", "publish.py android-comment "),
     ("ds-swift-compile.yml", "post"): ("ci-ds-comment", "ds_compile.py post "),
     # Coordinator, 3 Nov: a re-run at the same head edits that head's comment, so only this bot's own counts.
     ("ds-tests-pr.yml", "post"): ("ci-ds-comment", "ds_tests.py post "),
@@ -1395,6 +1397,122 @@ def renders_print_problems(root):
         quiet_tool_problems(root, "publish.py", PUBLISH_PRINT_VALUES,
                             {"PublishError", "StoreError", "GateDenial", "DsCompileError"})
 
+
+
+# May Playground's Android renders (android-renders.yml, android_renders.py, publish.py android-*): the iOS renders'
+# shape on Linux. The render job holds the PR read token in the pull request check alone and the two source-read keys in
+# the fetch alone; the Gradle test run, the seal and the verdict hold no secret and no GitHub token, and it hands over one
+# age-encrypted file, kept a day. The publish job binds the decrypt key, the may-renders write key and the comment token
+# each in one step. Dispatched with exactly source_sha and pr_number: the test filter is fixed in android_renders.py,
+# never an input, since inputs are public. android_renders.py prints only fixed lines, the outcome word and a count.
+ANDROID_RENDERS = "android-renders.yml"
+ANDROID_RENDERS_TOOL = 'python3 -I -S -B tools/may_release/android_renders.py {} --source-sha "$MAY_SOURCE_SHA"'
+ANDROID_RENDERS_RUNS = [
+    'python3 -I -S -B tools/may_release/gate.py --action renders --source-sha "$MAY_SOURCE_SHA" ' + RENDERS_PR,
+    'python3 -I -S -B tools/may_release/gate.py --action renders --source-sha "$MAY_SOURCE_SHA" --pr-number '
+    '"$MAY_PR_NUMBER" --check-pull',
+    "python3 -I -S -B tools/may_release/toolchain.py jdk",
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    'python3 -I -S -B tools/may_release/prepare.py --platform android --target playground --source-sha "$MAY_SOURCE_SHA" '
+    + RENDERS_PR,
+    ANDROID_RENDERS_TOOL.format("run"), ANDROID_RENDERS_TOOL.format("seal"), ANDROID_RENDERS_TOOL.format("verdict"),
+    'rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" "$RUNNER_TEMP/may-private" '
+    '"$RUNNER_TEMP/may-gradle" "$RUNNER_TEMP/may-tools" "$RUNNER_TEMP/may-android-renders-snapshots" '
+    '"$RUNNER_TEMP/may-android-renders-out" "$RUNNER_TEMP/may-renders-sealed"',
+    "python3 -I -S -B tools/may_release/toolchain.py age",
+    PUBLISH_TOOL.format("android-open"), PUBLISH_TOOL.format("android-push") + " " + RENDERS_PR,
+    PUBLISH_TOOL.format("android-comment") + " " + RENDERS_PR,
+    'rm -rf -- "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-renders-download" "$RUNNER_TEMP/may-publish-tree" '
+    '"$RUNNER_TEMP/may-publish-git"']
+ANDROID_RENDERS_UPLOAD = RENDERS_UPLOAD.replace("may-ios-renders-", "may-android-renders-")
+ANDROID_RENDERS_DOWNLOAD = RENDERS_DOWNLOAD.replace("may-ios-renders-", "may-android-renders-")
+ANDROID_RENDERS_SECRETS = set(COMPILE_SECRETS) | {PR_READ_SECRET, PR_COMMENT_SECRET, RENDERS_DECRYPT, RENDERS_WRITE}
+ANDROID_RENDERS_TESTS = ("MAY_RENDERS_TESTS", "${{ needs.render.outputs.tests }}")
+# The render job's outputs: as the iOS renders', and the tests' outcome word (passed, failed or timeout) for the comment.
+ANDROID_RENDERS_OUTPUTS = RENDERS_OUTPUTS.replace("    steps:\n", "      tests: ${{ steps.run.outputs.tests }}\n    steps:\n")
+ANDROID_RENDERS_ENV = (RENDERS_INPUTS - {("MAY_DS_SHA", "${{ inputs.ds_sha }}")}) | \
+    {("GH_TOKEN", "${{ github.token }}"), RENDERS_RECIPIENT, RENDERS_HANDED, ANDROID_RENDERS_TESTS} | \
+    {(name, "${{ secrets." + name + " }}") for name in ANDROID_RENDERS_SECRETS}
+
+
+@with_app_tokens(ANDROID_RENDERS)
+def android_renders_workflow_problems(text):
+    name = ANDROID_RENDERS + ": "
+    found = []
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, on, permissions, concurrency, jobs")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "pr_number"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly source_sha and pr_number")
+    if "\nconcurrency:\n  group: may-android-renders\n  cancel-in-progress: false\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    jobs = ("admission", "render", "publish")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in jobs] != [1, 1, 1] or \
+            text.count("permissions:") != 4:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != list(jobs) or \
+            [re.findall(r"(?m)^    runs-on: (.+)$", job_text(text, job)) for job in jobs] != [["ubuntu-24.04"]] * 3:
+        found.append(name + "jobs are not exactly admission, render and publish on Linux")
+    for job in ("render", "publish"):
+        if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job_text(text, job):
+            found.append(name + job + "'s environment is not the one admission chose")
+    if re.search(r"(?m)^    environment:", job_text(text, "admission")) or \
+            "    needs: admission\n" not in job_text(text, "render") or \
+            "    needs: [admission, render]\n" not in job_text(text, "publish"):
+        found.append(name + "render and publish do not run after admission (and publish after render)")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != ANDROID_RENDERS_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the check, the JDK, age, the fetch, the renders steps, "
+                     "the publish steps and the cleanups")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    if uses_in(text) != [CHECKOUT, CHECKOUT, UPLOAD_ARTIFACT, CHECKOUT, DOWNLOAD_ARTIFACT] or \
+            text.count("upload-artifact") != 1 or ANDROID_RENDERS_UPLOAD not in text or \
+            ANDROID_RENDERS_DOWNLOAD not in text:
+        found.append(name + "hands over something other than exactly the one encrypted renders file")
+    conditions = re.findall(r"(?m)^\s+(if: .+)$", text)
+    if conditions != RENDERS_CONDITIONS or re.search(r"(?m)^\s*(defaults|shell):", text) or \
+            text.count("continue-on-error: true") != 1 or \
+            re.findall(r"(?m)^    timeout-minutes: (\d+)$", text) != ["60", "30"]:
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than its own")
+    steps = {job: dict(job_steps(text, job)[1]) for job in jobs}
+    render, publish = steps["render"], steps["publish"]
+    check = render.get("Check the pull request head and environment before fetching", "")
+    fetch = render.get("Fetch the may-app commit and its design system quietly", "")
+    seal = render.get("Encrypt the run folder to the renders public key", "")
+    decrypt = publish.get("Decrypt and check the renders", "")
+    push = publish.get("Push the run folder to may-renders", "")
+    post = publish.get("Link the renders on the may-app pull request", "")
+    others = [chunk for job in ("render", "publish") for title, chunk in steps[job].items()
+              if chunk not in (check, fetch, decrypt, push, post)]
+    if secrets_in(text) != ANDROID_RENDERS_SECRETS or \
+            any(text.count("secrets." + n) != 1 for n in ANDROID_RENDERS_SECRETS) or \
+            secrets_in(check) != {PR_READ_SECRET} or secrets_in(fetch) != set(COMPILE_SECRETS) or \
+            secrets_in(decrypt) != {RENDERS_DECRYPT} or secrets_in(push) != {RENDERS_WRITE} or \
+            secrets_in(post) != {PR_COMMENT_SECRET} or any(secrets_in(chunk) for chunk in others) or \
+            text.count("GH_TOKEN") != 2 or "GH_TOKEN" in fetch or text.count("vars.") != 2 or \
+            RENDERS_RECIPIENT not in env_entries(seal) or RENDERS_RECIPIENT not in env_entries(decrypt) or \
+            RENDERS_HANDED not in env_entries(decrypt) or text.count("MAY_RENDERS_HANDED") != 1 or \
+            ANDROID_RENDERS_TESTS not in env_entries(post) or text.count("MAY_RENDERS_TESTS") != 1 or \
+            ANDROID_RENDERS_OUTPUTS not in job_text(text, "render") or text.count("outputs:") != 2 or \
+            any(e not in ANDROID_RENDERS_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
+                     "the decrypt key, the write key, the comment token (each in its one step), the outcome word and "
+                     "the inputs")
+    if "GITHUB_STEP_SUMMARY" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text:
+        found.append(name + "writes a step summary or carries a value between steps")
+    return found
+
+
+ANDROID_RENDERS_PRINT_VALUES = {"word", "int(count)"}
+
+
+def android_renders_print_problems(root):
+    return quiet_tool_problems(root, "android_renders.py", ANDROID_RENDERS_PRINT_VALUES,
+                               {"AndroidRendersError", "StoreError"}, {"GITHUB_OUTPUT": "write_output"})
 
 # May Playground's device tests against staging (device-tests.yml, device_tests.py, publish.py device-*). The Android
 # job holds the two source-read keys in its fetch alone and the staging sign-in secret in its run step alone; it hands
@@ -3310,6 +3428,8 @@ def control_problems(root):
     found += backend_ci_schedule_tool_problems(root)
     found += renders_workflow_problems((flows / RENDERS).read_text())
     found += renders_print_problems(root)
+    found += android_renders_workflow_problems((flows / ANDROID_RENDERS).read_text())
+    found += android_renders_print_problems(root)
     found += device_tests_workflow_problems((flows / DEVICE_TESTS).read_text())
     found += device_tests_print_problems(root)
     found += testflight_feedback_workflow_problems((flows / FEEDBACK).read_text())

@@ -18,6 +18,7 @@ CHECKERS = {
     "backend-ci-schedule.yml": static_check.backend_ci_schedule_workflow_problems,
     "ios-core-pr.yml": static_check.ios_core_workflow_problems,
     "ios-renders.yml": static_check.renders_workflow_problems,
+    "android-renders.yml": static_check.android_renders_workflow_problems,
     "ds-swift-compile.yml": static_check.ds_compile_workflow_problems,
     "may-app-review.yml": static_check.review_workflow_problems,
     "weekly-release.yml": static_check.weekly_release_workflow_problems,
@@ -164,7 +165,7 @@ class MintMutationTests(unittest.TestCase):
         self.assertEqual(set(static_check.COMMENT_SLUG_POSTS),
                          {("native-compile-pr.yml", "post"), ("native-compile-pr.yml", "swift-checks"),
                           ("ios-core-pr.yml", "core"), ("native-compile-pr.yml", "core"), ("ios-renders.yml", "publish"),
-                          ("ds-swift-compile.yml", "post"), ("ds-tests-pr.yml", "post")},
+                          ("android-renders.yml", "publish"), ("ds-swift-compile.yml", "post"), ("ds-tests-pr.yml", "post")},
                          "every post that dedupes on its head's marker")
         for (name, job), (step_id, run) in static_check.COMMENT_SLUG_POSTS.items():
             with self.subTest(workflow=name, job=job):
