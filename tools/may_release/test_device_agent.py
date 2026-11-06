@@ -353,7 +353,7 @@ class AgentRunTests(unittest.TestCase):
                          [(True, ["failed (model_rejected_request)"]), (False, None), (True, ["succeeded"])],
                          "each scenario's own codes, and nothing for one that sends no message")
         self.assertIn("May device tests (android): chat: fail", judge_out)
-        prompt = device_agent.JUDGE_PROMPT.format(goal="g", outcome="completed", actions=1, summary="s",
+        prompt = device_agent.JUDGE_PROMPT.format(goal="g", tag="t", outcome="completed", actions=1, summary="s",
                                                   hierarchy="h", delivery="succeeded", truth="t")
         self.assertIn("delivery codes only", prompt)
         self.assertIn("read when it finished", prompt)
@@ -1129,6 +1129,25 @@ class ServerTruthTests(unittest.TestCase):
         self.assertIn(device_tests.STRAY_NAVIGATION, publish.REASONS)
         self.assertNotEqual(verdict["verdict"], "pass", "never a pass")
 
+    def test_an_untagged_item_touched_is_always_a_fail_never_infra_or_a_pass(self):
+        """Coordinator, 6 Nov (run 84's iOS notes): the agent opened an existing, untagged task in the shared account,
+        which belongs to a real person, and backed out. The judge's stray untagged fails the run whatever else held."""
+        record = {"outcome": "completed", "actions": 25}
+        passed = {"server": [{"get": "/v1/agents", "status": 200, "pass": True}], "delivery": ["succeeded"]}
+        for judged in (("pass", "goal reached", "untagged"), ("fail", "opened another task", "untagged")):
+            for run in (record, dict(record, typing_failed=True), {"outcome": "blocked", "actions": 3}):
+                with self.subTest(judged=judged[0], run=run):
+                    verdict = device_tests.combined(passed, run, judged, sends=True)
+                    self.assertEqual(verdict, {"verdict": "fail", "reason": device_tests.UNTAGGED_TOUCHED})
+        self.assertIn(device_tests.UNTAGGED_TOUCHED, publish.REASONS)
+        self.assertIn("untagged", device_agent.STRAYS)
+        self.assertEqual(json.loads(device_agent.JUDGE_SCHEMA)["properties"]["stray"]["enum"], list(device_agent.STRAYS))
+        prompt = device_agent.JUDGE_PROMPT.format(goal="g", tag="qa-7-notes", outcome="completed", actions=1,
+                                                  summary="s", hierarchy="h", delivery="d", truth="t")
+        self.assertIn("whose name does not contain qa-7-notes and that the goal does not name", prompt)
+        self.assertIn("never open, edit or delete a task, chat, card or other item whose name does not contain qa-7",
+                      device_agent.AGENT_PROMPT.format(tag="qa-7"))
+
     def test_an_app_caused_navigation_or_a_failed_check_still_fails(self):
         record = {"outcome": "completed", "actions": 25}
         passed = {"server": [{"get": "/v1/agents", "status": 200, "pass": True}], "delivery": ["succeeded"]}
@@ -1611,7 +1630,7 @@ class AgentRunnerTests(unittest.TestCase):
         self.assertEqual(json.loads(command[command.index("--json-schema") + 1])["properties"]["verdict"]["enum"],
                          ["pass", "fail"])
         schema = json.loads(command[command.index("--json-schema") + 1])
-        self.assertEqual(schema["properties"]["stray"]["enum"], ["none", "agent", "app"])
+        self.assertEqual(schema["properties"]["stray"]["enum"], ["none", "agent", "app", "untagged"])
         self.assertIn("stray", schema["required"])
         self.assertIn("agent when the agent's own report says it tapped", device_agent.JUDGE_PROMPT)
         self.assertIn("app when the app went somewhere the goal did not lead with no such step of the agent's",
