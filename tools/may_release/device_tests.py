@@ -696,7 +696,7 @@ PUSH_ROW, PUSH_TRUTH, PUSH_PATH = "open-chat", {"push": "open-chat"}, "/v1/conve
 PUSH_MESSAGE = "{tag} push check. Reply with the word pushed."
 PUSH_ACTION, PUSH_TITLE, PUSH_BODY = "io.github.mayassistant.may.DEBUG_PUSH", "May device test push", \
     "Replied to your message."
-PUSH_REPLY_SECONDS, PUSH_POLL_SECONDS, PUSH_SETTLE_SECONDS = 120, 5, 4
+PUSH_REPLY_SECONDS, PUSH_POLL_SECONDS, PUSH_SETTLE_SECONDS, PUSH_BACKGROUND_SECONDS = 120, 5, 4, 2
 PUSH_FACTS = ("reply", "posted", "before", "entry", "tapped", "after")
 
 
@@ -756,6 +756,11 @@ def push_tap(adb, reply, wait=time.sleep):
     device_mcp.adb(config, "shell", "pm", "grant", APP_ID, "android.permission.POST_NOTIFICATIONS")
     xml, _ = device_mcp.android_dump(config)
     facts["before"] = xml is not None and shown(xml, body)
+    # Run 42244126293: posted, but no entry in the shade. On Android May shows no notification for a reply to the chat
+    # it has in front (may-app #1568), so this case is May in the background with that chat left open and scrolled
+    # up, then its notification tapped: Home first, and a moment for May to leave the front.
+    device_mcp.adb(config, "shell", "input", "keyevent", "3")
+    wait(PUSH_BACKGROUND_SECONDS)
     status, _ = device_mcp.adb(config, "shell", "am", "broadcast", "-a", PUSH_ACTION, "-p", APP_ID,
                                "--es", "kind", "chat_reply", "--es", "conversation_id", chat, "--es", "message_id",
                                message, "--es", "title", f"'{PUSH_TITLE}'", "--es", "body", f"'{PUSH_BODY}'")
