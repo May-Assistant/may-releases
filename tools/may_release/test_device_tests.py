@@ -3189,6 +3189,9 @@ class PushOpenChatTests(unittest.TestCase):
         for key, value in (("kind", "chat_reply"), ("conversation_id", self.CHAT), ("message_id", self.REPLY)):
             self.assertEqual(broadcast[broadcast.index(key) - 1:broadcast.index(key) + 2], ("--es", key, value))
         self.assertIn(("shell", "cmd", "statusbar", "expand-notifications"), calls)
+        # Run 42244126293: May shows no notification for the chat it has in front (may-app #1568): Home first.
+        self.assertLess(calls.index(("shell", "input", "keyevent", "3")), calls.index(broadcast),
+                        "May is sent to the background before its notification is posted")
         self.assertIn(("shell", "input", "tap", "200", "300"), calls, "the title's own element, at its centre")
         self.assertEqual(device_tests.push_verdict(facts), (200, True, False))
 
