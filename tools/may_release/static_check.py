@@ -269,6 +269,7 @@ WORKFLOW_MINTS = {
     "android-ci-schedule.yml": {"pick": ("ci-read",)},
     "weekly-release.yml": {"pick": ("ci-read",)},
     "backend-unit-pr.yml": {"backend": ("ci-read", "ci-comment")},
+    "web-tests-pr.yml": {"web": ("ci-read", "ci-comment")},
     "backend-ci-schedule.yml": {"pick": ("ci-read",)},
     "ios-core-pr.yml": {"core": ("ci-read", "ci-comment")},
     "ios-renders.yml": {"render": ("ci-read",), "publish": ("ci-comment",)},
@@ -929,6 +930,13 @@ COMPILE_PR_SANDBOX_INPUT = ("      sandbox:\n"
                             "        description: Temporary (#161) - build as the unprivileged macOS user; the default, "
                             "false, builds as today\n"
                             "        required: false\n        type: boolean\n        default: false\n")
+# The Xcode configuration (coordinator, 6 Nov: may-app #1797 is all #if DEBUG, which a Release build never compiles):
+# Release unless dispatched Debug, on the two compile steps and the post alone (compile.configuration; a Debug result
+# is posted under its own marker, never in place of Release's).
+COMPILE_PR_CONFIG = ("MAY_IOS_CONFIGURATION", "${{ inputs.configuration }}")
+COMPILE_PR_CONFIG_INPUT = ("      configuration:\n        description: [^\n]+\n        required: false\n"
+                           "        type: choice\n        options:\n          - Release\n          - Debug\n"
+                           "        default: Release")
 AGE_INSTALL = "python3 -I -S -B tools/may_release/toolchain.py age"
 COMPILE_PR_TOOL = "python3 -I -S -B tools/may_release/compile_pr_errors.py "
 SEAL_PR = COMPILE_PR_TOOL + 'seal --source-sha "$MAY_SOURCE_SHA"'
@@ -987,7 +995,8 @@ PR_READ_SECRET, PR_COMMENT_SECRET = "MAY_APP_PR_READ_TOKEN", "MAY_APP_PR_COMMENT
 # The native job's result, on the post alone: what it posts when no sealed record reached it (compile_pr_errors.py).
 COMPILE_PR_RESULT = ("MAY_NATIVE_RESULT", "${{ needs.native.result }}")
 COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT, COMPILE_PR_RESULT} | \
+                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT, COMPILE_PR_RESULT,
+                  COMPILE_PR_CONFIG} | \
     {(name, "${{ secrets." + name + " }}")
      for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET, COMPILE_PR_DECRYPT)}
 
@@ -1029,8 +1038,9 @@ def compile_pr_shape_problems(text):
         found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
-            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "sandbox"] or \
-            not trigger.endswith("\n" + COMPILE_PR_SANDBOX_INPUT.rstrip("\n")):
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "sandbox", "configuration"] or \
+            ("\n" + COMPILE_PR_SANDBOX_INPUT) not in trigger or \
+            not re.search("\n" + COMPILE_PR_CONFIG_INPUT + r"\Z", trigger) or text.count("inputs.configuration") != 3:
         found.append(name + ": is not dispatched with exactly pr_number, source_sha and the sandbox input, false by "
                      "default")
     if "\nconcurrency:\n  group: may-native-compile-pr\n" not in text:
@@ -1082,7 +1092,7 @@ def compile_pr_shape_problems(text):
     recheck = dict(steps["pull"]).get(PULL_STEP_NAMES[0], "")
     swift_recheck, swift_fetch, checks, swift_post, swift_clean = (swift_by_name.get(n, "") for n in SWIFT_STEP_NAMES)
     opener, post, post_clean = (post_by_name.get(n, "") for n in POST_STEP_NAMES[2:])
-    later = build + upload + verdict + clean + swift_clean + post_clean
+    later = upload + verdict + clean + swift_clean + post_clean
     # In each job each secret is bound exactly once: the PR token in the pull request check, so never in admission too
     # (review of #18, M2); the comment token in a post alone, never in the job that compiles (review of #130); the
     # decrypt key in the post job's open alone.
@@ -1095,7 +1105,9 @@ def compile_pr_shape_problems(text):
             any(secrets_in(f) != set(COMPILE_SECRETS) for f in (fetch, swift_fetch)) or \
             any(secrets_in(p) != {PR_COMMENT_SECRET} or "GH_TOKEN" in p for p in (post, swift_post)) or \
             any(secrets_in(r) != {PR_READ_SECRET} for r in (recheck, swift_recheck)) or secrets_in(later) or \
-            "env:" in later or secrets_in(checks) or secrets_in(seal) or \
+            "env:" in later or secrets_in(build) or \
+            any(env_entries(b) != [COMPILE_PR_CONFIG] for b in (runner_build, sandbox_build)) or \
+            secrets_in(checks) or secrets_in(seal) or \
             set(env_entries(checks)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")} or \
             set(env_entries(seal)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), COMPILE_PR_RECIPIENT} or \
             secrets_in(opener) != {COMPILE_PR_DECRYPT} or \
@@ -1103,7 +1115,7 @@ def compile_pr_shape_problems(text):
                                          (COMPILE_PR_DECRYPT, "${{ secrets." + COMPILE_PR_DECRYPT + " }}")} or \
             text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or text.count("needs.native.result") != 1 or \
             set(env_entries(post)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                                       ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RESULT,
+                                       ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RESULT, COMPILE_PR_CONFIG,
                                        (PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")} or \
             any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + ": a secret or env entry other than the pull request check's PR token, the fetch step's two "
@@ -1483,9 +1495,14 @@ DEVICE_NOTIF_SPIKE_INPUT = ("      ios_notif_spike:\n        description: [^\n]+
 DEVICE_PUSH_TAP = ("MAY_IOS_PUSH_TAP", "${{ inputs.ios_push_tap }}")
 DEVICE_PUSH_TAP_INPUT = ("      ios_push_tap:\n        description: [^\n]+\n        required: false\n"
                          "        type: boolean\n        default: false\n")
+# The Android slow-typing control (M and the coordinator, 6 Nov, #1785): off unless dispatched true, in the Android
+# scenarios step alone.
+DEVICE_SLOW_TYPING = ("MAY_ANDROID_SLOW_TYPING", "${{ inputs.android_slow_typing }}")
+DEVICE_SLOW_TYPING_INPUT = ("      android_slow_typing:\n        description: [^\n]+\n        required: false\n"
+                            "        type: boolean\n        default: false\n")
 DEVICE_ENV = {("MAY_SOURCE_SHA", "${{ inputs.source_sha || 'main' }}"), ("MAY_SCENARIOS", "${{ inputs.scenarios || 'all' }}"),
               ("GH_TOKEN", "${{ github.token }}"), DEVICE_REDUCE_MOTION, DEVICE_DIAGNOSTICS,
-              DEVICE_LOG_CHANGES, DEVICE_LOOP_CENSUS, DEVICE_NOTIF_SPIKE, DEVICE_PUSH_TAP} | DEVICE_VARS | \
+              DEVICE_LOG_CHANGES, DEVICE_LOOP_CENSUS, DEVICE_NOTIF_SPIKE, DEVICE_PUSH_TAP, DEVICE_SLOW_TYPING} | DEVICE_VARS | \
     {(name, "${{ secrets." + name + " }}") for name in DEVICE_SECRETS}
 
 
@@ -1499,9 +1516,12 @@ def device_tests_workflow_problems(text):
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch", "schedule"] or \
             re.findall(r"(?m)^      ([\w-]+):", trigger) != ["source_sha", "scenarios", "ios_reduce_motion",
                                                              "ios_diagnostics", "ios_log_changes", "ios_loop_census",
-                                                             "ios_notif_spike", "ios_push_tap", "tidy_file_taxes"] or \
+                                                             "ios_notif_spike", "ios_push_tap", "android_slow_typing",
+                                                             "tidy_file_taxes"] or \
             re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string", "boolean", "boolean", "boolean",
-                                                                 "boolean", "boolean", "boolean", "boolean"] or \
+                                                                 "boolean", "boolean", "boolean", "boolean",
+                                                                 "boolean"] or \
+            not re.search(DEVICE_SLOW_TYPING_INPUT, trigger) or \
             not re.search(DEVICE_REDUCE_MOTION_INPUT, trigger) or not re.search(DEVICE_DIAGNOSTICS_INPUT, trigger) or \
             not re.search(DEVICE_LOG_CHANGES_INPUT, trigger) or not re.search(DEVICE_LOOP_CENSUS_INPUT, trigger) or \
             not re.search(DEVICE_NOTIF_SPIKE_INPUT, trigger) or \
@@ -1587,6 +1607,7 @@ def device_tests_workflow_problems(text):
             text.count("inputs.ios_loop_census") != 1 or DEVICE_NOTIF_SPIKE not in env_entries(ios_scenarios) or \
             text.count("inputs.ios_notif_spike") != 2 or \
             DEVICE_PUSH_TAP not in env_entries(ios_scenarios) or text.count("inputs.ios_push_tap") != 1 or \
+            DEVICE_SLOW_TYPING not in env_entries(scenarios) or text.count("inputs.android_slow_typing") != 1 or \
             env_entries(steps["ios"].get(DEVICE_IOS_BUILD_STEP, "")) != [DEVICE_NOTIF_SPIKE] or \
             any(env_entries(steps["android"].get(step, "")) for step in steps["android"] if step.startswith("Build")) or \
             secrets_in(decrypt) != {"MAY_RENDERS_DECRYPT_KEY"} or secrets_in(push) != {"MAY_APP_RENDERS_WRITE_KEY"} or \
@@ -2166,6 +2187,127 @@ def backend_unit_silence_problems(root):
         return [BACKEND_TOOL + ": the Postgres service's log is not silenced (SILENCE_SQL, read back) before any pull "
                 "request code"]
     return []
+
+# May's web checks at an open may-app pull request head (web-tests-pr.yml, web_tests.py, web_tests_post.py): may-app's
+# web/ (design system at its web pin, npm ci, vitest, the build), with the same admission, pull request check and
+# environment as backend-unit-pr.yml, and its fetch plus --web (prepare.py: the design system at web/design-system.lock).
+# It holds nothing that lane does not: the PR read token in the check alone, the two source-read keys in the fetch alone,
+# the comment token in the post alone, and no secret or GitHub token on the checks' step (it runs the pull request's
+# own install scripts, tests and build) or the cleanup. Pinned whole: dispatch with exactly pr_number and source_sha,
+# read-only, Linux runners, no service, the pinned Node, nothing run but its seven commands, a 50-minute job timeout,
+# and no artifact, step summary or carried value. web_tests.py prints only fixed lines, a stage's name and verdict
+# from its own words, and integer test counts; web_tests_post.py only fixed lines, the pull request number and two
+# counts (web_tests_print_problems).
+WEB = "web-tests-pr.yml"
+PREPARE_WEB_PR = PREPARE_ANDROID_PR + " --web"
+WEB_RUN = 'python3 -I -S -B tools/may_release/web_tests.py --source-sha "$MAY_SOURCE_SHA" --record-outcome'
+WEB_POST = ('python3 -I -S -B tools/may_release/web_tests_post.py --source-sha "$MAY_SOURCE_SHA" '
+            '--pr-number "$MAY_PR_NUMBER"')
+WEB_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" '
+               '"$RUNNER_TEMP/may-web-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-npm" '
+               '"$RUNNER_TEMP/may-tools"')
+WEB_RUNS = [GATE_COMPILE_PR, BACKEND_NODE, GATE_CHECK_PULL, PREPARE_WEB_PR, WEB_RUN, WEB_POST, WEB_CLEANUP]
+WEB_STEP_NAMES = ["Install the pinned, checksum-verified Node",
+                  "Check the pull request head and environment before fetching",
+                  "Fetch the pull request head and the web design-system pin quietly",
+                  "Run the web checks without any credential, printing only pass or fail and counts",
+                  "Post the web failures on the may-app pull request, never in this log",
+                  "Remove private source, logs, dependencies and the pinned Node"]
+WEB_ENV = UNIT_INPUTS | {("GH_TOKEN", "${{ github.token }}")} | \
+    {(name, "${{ secrets." + name + " }}") for name in UNIT_SECRETS}
+WEB_RUN_NAME = "\nrun-name: 'May web checks for may-app #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'\non:\n"
+
+
+@with_app_tokens("web-tests-pr.yml")
+def web_tests_workflow_problems(text):
+    name = WEB + ": "
+    found = []
+    if "services:" in text or "image:" in text or "upload-artifact" in text or "GITHUB_STEP_SUMMARY" in text or \
+            "GITHUB_OUTPUT" in text or "GITHUB_ENV" in text or "GITHUB_PATH" in text or "--export" in text or \
+            "--platform ios" in text or "toolchain.py jdk" in text or \
+            [job_text(text, job).count("    runs-on: ubuntu-24.04\n") for job in ("admission", "web")] != [1, 1] or \
+            text.count("runs-on:") != 2:
+        found.append(name + "is not the Linux web run with no service, artifact, step summary or carried value")
+    if re.findall(r"(?m)^([\w-]+):", text) != ["name", "run-name", "on", "permissions", "concurrency", "jobs"]:
+        found.append(name + "top-level keys are not exactly name, run-name, on, permissions, concurrency, jobs")
+    if WEB_RUN_NAME not in text or text.count("run-name:") != 1:
+        found.append(name + "run-name is not exactly the pull request number and head SHA")
+    trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
+    if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha"] or \
+            re.findall(r"(?m)^        type: (\w+)$", trigger) != ["string", "string"]:
+        found.append(name + "is not dispatched with exactly pr_number and source_sha")
+    if "\nconcurrency:\n  group: may-web-tests\n" not in text:
+        found.append(name + "does not run one at a time in its own concurrency group")
+    if "\npermissions:\n  contents: read\nconcurrency:" not in text or re.search(r":\s*write\b", text) or \
+            [job_text(text, job).count(JOB_PERMISSIONS) for job in ("admission", "web")] != [1, 1] or \
+            text.count("permissions:") != 3:
+        found.append(name + "permissions are not exactly read-only (contents, and actions in each job)")
+    if re.findall(r"(?m)^  ([\w-]+):", text.partition("\njobs:\n")[2]) != ["admission", "web"]:
+        found.append(name + "jobs are not exactly admission and web")
+    runs = [re.sub(r"\s+", " ", r).strip() for r in re.findall(r"(?m)^\s+(?:-\s+)?run:[ \t]*(.*)$", text)]
+    if runs != WEB_RUNS or re.search(r"(?m)^\s+(?:-\s+)?run: *[|>]", text):
+        found.append(name + "runs something other than the gate, the Node install, the check, the fetch, the web "
+                     "checks, the post and the cleanup")
+    steps = {job: job_steps(text, job)[1] for job in ("admission", "web")}
+    leading = {job: [chunk.split(":", 1)[0] for _, chunk in found_steps] for job, found_steps in steps.items()}
+    names = [step for step, _ in steps["web"]]
+    cleanup = steps["web"][-1][1] if steps["web"] else ""
+    if leading != {"admission": ["uses", "id"], "web": ["uses"] + ["name"] * len(WEB_STEP_NAMES)} or \
+            names != [""] + WEB_STEP_NAMES or "\n        if: always()\n" not in cleanup or \
+            uses_in(text) != [CHECKOUT, CHECKOUT]:
+        found.append(name + "web's steps are not exactly the Node install, check, fetch, checks, post and an "
+                     "always-run cleanup")
+    if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 1)) or \
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 50\n" not in job_text(text, "web"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than web's 50 minutes")
+    job = job_text(text, "web")
+    if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
+            "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
+        found.append(name + "web's environment is not the one admission chose, after admission")
+    by_name = dict(steps["web"])
+    node, check, fetch, checks, post, clean = (by_name.get(n, "") for n in WEB_STEP_NAMES)
+    if secrets_in(text) != set(UNIT_SECRETS) or any(text.count("secrets." + n) != 1 for n in UNIT_SECRETS) or \
+            secrets_in(fetch) != set(COMPILE_SECRETS) or secrets_in(check) != {PR_READ_SECRET} or \
+            secrets_in(post) != {PR_COMMENT_SECRET} or \
+            secrets_in(node + checks + clean) or "GH_TOKEN" in fetch + checks + post or \
+            "env:" in node + clean or env_entries(checks) != [("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")] or \
+            sorted(env_entries(post)) != sorted(UNIT_INPUTS | {(PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")}) or \
+            any(e not in WEB_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
+        found.append(name + "a secret or env entry other than the check's PR token, the fetch's two source-read keys, "
+                     "the post's comment token and the dispatch's inputs")
+    if "${{ inputs." in "\n".join(runs):
+        found.append(name + "interpolates inputs into shell")
+    return found
+
+
+WEB_TOOL = "web_tests.py"
+WEB_PRINT_VALUES = {"name", "verdict", "int(tests)", "int(passed)", "int(failed)", "int(skipped)"}
+WEB_EXIT_CLASSES = {"WebTestsError", "StoreError"}
+WEB_POST_TOOL = "web_tests_post.py"
+WEB_POST_PRINT_VALUES = {"number", "int(total)", "int(errors)"}
+WEB_POST_EXIT_CLASSES = {"GateDenial", "WebPostError", "CompilePrError", "DsCompileError", "StoreError"}
+WEB_SUMMARY_VALUES = BACKEND_SUMMARY_VALUES
+
+
+def web_tests_print_problems(root):
+    found = quiet_tool_problems(root, WEB_TOOL, WEB_PRINT_VALUES, WEB_EXIT_CLASSES) + \
+        quiet_tool_problems(root, WEB_POST_TOOL, WEB_POST_PRINT_VALUES, WEB_POST_EXIT_CLASSES,
+                            {"GITHUB_STEP_SUMMARY": "write_summary"})
+    tree = ast.parse((root / "tools/may_release" / WEB_POST_TOOL).read_text())
+    lines, writer = function_source(tree, "summary_lines"), function_source(tree, "write_summary")
+    values = [ast.unparse(v.value) for n in ast.walk(lines) for v in getattr(n, "values", [])
+              if isinstance(n, ast.JoinedStr) and isinstance(v, ast.FormattedValue)] if lines else None
+    loop = [n for n in ast.walk(lines) if isinstance(n, ast.For)] if lines else []
+    words = assigned_literal(root / "tools/may_release" / WEB_POST_TOOL, "WORDS")
+    if values is None or not set(values) <= WEB_SUMMARY_VALUES or \
+            [ast.unparse(n.target) + " in " + ast.unparse(n.iter) for n in loop] != ["name in STAGES"] or \
+            writer is None or [a.arg for a in writer.args.args] != ["lines"] or \
+            not isinstance(words, dict) or not all(isinstance(w, str) for w in words.values()):
+        found.append(WEB_POST_TOOL + ": the step summary formats something other than fixed words, stage names and "
+                     "counts")
+    return found
+
 
 # The schedules (android-ci-schedule.yml, android_ci_schedule.py; backend-ci-schedule.yml, backend_ci_schedule.py) each
 # dispatch their lane's workflow (android-unit-pr.yml, backend-unit-pr.yml) for at most one may-app head a run. Each is
@@ -3128,6 +3270,8 @@ def control_problems(root):
     found += backend_unit_workflow_problems((flows / BACKEND).read_text())
     found += backend_unit_print_problems(root)
     found += backend_unit_silence_problems(root)
+    found += web_tests_workflow_problems((flows / WEB).read_text())
+    found += web_tests_print_problems(root)
     found += ios_core_workflow_problems((flows / IOS_CORE).read_text())
     found += ios_core_print_problems(root)
     found += compile_sandbox_problems(root)

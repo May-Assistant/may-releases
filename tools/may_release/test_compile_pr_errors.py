@@ -156,13 +156,15 @@ class RecordOutcomeTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def compile(self, record, fail_at=None, env=None):
+    def compile(self, record, fail_at=None, env=None, seen=None):
         archive_bytes = b"fixture generator"
         is_dir = Path.is_dir
         calls = []
 
         def fake_run(argv, log, cwd=None, env=None):
             calls.append(argv[0])
+            if seen is not None:
+                seen.append(list(argv))
             if argv[0] == "curl":
                 Path(argv[argv.index("-o") + 1]).write_bytes(archive_bytes)
             elif fail_at and fail_at in argv[0]:
@@ -234,6 +236,44 @@ class RecordOutcomeTests(unittest.TestCase):
 
 
 # ---- the post ----
+
+class ConfigurationTests(RecordOutcomeTests):
+    """Coordinator, 6 Nov (may-app #1797, all #if DEBUG): the pull request's compile builds Release unless dispatched
+    Debug, and a Debug result is posted under its own marker, never in place of Release's."""
+
+    def builds(self, record, configuration=None):
+        argvs = []
+        env = {"RUNNER_TEMP": str(self.root), "PATH": "/usr/bin"}
+        if configuration is not None:
+            env[compile_tool.CONFIGURATION_ENV] = configuration
+        error, _, _, _ = self.compile(record, env=env, seen=argvs)
+        builds = [a for a in argvs if a[0] == "xcodebuild"]
+        return error, [a[a.index("-configuration") + 1] for a in builds]
+
+    def test_release_unless_the_pull_requests_compile_is_dispatched_debug(self):
+        self.assertEqual(self.builds(True), (None, ["Release"]))
+        self.assertEqual(self.builds(True, ""), (None, ["Release"]))
+        self.assertEqual(self.builds(True, "Debug"), (None, ["Debug"]))
+        self.assertEqual(self.builds(False, "Debug")[1], ["Release"], "every other compile builds Release")
+
+    def test_any_other_configuration_is_refused_before_anything_builds(self):
+        for value in ("debug", "Profile", "Release Debug"):
+            with self.subTest(value=value):
+                error, built = self.builds(True, value)
+                self.assertIsInstance(error, compile_tool.CompileError)
+                self.assertEqual(built, [])
+
+    def test_a_debug_comment_says_debug_under_its_own_marker(self):
+        with patch.dict(os.environ, {compile_tool.CONFIGURATION_ENV: "Debug"}):
+            body = tool.comment_body(SHA, None, True, [], 0)
+            self.assertIn(", Debug, no signing)", body)
+            self.assertIn(f"<!-- may-ios-compile-pr-debug head={SHA} -->", body)
+            self.assertEqual(tool.marker(), "may-ios-compile-pr-debug")
+        with patch.dict(os.environ, {}, clear=True):
+            body = tool.comment_body(SHA, None, True, [], 0)
+            self.assertIn(", Release, no signing)", body)
+            self.assertIn(f"<!-- may-ios-compile-pr head={SHA} -->", body)
+
 
 class PostCase(unittest.TestCase):
     LOG = "\n".join([
@@ -483,6 +523,20 @@ class PostTests(PostCase):
         self.write(log=f"{CK}/ios/A.swift:1:1: error: {base64.b64encode(TOKEN.encode()).decode()}")
         _, error, _, _ = self.post()
         self.assertEqual(error.args[0], "The comment holds a credential; nothing was posted")
+        self.assertEqual(self.calls, [])
+
+
+class ConfigurationPostTests(PostCase):
+    def test_a_debug_post_leaves_the_release_comment_alone_and_a_bad_value_posts_nothing(self):
+        self.write("passed")
+        self.pages = {1: [{"id": 7, "user": {"login": "may-ci[bot]"},
+                           "body": f"release <!-- may-ios-compile-pr head={SHA} -->"}]}
+        code, error, out, _ = self.post(self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, MAY_IOS_CONFIGURATION="Debug"))
+        self.assertEqual((code, error), (0, None))
+        self.assertEqual([m for m, _, _, _ in self.calls if m in ("POST", "PATCH")], ["POST"], "a new comment")
+        self.calls = []
+        code, error, _, _ = self.post(self.environ(MAY_APP_PR_COMMENT_TOKEN=TOKEN, MAY_IOS_CONFIGURATION="Profile"))
+        self.assertIsInstance(error, CompilePrError)
         self.assertEqual(self.calls, [])
 
 

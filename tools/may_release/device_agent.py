@@ -26,7 +26,7 @@ import subprocess
 import sys
 import urllib.request
 
-from device_mcp import DRIVER_CAUSES, DUMP_FAILURES, MAX_LOOKS, kept_lines
+from device_mcp import DRIVER_CAUSES, DUMP_FAILURES, MAX_CHUNKS, MAX_LOOKS, MAX_TYPED, kept_lines
 from review import CLI_MAX_BYTES, CLI_SHA512, CLI_URL, checked_cli, header_safe, outcome
 
 # review.py's pinned release for macOS on Apple silicon (macos-15): npm's darwin-arm64 platform package, a single
@@ -45,7 +45,9 @@ AGENT_PROMPT = (
     "You are testing the May Playground app on an Android emulator, signed in to a staging test account. You have "
     "only the device tools. Rules: never sign out; never open account, device, billing or connection settings; "
     "never connect or disconnect an app; never approve, pay, or send anything to anyone outside the May app's own "
-    "chat. Put the tag {tag} in every name, title or message you create, exactly as written. Start with a screenshot "
+    "chat. Put the tag {tag} in every name, title or message you create, exactly as written. The account is shared: "
+    "never open, edit or delete a task, chat, card or other item whose name does not contain {tag}, unless the goal "
+    "names it; if you open one by mistake, go back at once and say so in the summary. Start with a screenshot "
     "and the hierarchy. When the goal is done and visible on screen, call done with outcome completed; if you cannot "
     "do it, call done with outcome blocked. Either way, say in the summary what you saw.")
 JUDGE_PROMPT = (
@@ -63,10 +65,13 @@ JUDGE_PROMPT = (
     "read: an error on screen, or the goal's own state missing from it, is a fail. note says why in at most three "
     "sentences. stray says whose step left the goal's path, if one did: agent when the agent's own report says it "
     "tapped, typed or opened something the goal forbids or does not ask for; app when the app went somewhere the goal "
-    "did not lead with no such step of the agent's; none when nothing left the goal's path.")
+    "did not lead with no such step of the agent's; none when nothing left the goal's path; untagged, before any "
+    "other, when the report or the screen shows the agent opened, edited or deleted a task, chat, card or other item "
+    "whose name does not contain {tag} and that the goal does not name, even if it went back at once.")
 # Coordinator, 3 Nov (run 41623657138's iOS poll-skip): who left the goal's path, so a stray step of the agent's own
-# is told from the app's (device_tests.combined).
-STRAYS = ("none", "agent", "app")
+# is told from the app's (device_tests.combined). Coordinator, 6 Nov (run 84's iOS notes opened an existing untagged
+# task in the shared account): untagged, the agent touched an item that is not this run's, is always a fail.
+STRAYS = ("none", "agent", "app", "untagged")
 JUDGE_SCHEMA = json.dumps({"type": "object", "additionalProperties": False, "required": ["verdict", "note", "stray"],
                            "properties": {"verdict": {"type": "string", "enum": ["pass", "fail"]},
                                           "note": {"type": "string", "maxLength": 600},
@@ -199,7 +204,8 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
             # Run 41656192676: the device server marked Android chat, poll and poll-skip typing failures, but this
             # copy dropped the mark, so device_tests.combined read "blocked" (a fail) instead of infra.
             **({"typing_failed": True} if record.get("typing_failed") is True else {}),
-            **({"looks": looks(record["looks"])} if "looks" in record else {})}
+            **({"looks": looks(record["looks"])} if "looks" in record else {}),
+            **({"typed": typed(record["typed"])} if "typed" in record else {})}
 
 
 LOOK_SHOTS = tuple(f"look-{n}.png" for n in range(1, MAX_LOOKS + 1))
@@ -210,6 +216,14 @@ def looks(found):
     return [{"shown": look["shown"], "shot": look["shot"] if look.get("shot") in LOOK_SHOTS else None}
             for look in (found if isinstance(found, list) else [])[:MAX_LOOKS]
             if isinstance(look, dict) and type(look.get("shown")) is int and 0 <= look["shown"] <= 1000]
+
+
+def typed(found):
+    """The device server's slow-typing lengths (device_mcp.slow_type) in their fixed shape: whole numbers or None."""
+    size = lambda n: type(n) is int and 0 <= n <= 100_000
+    return [{"want": entry["want"], "after": [n if size(n) else None for n in entry["after"][:MAX_CHUNKS]]}
+            for entry in (found if isinstance(found, list) else [])[:MAX_TYPED]
+            if isinstance(entry, dict) and size(entry.get("want")) and isinstance(entry.get("after"), list)]
 
 
 def redacted(text):
@@ -240,7 +254,7 @@ def judge(cli, goal, tag, agent, work, token, model):
     """The judge's verdict on one agent run: ("pass" | "fail" | "rate_limited" | "error", note, stray), stray one of
     STRAYS ("none" unless the judge said otherwise)."""
     work = fresh(work)
-    prompt = JUDGE_PROMPT.format(goal=filled(goal, tag), outcome=agent.get("outcome") or "none",
+    prompt = JUDGE_PROMPT.format(goal=filled(goal, tag), tag=tag, outcome=agent.get("outcome") or "none",
                                  actions=agent.get("actions", 0), summary=redacted(agent.get("summary")) or "(none)",
                                  hierarchy=agent.get("hierarchy") or "(none)",
                                  delivery=delivery_text(agent), truth=truth_text(agent))

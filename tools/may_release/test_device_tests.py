@@ -253,6 +253,21 @@ class ScenarioTests(unittest.TestCase):
         for stale in ("Notes tab", "Take notes"):
             self.assertNotIn(stale, goal)
 
+    def test_the_notes_scenario_checks_the_agenda_tab_took_before_going_on(self):
+        """Runs 82 and 83 (coordinator and N, 6 Nov): on iOS the Agenda tab's tap did nothing and notes was blocked; the
+        app was unchanged into run 84, which passed. The goal reads the hierarchy and taps the tab's own element again."""
+        goal = device_tests.scenarios("notes")[0]["goal"]
+        self.assertIn("if the Agenda screen is not showing yet, tap the Agenda tab again at the centre of its own "
+                      "element in the hierarchy, and check again, up to three times, before doing anything else", goal)
+
+    def test_onboarding_accepts_the_test_accounts_unavailable_number_screen(self):
+        """Run 83 (coordinator and N, 6 Nov): a test session's number search is refused (test_session_blocked), so the
+        phone step shows an unavailable screen with Continue alone, on both platforms; the judge failed the Continue."""
+        goal = device_tests.scenarios("onboarding")[0]["goal"]
+        self.assertIn("if the phone step instead says a number is unavailable for this account and offers only "
+                      "Continue, tap Continue there", goal)
+        self.assertIn("never making an address or getting a number", goal)
+
     def test_every_text_a_goal_asks_the_agent_to_type_is_text_type_accepts(self):
         """The security read of #110: "I'd" and "I'll" were refused by type, so the agent could never send them."""
         typed = []
@@ -2928,6 +2943,19 @@ class WorkflowPinTests(unittest.TestCase):
         self.assertEqual(self.text.count(build), 1)
         self.flagged(self.text.replace(build, line + build), "a secret, variable or env entry")
         block = self.text[self.text.index("      ios_push_tap:\n"):self.text.index("      tidy_file_taxes:\n")]
+        self.assertTrue(block.endswith("        type: boolean\n        default: false\n"), "off unless dispatched on")
+        self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
+        self.flagged(self.text.replace(block, ""), message)
+
+    def test_android_slow_typing_is_its_own_boolean_off_unless_dispatched_read_by_the_android_scenarios_step_alone(self):
+        """M and the coordinator, 6 Nov (#1785): a control run, so only a dispatch that asks."""
+        message = "ios_notif_spike, ios_push_tap and tidy_file_taxes booleans"
+        line = "          MAY_ANDROID_SLOW_TYPING: ${{ inputs.android_slow_typing }}\n"
+        self.assertEqual(self.text.count(line), 1, "the Android scenarios step alone")
+        self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
+        ios = "          MAY_IOS_PUSH_TAP: ${{ inputs.ios_push_tap }}\n"
+        self.flagged(self.text.replace(ios, ios + line), "a secret, variable or env entry")
+        block = self.text[self.text.index("      android_slow_typing:\n"):self.text.index("      tidy_file_taxes:\n")]
         self.assertTrue(block.endswith("        type: boolean\n        default: false\n"), "off unless dispatched on")
         self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
         self.flagged(self.text.replace(block, ""), message)
