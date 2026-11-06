@@ -197,10 +197,11 @@ class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
         # Onboarding runs last (coordinator, 26 Oct), so its account's time never crowds out chat and notes.
-        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "notes", "poll",
+        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "push-open", "notes", "poll",
                                "poll-skip", "routines", "onboarding"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")],
-                         ids[:-1] + ["chat-open-from-card", "onboarding"], "both devices run all, and iOS the card row")
+                         [i for i in ids[:-1] if i != "push-open"] + ["chat-open-from-card", "onboarding"],
+                         "both devices run all, iOS the card row, and Android alone the push tap")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
             device_tests.scenarios("sign-in,unknown")
@@ -274,7 +275,7 @@ class ScenarioTests(unittest.TestCase):
                           "platform (Android or iOS) are also listed; never open them.", row["goal"])
             self.assertNotIn("start a new chat", row["goal"])
         self.assertEqual([row["id"] for row in device_tests.scenarios() if row.get("chat")],
-                         ["chat", "poll", "poll-skip", "routines"])
+                         ["chat", "push-open", "poll", "poll-skip", "routines"])
 
     def test_goals_follow_their_prototypes_main_path_short_of_any_outward_step(self):
         """Coordinator, 24 Oct: where a flow has a prototype, its scenario follows the main path, so Expected and
@@ -3075,3 +3076,127 @@ class SecretNameTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PushOpenChatTests(unittest.TestCase):
+    """Coordinator, 6 Nov (#1788, #1794): a chat reply's notification tapped while that chat is open and scrolled up
+    scrolls the chat to the reply. Android alone: the debug Playground's DebugPushReceiver posts a real notification."""
+
+    TAG, CHAT, REPLY = "qa-7-a-push-open", "chat-1", "reply-2"
+
+    class Answer:
+        def __init__(self, status, data):
+            self.status, self.data = status, data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return json.dumps(self.data).encode()
+
+    def fake_staging(self, replies_after=1):
+        sent, reads = [], [0]
+        messages = [{"author": "user", "id": "m1", "body": f"Reply with the numbers, tag {self.TAG}"},
+                    {"author": "may", "id": "m2", "body": "1\n2\n3"}]
+
+        def post(request, timeout):
+            sent.append((request.full_url, json.loads(request.data)))
+            messages.append({"author": "user", "id": "m3", "body": json.loads(request.data)["body"]})
+            return self.Answer(202, {})
+
+        def get(request, timeout):
+            if request.full_url.endswith("/v1/agents"):
+                return self.Answer(200, {"agents": [{"id": "may", "name": "May"},
+                                                    {"id": self.CHAT, "name": f"Android chat {self.TAG}"}]})
+            reads[0] += 1
+            shown = messages + ([{"author": "may", "id": self.REPLY, "body": "Pushed."}]
+                                if reads[0] >= replies_after else [])
+            return self.Answer(200, {"messages": shown, "next_cursor": None})
+        return post, get, sent
+
+    def test_the_harness_sends_its_tagged_message_and_waits_for_mays_reply_to_it(self):
+        post, get, sent = self.fake_staging(replies_after=3)
+        waits = []
+        found = device_tests.push_reply("https://s", "t", self.TAG, post, get, waits.append)
+        self.assertEqual(found, (self.CHAT, self.REPLY, "Pushed."))
+        self.assertEqual(sent, [(f"https://s/v1/conversations/{self.CHAT}/messages",
+                                 {"client_message_id": self.TAG + "-push",
+                                  "body": f"{self.TAG} push check. Reply with the word pushed."})])
+        self.assertEqual(waits, [device_tests.PUSH_POLL_SECONDS] * 3)
+
+    def test_no_reply_in_time_or_no_chat_of_its_own_is_none(self):
+        post, get, _ = self.fake_staging(replies_after=10 ** 6)
+        self.assertIsNone(device_tests.push_reply("https://s", "t", self.TAG, post, get, lambda s: None, seconds=10))
+        post, get, sent = self.fake_staging()
+        self.assertIsNone(device_tests.push_reply("https://s", "t", "qa-8-other", post, get, lambda s: None))
+        self.assertEqual(sent, [], "never May's shared chat")
+
+    def screens(self, before=False, entry=True, after=True):
+        """uiautomator dumps in push_tap's order: before the broadcast, the shade, after the tap."""
+        reply = '<node text="Pushed." bounds="[0,0][9,9]"/>'
+        title = f'<node text="{device_tests.PUSH_TITLE}" bounds="[100,200][300,400]"/>'
+        return [f"<hierarchy>{reply if before else ''}<node text='1' bounds='[0,0][1,1]'/></hierarchy>".encode(),
+                f"<hierarchy>{title if entry else ''}</hierarchy>".encode(),
+                f"<hierarchy>{reply if after else ''}</hierarchy>".encode()]
+
+    def tap(self, **screens):
+        calls, dumps = [], self.screens(**screens)
+        with patch.object(device_tests.device_mcp, "adb", lambda config, *a, **k: calls.append(a) or (0, b"")), \
+                patch.object(device_tests.device_mcp, "android_dump", lambda config: (dumps.pop(0), None)):
+            facts = device_tests.push_tap("/sdk/adb", (self.CHAT, self.REPLY, "Pushed."), wait=lambda s: None)
+        return facts, calls
+
+    def test_the_tap_posts_the_replys_notification_and_taps_it_in_the_shade(self):
+        facts, calls = self.tap()
+        self.assertEqual(facts, {"reply": True, "posted": True, "before": False, "entry": True, "tapped": True,
+                                 "after": True})
+        broadcast = next(call for call in calls if "broadcast" in call)
+        self.assertEqual(broadcast[:6], ("shell", "am", "broadcast", "-a", device_tests.PUSH_ACTION, "-p"))
+        for key, value in (("kind", "chat_reply"), ("conversation_id", self.CHAT), ("message_id", self.REPLY)):
+            self.assertEqual(broadcast[broadcast.index(key) - 1:broadcast.index(key) + 2], ("--es", key, value))
+        self.assertIn(("shell", "cmd", "statusbar", "expand-notifications"), calls)
+        self.assertIn(("shell", "input", "tap", "200", "300"), calls, "the title's own element, at its centre")
+        self.assertEqual(device_tests.push_verdict(facts), (200, True, False))
+
+    def test_a_reply_on_screen_before_the_tap_could_not_be_checked_and_one_missing_after_fails(self):
+        facts, _ = self.tap(before=True)
+        self.assertEqual(device_tests.push_verdict(facts), (200, False, True))
+        facts, _ = self.tap(after=False)
+        self.assertEqual(device_tests.push_verdict(facts), (200, False, False))
+        facts, calls = self.tap(entry=False)
+        self.assertFalse(facts["tapped"])
+        self.assertFalse(any("tap" in call for call in calls if call[:2] == ("shell", "input")))
+        self.assertEqual(device_tests.push_verdict({"reply": False}), (0, False, False))
+
+    def test_the_truth_and_the_private_diag_say_fixed_words_alone(self):
+        row = next(r for r in device_tests.scenarios("push-open"))
+        facts = dict.fromkeys(device_tests.PUSH_FACTS, True)
+        facts["before"] = False
+        entry = {"server": []}
+        device_tests.server_reads(row, entry, "https://s", "t", self.TAG, None, None, None,
+                                  lambda base, token, tag: ["succeeded", "succeeded"], None, facts)
+        self.assertEqual(entry["server"][-1], {"get": device_tests.PUSH_PATH, "status": 200, "pass": True})
+        self.assertIn("after the harness tapped the notification of May's reply, the chat showed that reply: "
+                      "confirmed", device_tests.truth_lines(row, entry))
+        lines = device_tests.push_lines(facts).decode()
+        self.assertTrue(lines.startswith("== push tap ==\n"))
+        self.assertNotIn(self.CHAT, lines)
+        self.assertEqual(device_tests.push_lines(None), b"")
+
+    def test_the_row_is_android_alone_with_its_own_chat_and_the_push_truth(self):
+        row = next(r for r in device_tests.scenarios("push-open"))
+        self.assertEqual((row["push"], row["platforms"], row["chat"]), ("open-chat", ["android"], True))
+        self.assertIn(device_tests.PUSH_TRUTH, row["truth"])
+        self.assertEqual(device_tests.scenarios("push-open", "ios"), [])
+        rows = json.loads(device_tests.SCENARIOS.read_text())
+        for change in ({"platforms": ["android", "ios"]}, {"push": "other"}, {"truth": [{"delivery": "succeeded"}]}):
+            with self.subTest(change=change):
+                broken = [dict(r, **change) if r["id"] == "push-open" else r for r in rows]
+                with tempfile.TemporaryDirectory() as raw:
+                    path = Path(raw) / "s.json"
+                    path.write_text(json.dumps(broken))
+                    with patch.object(device_tests, "SCENARIOS", path), self.assertRaises(DeviceTestsError):
+                        device_tests.scenarios()
