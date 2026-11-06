@@ -513,7 +513,7 @@ class Diagnostics:
         """The scenario's start, in the log's own local time."""
         self.start = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b""):
+    def keep(self, folder, scenario, token, driver=None, onboarding=b"", flow=b"", push=b""):
         """Writes <scenario>.diag.txt when there is anything to keep; never an error. driver: the agent's DRIVER_FILE,
         each refused act's Maestro lines (device_mcp.refused); onboarding: the subflow's last lines when it did not
         pass; flow: a scripted flow's last Maestro lines when it did not pass (a scripted row runs no subflow)."""
@@ -577,9 +577,10 @@ class Diagnostics:
         watchdog = watchdog[len(watchdog) - room:] if len(watchdog) > room else watchdog
         # Counted from what is published, after the trim.
         self.loops += sum(1 for line in watchdog.splitlines(keepends=True) if LOOPS.search(line))
-        if not (crashes or refused or watchdog or onboarding or flow):
+        push = push[:256]  # device_tests.push_lines: six fixed yes/no lines, within DIAG_RESERVE
+        if not (crashes or refused or watchdog or onboarding or flow or push):
             return
-        text = (crashes + (b"== onboarding ==\n" + onboarding if onboarding else b"") +
+        text = (push + crashes + (b"== onboarding ==\n" + onboarding if onboarding else b"") +
                 (b"== maestro flow ==\n" + flow if flow else b"") +
                 (b"== driver ==\n" + refused if refused else b"") +
                 (b"== spans ==\n" + section if section else b"") +
@@ -1114,7 +1115,51 @@ def sweep_driver(udid, env, log, listed=None, kill=os.kill):
     return stopped
 
 
-def launch(udid, env, token, log):
+PUSH_LINE = re.compile(rb"push-tap fixture=file (?P<said>delivered completion_on_main=(?:true|false)|unanswered|"
+                       rb"unbuildable|unreadable)\b")
+
+
+def push_tap(udid, env, reply, look, log, lines=ios_push_tap.read_lines, quiet=renders.quiet, clock=time.monotonic,
+             sleep=time.sleep):
+    """The iOS tap (may-app #1797), with reply = (conversation id, reply id, reply body) and look(): a fresh hierarchy
+    from a look-only agent run, or None. {fact: bool} for each of device_tests.PUSH_FACTS. The ids go to the app's own
+    Documents file alone, which is removed after; nothing reaches this log."""
+    facts = dict.fromkeys(device_tests.PUSH_FACTS, False)
+    facts["reply"] = reply is not None
+    if reply is None:
+        return facts
+    chat, message, body = reply
+    seen = look()
+    facts["before"] = seen is not None and device_tests.shown_in(seen, body)
+    done = device_tests.bounded_output(["xcrun", "simctl", "get_app_container", udid, BUNDLE, "data"], env)
+    container = Path(done[1].decode("utf-8", "replace").strip()) if done is not None and not done[0] else None
+    if container is None or not container.is_absolute() or not (container / "Documents").is_dir():
+        return facts
+    data = container / "Documents" / device_tests.PUSH_FILE
+    try:
+        data.write_text(json.dumps({"kind": "chat_reply", "conversation_id": chat, "message_id": message}))
+        start = time.strftime("%Y-%m-%d %H:%M:%S")
+        posted = quiet(["xcrun", "simctl", "spawn", udid, "notifyutil", "-p", device_tests.PUSH_TRIGGER], log, env=env)
+        facts["posted"] = posted.returncode == 0
+        words, deadline = None, clock() + ios_push_tap.WAIT_SECONDS
+        while facts["posted"]:
+            found = [match["said"] for match in PUSH_LINE.finditer(lines(udid, env, start))]
+            words = found[-1] if found else None
+            if words is not None or clock() >= deadline:
+                break
+            sleep(ios_push_tap.POLL_SECONDS)
+    finally:
+        data.unlink(missing_ok=True)
+    facts["entry"] = words is not None and words.startswith(b"delivered")
+    facts["tapped"] = words == b"delivered completion_on_main=true"
+    if facts["entry"]:
+        sleep(device_tests.PUSH_SETTLE_SECONDS)
+        seen = look()
+        facts["after"] = seen is not None and device_tests.shown_in(seen, body)
+    return facts
+
+
+def launch(udid, env, token, log, listen=False):
     """The app, stopped and started again with a fresh test session in its launch environment (never an argument);
     signed out, with no token (the smoke scenario). SHOW_TOUCHES draws each tap in the app (may-app #1194, May
     Playground alone), as Android's show_touches does, since the simulator's recording never shows touches. The
@@ -1124,6 +1169,8 @@ def launch(udid, env, token, log):
     env = dict(env, **WATCHDOG_LAUNCH) if diagnostics_wanted() else env
     env = dict(env, **LOG_CHANGES_LAUNCH) if log_changes_wanted() else env
     env = dict(env, **LOOP_CENSUS_LAUNCH) if loop_census_wanted() else env
+    # The push-tap row alone (device_tests.PUSH_ROW): may-app #1797's running trigger listens, tapping nothing at launch.
+    env = dict(env, SIMCTL_CHILD_MAY_TEST_PUSH_TAP="listen") if listen else env
     launched = renders.quiet(["xcrun", "simctl", "launch", udid, BUNDLE, *SHOW_TOUCHES], log,
                              env=dict(env, SIMCTL_CHILD_MAY_TEST_SESSION=token) if token else env)
     if launched.returncode:
@@ -1148,7 +1195,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                   install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=device_tests.delete_fresh, calls_left=device_tests.model_calls_left,
                   revoked_by=device_tests.revoke, diagnosed=None, noted=device_tests.commitment_note,
-                  made=device_tests.open_chat, carded=device_tests.open_card):
+                  made=device_tests.open_chat, carded=device_tests.open_card, pushed_reply=device_tests.push_reply):
     delivered = delivered or device_tests.message_codes
     # A selection may name Android-only scenarios too; this job runs only the iOS ones among them.
     chosen = device_tests.scenarios(selection, "ios")
@@ -1259,6 +1306,10 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             if flow is not None and device_tests.flow_lacks_ids(row, flow, literals, "ios"):
                 entry.update(verdict="fail", reason=device_tests.FLOW_IDS)
                 continue
+            pushing, pushed = row.get("push") == device_tests.PUSH_ROW, None
+            if pushing and not device_tests.push_hooked(source):
+                entry["reason"] = device_tests.NO_PUSH_HOOK
+                continue
             token = accounts.session(row, base, secret, entry)
             if token is None:
                 continue
@@ -1278,7 +1329,7 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                 print(f"May device tests (ios): {count} leftover Maestro runner processes stopped before {scenario}")
             at(f"{row['id']}: launching the app")
             diagnostics.begin()
-            launch(udid, env, token, log)
+            launch(udid, env, token, log, listen=pushing)
             recorder = Recorder(udid, env, row["id"], private, log)
             recorder.start()
             started = time.monotonic()
@@ -1318,6 +1369,16 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
                           **({device_tests.device_mcp.LOOK_ENV: "chat"} if row.get("card") else {})}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"], claude[0],
                                            claude[1], seconds=device_tests.agent_seconds(row, device_agent.IOS_AGENT_SECONDS))
+                if pushing:
+                    at(f"{row['id']}: the notification tap")
+                    looks = iter(("look-before", "look-after"))
+
+                    def look():
+                        found = agent(cli, device_tests.PUSH_LOOK, own, device, private / "agent" / row["id"] / next(looks),
+                                      claude[0], claude[1], seconds=device_tests.PUSH_LOOK_SECONDS)
+                        return found.get("hierarchy") if found.get("outcome") == "completed" else None
+                    pushed = push_tap(udid, env, pushed_reply(base, token, own) if
+                                      records[row["id"]].get("outcome") == "completed" else None, look, log)
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(udid, env, folder / (row["id"] + "-end.png"), log)
@@ -1326,10 +1387,11 @@ def run_scenarios(selection, minted=device_tests.mint, checked=device_tests.serv
             recorder.halt()
             # Run 40181517145: poll's server read came after the conversion, half an hour past its session's mint,
             # and got 401. The server reads and the diagnostics come first; the conversion, however long, after.
-            device_tests.server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
+            device_tests.server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted, pushed)
             # After the server reads, which need the session while it lasts: a slow log read costs them nothing.
             diagnostics.keep(folder, row["id"], token, private / "agent" / row["id"] / device_tests.device_mcp.DRIVER_FILE,
-                             onboarding=onboarding, flow=flow_lines)
+                             onboarding=onboarding, flow=flow_lines,
+                             **({"push": device_tests.push_lines(pushed)} if pushed else {}))
             accounts.finish(row, base, token)
             token = ""
             entry["videos"] = recorder.stop(folder)

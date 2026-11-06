@@ -78,7 +78,8 @@
     "chat": true,
     "push": "open-chat",
     "platforms": [
-      "android"
+      "android",
+      "ios"
     ],
     "outward": false,
     "server": [],
@@ -89,7 +90,8 @@
       {
         "push": "open-chat"
       }
-    ]
+    ],
+    "seconds": 600
   },
   {
     "id": "notes",

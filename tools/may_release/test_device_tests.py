@@ -200,8 +200,7 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "push-open", "notes", "poll",
                                "poll-skip", "routines", "onboarding"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")],
-                         [i for i in ids[:-1] if i != "push-open"] + ["chat-open-from-card", "onboarding"],
-                         "both devices run all, iOS the card row, and Android alone the push tap")
+                         ids[:-1] + ["chat-open-from-card", "onboarding"], "both devices run all, and iOS the card row")
         self.assertEqual([row["id"] for row in device_tests.scenarios("connections")], ["connections"])
         with self.assertRaises(DeviceTestsError):
             device_tests.scenarios("sign-in,unknown")
@@ -3169,6 +3168,7 @@ class PushOpenChatTests(unittest.TestCase):
         facts, calls = self.tap(entry=False)
         self.assertFalse(facts["tapped"])
         self.assertFalse(any("tap" in call for call in calls if call[:2] == ("shell", "input")))
+        self.assertEqual(device_tests.push_verdict(facts), (200, False, True), "a tap the harness could not deliver")
         self.assertEqual(device_tests.push_verdict({"reply": False}), (0, False, False))
 
     def test_the_truth_and_the_private_diag_say_fixed_words_alone(self):
@@ -3186,13 +3186,13 @@ class PushOpenChatTests(unittest.TestCase):
         self.assertNotIn(self.CHAT, lines)
         self.assertEqual(device_tests.push_lines(None), b"")
 
-    def test_the_row_is_android_alone_with_its_own_chat_and_the_push_truth(self):
+    def test_the_row_runs_on_both_with_its_own_chat_and_the_push_truth(self):
         row = next(r for r in device_tests.scenarios("push-open"))
-        self.assertEqual((row["push"], row["platforms"], row["chat"]), ("open-chat", ["android"], True))
+        self.assertEqual((row["push"], row["platforms"], row["chat"]), ("open-chat", ["android", "ios"], True))
         self.assertIn(device_tests.PUSH_TRUTH, row["truth"])
-        self.assertEqual(device_tests.scenarios("push-open", "ios"), [])
+        self.assertEqual([r["id"] for r in device_tests.scenarios("push-open", "ios")], ["push-open"])
         rows = json.loads(device_tests.SCENARIOS.read_text())
-        for change in ({"platforms": ["android", "ios"]}, {"push": "other"}, {"truth": [{"delivery": "succeeded"}]}):
+        for change in ({"platforms": ["ios"]}, {"push": "other"}, {"truth": [{"delivery": "succeeded"}]}, {"chat": False}):
             with self.subTest(change=change):
                 broken = [dict(r, **change) if r["id"] == "push-open" else r for r in rows]
                 with tempfile.TemporaryDirectory() as raw:
@@ -3200,3 +3200,68 @@ class PushOpenChatTests(unittest.TestCase):
                     path.write_text(json.dumps(broken))
                     with patch.object(device_tests, "SCENARIOS", path), self.assertRaises(DeviceTestsError):
                         device_tests.scenarios()
+
+
+class PushOpenChatIosTests(unittest.TestCase):
+    """The iOS side (may-app #1797's running trigger): the ids in the app's Documents file, one notifyutil post, the
+    hook's line, and a look-only agent's hierarchy before and after."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.container = Path(self.directory.name) / "data"
+        (self.container / "Documents").mkdir(parents=True)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def tap(self, said=b"push-tap fixture=file delivered completion_on_main=true", before="", after="text='Pushed.' | (1, 2)",
+            reply=("chat-1", "reply-2", "Pushed.")):
+        posted, written, looks = [], [], [before, after]
+
+        def quiet(argv, log, env=None, **kwargs):
+            posted.append(argv)
+            written.append(json.loads((self.container / "Documents" / device_tests.PUSH_FILE).read_text()))
+            return subprocess.CompletedProcess(argv, 0)
+
+        with patch.object(device_tests, "bounded_output",
+                          lambda argv, env, **k: (0, str(self.container).encode() + b"\n")):
+            facts = device_ios.push_tap("udid-1", {}, reply, lambda: looks.pop(0), Path(self.directory.name) / "log",
+                                        lines=lambda udid, env, start: said, quiet=quiet, sleep=lambda s: None)
+        return facts, posted, written
+
+    def test_the_tap_writes_the_ids_posts_the_trigger_once_and_removes_the_file(self):
+        facts, posted, written = self.tap()
+        self.assertEqual(facts, {"reply": True, "posted": True, "before": False, "entry": True, "tapped": True,
+                                 "after": True})
+        self.assertEqual(posted, [["xcrun", "simctl", "spawn", "udid-1", "notifyutil", "-p", device_tests.PUSH_TRIGGER]])
+        self.assertEqual(written, [{"kind": "chat_reply", "conversation_id": "chat-1", "message_id": "reply-2"}])
+        self.assertFalse((self.container / "Documents" / device_tests.PUSH_FILE).exists())
+        self.assertEqual(device_tests.push_verdict(facts), (200, True, False))
+
+    def test_off_main_unanswered_or_no_line(self):
+        facts, _, _ = self.tap(said=b"push-tap fixture=file delivered completion_on_main=false")
+        self.assertEqual(device_tests.push_verdict(facts), (200, False, False), "off the main thread is a fail")
+        for said in (b"push-tap fixture=file unanswered", b"push-tap fixture=file unreadable", b""):
+            with self.subTest(said=said):
+                facts, _, _ = self.tap(said=said)
+                self.assertEqual(device_tests.push_verdict(facts), (200, False, True), "never a pass")
+
+    def test_the_reply_on_screen_before_could_not_be_checked_and_missing_after_fails(self):
+        facts, _, _ = self.tap(before="desc='Pushed.' | (1, 2)")
+        self.assertEqual(device_tests.push_verdict(facts), (200, False, True))
+        facts, _, _ = self.tap(after="text='1' | (1, 2)")
+        self.assertEqual(device_tests.push_verdict(facts), (200, False, False))
+        facts, posted, _ = self.tap(reply=None)
+        self.assertEqual((device_tests.push_verdict(facts), posted), ((0, False, False), []))
+
+    def test_a_commit_without_the_trigger_skips_the_row_on_ios(self):
+        source = Path(self.directory.name) / "src"
+        self.assertFalse(device_tests.push_hooked(source))
+        hook = source / device_tests.PUSH_HOOK_FILE
+        hook.parent.mkdir(parents=True)
+        hook.write_text("let other = 1\n")
+        self.assertFalse(device_tests.push_hooked(source))
+        hook.write_text(f'let name = "{device_tests.PUSH_TRIGGER}"\n')
+        self.assertTrue(device_tests.push_hooked(source))
+        self.assertIn(device_tests.NO_PUSH_HOOK, publish.REASONS)
+        self.assertTrue(device_tests.NO_PUSH_HOOK.startswith("skipped: "))

@@ -87,7 +87,7 @@ REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no
            device_tests.FLOW_NOT_RUN, device_tests.FLOW_FAILED, device_tests.SERVER_FAILED,
            device_tests.FLOW_TIMED_OUT, device_tests.INFRA_AGAIN, device_tests.INFRA_NO_RESTART, device_tests.INFRA_GONE,
            device_tests.TYPING_FAILED, device_tests.STRAY_ANSWER,
-           device_tests.STRAY_NAVIGATION)
+           device_tests.STRAY_NAVIGATION, device_tests.NO_PUSH_HOOK)
 MAX_NOTES = 600
 # A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
 DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)
