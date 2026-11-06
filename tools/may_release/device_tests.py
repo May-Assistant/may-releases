@@ -800,7 +800,10 @@ def push_verdict(facts):
 # PUSH_TRIGGER) skips the row on iOS (NO_PUSH_HOOK). The screen before and after the tap is read by a short look-only
 # agent run (PUSH_LOOK), whose done takes a fresh hierarchy, since the iOS screen is read through the agent's driver.
 PUSH_TRIGGER, PUSH_FILE = "io.github.mayassistant.may.playground.push-tap", "push-tap.json"
-PUSH_HOOK_FILE = "ios/App/Playground/PushTapHook.swift"
+# may-app #1797: the trigger's name is MayCore's (PushTapFixture.trigger), and the Playground's hook listens for it
+# through the Darwin notify center (run 42221581609 skipped iOS on a commit holding both: the name is not in the hook).
+PUSH_HOOK_FILE, PUSH_FIXTURE_FILE = "ios/App/Playground/PushTapHook.swift", "ios/MayCore/Sources/MayCore/PushTapFixture.swift"
+PUSH_HOOK_MARK = b"CFNotificationCenterGetDarwinNotifyCenter"
 NO_PUSH_HOOK = "skipped: the may-app commit has no running push-tap trigger on iOS"
 PUSH_LOOK = ("Look only, for device test {tag}: call hierarchy once, then call done with outcome completed. Do not tap, "
              "type, swipe or go back.")
@@ -808,12 +811,15 @@ PUSH_LOOK_SECONDS = 180
 
 
 def push_hooked(source):
-    """Whether the may-app checkout holds the iOS running push-tap trigger (may-app #1797)."""
-    path = source / PUSH_HOOK_FILE
-    try:
-        return path.is_file() and not path.is_symlink() and PUSH_TRIGGER.encode() in path.read_bytes()
-    except OSError:
-        return False
+    """Whether the may-app checkout holds the iOS running push-tap trigger (may-app #1797): MayCore names the trigger
+    and the Playground's hook listens through the Darwin notify center."""
+    def holds(relative, mark):
+        path = source / relative
+        try:
+            return path.is_file() and not path.is_symlink() and mark in path.read_bytes()
+        except OSError:
+            return False
+    return holds(PUSH_FIXTURE_FILE, PUSH_TRIGGER.encode()) and holds(PUSH_HOOK_FILE, PUSH_HOOK_MARK)
 
 
 def shown_in(hierarchy, body):

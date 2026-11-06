@@ -3283,13 +3283,18 @@ class PushOpenChatIosTests(unittest.TestCase):
         self.assertEqual((device_tests.push_verdict(facts), posted), ((0, False, False), []))
 
     def test_a_commit_without_the_trigger_skips_the_row_on_ios(self):
+        """Run 42221581609: the trigger's name is in MayCore (PushTapFixture.trigger), not in the hook's file."""
         source = Path(self.directory.name) / "src"
         self.assertFalse(device_tests.push_hooked(source))
-        hook = source / device_tests.PUSH_HOOK_FILE
+        hook, fixture = source / device_tests.PUSH_HOOK_FILE, source / device_tests.PUSH_FIXTURE_FILE
         hook.parent.mkdir(parents=True)
-        hook.write_text("let other = 1\n")
-        self.assertFalse(device_tests.push_hooked(source))
-        hook.write_text(f'let name = "{device_tests.PUSH_TRIGGER}"\n')
+        fixture.parent.mkdir(parents=True)
+        hook.write_text("CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), nil, {}, "
+                        "PushTapFixture.trigger as CFString, nil, .deliverImmediately)\n")
+        self.assertFalse(device_tests.push_hooked(source), "the hook alone, with no trigger named in MayCore")
+        fixture.write_text(f'public static let trigger = "{device_tests.PUSH_TRIGGER}"\n')
         self.assertTrue(device_tests.push_hooked(source))
+        hook.write_text("let other = 1\n")
+        self.assertFalse(device_tests.push_hooked(source), "the name alone, with no listening hook")
         self.assertIn(device_tests.NO_PUSH_HOOK, publish.REASONS)
         self.assertTrue(device_tests.NO_PUSH_HOOK.startswith("skipped: "))
