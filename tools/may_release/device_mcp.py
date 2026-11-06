@@ -898,7 +898,7 @@ def act(name, args, config):
     if name != "type":
         return False, [{"type": "text", "text": "Done"}]
     # What landed, so the agent never types it again piece by piece (run 40119835677: three minutes on one sentence).
-    xml, _ = android_dump(config)
+    xml = settled_dump(config, args["text"])
     landed = None if xml is None else focused_text(xml)
     if landed is None:
         return False, [{"type": "text", "text": "Done; the focused field could not be read, so take a hierarchy"}]
@@ -909,7 +909,7 @@ def act(name, args, config):
     rest = untyped(args["text"], focused_text(xml, raw=True), landed)
     if rest:
         status, _ = adb(config, "shell", "input", "text", rest.replace(" ", "%s"))
-        xml, _ = android_dump(config)
+        xml = settled_dump(config, args["text"])
         landed = None if status or xml is None else focused_text(xml)
         if landed is None or untyped(args["text"], focused_text(xml, raw=True), landed):
             config["typing_failed"] = True
@@ -917,6 +917,29 @@ def act(name, args, config):
             return True, [{"type": "text", "text": f"The text did not land whole, even typed again: the field {shown}. "
                                                    "Do not send it; call done now with outcome blocked"}]
     return False, [{"type": "text", "text": f"Done. The focused field now reads: {landed!r}"}]
+
+
+# M and the coordinator, 6 Nov (run 42244126293's push-open: "did not land whole", yet the judge saw the exact message
+# sent): Compose updates the field on a later frame than adb's input text returns, so a read at once can see a prefix,
+# and typing that "rest" again doubles it once the late frame lands. The field is read until it holds the whole text
+# or two reads SETTLE_GAP apart agree, at most SETTLE_READS reads, before it is compared or anything is typed again.
+SETTLE_GAP, SETTLE_READS = 0.3, 7
+
+
+def settled_dump(config, text):
+    """uiautomator's XML once the focused field has settled: it ends with text, or two reads SETTLE_GAP apart hold the
+    same field; the last read when it never settles; None when no read worked."""
+    xml, _ = android_dump(config)
+    for _ in range(SETTLE_READS - 1):
+        field = None if xml is None else focused_text(xml, raw=True)
+        if field is not None and not untyped(text, field, ""):
+            return xml
+        time.sleep(SETTLE_GAP)
+        again, _ = android_dump(config)
+        if again is not None and field is not None and focused_text(again, raw=True) == field:
+            return again
+        xml = again if again is not None else xml
+    return xml
 
 
 def untyped(text, field, shown):

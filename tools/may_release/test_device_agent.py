@@ -1661,7 +1661,8 @@ class DeviceServerTests(unittest.TestCase):
         self.assertEqual(self.call("tap", x=540, y=1200), (False, [{"type": "text", "text": "Done"}]))
         self.assertEqual(self.adb[-1], ["/sdk/adb", "-s", "emulator-5554", "shell", "input", "tap", "540", "1200"])
         self.call("type", text="This is device test qa-123. Reply!")
-        self.assertEqual(self.adb[-2][-1], "This%sis%sdevice%stest%sqa-123.%sReply!", "one input text call")
+        inputs = [argv for argv in self.adb if argv[-3:-1] == ["input", "text"]]
+        self.assertEqual([argv[-1] for argv in inputs], ["This%sis%sdevice%stest%sqa-123.%sReply!"], "one input text call")
         self.assertEqual(self.adb[-1][-3:], ["uiautomator", "dump", "/dev/tty"], "then what landed is read")
         self.call("swipe", x1=1, y1=2, x2=3, y2=4)
         self.assertEqual(self.adb[-1][-6:], ["swipe", "1", "2", "3", "4", "300"])
@@ -1677,11 +1678,15 @@ class DeviceServerTests(unittest.TestCase):
         """The type tool's answer when the focused field holds field after the input (and then, when given, after the
         input of what did not land); text: what is typed, the field's own end by default."""
         fields = [field] + ([then] if then is not None else [])
+        typed = [0]
 
         def run(argv, capture_output, stdin, timeout):
             self.adb.append(argv)
+            if argv[-3:-1] == ["input", "text"]:
+                typed[0] += 1
             if "uiautomator" in argv:
-                shown = fields.pop(0) if len(fields) > 1 else fields[0]
+                # The field changes only when something is typed (what each input left), never between reads.
+                shown = fields[min(typed[0], len(fields)) - 1] if typed[0] else fields[0]
                 return subprocess.CompletedProcess(argv, 0, (
                     b'<hierarchy><node text="Ask May" focused="false" bounds="[0,0][9,9]"/><node text="' + shown +
                     b'" focused="true" bounds="[0,0][9,9]"/></hierarchy>'), b"")
@@ -1768,6 +1773,35 @@ class DeviceServerTests(unittest.TestCase):
                          b"== slow typing ==\ntype 1: wanted 12, after each word: 4 ? ? 12\n")
         self.assertEqual(device_tests.typing_lines({"outcome": "completed"}), b"")
         self.assertEqual(device_tests.typing_lines({"typed": []}), b"== slow typing ==\nno type call\n")
+
+    def test_a_field_that_updates_a_frame_late_is_waited_for_and_never_typed_again(self):
+        """M and the coordinator, 6 Nov (run 42244126293): the first read saw a prefix, the field filled a frame later,
+        and the harness typed the rest again; now the field is read until it settles, and nothing is typed twice."""
+        typed = "Reply with the numbers from 1 to 40, one number a line, tag qa-1-a-push-open."
+        reads, sleeps = [typed[:20].encode(), typed.encode()], []
+
+        def run(argv, capture_output, stdin, timeout):
+            self.adb.append(argv)
+            if "uiautomator" in argv:
+                shown = reads.pop(0) if len(reads) > 1 else reads[0]
+                return subprocess.CompletedProcess(argv, 0, b'<hierarchy><node text="' + shown +
+                                                   b'" focused="true" bounds="[0,0][9,9]"/></hierarchy>', b"")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run), patch("device_mcp.time.sleep", sleeps.append):
+            failed, content = device_mcp.call("type", {"text": typed}, self.config)
+        self.assertFalse(failed)
+        self.assertEqual(len([a for a in self.adb if a[-3:-1] == ["input", "text"]]), 1, "never typed again")
+        self.assertEqual(sleeps, [device_mcp.SETTLE_GAP])
+        self.assertNotIn("typing_failed", self.config)
+        self.assertEqual(content[0]["text"], f"Done. The focused field now reads: {typed!r}")
+
+    def test_a_field_that_stays_short_is_still_typed_once_more_after_it_settles(self):
+        field, typed = b"Ask me about a snack, with three cho", "Ask me about a snack, with three choices, tag qa-1-a-poll"
+        with patch("device_mcp.time.sleep"):
+            failed, _ = self.answer_type(field, typed, then=typed.encode())
+        self.assertFalse(failed)
+        self.assertEqual(len([a for a in self.adb if a[-3:-1] == ["input", "text"]]), 2)
 
     def test_a_long_field_is_compared_whole_not_as_the_agent_was_shown_it(self):
         field = "word " * 80 + "end"
