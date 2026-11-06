@@ -1831,6 +1831,10 @@ class ReasonTests(unittest.TestCase):
                     branches = [part for branch in branches for part in
                                 ((branch.body, branch.orelse) if isinstance(branch, ast.IfExp) else (branch,))]
                 reasons |= {getattr(device_tests, v.id) if isinstance(v, ast.Name) else v.value for v in branches}
+            elif isinstance(value, ast.BoolOp) and isinstance(value.values[0], ast.Call) and \
+                    ast.unparse(value.values[0].func) == "push_reason" and isinstance(value.values[1], ast.Name):
+                # The push truth's own reason (push_reason: one of PUSH_REASONS), else the generic one.
+                reasons |= set(device_tests.PUSH_REASONS) | {getattr(device_tests, value.values[1].id)}
             else:
                 reasons.add(ast.unparse(value))  # a reason worked out at run time must be added here by hand
         # The judge step copies combined()'s reason, whose own values are read above from its returned dicts.
@@ -3298,3 +3302,47 @@ class PushOpenChatIosTests(unittest.TestCase):
         self.assertFalse(device_tests.push_hooked(source), "the name alone, with no listening hook")
         self.assertIn(device_tests.NO_PUSH_HOOK, publish.REASONS)
         self.assertTrue(device_tests.NO_PUSH_HOOK.startswith("skipped: "))
+
+
+class PushReportTests(unittest.TestCase):
+    """Coordinator, 6 Nov (run 42228230126): the push facts go into report.json, yes/no alone, and the push truth's
+    verdict says its own reason, never the agenda's or a server lookup's."""
+
+    FACTS = dict(dict.fromkeys(device_tests.PUSH_FACTS, True), before=False)  # a tap that passed
+
+    def settled(self, **facts):
+        row = next(r for r in device_tests.scenarios("push-open"))
+        entry = {"server": [], "delivery": ["succeeded", "succeeded"]}
+        device_tests.server_reads(row, entry, "https://s", "t", "qa-1-a-push-open", None, None, None,
+                                  lambda base, token, tag: ["succeeded", "succeeded"], None, dict(self.FACTS, **facts))
+        return entry, device_tests.combined(entry, {"outcome": "completed", "actions": 9}, ("pass", "ok"), sends=True)
+
+    def test_each_outcome_has_its_own_reason_and_the_facts_are_in_the_row(self):
+        for facts, expected in (({}, {"verdict": "pass", "reason": None}),
+                                ({"reply": False}, {"verdict": "fail", "reason": device_tests.PUSH_NO_REPLY}),
+                                ({"before": True}, {"verdict": device_tests.UNVERIFIED, "reason": device_tests.PUSH_BEFORE}),
+                                ({"entry": False}, {"verdict": device_tests.UNVERIFIED,
+                                                    "reason": device_tests.PUSH_UNDELIVERED}),
+                                ({"tapped": False}, {"verdict": "fail", "reason": device_tests.PUSH_OFF_MAIN}),
+                                ({"after": False}, {"verdict": "fail", "reason": device_tests.PUSH_NOT_SHOWN})):
+            with self.subTest(facts=facts):
+                entry, verdict = self.settled(**facts)
+                self.assertEqual(verdict, expected)
+                self.assertEqual(entry["push"], dict(self.FACTS, **facts))
+                self.assertTrue(all(type(v) is bool for v in entry["push"].values()))
+
+    def test_publish_takes_the_facts_as_yes_or_no_alone(self):
+        row = {"id": "push-open", "verdict": "fail", "reason": device_tests.PUSH_NOT_SHOWN, "videos": [],
+               "screenshots": [], "server": [{"get": device_tests.PUSH_PATH, "status": 200}],
+               "push": dict(self.FACTS, after=False)}
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "report.json"
+            for push, ok in ((row["push"], True), (dict(row["push"], extra=True), False),
+                             (dict(row["push"], after="no"), False), ({"reply": True}, False)):
+                with self.subTest(push=push):
+                    path.write_text(json.dumps({"device": "android", "scenarios": [dict(row, push=push)]}))
+                    if ok:
+                        publish.device_report(path, set(), {"push-open": "Push"})
+                    else:
+                        with self.assertRaises(PublishError):
+                            publish.device_report(path, set(), {"push-open": "Push"})

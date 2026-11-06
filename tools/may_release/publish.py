@@ -87,7 +87,8 @@ REASONS = ("outward actions are off (MAY_DEVICE_TESTS_OUTWARD)", "may-app has no
            device_tests.FLOW_NOT_RUN, device_tests.FLOW_FAILED, device_tests.SERVER_FAILED,
            device_tests.FLOW_TIMED_OUT, device_tests.INFRA_AGAIN, device_tests.INFRA_NO_RESTART, device_tests.INFRA_GONE,
            device_tests.TYPING_FAILED, device_tests.STRAY_ANSWER,
-           device_tests.STRAY_NAVIGATION, device_tests.UNTAGGED_TOUCHED, device_tests.NO_PUSH_HOOK)
+           device_tests.STRAY_NAVIGATION, device_tests.UNTAGGED_TOUCHED, device_tests.NO_PUSH_HOOK,
+           *device_tests.PUSH_REASONS)
 MAX_NOTES = 600
 # A chat scenario's message codes (device_tests.message_codes): codes alone, in a fixed shape.
 DELIVERY = re.compile(r"(?:[a-z][a-z0-9_]{0,63}(?: \([a-z][a-z0-9_]{0,63}\))?|no run|" + re.escape(device_tests.NONE_STORED)
@@ -513,7 +514,10 @@ def device_report(path, files, titles, dropped=frozenset()):
                 (isinstance(row.get("notes", ""), str) and len(row.get("notes", "")) <= MAX_NOTES) and
                 agent_ok(row.get("agent", {"outcome": None, "actions": 0, "summary": "", "hierarchy_failure": None})) and
                 (isinstance(row.get("delivery", []), list) and len(row.get("delivery", [])) <= device_tests.MAX_DELIVERY and
-                 all(isinstance(code, str) and DELIVERY.fullmatch(code) for code in row.get("delivery", [])))):
+                 all(isinstance(code, str) and DELIVERY.fullmatch(code) for code in row.get("delivery", []))) and
+                # The push truth's facts (device_tests.PUSH_FACTS): yes/no alone, never an id or text.
+                ("push" not in row or isinstance(row["push"], dict) and set(row["push"]) == set(device_tests.PUSH_FACTS)
+                 and all(type(value) is bool for value in row["push"].values()))):
             raise PublishError("A device report row is malformed")
         checked.append({"id": row["id"], "title": titles[row["id"]], "verdict": row["verdict"],
                         "reason": row.get("reason"), "videos": row.get("videos", []),
