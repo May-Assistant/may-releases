@@ -1720,6 +1720,55 @@ class DeviceServerTests(unittest.TestCase):
         self.assertEqual(content[0]["text"], "Done. The focused field now reads: '(hidden)'",
                          "a field hidden from the agent is never typed into again")
 
+    def test_slow_typing_sends_each_word_apart_and_keeps_only_the_fields_lengths(self):
+        """M and the coordinator, 6 Nov (#1785): the Android chat control types word by word, SLOW_GAP apart, and
+        records the focused field's length after each word, never its text."""
+        typed = "This is device test qa-9. Reply"
+        landed, sleeps = [], []
+        self.config.update(slow=True, typed=[])
+
+        def run(argv, capture_output, stdin, timeout):
+            self.adb.append(argv)
+            if argv[-3:-1] == ["input", "text"]:
+                landed.append(argv[-1].replace("%s", " "))
+            if "uiautomator" in argv:
+                field = "".join(landed).encode()
+                return subprocess.CompletedProcess(argv, 0, b'<hierarchy><node text="' + field +
+                                                   b'" focused="true" bounds="[0,0][9,9]"/></hierarchy>', b"")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with patch("device_mcp.subprocess.run", side_effect=run), patch("device_mcp.time.sleep", sleeps.append):
+            failed, content = device_mcp.call("type", {"text": typed}, self.config)
+        self.assertFalse(failed)
+        inputs = [argv[-1] for argv in self.adb if argv[-3:-1] == ["input", "text"]]
+        self.assertEqual(inputs, ["This", "%sis", "%sdevice", "%stest", "%sqa-9.", "%sReply"])
+        self.assertEqual(sleeps, [device_mcp.SLOW_GAP] * 6)
+        self.assertEqual(self.config["typed"], [{"want": len(typed), "after": [4, 7, 14, 19, 25, 31]}])
+        self.assertEqual(content[0]["text"], f"Done. The focused field now reads: {typed!r}")
+        with open(self.config["result"]) as stream:
+            self.assertEqual(json.load(stream)["typed"], self.config["typed"], "the lengths reach the record")
+        self.assertEqual(device_mcp.chunks("a  b "), ["a", "  b", " "])
+
+    def test_slow_typing_is_the_android_chat_scenarios_alone_and_off_by_default(self):
+        base = {"MAY_DEVICE_AGENT_RESULT": "/r.json", "MAY_DEVICE_ADB": "/sdk/adb", "MAY_DEVICE_SERIAL": "emulator-5554"}
+        self.assertNotIn("slow", device_mcp.settings(base))
+        self.assertTrue(device_mcp.settings(dict(base, MAY_DEVICE_SLOW_TYPING="1"))["slow"])
+        for value, row, wanted in (("true", "chat", {"MAY_DEVICE_SLOW_TYPING": "1"}), ("true", "poll", {}),
+                                   ("false", "chat", {}), (None, "chat", {})):
+            with self.subTest(value=value, row=row):
+                environ = {} if value is None else {"MAY_ANDROID_SLOW_TYPING": value}
+                with patch.dict(os.environ, environ, clear=True):
+                    self.assertEqual(device_tests.slow_typing({"id": row}), wanted)
+
+    def test_the_slow_typing_lengths_are_numbers_alone_in_the_private_diag(self):
+        record = {"typed": device_agent.typed([{"want": 12, "after": [4, None, "x", 12]}, {"want": "x", "after": []},
+                                               "junk"])}
+        self.assertEqual(record["typed"], [{"want": 12, "after": [4, None, None, 12]}])
+        self.assertEqual(device_tests.typing_lines(record),
+                         b"== slow typing ==\ntype 1: wanted 12, after each word: 4 ? ? 12\n")
+        self.assertEqual(device_tests.typing_lines({"outcome": "completed"}), b"")
+        self.assertEqual(device_tests.typing_lines({"typed": []}), b"== slow typing ==\nno type call\n")
+
     def test_a_long_field_is_compared_whole_not_as_the_agent_was_shown_it(self):
         field = "word " * 80 + "end"
         self.adb = []

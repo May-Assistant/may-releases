@@ -26,7 +26,7 @@ import subprocess
 import sys
 import urllib.request
 
-from device_mcp import DRIVER_CAUSES, DUMP_FAILURES, MAX_LOOKS, kept_lines
+from device_mcp import DRIVER_CAUSES, DUMP_FAILURES, MAX_CHUNKS, MAX_LOOKS, MAX_TYPED, kept_lines
 from review import CLI_MAX_BYTES, CLI_SHA512, CLI_URL, checked_cli, header_safe, outcome
 
 # review.py's pinned release for macOS on Apple silicon (macos-15): npm's darwin-arm64 platform package, a single
@@ -204,7 +204,8 @@ def run_agent(cli, goal, tag, device, work, token, model, seconds=AGENT_SECONDS)
             # Run 41656192676: the device server marked Android chat, poll and poll-skip typing failures, but this
             # copy dropped the mark, so device_tests.combined read "blocked" (a fail) instead of infra.
             **({"typing_failed": True} if record.get("typing_failed") is True else {}),
-            **({"looks": looks(record["looks"])} if "looks" in record else {})}
+            **({"looks": looks(record["looks"])} if "looks" in record else {}),
+            **({"typed": typed(record["typed"])} if "typed" in record else {})}
 
 
 LOOK_SHOTS = tuple(f"look-{n}.png" for n in range(1, MAX_LOOKS + 1))
@@ -215,6 +216,14 @@ def looks(found):
     return [{"shown": look["shown"], "shot": look["shot"] if look.get("shot") in LOOK_SHOTS else None}
             for look in (found if isinstance(found, list) else [])[:MAX_LOOKS]
             if isinstance(look, dict) and type(look.get("shown")) is int and 0 <= look["shown"] <= 1000]
+
+
+def typed(found):
+    """The device server's slow-typing lengths (device_mcp.slow_type) in their fixed shape: whole numbers or None."""
+    size = lambda n: type(n) is int and 0 <= n <= 100_000
+    return [{"want": entry["want"], "after": [n if size(n) else None for n in entry["after"][:MAX_CHUNKS]]}
+            for entry in (found if isinstance(found, list) else [])[:MAX_TYPED]
+            if isinstance(entry, dict) and size(entry.get("want")) and isinstance(entry.get("after"), list)]
 
 
 def redacted(text):

@@ -2947,6 +2947,19 @@ class WorkflowPinTests(unittest.TestCase):
         self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
         self.flagged(self.text.replace(block, ""), message)
 
+    def test_android_slow_typing_is_its_own_boolean_off_unless_dispatched_read_by_the_android_scenarios_step_alone(self):
+        """M and the coordinator, 6 Nov (#1785): a control run, so only a dispatch that asks."""
+        message = "ios_notif_spike, ios_push_tap and tidy_file_taxes booleans"
+        line = "          MAY_ANDROID_SLOW_TYPING: ${{ inputs.android_slow_typing }}\n"
+        self.assertEqual(self.text.count(line), 1, "the Android scenarios step alone")
+        self.flagged(self.text.replace(line, ""), "a secret, variable or env entry")
+        ios = "          MAY_IOS_PUSH_TAP: ${{ inputs.ios_push_tap }}\n"
+        self.flagged(self.text.replace(ios, ios + line), "a secret, variable or env entry")
+        block = self.text[self.text.index("      android_slow_typing:\n"):self.text.index("      tidy_file_taxes:\n")]
+        self.assertTrue(block.endswith("        type: boolean\n        default: false\n"), "off unless dispatched on")
+        self.flagged(self.text.replace(block, block.replace("default: false", "default: true")), message)
+        self.flagged(self.text.replace(block, ""), message)
+
     def test_the_ios_build_step_reads_the_spike_input_alone(self):
         """Coordinator, 3 Nov: the build step builds the spike's springboard tapper, with no secret, only for the spike."""
         step = ("      - name: Build May Playground for the simulator without secrets\n        env:\n"
