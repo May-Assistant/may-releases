@@ -267,6 +267,10 @@ STRAY_ANSWER = "the agent answered the question card itself, so its skip could n
 # own step strayed (never the app on its own) and every server read passed; infra, never a pass, and counted.
 STRAY_NAVIGATION = ("agent stray navigation: the agent's own step left the goal's path while every server check "
                     "passed (the harness's failure)")
+# Coordinator, 6 Nov: run 84's iOS notes opened an existing, untagged task in the shared device-test account, which
+# belongs to a real person. The judge's stray untagged is a fail whatever else it or the server said: never infra,
+# never a pass.
+UNTAGGED_TOUCHED = "the agent opened, edited or deleted an item without this run's tag (never allowed)"
 
 
 def fresh_switch():
@@ -2131,6 +2135,8 @@ def combined(entry, record, judged, sends=False, look=False):
         return {"verdict": "fail", "reason": SMOKE_MAESTRO}
     if record.get("state") == "rate_limited" or judged[0] == "rate_limited":
         return {"verdict": "skipped", "reason": RATE_LIMITED}
+    if stray_of(judged) == "untagged":
+        return {"verdict": "fail", "reason": UNTAGGED_TOUCHED}
     if record.get("typing_failed") is True:
         return {"verdict": INFRA, "reason": TYPING_FAILED}
     if any(check.get("stray") for check in entry.get("server", [])):
