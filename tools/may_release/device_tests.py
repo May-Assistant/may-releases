@@ -367,7 +367,7 @@ def scenarios(selection="all", platform="android"):
                     ("Send this message" in row["goal"]) == (row.get("chat") is True) and
                     ("chat" not in row or CHAT_GOAL in row["goal"] and OTHER_CHATS in row["goal"]) and
                     ("push" not in row or row["push"] == PUSH_ROW and row.get("chat") is True and
-                     row.get("platforms") == ["android"] and PUSH_TRUTH in row["truth"]) and
+                     row.get("platforms") in (["android"], ["android", "ios"]) and PUSH_TRUTH in row["truth"]) and
                     ("card" not in row or row["card"] is True and row.get("fresh") is True and "chat" not in row and
                      row["truth"] == [] and row.get("platforms") == ["ios"] and CARD_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
@@ -784,12 +784,43 @@ def push_tap(adb, reply, wait=time.sleep):
 
 
 def push_verdict(facts):
-    """(status, found, unverified) of the push truth from push_tap's facts."""
+    """(status, found, unverified) of the push truth from push_tap's facts (or device_ios.push_tap's): no reply, a
+    fail; the reply already on screen, or a tap the harness could not deliver (no shade entry on Android, no hook line
+    on iOS), could not be checked; otherwise it passes when the tap was taken and the reply then showed."""
     if not facts.get("reply"):
         return 0, False, False
-    if facts.get("before"):
+    if facts.get("before") or not facts.get("entry"):
         return 200, False, True
-    return 200, all(facts.get(name) for name in ("posted", "entry", "tapped", "after")), False
+    return 200, all(facts.get(name) for name in ("posted", "tapped", "after")), False
+
+
+# The iOS side (device_ios.push_tap; coordinator, 6 Nov): may-app #1797's debug-only running trigger. The debug
+# Playground, launched with MAY_TEST_PUSH_TAP=listen, taps once through its real delegate each time PUSH_TRIGGER is
+# posted, with the push data in its Documents/PUSH_FILE. A may-app commit without it (PUSH_HOOK_FILE does not name
+# PUSH_TRIGGER) skips the row on iOS (NO_PUSH_HOOK). The screen before and after the tap is read by a short look-only
+# agent run (PUSH_LOOK), whose done takes a fresh hierarchy, since the iOS screen is read through the agent's driver.
+PUSH_TRIGGER, PUSH_FILE = "io.github.mayassistant.may.playground.push-tap", "push-tap.json"
+PUSH_HOOK_FILE = "ios/App/Playground/PushTapHook.swift"
+NO_PUSH_HOOK = "skipped: the may-app commit has no running push-tap trigger on iOS"
+PUSH_LOOK = ("Look only, for device test {tag}: call hierarchy once, then call done with outcome completed. Do not tap, "
+             "type, swipe or go back.")
+PUSH_LOOK_SECONDS = 180
+
+
+def push_hooked(source):
+    """Whether the may-app checkout holds the iOS running push-tap trigger (may-app #1797)."""
+    path = source / PUSH_HOOK_FILE
+    try:
+        return path.is_file() and not path.is_symlink() and PUSH_TRIGGER.encode() in path.read_bytes()
+    except OSError:
+        return False
+
+
+def shown_in(hierarchy, body):
+    """Whether the agent's hierarchy lines (device_mcp's text='...' form) show the reply's first line."""
+    first = body.splitlines()[0].strip()[:40] if body.strip() else ""
+    return bool(first) and any(f"text={first!r}"[:-1] in line or f"desc={first!r}"[:-1] in line
+                               for line in str(hierarchy or "").splitlines())
 
 
 def push_lines(facts):
