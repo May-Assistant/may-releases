@@ -40,7 +40,7 @@ import sys
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it after the standard library.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from compile import OUTCOME
+from compile import OUTCOME, CompileError, configuration
 from ds_compile import (APP_SLUG, DsCompileError, MAX_BODY, MAX_ERRORS, SHA, XCODE, comment_author, diagnostics,
                         fence_for, post_or_update, request, run_url)
 from gate import AGE_RECIPIENT, APP_REPO, GateDenial, pull_number, validate_pull_request
@@ -65,6 +65,12 @@ SCHEME, DESTINATION = "MayPlayground", "generic/platform=iOS Simulator"
 # The design system prepare.py checks out inside the may-app checkout: not may-app's own files.
 EXCLUDED = ("android/build-deps/",)
 MARKER = "may-ios-compile-pr"
+
+
+def marker():
+    """This run's comment marker: MARKER for Release; a Debug compile's own, so it never replaces the Release result
+    (compile.configuration)."""
+    return MARKER if configuration() == "Release" else MARKER + "-debug"
 # The native job's own result (needs.native.result), for the post job when no record reached it (coordinator, 26 Oct:
 # with the key pair unset, #133's post was silent and the may-app merge gate had no result to read). Only success and
 # failure are posted, as the result line alone: no detail, still head-marked.
@@ -85,7 +91,7 @@ def result_body(sha, url, passed):
              "may-native-compile-pr, or the job stopped before its seal)."]
     if url:
         lines += ["", f"Run: {url}"]
-    return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
+    return "\n".join(lines) + f"\n\n<!-- {marker()} head={sha} -->" + FOOTER
 
 
 def gating_lines(tests):
@@ -119,7 +125,7 @@ def comment_body(sha, url, passed, errors, total, tests=None):
     tests' record (ios_gating.py), none listed when None."""
     if not SHA.fullmatch(sha or ""):
         raise CompilePrError("The compiled commit is not an exact SHA")
-    how = f"Xcode {XCODE} (`xcodebuild`, scheme `{SCHEME}`, {DESTINATION}, Release, no signing)"
+    how = f"Xcode {XCODE} (`xcodebuild`, scheme `{SCHEME}`, {DESTINATION}, {configuration()}, no signing)"
     if passed:
         lines = ["### May iOS compile: passed", "", f"`{sha}` compiles with {how}."]
     else:
@@ -137,7 +143,7 @@ def comment_body(sha, url, passed, errors, total, tests=None):
     lines += gating_lines(tests or ios_gating.record("none"))
     if url:
         lines += ["", f"Run: {url}"]
-    body = "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
+    body = "\n".join(lines) + f"\n\n<!-- {marker()} head={sha} -->" + FOOTER
     if len(body) > MAX_BODY:
         raise CompilePrError("The comment would be too long to post")
     return body
@@ -342,6 +348,10 @@ def post(sha, pr, call_api=github):
     token = os.environ.pop(COMMENT_TOKEN, "")
     if not SHA.fullmatch(sha or ""):
         raise CompilePrError("Source SHA is not an exact lowercase commit SHA")
+    try:
+        configuration()
+    except CompileError:
+        raise CompilePrError("The compile configuration is neither Release nor Debug; nothing was posted") from None
     number = pull_number(pr)
     path = private_root() / PRIVATE / RECORD
     sealed = path.is_file() and not path.is_symlink()
@@ -375,7 +385,7 @@ def post(sha, pr, call_api=github):
         raise CompilePrError("The pull request is no longer open at the compiled head; nothing was posted") from None
     # Only the comment app's own comments are edited or count as posted; without its slug (the PAT fallback), none.
     author = comment_author(os.environ)
-    done = post_or_update(listed_only(call_api), APP_REPO, number, sha, body, token, MARKER, author)
+    done = post_or_update(listed_only(call_api), APP_REPO, number, sha, body, token, marker(), author)
     if done == "same":
         print(f"May iOS compile result already posted for this head on may-app #{number}; nothing posted again")
         return 0 if passed and gated else 1

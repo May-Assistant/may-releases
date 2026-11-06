@@ -514,6 +514,12 @@ gh workflow run native-compile-draft.yml -f platform=ios -f source_sha=<reviewed
 gh workflow run native-compile-pr.yml -f pr_number=<may-app PR number> -f source_sha=<that PR's current head SHA> --repo May-Assistant/may-releases --ref main
 ```
 
+- **Configuration** (`configuration`, optional): `Release`, the default and what may-app's merge reads, or `Debug`, so that `#if DEBUG` code (debug-only hooks such as may-app #1797's) compiles before it merges (coordinator, 6 Nov). Only the two compile steps and the post read it (`MAY_IOS_CONFIGURATION`); `compile.py` refuses any other value before building, and builds Release whenever it is not the pull request's compile. The comment names the configuration, and a Debug result is posted under its own marker (`may-ios-compile-pr-debug`), so it never replaces the Release result for that head:
+
+  ```
+  gh workflow run native-compile-pr.yml -f pr_number=<n> -f source_sha=<sha> -f configuration=Debug --repo May-Assistant/may-releases --ref main
+  ```
+
 - **Admission** (`gate.py --action compile-pr`, no environment) checks the dispatch (main only, manual) and the inputs. It also checks that `may-native-compile-pr` exists and has exactly the right policy:
   - administrator bypass off;
   - a custom branch policy of exactly `main`;
