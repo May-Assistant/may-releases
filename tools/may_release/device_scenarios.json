@@ -95,7 +95,7 @@
     "id": "notes",
     "title": "Add a note to a new agenda task",
     "driver": "agent",
-    "goal": "In May Playground, tap the Agenda tab in the bottom bar (not a chat). Do not open any existing task; create a new one. Add a new task titled {tag} task, then open that task. On its Details tab, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on it.",
+    "goal": "In May Playground, tap the Agenda tab in the bottom bar (not a chat). Then read the hierarchy: if the Agenda screen is not showing yet, tap the Agenda tab again at the centre of its own element in the hierarchy, and check again, up to three times, before doing anything else. Do not open any existing task; create a new one. Add a new task titled {tag} task, then open that task. On its Details tab, tap the notes field that says Add notes and type: {tag} note from the device test. Then go back, open the {tag} task again and check that the note is shown on it.",
     "platforms": [
       "android",
       "ios"
@@ -187,7 +187,7 @@
     "id": "onboarding",
     "title": "Go through onboarding on a new account",
     "driver": "agent",
-    "goal": "May Playground has just signed in to a new account for device test {tag} and shows its first-run onboarding. Go through it: on Hi, I'm May tap Accept and continue; on the email step and on the phone step tap Not now, never making an address or getting a number; on I have my own computer tap Continue; on Connect your apps tap Not now, never connecting an app; on Make me yours tap Purple, then Continue; on Let me reach you tap Not now, never turning on notifications; on I'm all set, tap Start chatting. Do not type anything or change a setting. You are done, and must stop at once and report success, as soon as you have tapped Not now on Let me reach you, or as soon as the app's main tabs (Chats, Agenda) show, whichever comes first.",
+    "goal": "May Playground has just signed in to a new account for device test {tag} and shows its first-run onboarding. Go through it: on Hi, I'm May tap Accept and continue; on the email step and on the phone step tap Not now, never making an address or getting a number; if the phone step instead says a number is unavailable for this account and offers only Continue, tap Continue there, as test accounts are expected to see that screen; on I have my own computer tap Continue; on Connect your apps tap Not now, never connecting an app; on Make me yours tap Purple, then Continue; on Let me reach you tap Not now, never turning on notifications; on I'm all set, tap Start chatting. Do not type anything or change a setting. You are done, and must stop at once and report success, as soon as you have tapped Not now on Let me reach you, or as soon as the app's main tabs (Chats, Agenda) show, whichever comes first.",
     "platforms": [
       "android",
       "ios"

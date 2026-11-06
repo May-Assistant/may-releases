@@ -103,7 +103,7 @@ def sandbox_project(source, private):
     return project
 
 
-def build_sandboxed(source, private, generator, developer, target, log):
+def build_sandboxed(source, private, generator, developer, target, log, config="Release"):
     """XcodeGen and each scheme's xcodebuild as the sandbox's user, each stopped after; True when every one exited
     0. A stage that fails or runs out of time ends the build there."""
     mac_sandbox.setup(log, {"src": source, "xcodegen": generator}, Path(os.environ.get("HOME") or Path.home()),
@@ -143,7 +143,7 @@ def build_sandboxed(source, private, generator, developer, target, log):
         start = mac_sandbox.log_size(log)
         status = mac_sandbox.step(mac_sandbox.sandboxed(
             ["/usr/bin/xcodebuild", "-project", str(root / "src/ios/May.xcodeproj"), "-scheme", scheme,
-             "-configuration", "Release", "-destination", "generic/platform=iOS Simulator",
+             "-configuration", config, "-destination", "generic/platform=iOS Simulator",
              "-derivedDataPath", str(root / "derived"), "-clonedSourcePackagesDirPath", str(root / "packages"),
              "CODE_SIGNING_ALLOWED=NO", "build"], tools, env), log, "/", deadline)
         stop_all(log)
@@ -156,6 +156,19 @@ def build_sandboxed(source, private, generator, developer, target, log):
 
 # The PR compile's recorded outcome, in may-private: {"result": "passed" | "failed"} (compile_pr_errors.py reads it).
 OUTCOME = "ios-compile-result.json"
+# Coordinator, 6 Nov (may-app #1797, all #if DEBUG): the PR compile builds Release unless its dispatch asks for Debug
+# (native-compile-pr.yml's configuration input, as MAY_IOS_CONFIGURATION on the compile steps and the post alone), so
+# debug-only code is compiled before it merges too. A Debug result is posted under its own marker (compile_pr_errors),
+# never in place of the Release result the may-app merge reads.
+CONFIGURATION_ENV, CONFIGURATIONS = "MAY_IOS_CONFIGURATION", ("Release", "Debug")
+
+
+def configuration():
+    """The PR compile's Xcode configuration: Release when unset, Debug when dispatched so; refuses anything else."""
+    chosen = os.environ.get(CONFIGURATION_ENV, "") or "Release"
+    if chosen not in CONFIGURATIONS:
+        raise CompileError("The compile configuration is neither Release nor Debug")
+    return chosen
 
 
 def compile_native(platform, target=None, record=False, sandbox=False):
@@ -166,6 +179,8 @@ def compile_native(platform, target=None, record=False, sandbox=False):
         raise CompileError("Only the iOS compile records its outcome")
     if sandbox and not record:
         raise CompileError("Only the recorded iOS compile runs as the unprivileged user")
+    # The pull request's compile alone may build Debug; every other compile builds Release.
+    config = configuration() if record else "Release"
     root = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
     source, private = root / "may-source", root / "may-private"
     if not os.environ.get("RUNNER_TEMP") or not source.is_dir() or not private.is_dir():
@@ -197,7 +212,7 @@ def compile_native(platform, target=None, record=False, sandbox=False):
             (private / ios_gating.RESULT).unlink(missing_ok=True)
         if sandbox:
             try:
-                passed = build_sandboxed(source, private, binary.parents[2], developer, target, log)
+                passed = build_sandboxed(source, private, binary.parents[2], developer, target, log, config)
             finally:
                 left = mac_sandbox.teardown(log)
                 if left:
@@ -211,7 +226,7 @@ def compile_native(platform, target=None, record=False, sandbox=False):
             run([str(binary), "generate"], log, cwd=source / "ios", env=env)
             for scheme in IOS_SCHEMES[target]:
                 run(["xcodebuild", "-project", str(source / "ios/May.xcodeproj"), "-scheme", scheme,
-                     "-configuration", "Release", "-destination", "generic/platform=iOS Simulator",
+                     "-configuration", config, "-destination", "generic/platform=iOS Simulator",
                      "-derivedDataPath", str(root / "may-derived"),
                      "-clonedSourcePackagesDirPath", str(root / "may-packages"),
                      "CODE_SIGNING_ALLOWED=NO", "build"], log, env=env)

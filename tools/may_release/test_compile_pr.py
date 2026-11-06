@@ -310,6 +310,22 @@ class PullRequestWorkflowShapeTests(unittest.TestCase):
     def test_the_committed_workflow_passes(self):
         self.assertEqual(static_check.compile_pr_workflow_problems((static_check.ROOT / PR_WORKFLOW).read_text()), [])
 
+    def test_the_configuration_input_is_release_by_default_and_reaches_the_compiles_and_the_post_alone(self):
+        """Coordinator, 6 Nov (may-app #1797): Debug may be dispatched so debug-only code compiles before it merges."""
+        text = (static_check.ROOT / PR_WORKFLOW).read_text()
+        line = "          MAY_IOS_CONFIGURATION: ${{ inputs.configuration }}\n"
+        self.assertEqual(text.count(line), 3)
+        fetch_env = "          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n"
+        for what, changed in (("Debug by default", text.replace("        default: Release", "        default: Debug")),
+                              ("a third option", text.replace("          - Debug\n", "          - Debug\n          - Profile\n")),
+                              ("on the fetch too", text.replace(fetch_env, fetch_env + line, 1)),
+                              ("off one compile step", text.replace("        env:\n" + line, "", 1)),
+                              ("no input", text.replace(text[text.index("      configuration:\n"):
+                                                             text.index("permissions:")], ""))):
+            with self.subTest(what):
+                self.assertNotEqual(changed, text)
+                self.assertTrue(static_check.compile_pr_workflow_problems(changed))
+
     def test_each_widening_is_flagged(self):
         name = "native-compile-pr.yml: "
         secret = name + ("a secret or env entry other than the pull request check's PR token, the fetch step's two "
