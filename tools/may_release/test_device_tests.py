@@ -3116,7 +3116,7 @@ def push_open_row():
 
 class PushOpenChatTests(unittest.TestCase):
     """Coordinator, 6 Nov (#1788, #1794): a chat reply's notification tapped while that chat is open and scrolled up
-    scrolls the chat to the reply. Android alone: the debug Playground's DebugPushReceiver posts a real notification."""
+    scrolls the chat to the reply. On Android the debug Playground posts a real notification from a broadcast."""
 
     TAG, CHAT, REPLY = "qa-7-a-push-open", "chat-1", "reply-2"
 
@@ -3294,19 +3294,23 @@ class PushOpenChatIosTests(unittest.TestCase):
         self.assertEqual((device_tests.push_verdict(facts), posted), ((0, False, False), []))
 
     def test_a_commit_without_the_trigger_skips_the_row_on_ios(self):
-        """Run 42221581609: the trigger's name is in MayCore (PushTapFixture.trigger), not in the hook's file."""
+        """Run 42221581609: found wherever the checkout names it, read at run time (no may-app path is named here)."""
         source = Path(self.directory.name) / "src"
         self.assertFalse(device_tests.push_hooked(source))
-        hook, fixture = source / device_tests.PUSH_HOOK_FILE, source / device_tests.PUSH_FIXTURE_FILE
-        hook.parent.mkdir(parents=True)
-        fixture.parent.mkdir(parents=True)
-        hook.write_text("CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), nil, {}, "
-                        "PushTapFixture.trigger as CFString, nil, .deliverImmediately)\n")
-        self.assertFalse(device_tests.push_hooked(source), "the hook alone, with no trigger named in MayCore")
-        fixture.write_text(f'public static let trigger = "{device_tests.PUSH_TRIGGER}"\n')
+        one, two = source / "ios/A/One.swift", source / "ios/B/Two.swift"
+        one.parent.mkdir(parents=True)
+        two.parent.mkdir(parents=True)
+        one.write_text("listen(CFNotificationCenterGetDarwinNotifyCenter())\n")
+        self.assertFalse(device_tests.push_hooked(source), "a listener alone, with no trigger named")
+        two.write_text(f'let trigger = "{device_tests.PUSH_TRIGGER}"\n')
         self.assertTrue(device_tests.push_hooked(source))
-        hook.write_text("let other = 1\n")
-        self.assertFalse(device_tests.push_hooked(source), "the name alone, with no listening hook")
+        one.write_text("let other = 1\n")
+        self.assertFalse(device_tests.push_hooked(source), "the name alone, with no listener")
+        one.unlink()
+        one.symlink_to(two)
+        (source / "ios/C").mkdir()
+        (source / "ios/C/Big.swift").write_bytes(device_tests.PUSH_HOOK_MARK + b" " * device_tests.MAX_SWIFT_BYTES)
+        self.assertFalse(device_tests.push_hooked(source), "never through a link or an oversized file")
         self.assertIn(device_tests.NO_PUSH_HOOK, publish.REASONS)
         self.assertTrue(device_tests.NO_PUSH_HOOK.startswith("skipped: "))
 

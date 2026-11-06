@@ -685,9 +685,9 @@ def tidy(minted=mint, tidied=tidy_notes, revoked_by=None):
 
 
 # Coordinator, 6 Nov (#1788 iOS, #1794 Android): a chat reply's notification tapped while that same chat is open and
-# scrolled up must scroll the chat to the reply. A row with "push": "open-chat" (Android alone: a debug May Playground's
-# DebugPushReceiver posts a real May notification through the app's own push path, MayPush.post, from an adb broadcast,
-# where the iOS simulator never delivers a tap) has its agent open its own chat, get a long reply and scroll up. Then
+# scrolled up must scroll the chat to the reply. A row with "push": "open-chat" (on Android a debug May Playground posts
+# a real May notification, through the app's own push path, from an adb broadcast) has its agent open its own chat,
+# get a long reply and scroll up. Then
 # the harness sends PUSH_MESSAGE over the API, waits for May's reply to it, posts that reply's notification (its chat's
 # and its own real ids) through the broadcast, opens the shade and taps it by its title. The truth {"push": "open-chat"}
 # passes when the reply was off screen before the tap and on screen after it; on screen before, it could not be
@@ -803,14 +803,14 @@ def push_verdict(facts):
 
 # The iOS side (device_ios.push_tap; coordinator, 6 Nov): may-app #1797's debug-only running trigger. The debug
 # Playground, launched with MAY_TEST_PUSH_TAP=listen, taps once through its real delegate each time PUSH_TRIGGER is
-# posted, with the push data in its Documents/PUSH_FILE. A may-app commit without it (PUSH_HOOK_FILE does not name
-# PUSH_TRIGGER) skips the row on iOS (NO_PUSH_HOOK). The screen before and after the tap is read by a short look-only
+# posted, with the push data in its Documents/PUSH_FILE. A may-app commit without it (push_hooked) skips the row on
+# iOS (NO_PUSH_HOOK). The screen before and after the tap is read by a short look-only
 # agent run (PUSH_LOOK), whose done takes a fresh hierarchy, since the iOS screen is read through the agent's driver.
 PUSH_TRIGGER, PUSH_FILE = "io.github.mayassistant.may.playground.push-tap", "push-tap.json"
-# may-app #1797: the trigger's name is MayCore's (PushTapFixture.trigger), and the Playground's hook listens for it
-# through the Darwin notify center (run 42221581609 skipped iOS on a commit holding both: the name is not in the hook).
-PUSH_HOOK_FILE, PUSH_FIXTURE_FILE = "ios/App/Playground/PushTapHook.swift", "ios/MayCore/Sources/MayCore/PushTapFixture.swift"
-PUSH_HOOK_MARK = b"CFNotificationCenterGetDarwinNotifyCenter"
+# may-app #1797: a commit holds the trigger when one of its Swift files under ios/ names PUSH_TRIGGER and one listens
+# through Apple's Darwin notify center (PUSH_HOOK_MARK, Apple's own API name). Found by reading the private checkout at
+# run time, so no may-app file is named here (run 42221581609: a fixed path missed where #1797 names the trigger).
+PUSH_HOOK_MARK, MAX_SWIFT_FILES, MAX_SWIFT_BYTES = b"CFNotificationCenterGetDarwinNotifyCenter", 5000, 2 * 1024 * 1024
 NO_PUSH_HOOK = "skipped: the may-app commit has no running push-tap trigger on iOS"
 PUSH_LOOK = ("Look only, for device test {tag}: call hierarchy once, then call done with outcome completed. Do not tap, "
              "type, swipe or go back.")
@@ -818,15 +818,25 @@ PUSH_LOOK_SECONDS = 180
 
 
 def push_hooked(source):
-    """Whether the may-app checkout holds the iOS running push-tap trigger (may-app #1797): MayCore names the trigger
-    and the Playground's hook listens through the Darwin notify center."""
-    def holds(relative, mark):
-        path = source / relative
+    """Whether the may-app checkout holds the iOS running push-tap trigger (may-app #1797): a Swift file under ios/
+    names PUSH_TRIGGER and one listens through the Darwin notify center (at most MAX_SWIFT_FILES files read, none
+    larger than MAX_SWIFT_BYTES, never a link)."""
+    root, named, listening = source / "ios", False, False
+    if root.is_symlink() or not root.is_dir():
+        return False
+    for count, path in enumerate(root.rglob("*.swift")):
+        if count >= MAX_SWIFT_FILES:
+            break
         try:
-            return path.is_file() and not path.is_symlink() and mark in path.read_bytes()
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_SWIFT_BYTES:
+                continue
+            data = path.read_bytes()
         except OSError:
-            return False
-    return holds(PUSH_FIXTURE_FILE, PUSH_TRIGGER.encode()) and holds(PUSH_HOOK_FILE, PUSH_HOOK_MARK)
+            continue
+        named, listening = named or PUSH_TRIGGER.encode() in data, listening or PUSH_HOOK_MARK in data
+        if named and listening:
+            return True
+    return False
 
 
 def shown_in(hierarchy, body):
