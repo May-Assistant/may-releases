@@ -253,3 +253,66 @@ class CheckoutIsTests(unittest.TestCase):
             subprocess.run(git + ["config", "core.fsmonitor", str(hook)], check=True)
             self.assertTrue(prepare.checkout_is(repo, head))
             self.assertFalse(marker.exists(), "the checkout's fsmonitor hook ran")
+
+
+WEB_PIN = "3" * 40
+
+
+class WebPinTests(unittest.TestCase):
+    """prepare.py --web (web-tests-pr.yml alone): also the design system at may-app's web pin, in web/build-deps."""
+
+    def run_prepare(self, web_lock=None, platform="android", target="playground", pull="42", checked_out=None,
+                    planted=False):
+        fetched = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def fake_fetch(dest, remote, sha, key_text, private, label, **options):
+                dest.mkdir()
+                fetched.append((label, sha))
+                if label == "app":
+                    (dest / "ios").mkdir()
+                    (dest / "android").mkdir()
+                    (dest / "web").mkdir()
+                    (dest / "ios/project.yml").write_text(project_yml())
+                    (dest / "android/design-system.lock").write_text(lock_file())
+                    if web_lock is not False:
+                        (dest / "web/design-system.lock").write_text(
+                            web_lock if web_lock is not None else "# A comment, (#249) = no pin\n" + lock_file(WEB_PIN))
+                    if planted:
+                        (dest / "web/build-deps/may-design-system").mkdir(parents=True)
+
+            def fake_head(checkout):
+                return checked_out if checked_out is not None and "web" in str(checkout) else fetched[-1][1]
+
+            with patch.dict(os.environ, {"RUNNER_TEMP": directory, "MAY_APP_READ_KEY": "k", "MAY_DS_READ_KEY": "k"}), \
+                    patch("prepare.fetch", side_effect=fake_fetch), patch("prepare.head_revision", side_effect=fake_head):
+                prepare("a" * 40, platform, target, pull, None, True)
+                record = json.loads((root / "may-private" / DESIGN_SYSTEM_RECORD).read_text())
+                placed = (root / "may-source/web/build-deps/may-design-system").is_dir()
+            return fetched, record, placed
+
+    def test_the_web_pin_is_fetched_into_web_build_deps_and_recorded(self):
+        fetched, record, placed = self.run_prepare()
+        self.assertEqual(fetched, [("app", "a" * 40), ("ds", ANDROID_PIN), ("ds-web", WEB_PIN)])
+        self.assertTrue(placed)
+        self.assertEqual(record["web"], WEB_PIN)
+        self.assertEqual(record["design_system"], PINS)
+
+    def test_a_missing_malformed_or_untrusted_web_pin_fails(self):
+        for case, lock in (("missing", False), ("branch", lock_file("main")),
+                           ("elsewhere", lock_file(WEB_PIN, "https://github.com/someone/may-design-system"))):
+            with self.subTest(case=case), self.assertRaises(PrepareError):
+                self.run_prepare(web_lock=lock)
+
+    def test_a_checkout_other_than_the_web_pin_or_a_planted_path_fails(self):
+        with self.assertRaises(PrepareError):
+            self.run_prepare(checked_out="4" * 40)
+        with self.assertRaises(PrepareError):
+            self.run_prepare(planted=True)
+
+    def test_web_is_for_a_pull_requests_android_playground_fetch_only(self):
+        for platform, target, pull in (("ios", "playground", "42"), ("android", "production", "42"),
+                                       ("android", "playground", None), (None, None, "42")):
+            with self.subTest(platform=platform, target=target, pull=pull), self.assertRaises(PrepareError):
+                self.run_prepare(platform=platform, target=target, pull=pull)
