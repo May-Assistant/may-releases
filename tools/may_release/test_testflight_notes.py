@@ -228,10 +228,15 @@ class WorkflowTests(unittest.TestCase):
         store = (static_check.ROOT / ".github/workflows/store-release-draft.yml").read_text()
         self.assertEqual(static_check.store_problems(store), [])
         self.assertEqual(static_check.testflight_notes_problems(static_check.ROOT), [])
-        condition = "        if: ${{ !cancelled() && steps.testflight_upload.outcome == 'success' }}\n"
+        # The notes step's own condition (the dSYM upload after it has the same one; coordinator, 6 Nov).
+        condition = ("      - name: " + static_check.NOTES_SEND + "\n        # Only after a successful upload; the notes "
+                     "came in the handoff and are never printed, only counted.\n"
+                     "        if: ${{ !cancelled() && steps.testflight_upload.outcome == 'success' }}\n")
         compose = "      - name: " + static_check.NOTES_COMPOSE + "\n"
-        for old, new in ((condition, "        if: ${{ !cancelled() }}\n"),
-                         (condition, ""),
+        bare = "      - name: " + static_check.NOTES_SEND + "\n        # Only after a successful upload; the notes came " \
+            "in the handoff and are never printed, only counted.\n"
+        for old, new in ((condition, bare + "        if: ${{ !cancelled() }}\n"),
+                         (condition, bare),
                          (compose, "      - name: Compose them\n"),
                          ("        run: python3 -I -S -B tools/may_release/testflight_notes.py send",
                           "        run: python3 -I -S -B tools/may_release/testflight_notes.py compose"),

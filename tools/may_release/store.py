@@ -120,6 +120,8 @@ SECRET_NAMES = (
     "MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID",
     "MAY_ARTIFACT_DECRYPT_KEY",
     "MAY_POSTHOG_ANDROID_KEY", "MAY_POSTHOG_IOS_KEY",
+    # The PostHog personal API key that uploads an iOS release's dSYMs (dsym_upload.py alone, after the upload).
+    "MAY_POSTHOG_IOS_SYMBOLS_KEY",
     "MAY_GOOGLE_SERVICES_JSON",
     # The repository secret gate.py reads may-app pull requests with (compile-pr); no tool step may hold it.
     "MAY_APP_PR_READ_TOKEN",

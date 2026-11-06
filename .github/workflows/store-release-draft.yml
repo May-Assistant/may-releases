@@ -446,6 +446,17 @@ jobs:
           MAY_ASC_KEY_ID: ${{ vars.MAY_ASC_KEY_ID }}
           MAY_ASC_ISSUER_ID: ${{ secrets.MAY_ASC_ISSUER_ID }}
         run: python3 -I -S -B tools/may_release/testflight_notes.py send --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
+      - name: Check the checkout is exactly its commit before uploading the dSYMs
+        run: python3 -I -S -B tools/may_release/integrity.py
+      - name: Upload the archive's dSYMs to PostHog, never failing the release
+        # Only after a successful upload, as the notes. It installs the pinned PostHog CLI itself (toolchain.py) and
+        # never fails the release: an unset key skips, and a failed upload is reported.
+        if: ${{ !cancelled() && steps.testflight_upload.outcome == 'success' }}
+        env:
+          MAY_POSTHOG_IOS_SYMBOLS_KEY: ${{ secrets.MAY_POSTHOG_IOS_SYMBOLS_KEY }}
+          MAY_POSTHOG_IOS_PROJECT_ID: ${{ vars.MAY_POSTHOG_IOS_PROJECT_ID }}
+          MAY_POSTHOG_IOS_HOST: ${{ vars.MAY_POSTHOG_IOS_HOST }}
+        run: python3 -I -S -B tools/may_release/dsym_upload.py --target "$MAY_TARGET" --source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"
       - name: Remove task-owned archive, keys and logs
         if: always()
         run: python3 -I -S -B tools/may_release/cleanup.py release

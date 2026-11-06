@@ -22,6 +22,10 @@ was recorded on 2026-10-13:
   https://www.swift.org/keys/all-keys.asc: a good signature from the Swift 6.x Release Signing Key,
   primary key fingerprint 52BB 7E3D E28A 71BE 22EC 05FF EF80 A866 B47A 981F. The pin is that
   archive's SHA-256.
+- posthog-cli 0.18.12 (darwin arm64), recorded on 2026-11-06 for dsym_upload.py (the iOS release's dSYMs): the
+  SHA-256 of https://github.com/PostHog/posthog/releases/download/posthog-cli/v0.18.12/
+  posthog-cli-aarch64-apple-darwin.tar.gz equals the release's own .sha256 file beside it, and the npm package
+  @posthog/cli@0.18.12 (published 2026-10-21) points at that release. No signature is published.
 
 Tools land under $RUNNER_TEMP/may-tools. Scripts call them by absolute path.
 """
@@ -63,6 +67,11 @@ TOOLS = {
         "https://download.swift.org/swift-6.2.4-release/ubuntu2404/swift-6.2.4-RELEASE/"
         "swift-6.2.4-RELEASE-ubuntu24.04.tar.gz",
         "15608c4fa0364ef906014343d81639cf58169e8a40de2b2d3503c3f35a8bb66d", "swift-6.2.4-RELEASE-ubuntu24.04"),
+    # dsym_upload.py uploads an iOS release's dSYMs to PostHog with this exact CLI (macOS release runners alone).
+    ("posthog-cli", "Darwin", "arm64"): (
+        "https://github.com/PostHog/posthog/releases/download/posthog-cli/v0.18.12/"
+        "posthog-cli-aarch64-apple-darwin.tar.gz",
+        "39f4bd1ea864d2335686a7097f85b5003983a906f934c925afe4443bc5384989", "posthog-cli-aarch64-apple-darwin"),
 }
 
 
@@ -119,7 +128,7 @@ def install(name, system=None, machine=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("tool", choices=("jdk", "age", "node", "swift"))
+    parser.add_argument("tool", choices=("jdk", "age", "node", "swift", "posthog-cli"))
     parser.add_argument("--export", action="store_true",
                         help="add to GITHUB_PATH (and JAVA_HOME to GITHUB_ENV); for no-secret jobs only")
     args = parser.parse_args()
