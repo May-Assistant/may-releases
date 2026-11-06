@@ -77,10 +77,7 @@
     "goal": "In May Playground, on the Chats screen, open the chat named {platform} chat {tag}, made for this test; do not open the chat named May or any other chat, and do not use the + button. Chats named for the other platform (Android or iOS) are also listed; never open them. Send this message: Reply with the numbers from 1 to 40, one number a line, tag {tag}. Then wait until May's reply shows its numbers. Then swipe down on the conversation, from x=540 y=900 to x=540 y=1900, four times, so that older messages show and the newest are out of view. Then call done with outcome completed. Do not type, tap or send anything else, and do not open the notification shade.",
     "chat": true,
     "push": "open-chat",
-    "platforms": [
-      "android",
-      "ios"
-    ],
+    "platforms": [],
     "outward": false,
     "server": [],
     "truth": [

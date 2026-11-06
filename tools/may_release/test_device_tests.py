@@ -197,7 +197,7 @@ class ScenarioTests(unittest.TestCase):
     def test_the_committed_list(self):
         ids = [row["id"] for row in device_tests.scenarios()]
         # Onboarding runs last (coordinator, 26 Oct), so its account's time never crowds out chat and notes.
-        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "push-open", "notes", "poll",
+        self.assertEqual(ids, ["sign-in", "sign-out", "connections", "connection-detail", "chat", "notes", "poll",
                                "poll-skip", "routines", "onboarding"])
         self.assertEqual([row["id"] for row in device_tests.scenarios("all", "ios")],
                          ids[:-1] + ["chat-open-from-card", "onboarding"], "both devices run all, and iOS the card row")
@@ -289,7 +289,7 @@ class ScenarioTests(unittest.TestCase):
                           "platform (Android or iOS) are also listed; never open them.", row["goal"])
             self.assertNotIn("start a new chat", row["goal"])
         self.assertEqual([row["id"] for row in device_tests.scenarios() if row.get("chat")],
-                         ["chat", "push-open", "poll", "poll-skip", "routines"])
+                         ["chat", "poll", "poll-skip", "routines"])
 
     def test_goals_follow_their_prototypes_main_path_short_of_any_outward_step(self):
         """Coordinator, 24 Oct: where a flow has a prototype, its scenario follows the main path, so Expected and
@@ -3109,6 +3109,11 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def push_open_row():
+    """The push-open row as committed (off on both devices since 6 Nov), read from the list itself."""
+    return next(r for r in json.loads(device_tests.SCENARIOS.read_text()) if r["id"] == "push-open")
+
+
 class PushOpenChatTests(unittest.TestCase):
     """Coordinator, 6 Nov (#1788, #1794): a chat reply's notification tapped while that chat is open and scrolled up
     scrolls the chat to the reply. Android alone: the debug Playground's DebugPushReceiver posts a real notification."""
@@ -3204,7 +3209,7 @@ class PushOpenChatTests(unittest.TestCase):
         self.assertEqual(device_tests.push_verdict({"reply": False}), (0, False, False))
 
     def test_the_truth_and_the_private_diag_say_fixed_words_alone(self):
-        row = next(r for r in device_tests.scenarios("push-open"))
+        row = push_open_row()
         facts = dict.fromkeys(device_tests.PUSH_FACTS, True)
         facts["before"] = False
         entry = {"server": []}
@@ -3218,11 +3223,13 @@ class PushOpenChatTests(unittest.TestCase):
         self.assertNotIn(self.CHAT, lines)
         self.assertEqual(device_tests.push_lines(None), b"")
 
-    def test_the_row_runs_on_both_with_its_own_chat_and_the_push_truth(self):
-        row = next(r for r in device_tests.scenarios("push-open"))
-        self.assertEqual((row["push"], row["platforms"], row["chat"]), ("open-chat", ["android", "ios"], True))
+    def test_the_row_is_off_on_both_devices_with_its_own_chat_and_the_push_truth(self):
+        """Samuel's call, 6 Nov: its chats and reply notifications reached his phone, for an edge case. Off on both."""
+        row = push_open_row()
+        self.assertEqual((row["push"], row["platforms"], row["chat"]), ("open-chat", [], True))
         self.assertIn(device_tests.PUSH_TRUTH, row["truth"])
-        self.assertEqual([r["id"] for r in device_tests.scenarios("push-open", "ios")], ["push-open"])
+        for platform in ("android", "ios"):
+            self.assertNotIn("push-open", [r["id"] for r in device_tests.scenarios("all", platform)])
         rows = json.loads(device_tests.SCENARIOS.read_text())
         for change in ({"platforms": ["ios"]}, {"push": "other"}, {"truth": [{"delivery": "succeeded"}]}, {"chat": False}):
             with self.subTest(change=change):
@@ -3311,7 +3318,7 @@ class PushReportTests(unittest.TestCase):
     FACTS = dict(dict.fromkeys(device_tests.PUSH_FACTS, True), before=False)  # a tap that passed
 
     def settled(self, **facts):
-        row = next(r for r in device_tests.scenarios("push-open"))
+        row = push_open_row()
         entry = {"server": [], "delivery": ["succeeded", "succeeded"]}
         device_tests.server_reads(row, entry, "https://s", "t", "qa-1-a-push-open", None, None, None,
                                   lambda base, token, tag: ["succeeded", "succeeded"], None, dict(self.FACTS, **facts))
