@@ -464,8 +464,10 @@ class SandboxStaticCheckTests(unittest.TestCase):
         # is today's build.
         text = (static_check.ROOT / ".github/workflows/native-compile-pr.yml").read_text()
         self.assertIn(static_check.COMPILE_PR_SANDBOX_INPUT, text)
-        runner = ("        if: ${{ !inputs.sandbox }}\n        run: " + static_check.COMPILE_IOS_PR_RUNNER + "\n")
-        sandboxed = ("        if: ${{ inputs.sandbox }}\n        run: " + static_check.COMPILE_IOS_PR + "\n")
+        # Each also reads the dispatch's configuration (coordinator, 6 Nov: Release unless dispatched Debug).
+        config = "        env:\n          MAY_IOS_CONFIGURATION: ${{ inputs.configuration }}\n"
+        runner = ("        if: ${{ !inputs.sandbox }}\n" + config + "        run: " + static_check.COMPILE_IOS_PR_RUNNER + "\n")
+        sandboxed = ("        if: ${{ inputs.sandbox }}\n" + config + "        run: " + static_check.COMPILE_IOS_PR + "\n")
         self.assertIn(runner, text)
         self.assertIn(sandboxed, text)
         self.assertEqual(text.count("tools/may_release/compile.py"), 2)

@@ -930,6 +930,13 @@ COMPILE_PR_SANDBOX_INPUT = ("      sandbox:\n"
                             "        description: Temporary (#161) - build as the unprivileged macOS user; the default, "
                             "false, builds as today\n"
                             "        required: false\n        type: boolean\n        default: false\n")
+# The Xcode configuration (coordinator, 6 Nov: may-app #1797 is all #if DEBUG, which a Release build never compiles):
+# Release unless dispatched Debug, on the two compile steps and the post alone (compile.configuration; a Debug result
+# is posted under its own marker, never in place of Release's).
+COMPILE_PR_CONFIG = ("MAY_IOS_CONFIGURATION", "${{ inputs.configuration }}")
+COMPILE_PR_CONFIG_INPUT = ("      configuration:\n        description: [^\n]+\n        required: false\n"
+                           "        type: choice\n        options:\n          - Release\n          - Debug\n"
+                           "        default: Release")
 AGE_INSTALL = "python3 -I -S -B tools/may_release/toolchain.py age"
 COMPILE_PR_TOOL = "python3 -I -S -B tools/may_release/compile_pr_errors.py "
 SEAL_PR = COMPILE_PR_TOOL + 'seal --source-sha "$MAY_SOURCE_SHA"'
@@ -988,7 +995,8 @@ PR_READ_SECRET, PR_COMMENT_SECRET = "MAY_APP_PR_READ_TOKEN", "MAY_APP_PR_COMMENT
 # The native job's result, on the post alone: what it posts when no sealed record reached it (compile_pr_errors.py).
 COMPILE_PR_RESULT = ("MAY_NATIVE_RESULT", "${{ needs.native.result }}")
 COMPILE_PR_ENV = {("GH_TOKEN", "${{ github.token }}"), ("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT, COMPILE_PR_RESULT} | \
+                  ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RECIPIENT, COMPILE_PR_RESULT,
+                  COMPILE_PR_CONFIG} | \
     {(name, "${{ secrets." + name + " }}")
      for name in COMPILE_SECRETS + (PR_READ_SECRET, PR_COMMENT_SECRET, COMPILE_PR_DECRYPT)}
 
@@ -1030,8 +1038,9 @@ def compile_pr_shape_problems(text):
         found.append(name + ": top-level keys are not exactly name, on, permissions, concurrency, jobs")
     trigger = text.partition("\non:\n")[2].partition("\npermissions:")[0]
     if re.findall(r"(?m)^  ([\w-]+):", trigger) != ["workflow_dispatch"] or \
-            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "sandbox"] or \
-            not trigger.endswith("\n" + COMPILE_PR_SANDBOX_INPUT.rstrip("\n")):
+            re.findall(r"(?m)^      ([\w-]+):", trigger) != ["pr_number", "source_sha", "sandbox", "configuration"] or \
+            ("\n" + COMPILE_PR_SANDBOX_INPUT) not in trigger or \
+            not re.search("\n" + COMPILE_PR_CONFIG_INPUT + r"\Z", trigger) or text.count("inputs.configuration") != 3:
         found.append(name + ": is not dispatched with exactly pr_number, source_sha and the sandbox input, false by "
                      "default")
     if "\nconcurrency:\n  group: may-native-compile-pr\n" not in text:
@@ -1083,7 +1092,7 @@ def compile_pr_shape_problems(text):
     recheck = dict(steps["pull"]).get(PULL_STEP_NAMES[0], "")
     swift_recheck, swift_fetch, checks, swift_post, swift_clean = (swift_by_name.get(n, "") for n in SWIFT_STEP_NAMES)
     opener, post, post_clean = (post_by_name.get(n, "") for n in POST_STEP_NAMES[2:])
-    later = build + upload + verdict + clean + swift_clean + post_clean
+    later = upload + verdict + clean + swift_clean + post_clean
     # In each job each secret is bound exactly once: the PR token in the pull request check, so never in admission too
     # (review of #18, M2); the comment token in a post alone, never in the job that compiles (review of #130); the
     # decrypt key in the post job's open alone.
@@ -1096,7 +1105,9 @@ def compile_pr_shape_problems(text):
             any(secrets_in(f) != set(COMPILE_SECRETS) for f in (fetch, swift_fetch)) or \
             any(secrets_in(p) != {PR_COMMENT_SECRET} or "GH_TOKEN" in p for p in (post, swift_post)) or \
             any(secrets_in(r) != {PR_READ_SECRET} for r in (recheck, swift_recheck)) or secrets_in(later) or \
-            "env:" in later or secrets_in(checks) or secrets_in(seal) or \
+            "env:" in later or secrets_in(build) or \
+            any(env_entries(b) != [COMPILE_PR_CONFIG] for b in (runner_build, sandbox_build)) or \
+            secrets_in(checks) or secrets_in(seal) or \
             set(env_entries(checks)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}")} or \
             set(env_entries(seal)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"), COMPILE_PR_RECIPIENT} or \
             secrets_in(opener) != {COMPILE_PR_DECRYPT} or \
@@ -1104,7 +1115,7 @@ def compile_pr_shape_problems(text):
                                          (COMPILE_PR_DECRYPT, "${{ secrets." + COMPILE_PR_DECRYPT + " }}")} or \
             text.count("vars.MAY_RENDERS_RECIPIENT") != 2 or text.count("needs.native.result") != 1 or \
             set(env_entries(post)) != {("MAY_SOURCE_SHA", "${{ inputs.source_sha }}"),
-                                       ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RESULT,
+                                       ("MAY_PR_NUMBER", "${{ inputs.pr_number }}"), COMPILE_PR_RESULT, COMPILE_PR_CONFIG,
                                        (PR_COMMENT_SECRET, "${{ secrets." + PR_COMMENT_SECRET + " }}")} or \
             any(e not in COMPILE_PR_ENV for e in env_entries(text)) or re.search(r"(?m)^(    )?env:", text):
         found.append(name + ": a secret or env entry other than the pull request check's PR token, the fetch step's two "
