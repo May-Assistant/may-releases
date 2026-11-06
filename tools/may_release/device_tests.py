@@ -54,6 +54,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from xml.etree import ElementTree
 import zipfile
 
 # Run as `python3 -I -S -B`: the script folder is not on sys.path, so append it
@@ -356,6 +357,7 @@ def scenarios(selection="all", platform="android"):
                     all(isinstance(c, dict) and (set(c) == {"get"} and c["get"] in TRUTH_PATHS or
                                                  set(c) == {"question"} and c["question"] in QUESTION_STATES or
                                                  c == DELIVERY_TRUTH and "Send this message" in row["goal"] or
+                                                 c == PUSH_TRUTH and row.get("push") == PUSH_ROW or
                                                  set(c) == {"get", "task", "note"} and c["get"] == NOTE_PATH and
                                                  c["task"] == "{tag} task" and NOTE_GOAL in row["goal"] and
                                                  row["goal"].endswith(NOTE_END) and "delete" not in row["goal"].lower() and
@@ -364,6 +366,8 @@ def scenarios(selection="all", platform="android"):
                         for c in row["truth"]) and
                     ("Send this message" in row["goal"]) == (row.get("chat") is True) and
                     ("chat" not in row or CHAT_GOAL in row["goal"] and OTHER_CHATS in row["goal"]) and
+                    ("push" not in row or row["push"] == PUSH_ROW and row.get("chat") is True and
+                     row.get("platforms") == ["android"] and PUSH_TRUTH in row["truth"]) and
                     ("card" not in row or row["card"] is True and row.get("fresh") is True and "chat" not in row and
                      row["truth"] == [] and row.get("platforms") == ["ios"] and CARD_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
@@ -680,7 +684,123 @@ def tidy(minted=mint, tidied=tidy_notes, revoked_by=None):
         raise DeviceTestsError("A task's notes could not be saved")
 
 
-def server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted):
+# Coordinator, 6 Nov (#1788 iOS, #1794 Android): a chat reply's notification tapped while that same chat is open and
+# scrolled up must scroll the chat to the reply. A row with "push": "open-chat" (Android alone: a debug May Playground's
+# DebugPushReceiver posts a real May notification through the app's own push path, MayPush.post, from an adb broadcast,
+# where the iOS simulator never delivers a tap) has its agent open its own chat, get a long reply and scroll up. Then
+# the harness sends PUSH_MESSAGE over the API, waits for May's reply to it, posts that reply's notification (its chat's
+# and its own real ids) through the broadcast, opens the shade and taps it by its title. The truth {"push": "open-chat"}
+# passes when the reply was off screen before the tap and on screen after it; on screen before, it could not be
+# checked. The facts go, in fixed words, to the scenario's private diag alone; no id or text is printed or kept.
+PUSH_ROW, PUSH_TRUTH, PUSH_PATH = "open-chat", {"push": "open-chat"}, "/v1/conversations"
+PUSH_MESSAGE = "{tag} push check. Reply with the word pushed."
+PUSH_ACTION, PUSH_TITLE, PUSH_BODY = "io.github.mayassistant.may.DEBUG_PUSH", "May device test push", \
+    "Replied to your message."
+PUSH_REPLY_SECONDS, PUSH_POLL_SECONDS, PUSH_SETTLE_SECONDS = 120, 5, 4
+PUSH_FACTS = ("reply", "posted", "before", "entry", "tapped", "after")
+
+
+def push_reply(base, token, tag, post=urllib.request.urlopen, get=urllib.request.urlopen, wait=time.sleep,
+               seconds=PUSH_REPLY_SECONDS):
+    """PUSH_MESSAGE sent in the run's own chat (run_chats), keyed by the tag, and May's reply to it waited for:
+    (conversation id, reply id, reply body), or None. Nothing is printed."""
+    status, data = read_json(base, token, "/v1/agents", get)
+    chats = run_chats(data, tag) if status == 200 else []
+    if not chats:
+        return None
+    chat = chats[0]["id"]
+    request = urllib.request.Request(base + f"/v1/conversations/{chat}/messages", method="POST",
+                                     data=json.dumps({"client_message_id": tag + "-push",
+                                                      "body": PUSH_MESSAGE.replace("{tag}", tag)}).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with post(request, timeout=60) as reply:
+            if reply.status not in (200, 202):
+                return None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return None
+    for _ in range(max(1, seconds // PUSH_POLL_SECONDS)):
+        wait(PUSH_POLL_SECONDS)
+        status, messages = chat_messages(base, token, chat, get)
+        sent = next((at for at, message in enumerate(messages) if message.get("author") == "user" and
+                     holds(message, tag) and "push check" in str(message.get("body", ""))), None)
+        if sent is None:
+            continue
+        answer = next((message for message in messages[sent + 1:] if message.get("author") == "may" and
+                       isinstance(message.get("id"), str) and AGENT_ID.fullmatch(message["id"]) and
+                       isinstance(message.get("body"), str) and message["body"].strip()), None)
+        if answer is not None:
+            return chat, answer["id"], answer["body"].strip()
+    return None
+
+
+def shown(xml, body):
+    """Whether a screen (uiautomator's XML) shows the reply: an element whose text starts with its first line."""
+    first = body.splitlines()[0].strip()[:40] if body.strip() else ""
+    try:
+        nodes = ElementTree.fromstring(xml).iter("node")
+    except ElementTree.ParseError:
+        return False
+    return bool(first) and any(str(node.get("text", "")).strip().startswith(first) for node in nodes)
+
+
+def push_tap(adb, reply, wait=time.sleep):
+    """The tap itself, on the emulator, with reply = (conversation id, reply id, reply body): {fact: bool} for each of
+    PUSH_FACTS. The ids go to the broadcast alone; nothing reaches this log."""
+    config = {"adb": str(adb), "serial": SERIAL}
+    facts = dict.fromkeys(PUSH_FACTS, False)
+    facts["reply"] = reply is not None
+    if reply is None:
+        return facts
+    chat, message, body = reply
+    device_mcp.adb(config, "shell", "pm", "grant", APP_ID, "android.permission.POST_NOTIFICATIONS")
+    xml, _ = device_mcp.android_dump(config)
+    facts["before"] = xml is not None and shown(xml, body)
+    status, _ = device_mcp.adb(config, "shell", "am", "broadcast", "-a", PUSH_ACTION, "-p", APP_ID,
+                               "--es", "kind", "chat_reply", "--es", "conversation_id", chat, "--es", "message_id",
+                               message, "--es", "title", f"'{PUSH_TITLE}'", "--es", "body", f"'{PUSH_BODY}'")
+    facts["posted"] = status == 0
+    wait(2)
+    device_mcp.adb(config, "shell", "cmd", "statusbar", "expand-notifications")
+    wait(2)
+    xml, _ = device_mcp.android_dump(config)
+    entry = None
+    if xml is not None:
+        try:
+            entry = next((node for node in ElementTree.fromstring(xml).iter("node")
+                          if str(node.get("text", "")).strip() == PUSH_TITLE), None)
+        except ElementTree.ParseError:
+            entry = None
+    box = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", entry.get("bounds", "")) if entry is not None else None
+    facts["entry"] = box is not None
+    if box:
+        x, y = (int(box[1]) + int(box[3])) // 2, (int(box[2]) + int(box[4])) // 2
+        status, _ = device_mcp.adb(config, "shell", "input", "tap", str(x), str(y))
+        facts["tapped"] = status == 0
+        wait(PUSH_SETTLE_SECONDS)
+        xml, _ = device_mcp.android_dump(config)
+        facts["after"] = xml is not None and shown(xml, body)
+    return facts
+
+
+def push_verdict(facts):
+    """(status, found, unverified) of the push truth from push_tap's facts."""
+    if not facts.get("reply"):
+        return 0, False, False
+    if facts.get("before"):
+        return 200, False, True
+    return 200, all(facts.get(name) for name in ("posted", "entry", "tapped", "after")), False
+
+
+def push_lines(facts):
+    """The push check's section of the private diag, fixed words alone; b"" when the scenario has none."""
+    if not facts:
+        return b""
+    return ("== push tap ==\n" + "\n".join(f"{name}: {'yes' if facts.get(name) else 'no'}" for name in PUSH_FACTS)
+            + "\n").encode()
+
+
+def server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted, pushed=None):
     """A scenario's server reads with its own session, while it lasts, into entry: its plain reads (each expecting a
     status), its delivery codes when it sends May a message, and its truth, every read with the scenario's own tag."""
     for check in row["server"]:
@@ -701,6 +821,12 @@ def server_reads(row, entry, base, token, own, checked, truth, asked, delivered,
         elif check == DELIVERY_TRUTH:
             path, status = "/v1/agents", 0 if codes is None else 200
             found = bool(codes) and all(code == "succeeded" for code in codes)
+        elif check == PUSH_TRUTH:
+            status, found, unverified = push_verdict(pushed or {})
+            if unverified:
+                entry["server"].append({"get": PUSH_PATH, "status": status, "pass": False, "unverified": True})
+                continue
+            path = PUSH_PATH
         elif "note" in check:
             status, state = noted(base, token, check["task"].replace("{tag}", own), check["note"].replace("{tag}", own))
             if state == "beyond":
@@ -1313,7 +1439,7 @@ class Diagnostics:
                 found[match.group(0)] = entry.strip()
         return found
 
-    def keep(self, folder, scenario, token, flow=b"", typing=b""):
+    def keep(self, folder, scenario, token, flow=b"", typing=b"", push=b""):
         """Writes <scenario>.diag.txt when there is anything to keep; never an error. flow: a failed scripted flow's
         last Maestro lines (last_lines), kept first, at most MAX_DIAG // 16. typing: the slow-typing lengths
         (typing_lines), numbers alone, kept next, at most MAX_DIAG // 16."""
@@ -1334,13 +1460,13 @@ class Diagnostics:
         stacks = stacks[:MAX_DIAG // 2]
         failures = [line for line in logcat.splitlines(keepends=True) if NETWORK_TAG.search(line)]
         network = b"".join(failures[:MAX_NETWORK_LINES])[:MAX_DIAG // 8]
-        typing = typing[:MAX_DIAG // 16]
-        room = MAX_DIAG - len(flow) - len(typing) - len(stacks) - len(network) - 160  # the section headers' room
+        typing, push = typing[:MAX_DIAG // 16], push[:MAX_DIAG // 16]
+        room = MAX_DIAG - len(flow) - len(typing) - len(push) - len(stacks) - len(network) - 160  # the headers' room
         logcat = logcat[len(logcat) - room:] if len(logcat) > room else logcat
-        if not (flow or typing or stacks or logcat):
+        if not (flow or typing or push or stacks or logcat):
             return
         # UTF-8 throughout, still within MAX_DIAG once any stray byte is replaced.
-        text = ((b"== maestro flow ==\n" + flow if flow else b"") + typing + stacks +
+        text = ((b"== maestro flow ==\n" + flow if flow else b"") + typing + push + stacks +
                 (b"== network ==\n" + network if network else b"") +
                 (b"== logcat ==\n" + logcat if logcat else b"")).decode("utf-8", "replace").encode()
         text = text[:MAX_DIAG].decode("utf-8", "ignore").encode()
@@ -1920,7 +2046,7 @@ def settle(entry, row, passed, ran=True, timed_out=False):
 def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, asked=question_truth, cleaned=cleanup,
                   agent=device_agent.run_agent, install=device_agent.install, budgeted=None, delivered=None,
                   deleted_by=delete_fresh, calls_left=model_calls_left, diagnosed=None, revoked_by=revoke,
-                  noted=commitment_note, made=open_chat):
+                  noted=commitment_note, made=open_chat, pushed_reply=push_reply):
     delivered = delivered or message_codes
     chosen = scenarios(selection, "android")
     agents, staged = uses(chosen)
@@ -1999,6 +2125,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
 
         while queue:
             row = queue.pop(0)
+            pushed = None
             entry = {"id": row["id"], "title": row["title"], "verdict": "skipped", "videos": [], "screenshots": [],
                      "server": []}
             results.append(entry)
@@ -2098,6 +2225,10 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
                           **steps(row), **slow_typing(row)}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"],
                                            claude[0], claude[1], seconds=agent_seconds(row))
+                if row.get("push") == PUSH_ROW:
+                    at(f"{row['id']}: the notification tap")
+                    pushed = push_tap(adb, pushed_reply(base, token, own) if
+                                      records[row["id"]].get("outcome") == "completed" else None)
             entry["seconds"] = int(time.monotonic() - started)
             at(f"{row['id']}: screenshot, recording and server reads")
             shot = screenshot(adb, env, folder / (row["id"] + "-end.png"), log)
@@ -2106,10 +2237,11 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             # Run 40181517145: iOS read poll's server truth half an hour after its session was minted, behind the
             # recording's conversion, and got 401. The server reads come first, then the diagnostics, and only then
             # the recording's pull (and on iOS its conversion), on both platforms.
-            server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
+            server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted, pushed)
             # After the server reads, which need the session while it lasts: a slow dumpsys costs them nothing.
-            typed = typing_lines(records.get(row["id"]))
-            diagnostics.keep(folder, row["id"], token, flow=flow_lines, **({"typing": typed} if typed else {}))
+            typed, pushed_diag = typing_lines(records.get(row["id"])), push_lines(pushed)
+            diagnostics.keep(folder, row["id"], token, flow=flow_lines, **({"typing": typed} if typed else {}),
+                             **({"push": pushed_diag} if pushed_diag else {}))
             accounts.finish(row, base, token)
             entry["videos"] = recorder.stop(folder)
             settle(entry, row, passed if flow is not None else None, ran=flow_ran(folder, row), timed_out=timed_out)
@@ -2328,6 +2460,8 @@ def truth_lines(row, entry):
             what = "every tagged message this run sent has a succeeded reply"
         elif "note" in check:
             what = "the task titled with the tag holds the goal's note and none of that title is left open"
+        elif check == PUSH_TRUTH:
+            what = "after the harness tapped the notification of May's reply, the chat showed that reply"
         else:
             what = f"an item holding the tag is listed by GET {check['get']}"
         lines.append(what + ": " + ("could not be checked" if read.get("unverified") else
