@@ -3323,7 +3323,11 @@ class PushReportTests(unittest.TestCase):
                                 ({"before": True}, {"verdict": device_tests.UNVERIFIED, "reason": device_tests.PUSH_BEFORE}),
                                 ({"entry": False}, {"verdict": device_tests.UNVERIFIED,
                                                     "reason": device_tests.PUSH_UNDELIVERED}),
+                                # iOS alone: the hook delivered the tap (entry) with its completion off main.
                                 ({"tapped": False}, {"verdict": "fail", "reason": device_tests.PUSH_OFF_MAIN}),
+                                # Android's own tap that did not land: entry false too, so unverified, never a fail.
+                                ({"tapped": False, "entry": False}, {"verdict": device_tests.UNVERIFIED,
+                                                                     "reason": device_tests.PUSH_UNDELIVERED}),
                                 ({"after": False}, {"verdict": "fail", "reason": device_tests.PUSH_NOT_SHOWN})):
             with self.subTest(facts=facts):
                 entry, verdict = self.settled(**facts)
@@ -3346,3 +3350,19 @@ class PushReportTests(unittest.TestCase):
                     else:
                         with self.assertRaises(PublishError):
                             publish.device_report(path, set(), {"push-open": "Push"})
+
+
+class AndroidTapNotLandedTests(PushOpenChatTests):
+    """Review of #210: on Android, tapped is adb's own tap, so one that did not land is the harness's, never May's."""
+
+    def test_an_adb_tap_that_fails_is_undelivered_never_off_main(self):
+        dumps = self.screens()
+
+        def adb(config, *args, **kwargs):
+            return (1, b"") if args[:3] == ("shell", "input", "tap") else (0, b"")
+        with patch.object(device_tests.device_mcp, "adb", adb), \
+                patch.object(device_tests.device_mcp, "android_dump", lambda config: (dumps.pop(0), None)):
+            facts = device_tests.push_tap("/sdk/adb", (self.CHAT, self.REPLY, "Pushed."), wait=lambda s: None)
+        self.assertEqual((facts["entry"], facts["tapped"], facts["after"]), (False, False, False))
+        self.assertEqual(device_tests.push_verdict(facts), (200, False, True))
+        self.assertEqual(device_tests.push_reason(facts), device_tests.PUSH_UNDELIVERED)

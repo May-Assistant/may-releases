@@ -777,6 +777,12 @@ def push_tap(adb, reply, wait=time.sleep):
         x, y = (int(box[1]) + int(box[3])) // 2, (int(box[2]) + int(box[4])) // 2
         status, _ = device_mcp.adb(config, "shell", "input", "tap", str(x), str(y))
         facts["tapped"] = status == 0
+        # On Android a tap is delivered only when adb's own tap landed (review of #210): one that did not is the
+        # harness's, so entry goes false with it and the truth is unverified (PUSH_UNDELIVERED), never a fail. On iOS
+        # entry is the hook's delivered line and tapped its completion_on_main, so PUSH_OFF_MAIN is iOS's alone.
+        facts["entry"] = facts["tapped"]
+        if not facts["tapped"]:
+            return facts
         wait(PUSH_SETTLE_SECONDS)
         xml, _ = device_mcp.android_dump(config)
         facts["after"] = xml is not None and shown(xml, body)
@@ -848,6 +854,8 @@ def push_reason(facts):
         return PUSH_BEFORE
     if not facts.get("entry"):
         return PUSH_UNDELIVERED
+    # entry true with tapped false is iOS's alone (the hook delivered the tap off the main thread): Android's push_tap
+    # sets entry false whenever its own tap did not land.
     if not facts.get("posted") or not facts.get("tapped"):
         return PUSH_OFF_MAIN if facts.get("posted") else PUSH_UNDELIVERED
     if not facts.get("after"):
