@@ -156,6 +156,11 @@ NOTES_SEND = "Set the TestFlight What to test notes on the uploaded build"
 NOTES_IF = "${{ !cancelled() && steps.testflight_upload.outcome == 'success' }}"
 NOTES_SEND_COMMAND = ('python3 -I -S -B tools/may_release/testflight_notes.py send --target "$MAY_TARGET" '
                       '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
+# The dSYM upload (dsym_upload.py; coordinator, 6 Nov): after a successful TestFlight upload alone, as the notes, with
+# the PostHog symbols key alone and the project id and iOS host variables; it never fails the release.
+DSYM_SEND = "Upload the archive's dSYMs to PostHog, never failing the release"
+DSYM_COMMAND = ('python3 -I -S -B tools/may_release/dsym_upload.py --target "$MAY_TARGET" '
+                '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER"')
 # Store workflow: job -> (ordered named steps, {step: exact secrets}, allowed actions).
 STORE_JOBS = {
     "android-build": (
@@ -183,25 +188,26 @@ STORE_JOBS = {
         {FETCH: READ_KEYS, IOS_BUILD: {"MAY_POSTHOG_IOS_KEY"}}, {CHECKOUT, UPLOAD_ARTIFACT}),
     "ios-release": (
         ["Install pinned age", DECRYPT, "Sign and verify internal-TestFlight IPA",
-         "Upload verified IPA for internal TestFlight", CONFIRM, REPORT, NOTES_SEND],
+         "Upload verified IPA for internal TestFlight", CONFIRM, REPORT, NOTES_SEND, DSYM_SEND],
         {DECRYPT: {"MAY_ARTIFACT_DECRYPT_KEY"},
          "Sign and verify internal-TestFlight IPA": {"MAY_IOS_CERT_BASE64", "MAY_IOS_CERT_PASSWORD",
                                                      "MAY_IOS_PROFILE_BASE64"},
          "Upload verified IPA for internal TestFlight": {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"},
-         NOTES_SEND: {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"}},
+         NOTES_SEND: {"MAY_ASC_KEY_BASE64", "MAY_ASC_ISSUER_ID"},
+         DSYM_SEND: {"MAY_POSTHOG_IOS_SYMBOLS_KEY"}},
         {CHECKOUT, DOWNLOAD_ARTIFACT}),
 }
 # In a release job every command is this repository's own Python, with arguments
 # from a safe character set: no ; | & ` ( ) < > { } or newline, so no $( or chaining.
 RELEASE_COMMAND = re.compile(
-    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|sign_only|play_upload|ios_upload|confirm_upload|dry_run|cleanup|integrity|testflight_notes)\.py"
+    r"python3 -I -S -B tools/may_release/(gate|toolchain|handoff|sign|sign_only|play_upload|ios_upload|confirm_upload|dry_run|cleanup|integrity|testflight_notes|dsym_upload)\.py"
     r"( [A-Za-z0-9_./\"$=-]+)*")
 ADMISSION_GATE = ('python3 -I -S -B tools/may_release/gate.py --action "$MAY_PLATFORM" --target "$MAY_TARGET" '
                   '--source-sha "$MAY_SOURCE_SHA" --build-number "$MAY_BUILD_NUMBER" --dry-run "$MAY_DRY_RUN" '
                   '--sign-only "$MAY_SIGN_ONLY"')
 CONTINUE_ON_ERROR = re.compile(r"(?m)^\s*(-\s+)?continue-on-error:")
 VARS = {"MAY_ANDROID_KEY_ALIAS", "MAY_ANDROID_CERT_SHA256", "MAY_PLAY_ACCOUNT", "MAY_ASC_KEY_ID", "MAY_POSTHOG_HOST",
-        "MAY_POSTHOG_IOS_HOST"}
+        "MAY_POSTHOG_IOS_HOST", "MAY_POSTHOG_IOS_PROJECT_ID"}
 INPUTS = {"MAY_TARGET": "target", "MAY_SOURCE_SHA": "source_sha", "MAY_BUILD_NUMBER": "build_number"}
 
 
@@ -659,7 +665,8 @@ def store_problems(store):
         # Each PostHog host variable: only on its own platform's build step (never at job level, on another step or
         # in another job). Neither name contains the other.
         for host_job, (step, _, host) in POSTHOG_BUILD_STEPS.items():
-            allowed_host = job == host_job and [n for n, t in steps if host in t] in ([], [step])
+            allowed_host = job == host_job and [n for n, t in steps if host in t] in ([], [step]) or \
+                job == "ios-release" and host == "MAY_POSTHOG_IOS_HOST" and [n for n, t in steps if host in t] == [DSYM_SEND]
             if host in job_text(store, job) and not (allowed_host and host not in header):
                 found.append(f"store {job}: reads the PostHog host outside the crash-report key's build step")
         # The dry run must still build, seal, open, sign and verify: only the
@@ -690,6 +697,13 @@ def store_problems(store):
                 if condition != NOTES_IF or run_commands(text) != [NOTES_SEND_COMMAND] or \
                         ("          MAY_DRY_RUN: " + DRY_RUN_ENV + "\n") not in text:
                     found.append(f"store {job}: the TestFlight notes are not set only after a successful upload")
+            elif job == "ios-release" and name == DSYM_SEND:
+                if condition != NOTES_IF or run_commands(text) != [DSYM_COMMAND] or set(env_entries(text)) != {
+                        ("MAY_POSTHOG_IOS_SYMBOLS_KEY", "${{ secrets.MAY_POSTHOG_IOS_SYMBOLS_KEY }}"),
+                        ("MAY_POSTHOG_IOS_PROJECT_ID", "${{ vars.MAY_POSTHOG_IOS_PROJECT_ID }}"),
+                        ("MAY_POSTHOG_IOS_HOST", "${{ vars.MAY_POSTHOG_IOS_HOST }}")}:
+                    found.append(f"store {job}: the dSYM upload is not exactly the symbols key's step after a "
+                                 "successful upload")
             elif release and name == REPORT:
                 if condition != REPORT_IF or not run_commands(text) or not run_commands(text)[0].startswith(
                         "python3 -I -S -B tools/may_release/dry_run.py --platform " + platform + " "):
@@ -1902,6 +1916,22 @@ BACKEND_POST_EXIT_CLASSES = {"GateDenial", "BackendPostError", "CompilePrError",
 # from a recorded verdict read_record checked), and integer counts only.
 BACKEND_SUMMARY_VALUES = {"verdict", "name", "WORDS[outcome['stages'][name]]", "int(counts[0])", "int(counts[1])",
                           "int(counts[2])", "int(counts[3])", "int(failed['total'])", "int(failed['typecheck_total'])"}
+
+
+# dsym_upload.py prints only fixed lines, the number of dSYM bundles and the CLI's integer exit status, and never
+# exits non-zero (it never fails the release).
+DSYM_TOOL = "dsym_upload.py"
+DSYM_PRINT_VALUES = {"int(count)", "int(status)"}
+
+
+def dsym_upload_print_problems(root):
+    found = quiet_tool_problems(root, DSYM_TOOL, DSYM_PRINT_VALUES, set())
+    tree = ast.parse((root / "tools/may_release" / DSYM_TOOL).read_text())
+    if any(isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) and called_name(n.exc.func) == "SystemExit"
+           for n in ast.walk(tree)) or any(isinstance(n, ast.Call) and ast.unparse(n.func) in ("sys.exit", "exit", "quit")
+                                           for n in ast.walk(tree)):
+        found.append(DSYM_TOOL + ": exits on its own, which could fail the release")
+    return found
 
 
 def backend_unit_print_problems(root):
@@ -3258,6 +3288,7 @@ def control_problems(root):
     found += android_ci_schedule_tool_problems(root)
     found += backend_unit_workflow_problems((flows / BACKEND).read_text())
     found += backend_unit_print_problems(root)
+    found += dsym_upload_print_problems(root)
     found += backend_unit_silence_problems(root)
     found += web_tests_workflow_problems((flows / WEB).read_text())
     found += web_tests_print_problems(root)

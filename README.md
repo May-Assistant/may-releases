@@ -54,7 +54,7 @@ Confirmed from the repository's Actions secrets page on 2026-10-13. All secrets 
 | --- | --- |
 | `may-native-compile` | `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`; optional `MAY_POSTHOG_ANDROID_KEY` (and variable `MAY_POSTHOG_HOST`) and `MAY_POSTHOG_IOS_KEY` (and variable `MAY_POSTHOG_IOS_HOST`); optional `MAY_GOOGLE_SERVICES_JSON` |
 | `may-android-internal`, `may-android-playground-internal` | `MAY_ANDROID_KEYSTORE_BASE64`, `MAY_ANDROID_KEY_PASSWORD`, `MAY_ANDROID_STORE_PASSWORD`, `MAY_PLAY_JSON`, `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` |
-| `may-ios-internal`, `may-ios-playground-internal` | `MAY_IOS_CERT_BASE64`, `MAY_IOS_CERT_PASSWORD`, `MAY_IOS_PROFILE_BASE64`, `MAY_ASC_KEY_BASE64`, `MAY_ASC_ISSUER_ID`, `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY` |
+| `may-ios-internal`, `may-ios-playground-internal` | `MAY_IOS_CERT_BASE64`, `MAY_IOS_CERT_PASSWORD`, `MAY_IOS_PROFILE_BASE64`, `MAY_ASC_KEY_BASE64`, `MAY_ASC_ISSUER_ID`, `MAY_APP_READ_KEY`, `MAY_DS_READ_KEY`; optional `MAY_POSTHOG_IOS_SYMBOLS_KEY` (and variable `MAY_POSTHOG_IOS_PROJECT_ID`) for the dSYM upload |
 
 Since that check, `MAY_PLAY_JSON` was deleted from `may-android-playground-internal` for the stage-1 dry run and re-added before stage 2's uploads (May Playground build 5 uploaded through the workflow; see [Stage 2](#stage-2-android-uploads-to-the-internal-track-done)).
 
@@ -473,6 +473,15 @@ In the Actions UI, choose **May protected store release (stage 4, Android intern
 - **Steps** (as the other schedules, so no step holds two credentials): `admit` (no environment) checks the trigger, `main` and `may-native-compile-pr`'s policy; `runs` (`GITHUB_TOKEN` alone) reads the store runs; `pick` (`MAY_APP_PR_READ_TOKEN` alone) reads may-app's merged pull requests to find the cut; `dispatch` (`GITHUB_TOKEN`, `actions: write`) sends at most one `workflow_dispatch` of `store-release-draft.yml` on `main` with exactly a platform, `playground`, the cut, a build number, `dry_run=false` and `sign_only=false`.
 - **What is printed:** fixed lines, build numbers and the cut's SHA, which the store run's name carries in public anyway. No may-app title, branch or file name.
 - **Pinned by `static_check.py`:** the workflow with the other schedules (`SCHEDULES`, its own cron in `SCHEDULE_CRONS`), the token mint, `TARGET`, `RUNS_PATH` and the store run name.
+
+### iOS dSYMs to PostHog
+
+After a successful TestFlight upload, `ios-release` uploads the archive's dSYMs to PostHog, so the app's crash reports are symbolicated (coordinator, 6 Nov; `dsym_upload.py`):
+
+- **The step** runs right after the notes, under the same condition (`!cancelled()` and the upload step's outcome `success`), after its own checkout integrity check. It holds the secret `MAY_POSTHOG_IOS_SYMBOLS_KEY` alone, with the variables `MAY_POSTHOG_IOS_PROJECT_ID` and `MAY_POSTHOG_IOS_HOST`; `static_check.py` pins all of it.
+- **The key** is a PostHog *personal* API key with exactly the scopes "error tracking write" and "organization read". The step takes it out of its environment at once and gives it only to the CLI's own environment (`POSTHOG_CLI_API_KEY`, with `POSTHOG_CLI_PROJECT_ID`) and a `HOME` of its own under `may-private`.
+- **The CLI** is PostHog's `posthog-cli` 0.18.12 for macOS arm64, pinned by URL and SHA-256 in `toolchain.py` (checked against the release's own `.sha256`). It is installed by this step, after the key is out of its environment, and run as `posthog-cli --host <app host> dsym upload --directory May.xcarchive/dSYMs`, with no source included. The app host follows the crash-report cloud (`us.i` → `https://us.posthog.com`, `eu.i` → `https://eu.posthog.com`; US when unset). PostHog's CLI also sends its own usage telemetry to PostHog; no switch to turn that off was found.
+- **It never fails the release**: an unset key or project id, a missing archive folder or no dSYM bundle skips with a fixed line; a failed or timed-out upload is reported with the CLI's exit status and still exits 0. The log has fixed lines, the number of dSYM bundles and the exit status alone; the CLI's output goes to a private log.
 
 ### TestFlight "What to test" notes
 
