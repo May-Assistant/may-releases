@@ -367,7 +367,7 @@ def scenarios(selection="all", platform="android"):
                     ("Send this message" in row["goal"]) == (row.get("chat") is True) and
                     ("chat" not in row or CHAT_GOAL in row["goal"] and OTHER_CHATS in row["goal"]) and
                     ("push" not in row or row["push"] == PUSH_ROW and row.get("chat") is True and
-                     row.get("platforms") in (["android"], ["android", "ios"]) and PUSH_TRUTH in row["truth"]) and
+                     row.get("platforms") in ([], ["android"], ["android", "ios"]) and PUSH_TRUTH in row["truth"]) and
                     ("card" not in row or row["card"] is True and row.get("fresh") is True and "chat" not in row and
                      row["truth"] == [] and row.get("platforms") == ["ios"] and CARD_GOAL in row["goal"]) or
                     driver == SMOKE and "flow" not in row and "truth" not in row and
