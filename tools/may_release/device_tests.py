@@ -795,9 +795,10 @@ def push_verdict(facts):
     on iOS), could not be checked; otherwise it passes when the tap was taken and the reply then showed."""
     if not facts.get("reply"):
         return 0, False, False
-    if facts.get("before") or not facts.get("entry"):
+    # Not posted is undelivered too (review of #210): the harness's, never a fail, as PUSH_UNDELIVERED says.
+    if facts.get("before") or not facts.get("entry") or not facts.get("posted"):
         return 200, False, True
-    return 200, all(facts.get(name) for name in ("posted", "tapped", "after")), False
+    return 200, all(facts.get(name) for name in ("tapped", "after")), False
 
 
 # The iOS side (device_ios.push_tap; coordinator, 6 Nov): may-app #1797's debug-only running trigger. The debug
@@ -852,12 +853,12 @@ def push_reason(facts):
         return PUSH_NO_REPLY
     if facts.get("before"):
         return PUSH_BEFORE
-    if not facts.get("entry"):
+    if not facts.get("entry") or not facts.get("posted"):
         return PUSH_UNDELIVERED
     # entry true with tapped false is iOS's alone (the hook delivered the tap off the main thread): Android's push_tap
     # sets entry false whenever its own tap did not land.
-    if not facts.get("posted") or not facts.get("tapped"):
-        return PUSH_OFF_MAIN if facts.get("posted") else PUSH_UNDELIVERED
+    if not facts.get("tapped"):
+        return PUSH_OFF_MAIN
     if not facts.get("after"):
         return PUSH_NOT_SHOWN
     return None

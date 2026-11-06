@@ -3328,6 +3328,8 @@ class PushReportTests(unittest.TestCase):
                                 # Android's own tap that did not land: entry false too, so unverified, never a fail.
                                 ({"tapped": False, "entry": False}, {"verdict": device_tests.UNVERIFIED,
                                                                      "reason": device_tests.PUSH_UNDELIVERED}),
+                                ({"posted": False}, {"verdict": device_tests.UNVERIFIED,
+                                                     "reason": device_tests.PUSH_UNDELIVERED}),
                                 ({"after": False}, {"verdict": "fail", "reason": device_tests.PUSH_NOT_SHOWN})):
             with self.subTest(facts=facts):
                 entry, verdict = self.settled(**facts)
