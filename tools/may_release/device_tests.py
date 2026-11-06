@@ -777,6 +777,12 @@ def push_tap(adb, reply, wait=time.sleep):
         x, y = (int(box[1]) + int(box[3])) // 2, (int(box[2]) + int(box[4])) // 2
         status, _ = device_mcp.adb(config, "shell", "input", "tap", str(x), str(y))
         facts["tapped"] = status == 0
+        # On Android a tap is delivered only when adb's own tap landed (review of #210): one that did not is the
+        # harness's, so entry goes false with it and the truth is unverified (PUSH_UNDELIVERED), never a fail. On iOS
+        # entry is the hook's delivered line and tapped its completion_on_main, so PUSH_OFF_MAIN is iOS's alone.
+        facts["entry"] = facts["tapped"]
+        if not facts["tapped"]:
+            return facts
         wait(PUSH_SETTLE_SECONDS)
         xml, _ = device_mcp.android_dump(config)
         facts["after"] = xml is not None and shown(xml, body)
@@ -789,9 +795,10 @@ def push_verdict(facts):
     on iOS), could not be checked; otherwise it passes when the tap was taken and the reply then showed."""
     if not facts.get("reply"):
         return 0, False, False
-    if facts.get("before") or not facts.get("entry"):
+    # Not posted is undelivered too (review of #210): the harness's, never a fail, as PUSH_UNDELIVERED says.
+    if facts.get("before") or not facts.get("entry") or not facts.get("posted"):
         return 200, False, True
-    return 200, all(facts.get(name) for name in ("posted", "tapped", "after")), False
+    return 200, all(facts.get(name) for name in ("tapped", "after")), False
 
 
 # The iOS side (device_ios.push_tap; coordinator, 6 Nov): may-app #1797's debug-only running trigger. The debug
@@ -829,6 +836,34 @@ def shown_in(hierarchy, body):
                                for line in str(hierarchy or "").splitlines())
 
 
+# The push truth's own reasons (combined), from its facts: never the agenda's or a server read's words.
+PUSH_NO_REPLY = "May did not reply in time to the harness's push-check message, so no notification was tapped"
+PUSH_BEFORE = "the reply already showed before the notification tap (unverified, never a pass)"
+PUSH_UNDELIVERED = "the harness could not deliver the notification tap (unverified, never a pass)"
+PUSH_OFF_MAIN = "the notification tap's completion did not run on the main thread"
+PUSH_NOT_SHOWN = "the chat did not show the reply after the notification tap"
+PUSH_REASONS = (PUSH_NO_REPLY, PUSH_BEFORE, PUSH_UNDELIVERED, PUSH_OFF_MAIN, PUSH_NOT_SHOWN)
+
+
+def push_reason(facts):
+    """Why the push truth did not pass, from its facts (push_verdict's order); None when it passed or has none."""
+    if not isinstance(facts, dict):
+        return None
+    if not facts.get("reply"):
+        return PUSH_NO_REPLY
+    if facts.get("before"):
+        return PUSH_BEFORE
+    if not facts.get("entry") or not facts.get("posted"):
+        return PUSH_UNDELIVERED
+    # entry true with tapped false is iOS's alone (the hook delivered the tap off the main thread): Android's push_tap
+    # sets entry false whenever its own tap did not land.
+    if not facts.get("tapped"):
+        return PUSH_OFF_MAIN
+    if not facts.get("after"):
+        return PUSH_NOT_SHOWN
+    return None
+
+
 def push_lines(facts):
     """The push check's section of the private diag, fixed words alone; b"" when the scenario has none."""
     if not facts:
@@ -859,6 +894,9 @@ def server_reads(row, entry, base, token, own, checked, truth, asked, delivered,
             path, status = "/v1/agents", 0 if codes is None else 200
             found = bool(codes) and all(code == "succeeded" for code in codes)
         elif check == PUSH_TRUTH:
+            # The facts, yes/no alone, in the report too (coordinator, 6 Nov: run 42228230126's sealed diag was not
+            # readable in may-renders, and the generic reasons read as a failed server lookup).
+            entry["push"] = {name: bool((pushed or {}).get(name)) for name in PUSH_FACTS}
             status, found, unverified = push_verdict(pushed or {})
             if unverified:
                 entry["server"].append({"get": PUSH_PATH, "status": status, "pass": False, "unverified": True})
@@ -2364,10 +2402,16 @@ def combined(entry, record, judged, sends=False, look=False):
         return {"verdict": "ui-pass", "reason": UNCONFIGURED}
     # A pass needs the screen and every server read; a read that failed is a fail, one that could not tell is
     # unverified, never a pass (coordinator, 25 Oct).
-    if any(not check["pass"] and not check.get("unverified") for check in entry["server"]):
+    others = [check for check in entry["server"] if check.get("get") != PUSH_PATH or "push" not in entry]
+    pushing = [check for check in entry["server"] if check not in others]
+    if any(not check["pass"] and not check.get("unverified") for check in others):
         return {"verdict": "fail", "reason": NO_TRUTH}
-    if any(check.get("unverified") for check in entry["server"]):
+    if any(not check["pass"] and not check.get("unverified") for check in pushing):
+        return {"verdict": "fail", "reason": push_reason(entry["push"]) or NO_TRUTH}
+    if any(check.get("unverified") for check in others):
         return {"verdict": UNVERIFIED, "reason": NOT_REACHED}
+    if any(check.get("unverified") for check in pushing):
+        return {"verdict": UNVERIFIED, "reason": push_reason(entry["push"]) or NOT_REACHED}
     return {"verdict": "pass", "reason": None}
 
 
