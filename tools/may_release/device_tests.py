@@ -1309,9 +1309,10 @@ class Diagnostics:
                 found[match.group(0)] = entry.strip()
         return found
 
-    def keep(self, folder, scenario, token, flow=b""):
+    def keep(self, folder, scenario, token, flow=b"", typing=b""):
         """Writes <scenario>.diag.txt when there is anything to keep; never an error. flow: a failed scripted flow's
-        last Maestro lines (last_lines), kept first, at most MAX_DIAG // 16."""
+        last Maestro lines (last_lines), kept first, at most MAX_DIAG // 16. typing: the slow-typing lengths
+        (typing_lines), numbers alone, kept next, at most MAX_DIAG // 16."""
         found = []
         for tag in (ANR, CRASH):
             entries = self.entries(tag)
@@ -1329,12 +1330,13 @@ class Diagnostics:
         stacks = stacks[:MAX_DIAG // 2]
         failures = [line for line in logcat.splitlines(keepends=True) if NETWORK_TAG.search(line)]
         network = b"".join(failures[:MAX_NETWORK_LINES])[:MAX_DIAG // 8]
-        room = MAX_DIAG - len(flow) - len(stacks) - len(network) - 160  # the section headers' room
+        typing = typing[:MAX_DIAG // 16]
+        room = MAX_DIAG - len(flow) - len(typing) - len(stacks) - len(network) - 160  # the section headers' room
         logcat = logcat[len(logcat) - room:] if len(logcat) > room else logcat
-        if not (flow or stacks or logcat):
+        if not (flow or typing or stacks or logcat):
             return
         # UTF-8 throughout, still within MAX_DIAG once any stray byte is replaced.
-        text = ((b"== maestro flow ==\n" + flow if flow else b"") + stacks +
+        text = ((b"== maestro flow ==\n" + flow if flow else b"") + typing + stacks +
                 (b"== network ==\n" + network if network else b"") +
                 (b"== logcat ==\n" + logcat if logcat else b"")).decode("utf-8", "replace").encode()
         text = text[:MAX_DIAG].decode("utf-8", "ignore").encode()
@@ -1823,6 +1825,28 @@ def cap(row, default=device_agent.AGENT_SECONDS):
     return agent_seconds(row, default) + onboarding
 
 
+# M and the coordinator, 6 Nov (#1785): device-tests.yml's android_slow_typing makes the Android chat scenario type
+# word by word (device_mcp.slow_type); its private diag gets the field's length after each word, numbers alone.
+SLOW_TYPING, SLOW_SCENARIOS = "MAY_ANDROID_SLOW_TYPING", ("chat",)
+
+
+def slow_typing(row):
+    """The Android device server's slow-typing switch for this row, or nothing."""
+    wanted = os.environ.get(SLOW_TYPING) == "true" and row["id"] in SLOW_SCENARIOS
+    return {device_mcp.SLOW_ENV: "1"} if wanted else {}
+
+
+def typing_lines(record):
+    """The slow-typing section of a scenario's private diag: per type call, the length wanted and the field's length
+    after each word ("?" unread), numbers alone; b"" when the run did not type slowly."""
+    if not isinstance(record, dict) or "typed" not in record:
+        return b""
+    lines = [f"type {n + 1}: wanted {int(entry['want'])}, after each word: " +
+             " ".join("?" if size is None else str(int(size)) for size in entry["after"])
+             for n, entry in enumerate(record["typed"])]
+    return ("== slow typing ==\n" + "\n".join(lines or ["no type call"]) + "\n").encode()
+
+
 def steps(row):
     """The device server's step limit for a row that sets its own (MAY_DEVICE_STEPS), or nothing for the default."""
     return {"MAY_DEVICE_STEPS": str(row["steps"])} if "steps" in row else {}
@@ -2067,7 +2091,7 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             if row["driver"] != "maestro":
                 at(f"{row['id']}: the agent")
                 device = {"MAY_DEVICE_PLATFORM": "android", "MAY_DEVICE_ADB": str(adb), "MAY_DEVICE_SERIAL": SERIAL,
-                          **steps(row)}
+                          **steps(row), **slow_typing(row)}
                 records[row["id"]] = agent(cli, row["goal"], own, device, private / "agent" / row["id"],
                                            claude[0], claude[1], seconds=agent_seconds(row))
             entry["seconds"] = int(time.monotonic() - started)
@@ -2080,7 +2104,8 @@ def run_scenarios(selection, minted=mint, checked=server_check, truth=tagged, as
             # the recording's pull (and on iOS its conversion), on both platforms.
             server_reads(row, entry, base, token, own, checked, truth, asked, delivered, noted)
             # After the server reads, which need the session while it lasts: a slow dumpsys costs them nothing.
-            diagnostics.keep(folder, row["id"], token, flow=flow_lines)
+            typed = typing_lines(records.get(row["id"]))
+            diagnostics.keep(folder, row["id"], token, flow=flow_lines, **({"typing": typed} if typed else {}))
             accounts.finish(row, base, token)
             entry["videos"] = recorder.stop(folder)
             settle(entry, row, passed if flow is not None else None, ran=flow_ran(folder, row), timed_out=timed_out)

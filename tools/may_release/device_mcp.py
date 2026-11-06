@@ -127,6 +127,37 @@ UDID = re.compile(r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}
 BUNDLE = re.compile(r"[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*){2,5}")
 
 
+# M and the coordinator, 6 Nov (#1785): Android chat's sent text was cut or doubled in runs 82 to 84, under adb's
+# fast input text. A control run (device-tests.yml's android_slow_typing, the chat scenario alone) types each word on
+# its own, SLOW_GAP seconds apart, and reads the focused field's length after each: lengths alone, never the text, kept
+# in the result (typed) for the scenario's private diag. Slow input that lands whole points at the app's composer
+# under fast input; slow input that is still cut points at the harness.
+SLOW_ENV, SLOW_GAP, MAX_TYPED, MAX_CHUNKS = "MAY_DEVICE_SLOW_TYPING", 0.3, 20, 60
+
+
+def chunks(text):
+    """text as slow typing sends it: each word with the spaces before it, so the chunks join to exactly text."""
+    return re.findall(r" *[^ ]+| +$", text)
+
+
+def slow_type(config, text):
+    """Types text word by word, SLOW_GAP apart, and records the focused field's length after each word (None when it
+    could not be read): (failed, nothing). Nothing typed is kept, only lengths."""
+    lengths = []
+    for chunk in chunks(text):
+        status, _ = adb(config, "shell", "input", "text", chunk.replace(" ", "%s"))
+        if status:
+            return True
+        time.sleep(SLOW_GAP)
+        xml, _ = android_dump(config)
+        field = None if xml is None else focused_text(xml, raw=True)
+        if len(lengths) < MAX_CHUNKS:
+            lengths.append(None if field is None else len(field))
+    if len(config["typed"]) < MAX_TYPED:
+        config["typed"].append({"want": len(text), "after": lengths})
+    return False
+
+
 def settings(environ):
     result = environ.get("MAY_DEVICE_AGENT_RESULT", "")
     if not result:
@@ -139,7 +170,8 @@ def settings(environ):
         adb, serial = environ.get("MAY_DEVICE_ADB", ""), environ.get("MAY_DEVICE_SERIAL", "")
         if not (adb and re.fullmatch(r"emulator-[0-9]{4}", serial)):
             return None
-        return dict(base, platform="android", adb=adb, serial=serial)
+        return dict(base, platform="android", adb=adb, serial=serial,
+                    **({"slow": True, "typed": []} if environ.get(SLOW_ENV) == "1" else {}))
     if environ.get("MAY_DEVICE_PLATFORM") != "ios":
         return None
     udid, maestro, bundle = (environ.get(name, "") for name in ("MAY_DEVICE_UDID", "MAY_DEVICE_MAESTRO",
@@ -775,6 +807,7 @@ def record(config, outcome, summary):
                        "hierarchy_cause": config.get("hierarchy_cause"), "refusal_cause": config.get("refusal_cause"),
                        **({"wedged": True} if config.get("wedged") else {}),
                        **({"typing_failed": True} if config.get("typing_failed") else {}),
+                       **({"typed": config["typed"]} if config.get("slow") else {}),
                        **({"looks": config["looks"]} if config.get("look") else {})}, output)
         os.replace(partial, config["result"])
     finally:
@@ -856,7 +889,10 @@ def act(name, args, config):
         argv = ["shell", "input", "keyevent", "4"]
     else:
         return True, [{"type": "text", "text": "Those arguments are not allowed for " + name}]
-    status, _ = adb(config, *argv)
+    if name == "type" and config.get("slow"):
+        status = slow_type(config, args["text"])
+    else:
+        status, _ = adb(config, *argv)
     if status:
         return True, [{"type": "text", "text": "The device did not take it"}]
     if name != "type":

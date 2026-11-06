@@ -42,6 +42,11 @@ on:
         required: false
         type: boolean
         default: false
+      android_slow_typing:
+        description: Control run - the Android chat scenario types word by word, 300 ms apart, keeping only the field's lengths privately
+        required: false
+        type: boolean
+        default: false
       tidy_file_taxes:
         description: One-off, instead of the scenarios - remove earlier runs' leftover note lines from the test account's "file taxes" task
         required: false
@@ -139,6 +144,7 @@ jobs:
           MAY_DEVICE_TESTS_FRESH: ${{ vars.MAY_DEVICE_TESTS_FRESH }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MAY_DEVICE_TESTS_MODEL: ${{ vars.MAY_DEVICE_TESTS_MODEL }}
+          MAY_ANDROID_SLOW_TYPING: ${{ inputs.android_slow_typing }}
         run: python3 -I -S -B tools/may_release/device_tests.py run --scenarios "$MAY_SCENARIOS"
       - name: Judge the agent scenarios
         env:
