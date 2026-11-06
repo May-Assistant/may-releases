@@ -36,6 +36,8 @@ The [Android unit-suite workflow](.github/workflows/android-unit-pr.yml) runs ma
 
 The [backend checks workflow](.github/workflows/backend-unit-pr.yml) runs may-app's backend CI (its own `backend-ci.yml` is switched off, because may-app's Actions are blocked by billing) at the head of an open may-app pull request: the pinned Node 22.22.0 against a Postgres 16.15 service container pinned by digest, then `npm ci`, the typecheck, migrations from scratch twice with the ledger check, and `npm test`, on `ubuntu-24.04`, with the same admission, fetch and environment as the Android unit suites (`may-native-compile-pr`). It publishes only each stage's pass or fail and the test, pass, failure and skip counts; the failures go only to the may-app pull request (see [Backend checks at a pull request head](#backend-checks-at-a-pull-request-head)). [`backend-ci-schedule.yml`](.github/workflows/backend-ci-schedule.yml) dispatches it every 15 minutes for one open may-app head that touches `backend/` (see [Backend checks on a schedule](#backend-checks-on-a-schedule)).
 
+The [web checks workflow](.github/workflows/web-tests-pr.yml) checks may-app's `web/` at the head of an open may-app pull request: the design system at its web pin (`npm run fetch-ds`), `npm ci`, `npx vitest run` and `npm run build`, with the same admission, fetch and environment as the backend checks. It publishes only each stage's pass or fail and the test counts; the failures go only to the may-app pull request (see [Web checks at a pull request head](#web-checks-at-a-pull-request-head)).
+
 The [iOS core suite workflow](.github/workflows/ios-core-pr.yml) builds and tests may-app's `ios/MayCore` package (Foundation only) on `ubuntu-24.04` with the pinned, checksum-verified Swift 6.2.4, at the head of an open may-app pull request, with the same admission, fetch and environment as the iOS compile's Linux Swift checks (`may-native-compile-pr`). It publishes only pass or fail and XCTest's counts; the failures go only to the may-app pull request (see [iOS core suite at a pull request head](#ios-core-suite-at-a-pull-request-head)).
 
 The [design-system Swift compile workflow](.github/workflows/ds-swift-compile.yml) compiles may-design-system's Swift package at the head of an open may-design-system pull request and posts its compile errors on that pull request, never in this log, in its own environment `may-ds-renders`. It needs no approval, and it is not usable until Samuel creates that environment's secrets (see [Design-system Swift compile of a pull request head](#design-system-swift-compile-of-a-pull-request-head)).
@@ -673,6 +675,34 @@ gh workflow run backend-unit-pr.yml -f pr_number=<may-app PR number> -f source_s
 - **One run per head**, as the Android schedule: a head with a backend run in the last 30 days is skipped, whatever its result; dispatch `backend-unit-pr.yml` by hand to run it again. A new push is a new head.
 - **What is printed:** fixed lines, counts, and the picked number and head SHA, which `backend-unit-pr.yml`'s run name makes public anyway. Only the number and SHA are carried between steps, in `$RUNNER_TEMP/may-backend-ci`, which is always removed.
 - **Threat model:** the Android schedule's, unchanged. `control_dispatch` refuses any path but `actions/workflows/backend-unit-pr.yml/dispatches`, any ref but `main` and any input but a pull request number and an exact SHA, before it sends anything; `static_check.py` pins that it is the tool's only request with a body or method, and that the tool reads may-app only through `android_ci_schedule.app_get`.
+
+### Web checks at a pull request head
+
+`web-tests-pr.yml` checks may-app's `web/` on an open may-app pull request, because may-app's own Actions are blocked by billing. It runs the web app's own commands: the design system at its web pin, `npm ci`, `npx vitest run` and `npm run build`.
+
+```
+gh workflow run web-tests-pr.yml -f pr_number=<may-app PR number> -f source_sha=<that PR's current head SHA> --repo May-Assistant/may-releases --ref main
+```
+
+- **Admission, pull request check and fetch** are the backend checks': `gate.py --action compile-pr` (`may-native-compile-pr`), then `--check-pull` with `MAY_APP_PR_READ_TOKEN`, then `prepare.py --platform android --target playground --pr-number` with the two read-only deploy keys, plus `--web`. `--web` also fetches the design system at `web/design-system.lock`'s revision (checked for form and trust like the Android lock; it may be ahead of the native pins, since its web-only components never move them) into `web/build-deps/may-design-system`, and records it as `web` beside the native pins. **No new environment, secret or variable is needed.**
+- **The job** runs on `ubuntu-24.04` and times out at 50 minutes. `toolchain.py node` installs the pinned Node 22.22.0, which `web/package.json`'s `engines` allow. There's no `actions/setup-node` and no Actions cache: npm's cache is a folder under `$RUNNER_TEMP`.
+- **The stages** (`web_tests.py`, no secret and no `GH_TOKEN`), in order:
+  1. **toolchain**: Node is exactly `v22.22.0` and npm runs.
+  2. **design-system**: `npm run fetch-ds`, which is may-app's own `fetch-design-system.sh`. The pin is already checked out, so the script fetches nothing. It checks the checkout is exactly the pin and clean, then builds the design system's web library. A failure stops the stages after it.
+  3. **install**: `npm ci --no-audit --no-fund` in `web/`. A failure stops the stages after it.
+  4. **tests**: `npx --no-install vitest run`, with vitest's json reporter writing to a private file. The stage fails on a failing test, on a test file that didn't load, on no tests at all, or on a non-zero exit.
+  5. **build**: `npm run build` (`tsc --noEmit`, the Vite builds, the landing prerender and `check-build.mjs`). It runs even when tests failed, so one red stage doesn't hide another.
+- **What is published:** one line per stage, `May web <stage>: passed|failed|did not finish in time|did not run (…)`, and one line of counts, `May web tests: <n> tests, <n> passed, <n> failed, <n> skipped`, from vitest's json report (skipped counts pending and todo). No test name, message, path or log line. The cleanup always removes the source, both design-system checkouts, the private logs, npm's cache and the pinned Node.
+- **The failures go to the pull request, never here.** The record holds:
+  - each failing test's full name, the first line of its error and its file;
+  - each test file that didn't load;
+  - `tsc`'s errors from the build;
+  - for a failed stage with neither, its last 40 log lines.
+
+  `web_tests_post.py` works like `backend_unit_post.py`. It posts once per head (marker `may-web-tests-pr`) with `MAY_APP_PR_COMMENT_TOKEN` alone, prints only fixed lines, the pull request number and two counts, and fails the job when the checks failed.
+- **Pinned by `static_check.py`:** the whole workflow (`web_tests_workflow_problems`) and the output lint of both tools (`web_tests_print_problems`).
+- **Residual risk:** the backend checks', unchanged. `npm ci` runs install scripts, and the pull request's own tests and build run on a runner whose job holds the deploy keys and the read token, each in its own step.
+- **Run name:** `May web checks for may-app #<number> at <head SHA>`. There is no schedule yet; dispatch it by hand.
 
 ### iOS core suite at a pull request head
 

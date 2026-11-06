@@ -19,6 +19,12 @@ may render with a may-design-system commit other than may-app's pin. That commit
 must be in the history of may-design-system's main or claude/may-integration
 (DS_BASES); project.yml is pointed at a checkout of it, and the record names it as
 the iOS revision. Renders are evidence for a review, never a store build.
+
+The web checks (--web, web-tests-pr.yml alone, with --platform android --target playground and --pr-number) also
+fetch the design system at may-app's web pin (web/design-system.lock, which may be ahead of Android's: its web-only
+components never move the native pins), into web/build-deps/may-design-system, where may-app's own
+web/scripts/fetch-design-system.sh expects it. That script then finds the exact pin checked out and fetches nothing.
+The web pin is checked for form and trust like the Android lock, and recorded beside the native pins as "web".
 """
 
 import argparse
@@ -80,6 +86,15 @@ def pins(ios_project, android_lock, platform=None, target=None):
         raise PrepareError("Android design-system pin is malformed or untrusted")
     record = design_system_pins({"ios": match.group(1), "android": lock["revision"]}, platform, target)
     return record, match.group(0)
+
+
+def web_pin(web_lock):
+    """may-app's web design-system pin (web/design-system.lock), well-formed and trusted, as the Android lock."""
+    lock = dict(line.split("=", 1) for line in web_lock.splitlines() if "=" in line and not line.startswith("#"))
+    if (lock.get("repository") not in (DS_URL, DS_URL + ".git") or
+            not re.fullmatch(r"[0-9a-f]{40}", lock.get("revision") or "")):
+        raise PrepareError("Web design-system pin is malformed or untrusted")
+    return lock["revision"]
 
 
 def head_revision(checkout):
@@ -195,7 +210,7 @@ def head_of(checkout, ref, env):
     return result.stdout.decode().strip() if not result.returncode else ""
 
 
-def prepare(source_sha, platform=None, target=None, pull=None, ds_sha=None):
+def prepare(source_sha, platform=None, target=None, pull=None, ds_sha=None, web=False):
     """Fetch the exact app commit and the design system pinned for `platform`.
 
     With a platform and target (a store build), only that platform's pin is
@@ -208,6 +223,8 @@ def prepare(source_sha, platform=None, target=None, pull=None, ds_sha=None):
         raise PrepareError("Platform and target must be given together")
     if ds_sha is not None and (platform, target) != ("ios", "playground"):
         raise PrepareError("A design-system override is for the iOS Playground renders only")
+    if web and ((platform, target) != ("android", "playground") or pull is None or ds_sha is not None):
+        raise PrepareError("The web design system is for a pull request's web checks only")
     root = private_runner_root()
     private = root / "may-private"
     private.mkdir(mode=0o700)
@@ -246,10 +263,31 @@ def prepare(source_sha, platform=None, target=None, pull=None, ds_sha=None):
     if platform != "android" and revision == record["ios"]:
         project = project_path.read_text()
         project_path.write_text(project.replace(old_spec, "  MayDesignSystem:\n    path: " + str(ds_local), 1))
-    write_private(private / DESIGN_SYSTEM_RECORD,
-                  json.dumps({"platform": platform, "target": target, "source_sha": source_sha,
-                              "design_system": record}, sort_keys=True).encode())
+    written = {"platform": platform, "target": target, "source_sha": source_sha, "design_system": record}
+    if web:
+        written["web"] = prepare_web(root, source, private)
+    write_private(private / DESIGN_SYSTEM_RECORD, json.dumps(written, sort_keys=True).encode())
     print("Exact private May app and design-system sources prepared on protected runner")
+
+
+def prepare_web(root, source, private):
+    """Fetch the design system at may-app's web pin into web/build-deps/may-design-system; returns the pin."""
+    lock_path = source / "web/design-system.lock"
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise PrepareError("Web design-system pin is malformed or untrusted")
+    revision = web_pin(lock_path.read_text())
+    checkout = root / "may-web-design-system"
+    fetch(checkout, DS, revision, os.environ.get("MAY_DS_READ_KEY", ""), private, "ds-web")
+    local = source / "web/build-deps/may-design-system"
+    if local.exists() or local.is_symlink() or local.parent.is_symlink():
+        raise PrepareError("Web design-system build path already exists")
+    if not local.parent.resolve().is_relative_to(source.resolve()):
+        raise PrepareError("Web design-system build path escapes private source")
+    local.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(checkout), str(local))
+    if head_revision(local) != revision:
+        raise PrepareError("Web design-system checkout is not the web pin")
+    return revision
 
 
 if __name__ == "__main__":
@@ -262,8 +300,10 @@ if __name__ == "__main__":
     parser.add_argument("--pr-number")
     # The iOS renders alone: a may-design-system commit to render with instead of may-app's iOS pin.
     parser.add_argument("--ds-sha")
+    # The web checks alone (web-tests-pr.yml): also the design system at may-app's web pin.
+    parser.add_argument("--web", action="store_true")
     args = parser.parse_args()
     try:
-        prepare(args.source_sha, args.platform, args.target, args.pr_number, args.ds_sha or None)
+        prepare(args.source_sha, args.platform, args.target, args.pr_number, args.ds_sha or None, args.web)
     except (PrepareError, StoreError, OSError, subprocess.SubprocessError):
         raise SystemExit("Private May source preparation failed; no source or credential was printed") from None
