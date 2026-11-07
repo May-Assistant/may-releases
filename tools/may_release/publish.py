@@ -116,6 +116,11 @@ DOWNLOAD, TREE = "may-renders-download/renders.age", "may-publish-tree"
 # The render job's upload's artifact id, set when it handed sealed renders over (ios-renders.yml, run 41068959429).
 HANDED = "MAY_RENDERS_HANDED"
 MARKER = "may-ios-renders"
+# Android renders (android-renders.yml, android_renders.py): the same run folder layout as iOS's, published under
+# ANDROID_PREFIX in may-renders, so never in place of an iOS folder; the render job's test outcome, a fixed word, comes
+# as MAY_RENDERS_TESTS for the pull request comment, which has its own marker.
+ANDROID_PREFIX, ANDROID_MARKER, TESTS, TEST_WORDS = "android-renders/", "may-android-renders", "MAY_RENDERS_TESTS", \
+    ("passed", "failed", "timeout")
 AUTHOR = ("-c", "user.name=May renders", "-c", "user.email=renders@may-releases.invalid")
 README = ("# May parity renders and device tests\n\nWritten by may-releases, never by hand.\n\n"
           "- ios-renders.yml: one folder per may-app commit (its first 12 hex digits), the newest " + str(KEEP) +
@@ -249,6 +254,26 @@ def extract(archive, members, destination):
 
 
 def open_renders(sha):
+    pngs = open_sealed(sha)
+    if pngs is None:
+        print("May iOS renders: no sealed renders from this run attempt; nothing will be published")
+        return
+    folder = folder_of(sha)
+    print(f"May iOS renders decrypted and checked: run folder {folder}/ with {pngs} images")
+
+
+def open_android(sha):
+    pngs = open_sealed(sha)
+    if pngs is None:
+        print("May Android renders: no sealed renders from this run attempt; nothing will be published")
+        return
+    folder = folder_of(sha)
+    print(f"May Android renders decrypted and checked: run folder {folder}/ with {pngs} images")
+
+
+def open_sealed(sha):
+    """The render job's sealed run folder, decrypted and checked into TREE: how many images, or None when this run
+    attempt sealed nothing."""
     require_step_secrets((DECRYPT_KEY,))
     folder = folder_of(sha)
     lines = [l.strip() for l in os.environ.pop(DECRYPT_KEY, "").splitlines() if l.strip() and not l.startswith("#")]
@@ -261,8 +286,7 @@ def open_renders(sha):
         if os.environ.get(HANDED, "").strip():
             raise PublishError("The render job handed over sealed renders, but they did not reach this job; nothing "
                                "was published")
-        print("May iOS renders: no sealed renders from this run attempt; nothing will be published")
-        return
+        return None
     recipient = os.environ.get(RECIPIENT, "").strip()
     if not AGE_RECIPIENT.fullmatch(recipient):
         raise PublishError("MAY_RENDERS_RECIPIENT is not set to an age public key in may-ios-renders")
@@ -284,8 +308,7 @@ def open_renders(sha):
         raise PublishError("The renders are not a readable archive") from None
     finally:
         plain.unlink(missing_ok=True)
-    pngs = sum(1 for _ in (tree / folder).rglob("*.png"))
-    print(f"May iOS renders decrypted and checked: run folder {folder}/ with {pngs} images")
+    return sum(1 for _ in (tree / folder).rglob("*.png"))
 
 
 def decrypt(sealed, plain, identity, recipient, private):
@@ -460,6 +483,25 @@ def push(sha, pr=None, run_git=git):
     entry = {"folder": folder, "source_sha": sha, "pull": number, "run": run_id()}
     kept, removed, _ = publish_tree(tree, "", folder, entry, f"Renders of may-app {sha}", key_text, run_git)
     print(f"May iOS renders published to may-renders as {folder}/ ({len(kept)} run folders kept, "
+          f"{len(removed)} removed)")
+
+
+def push_android(sha, pr=None, run_git=git):
+    require_step_secrets((WRITE_KEY,))
+    folder = folder_of(sha)
+    key_text = write_key()
+    tree = runner_root() / TREE / folder
+    if not tree.is_dir():
+        print("May Android renders: nothing was decrypted, so nothing was pushed")
+        return
+    if not key_text:
+        print("May Android renders: MAY_APP_RENDERS_WRITE_KEY is not set; nothing was pushed")
+        return
+    number = pull_number(pr) if pr is not None else None
+    entry = {"folder": folder, "source_sha": sha, "pull": number, "run": run_id()}
+    kept, removed, _ = publish_tree(tree, ANDROID_PREFIX, folder, entry, f"Android renders of may-app {sha}", key_text,
+                                    run_git)
+    print(f"May Android renders published to may-renders as android-renders/{folder}/ ({len(kept)} run folders kept, "
           f"{len(removed)} removed)")
 
 
@@ -845,6 +887,53 @@ def comment_body(sha, folder, images, url):
     return "\n".join(lines) + f"\n\n<!-- {MARKER} head={sha} -->" + FOOTER
 
 
+def android_comment_body(sha, folder, images, tests, url):
+    """The Android renders' comment on the private pull request: the tests' outcome, the count and the links."""
+    base = f"https://github.com/{RENDERS_REPO}/tree/{BRANCH}/{ANDROID_PREFIX}{folder}"
+    lines = [f"**Android renders** for {sha}: tests {tests}, {images} images.", "",
+             f"- Renders: https://github.com/{RENDERS_REPO}/blob/{BRANCH}/{ANDROID_PREFIX}{folder}/README.md",
+             f"- Run folder: {base}",
+             f"- Build log (its tail): https://github.com/{RENDERS_REPO}/blob/{BRANCH}/{ANDROID_PREFIX}{folder}/build.log"]
+    if url:
+        lines += ["", f"Run: {url}"]
+    return "\n".join(lines) + f"\n\n<!-- {ANDROID_MARKER} head={sha} -->" + FOOTER
+
+
+def android_comment(sha, pr, call_api=github):
+    require_step_secrets((COMMENT_TOKEN,))
+    token = os.environ.pop(COMMENT_TOKEN, "")
+    folder = folder_of(sha)
+    if pr is None:
+        print("May Android renders: not a pull request's renders; no comment posted")
+        return
+    number = pull_number(pr)
+    tree = runner_root() / TREE / folder
+    if not tree.is_dir():
+        print("May Android renders: nothing was published, so no comment posted")
+        return
+    if not token:
+        print("May Android renders: comment skipped: no token (MAY_APP_PR_COMMENT_TOKEN is not set)")
+        return
+    if len(token) < 20:
+        raise PublishError("The may-app comment token is malformed (MAY_APP_PR_COMMENT_TOKEN); nothing was posted")
+    tests = os.environ.get(TESTS, "").strip()
+    tests = tests if tests in TEST_WORDS else "unknown"
+    body = android_comment_body(sha, folder, sum(1 for _ in tree.rglob("*.png")), tests, run_url(os.environ))
+    if len(body) > MAX_BODY or holds(body, token):
+        raise PublishError("The comment is too long or holds a credential; nothing was posted")
+    status, pull = call_api("GET", f"/repos/{APP_REPO}/pulls/{number}", None, token)
+    if status != 200:
+        raise PublishError("The may-app pull request could not be read again; nothing was posted")
+    try:
+        validate_pull_request(pull, number, sha)
+    except GateDenial:
+        raise PublishError("The pull request is no longer open at the rendered head; nothing was posted") from None
+    if post_once(call_api, APP_REPO, number, sha, body, token, ANDROID_MARKER, comment_author(os.environ)):
+        print(f"May Android renders linked on may-app #{number}")
+    else:
+        print(f"May Android renders already linked for this head on may-app #{number}; nothing posted again")
+
+
 def comment(sha, pr, call_api=github):
     require_step_secrets((COMMENT_TOKEN,))
     token = os.environ.pop(COMMENT_TOKEN, "")
@@ -880,7 +969,8 @@ def comment(sha, pr, call_api=github):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("open", "push", "comment", "device-open", "device-push", "device-release"))
+    parser.add_argument("command", choices=("open", "push", "comment", "device-open", "device-push", "device-release",
+                                            "android-open", "android-push", "android-comment"))
     parser.add_argument("--source-sha")
     parser.add_argument("--pr-number")
     args = parser.parse_args()
@@ -891,6 +981,12 @@ if __name__ == "__main__":
             push_device()
         elif args.command == "device-release":
             release_device()
+        elif args.command == "android-open":
+            open_android(args.source_sha)
+        elif args.command == "android-push":
+            push_android(args.source_sha, args.pr_number or None)
+        elif args.command == "android-comment":
+            android_comment(args.source_sha, args.pr_number or None)
         elif args.command == "open":
             open_renders(args.source_sha)
         elif args.command == "push":
