@@ -120,6 +120,38 @@ class PostTests(unittest.TestCase):
         self.assertEqual(len(self.posted()), 1)
         self.assertIn(SECRET_TEXT, self.posted()[0])
 
+    def test_preview_result_posts_only_from_the_main_web_workflow(self):
+        self.write(*recorded("passed", []))
+        preview = pull(base={"ref": "codex/may-web-preview", "repo": {"full_name": "May-Assistant/may-app"}})
+        workflow = "May-Assistant/may-releases/.github/workflows/web-tests-pr.yml@refs/heads/main"
+        self.assertEqual(self.post(self.api(preview), extra={"GITHUB_WORKFLOW_REF": workflow})[0], 0)
+        self.assertEqual(len(self.posted()), 1)
+        for ref in [None, workflow.replace("refs/heads/main", "refs/heads/feature"),
+                    workflow.replace("web-tests-pr.yml", "backend-unit-pr.yml")]:
+            with self.subTest(ref=ref):
+                self.calls = []
+                with self.assertRaises(WebPostError):
+                    self.post(self.api(preview), extra={"GITHUB_WORKFLOW_REF": ref} if ref else {})
+                self.assertEqual(self.posted(), [])
+
+    def test_preview_result_retains_exact_head_open_repo_and_base_checks(self):
+        workflow = "May-Assistant/may-releases/.github/workflows/web-tests-pr.yml@refs/heads/main"
+        for changes in [
+            {"head": {"sha": OTHER, "ref": "f", "repo": {"full_name": "May-Assistant/may-app"}}},
+            {"state": "closed"},
+            {"head": {"sha": SHA, "ref": "f", "repo": {"full_name": "someone/may-app"}}},
+            {"base": {"ref": "feature", "repo": {"full_name": "May-Assistant/may-app"}}},
+            {"base": {"ref": "codex/may-web-preview", "repo": {"full_name": "someone/may-app"}}},
+        ]:
+            with self.subTest(changes=changes):
+                preview = pull(base={"ref": "codex/may-web-preview", "repo": {"full_name": "May-Assistant/may-app"}}, **{k:v for k,v in changes.items() if k != "base"})
+                if "base" in changes:
+                    preview["base"] = changes["base"]
+                self.calls = []
+                with self.assertRaises(WebPostError):
+                    self.post(self.api(preview), extra={"GITHUB_WORKFLOW_REF": workflow})
+                self.assertEqual(self.posted(), [])
+
     def test_a_pass_is_posted_and_passes(self):
         self.write(*recorded("passed", []))
         self.assertEqual(self.post(self.api()), (0, "May web checks passed; result posted to may-app #42\n"))
