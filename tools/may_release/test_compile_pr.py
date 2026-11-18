@@ -94,6 +94,48 @@ class FakeResponse(io.BytesIO):
 class AdmissionCommandTests(unittest.TestCase):
     """gate.py's CLI for compile-pr, with GitHub's API answered by a fake."""
 
+    def test_preview_is_admitted_only_by_the_main_web_workflow(self):
+        value = pull(base__ref="codex/may-web-preview")
+        env = {"GITHUB_WORKFLOW_REF": "May-Assistant/may-releases/.github/workflows/web-tests-pr.yml@refs/heads/main"}
+        denial, _, written = self.run_gate(self.CHECK + ["--web-preview"], self.answers(value), env)
+        self.assertIsNone(denial)
+        self.assertIn("may-native-compile-pr", written)
+        denial, _, written = self.run_gate(self.CHECK, self.answers(value), env)
+        self.assertIsNotNone(denial)
+        self.assertEqual(written, "")
+
+    def test_preview_option_refuses_other_workflows_before_any_metadata_read(self):
+        for ref in [None, "May-Assistant/may-releases/.github/workflows/backend-unit-pr.yml@refs/heads/main",
+                    "May-Assistant/may-releases/.github/workflows/web-tests-pr.yml@refs/heads/feature"]:
+            with self.subTest(ref=ref):
+                denial, seen, written = self.run_gate(self.CHECK + ["--web-preview"], self.answers(pull()),
+                                                    {"GITHUB_WORKFLOW_REF": ref})
+                self.assertIsNotNone(denial)
+                self.assertEqual((seen, written), ([], ""))
+
+    def test_preview_option_refuses_other_actions_even_from_the_web_workflow(self):
+        workflow = "May-Assistant/may-releases/.github/workflows/web-tests-pr.yml@refs/heads/main"
+        for action in ["compile", "ds-compile", "renders", "device-tests", "ios", "android"]:
+            with self.subTest(action=action), self.assertRaises(GateDenial):
+                gate.validate_web_preview_route(action, True, workflow)
+
+    def test_preview_route_keeps_exact_head_same_repo_open_and_base_checks(self):
+        env = {"GITHUB_WORKFLOW_REF": "May-Assistant/may-releases/.github/workflows/web-tests-pr.yml@refs/heads/main"}
+        for changes in [{"base__ref": "feature"}, {"base__repo__full_name": "someone/may-app"},
+                        {"head__repo__full_name": "someone/may-app"}, {"head__sha": OTHER}, {"state": "closed"}]:
+            with self.subTest(changes=changes):
+                value = pull(base__ref="codex/may-web-preview")
+                for path, new in changes.items():
+                    node = value
+                    *parents, leaf = path.split("__")
+                    for key in parents:
+                        node = node[key]
+                    node[leaf] = new
+                denial, seen, written = self.run_gate(self.CHECK + ["--web-preview"], self.answers(value), env)
+                self.assertIsNotNone(denial)
+                self.assertEqual(written, "")
+                self.assertFalse([url for url, _ in seen if "/environments/" in url])
+
     def run_gate(self, args, answers, env=None):
         seen = []
 

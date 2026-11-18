@@ -2354,7 +2354,8 @@ WEB_POST = ('python3 -I -S -B tools/may_release/web_tests_post.py --source-sha "
 WEB_CLEANUP = ('rm -rf -- "$RUNNER_TEMP/may-source" "$RUNNER_TEMP/may-design-system" '
                '"$RUNNER_TEMP/may-web-design-system" "$RUNNER_TEMP/may-private" "$RUNNER_TEMP/may-npm" '
                '"$RUNNER_TEMP/may-tools"')
-WEB_RUNS = [GATE_COMPILE_PR, BACKEND_NODE, GATE_CHECK_PULL, PREPARE_WEB_PR, WEB_RUN, WEB_POST, WEB_CLEANUP]
+WEB_RUNS = [GATE_COMPILE_PR + " --web-preview", BACKEND_NODE, GATE_CHECK_PULL + " --web-preview",
+            PREPARE_WEB_PR, WEB_RUN, WEB_POST, WEB_CLEANUP]
 WEB_STEP_NAMES = ["Install the pinned, checksum-verified Node",
                   "Check the pull request head and environment before fetching",
                   "Fetch the pull request head and the web design-system pin quietly",

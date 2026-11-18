@@ -230,15 +230,26 @@ def pull_number(value):
     return int(value)
 
 
-def validate_pull_request(pull, number, sha):
+def validate_web_preview_route(action, enabled, workflow_ref):
+    if enabled and (action != "compile-pr" or workflow_ref !=
+                    "May-Assistant/may-releases/.github/workflows/web-tests-pr.yml@refs/heads/main"):
+        raise GateDenial("Preview admission is only available to the main web-check workflow")
+    return enabled
+
+
+def validate_pull_request(pull, number, sha, *, web_preview=False):
     """The may-app pull request (GET /repos/May-Assistant/may-app/pulls/{number}) is open, against
-    may-app's main, from may-app itself, and its head is exactly sha. Anything unreadable denies."""
+    may-app's main (or the fixed preview base for the opted-in web workflow), from may-app itself,
+    and its head is exactly sha. Anything unreadable denies."""
     if not isinstance(pull, dict) or pull.get("number") != number:
         raise GateDenial("Pull request metadata is unreadable")
     if pull.get("state") != "open":
         raise GateDenial("Pull request is not open")
     base, head = pull.get("base") or {}, pull.get("head") or {}
-    if base.get("ref") != "main" or (base.get("repo") or {}).get("full_name") != APP_REPO:
+    admitted_bases = ("main", "codex/may-web-preview") if web_preview else ("main",)
+    if base.get("ref") not in admitted_bases or (base.get("repo") or {}).get("full_name") != APP_REPO:
+        if web_preview:
+            raise GateDenial("Web-check pull request is not against an admitted may-app base")
         raise GateDenial("Pull request is not against may-app main")
     if (head.get("repo") or {}).get("full_name") != APP_REPO:
         raise GateDenial("Pull request head is not in may-app itself (forks are refused)")
@@ -365,7 +376,9 @@ def main():
     # compile-pr, ds-compile or renders (with a pull request) on its environment's runner, before the fetch: read the
     # pull request itself.
     parser.add_argument("--check-pull", action="store_true")
+    parser.add_argument("--web-preview", action="store_true")
     args = parser.parse_args()
+    web_preview = validate_web_preview_route(args.action, args.web_preview, os.environ.get("GITHUB_WORKFLOW_REF"))
     if args.action in OPTIONAL_PULL_ACTIONS:
         if args.check_pull and args.pr_number is None:
             raise GateDenial("Only a pull request's renders read a pull request")
@@ -409,7 +422,7 @@ def main():
             if not pull_token:
                 raise GateDenial("Pull-request read token unavailable")
             pull = get_app_pull(number, pull_token)
-            validate_pull_request(pull, number, args.source_sha)
+            validate_pull_request(pull, number, args.source_sha, web_preview=web_preview)
             author = login_or_unknown((pull.get("user") or {}).get("login"))
     elif args.action == "ds-compile":
         number = pull_number(args.pr_number)
