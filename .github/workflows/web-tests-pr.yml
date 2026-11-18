@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Open May-Assistant/may-app pull request against main (not from a fork)
+        description: Open May-Assistant/may-app pull request against main or codex/may-web-preview (not from a fork)
         required: true
         type: string
       source_sha:
@@ -22,7 +22,8 @@ jobs:
     # may-app's web/ checked at the head of an open may-app pull request on a free Linux runner: the pinned Node
     # 22.22.0, then may-app's own fetch-design-system.sh (npm run fetch-ds) on the web pin prepare.py --web fetched,
     # npm ci, npx vitest run and npm run build (web_tests.py STAGES). The same gate, fetch and environment as
-    # backend-unit-pr.yml (gate.py --action compile-pr: may-native-compile-pr, no required reviewer, main only),
+    # backend-unit-pr.yml (may-native-compile-pr, no required reviewer, control-workflow main only),
+    # with the web-only opt-in for the fixed may-app preview base; other check/release gates remain main-only.
     # because it holds the same things: two read-only deploy keys and a pull-request read token, each in its own step,
     # and the pull-request comment token in the post alone. Nothing is signed, uploaded or deployed. Every stage's
     # output stays in a private log, only fixed lines with counts are printed, and the failures go only to the may-app
@@ -42,7 +43,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
-        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER"
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --web-preview
   web:
     needs: admission
     runs-on: ubuntu-24.04
@@ -85,7 +86,7 @@ jobs:
           MAY_APP_PR_READ_TOKEN: ${{ steps.ci-read.outputs.token || secrets.MAY_APP_PR_READ_TOKEN }}
           MAY_SOURCE_SHA: ${{ inputs.source_sha }}
           MAY_PR_NUMBER: ${{ inputs.pr_number }}
-        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull
+        run: python3 -I -S -B tools/may_release/gate.py --action compile-pr --source-sha "$MAY_SOURCE_SHA" --pr-number "$MAY_PR_NUMBER" --check-pull --web-preview
       # prepare.py's pull-request fetch, as backend-unit-pr.yml's, plus --web: the design system at may-app's web pin,
       # where web/scripts/fetch-design-system.sh expects it.
       - name: Fetch the pull request head and the web design-system pin quietly
