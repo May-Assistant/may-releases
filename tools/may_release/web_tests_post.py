@@ -26,7 +26,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from backend_unit_post import fenced, text_or_none
 from compile_pr_errors import CompilePrError, github
 from ds_compile import DsCompileError, MAX_BODY, SHA, post_once, run_url
-from gate import APP_REPO, GateDenial, pull_number, validate_pull_request
+from gate import APP_REPO, GateDenial, pull_number, validate_pull_request, validate_web_preview_route
 from prepare import PrepareError, head_revision
 from review_mcp import FOOTER, holds
 from store import StoreError, require_step_secrets
@@ -192,7 +192,10 @@ def post(sha, pr, call_api=github):
     if status != 200:
         raise WebPostError("The may-app pull request could not be read again; nothing was posted")
     try:
-        validate_pull_request(pull, number, sha)
+        web_preview = isinstance(pull, dict) and isinstance(pull.get("base"), dict) and \
+            pull["base"].get("ref") == "codex/may-web-preview"
+        validate_web_preview_route("compile-pr", web_preview, os.environ.get("GITHUB_WORKFLOW_REF"))
+        validate_pull_request(pull, number, sha, web_preview=web_preview)
     except GateDenial:
         raise WebPostError("The pull request is no longer open at the tested head; nothing was posted") from None
     if not post_once(call_api, APP_REPO, number, sha, body, token, MARKER):
