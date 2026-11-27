@@ -12,7 +12,7 @@ against the job's Postgres 16.15 service container (pinned by digest in backend-
   every backend/migrations/NNN_name.sql to be applied exactly once (schema_migrations), the first run to say
   `applied <n> migration(s)` and the second to end with `schema up to date`;
 - tests: `npm test` (node --test, which bounds each file itself) with the job's Postgres as MAY_TEST_ADMIN_URL,
-  stopped after 25 minutes (the suite outgrew backend-ci.yml's 15 by 25 Oct).
+  stopped after 40 minutes (the suite outgrew backend-ci.yml's 15 by 25 Oct).
 An install that fails stops the stages after it; a failed typecheck or migration run still runs the stages after it,
 so one red stage does not hide another (as Gradle's --continue in android_unit.py).
 
@@ -376,7 +376,7 @@ def report(stages, counts):
         tests, passed, failed, skipped = (int(n) for n in counts)
         print(f"May backend tests: {int(tests)} tests, {int(passed)} passed, {int(failed)} failed, {int(skipped)} skipped")
     if stages["tests"] == "timeout":
-        raise BackendTestsError("npm test did not finish within 25 minutes")
+        raise BackendTestsError("npm test did not finish within 40 minutes")
     if any(stages[name] != "passed" for name in STAGES):
         raise BackendTestsError("At least one May backend check did not pass")
     print("Every May backend check passed")

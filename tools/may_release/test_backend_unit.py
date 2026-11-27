@@ -214,7 +214,7 @@ class RunTests(Fixture):
 
     def test_npm_test_that_does_not_finish_fails(self):
         out, error = self.run_checks(self.fake(test_timeout=True, test_output=tap(self.root, summary=False)))
-        self.assertEqual(error, "npm test did not finish within 25 minutes")
+        self.assertEqual(error, "npm test did not finish within 40 minutes")
         self.assertIn("May backend tests: did not finish in time", out)
         self.assertEqual(backend_unit.TEST_SECONDS, 40 * 60)
 
