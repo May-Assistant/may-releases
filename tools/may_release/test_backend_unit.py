@@ -216,7 +216,7 @@ class RunTests(Fixture):
         out, error = self.run_checks(self.fake(test_timeout=True, test_output=tap(self.root, summary=False)))
         self.assertEqual(error, "npm test did not finish within 25 minutes")
         self.assertIn("May backend tests: did not finish in time", out)
-        self.assertEqual(backend_unit.TEST_SECONDS, 25 * 60)
+        self.assertEqual(backend_unit.TEST_SECONDS, 40 * 60)
 
     def test_a_failed_install_stops_every_later_stage(self):
         out, error = self.run_checks(self.fake(install=1))
@@ -498,7 +498,7 @@ class WorkflowTests(unittest.TestCase):
             "GH_TOKEN on the checks": (checks_step, checks_step + "          GH_TOKEN: ${{ github.token }}\n", secret),
             "a read key on the Node install": (node_step, node_step + "        env:\n          MAY_DS_READ_KEY: ${{ secrets.MAY_DS_READ_KEY }}\n", secret),
             "a comment token in the fetch": (fetch_env, fetch_env + "          MAY_APP_PR_COMMENT_TOKEN: ${{ secrets.MAY_APP_PR_COMMENT_TOKEN }}\n", secret),
-            "a job-level env": ("    timeout-minutes: 30\n", "    timeout-minutes: 30\n    env:\n      CI: '1'\n", secret),
+            "a job-level env": ("    timeout-minutes: 50\n", "    timeout-minutes: 50\n    env:\n      CI: '1'\n", secret),
             "a secret in the service": ("          POSTGRES_HOST_AUTH_METHOD: trust\n",
                                         "          POSTGRES_HOST_AUTH_METHOD: trust\n          POSTGRES_PASSWORD: ${{ secrets.MAY_APP_READ_KEY }}\n", service),
             "a Postgres tag without its digest": ("postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d",
@@ -533,7 +533,7 @@ class WorkflowTests(unittest.TestCase):
                                  name + "permissions are not exactly read-only"),
             "the Android lane's concurrency group": ("  group: may-backend-unit-pr\n", "  group: may-android-unit-pr\n",
                                                      name + "does not run one at a time in its own concurrency group"),
-            "a longer timeout": ("    timeout-minutes: 30\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
+            "a longer timeout": ("    timeout-minutes: 50\n", "    timeout-minutes: 360\n", name + "sets a shell, defaults"),
             "a macOS runner": ("  backend:\n    needs: admission\n    runs-on: ubuntu-24.04\n",
                                "  backend:\n    needs: admission\n    runs-on: macos-15\n", shape),
             "no log guard": ("      - name: Check the database log holds no statement text, never printing it\n        if: always()\n",

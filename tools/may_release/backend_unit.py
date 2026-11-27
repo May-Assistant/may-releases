@@ -63,8 +63,9 @@ INSTALL_SECONDS = 10 * 60
 TYPECHECK_SECONDS = 10 * 60
 MIGRATE_SECONDS = 5 * 60
 # Run 9 (40239424875) stopped at 15 minutes with no summary; the suite (2,562 tests on 24 Oct, its whole stage list in
-# 14:41) now needs about 17-18. Headroom inside the job's 30 minutes and the one-hour app token.
-TEST_SECONDS = 25 * 60
+# 14:41) now needs about 17-18. By 27 Nov it took 17-25 minutes run to run (25:00 passed, 25:25 timed out), so the
+# budget is 40 minutes, inside the job's 50 and the one-hour app token.
+TEST_SECONDS = 40 * 60
 # The service container's own log goes into this public job log at teardown (docker logs --details), and Postgres
 # logs each failing statement's text with it: runs 1-9 published may-app's SQL that way. Before anything else, the
 # cluster logs nothing but a panic. ALTER SYSTEM runs outside a transaction, so each is its own psql call.
