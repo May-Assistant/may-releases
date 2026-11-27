@@ -48,8 +48,8 @@ jobs:
     needs: admission
     runs-on: ubuntu-24.04
     environment: ${{ needs.admission.outputs.environment }}
-    # npm test alone stops at 25 minutes (backend_unit.TEST_SECONDS); the rest of the job takes about 2.
-    timeout-minutes: 30
+    # npm test alone stops at 40 minutes (backend_unit.TEST_SECONDS); the rest of the job takes about 2.
+    timeout-minutes: 50
     permissions:
       contents: read
       actions: read

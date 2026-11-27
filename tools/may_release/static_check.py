@@ -2009,8 +2009,8 @@ def backend_unit_workflow_problems(text):
         found.append(name + "backend's steps are not exactly the Node install, check, fetch, checks, post, an "
                      "always-run database log guard and an always-run cleanup")
     if re.search(r"(?m)^\s*(defaults|shell|if|continue-on-error):", text.replace("        if: always()\n", "", 2)) or \
-            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 30\n" not in job_text(text, "backend"):
-        found.append(name + "sets a shell, defaults, a condition or a timeout other than backend's 30 minutes")
+            text.count("timeout-minutes:") != 1 or "    timeout-minutes: 50\n" not in job_text(text, "backend"):
+        found.append(name + "sets a shell, defaults, a condition or a timeout other than backend's 50 minutes")
     job = job_text(text, "backend")
     if "    environment: ${{ needs.admission.outputs.environment }}\n" not in job or \
             "    needs: admission\n" not in job or re.search(r"(?m)^    environment:", job_text(text, "admission")):
